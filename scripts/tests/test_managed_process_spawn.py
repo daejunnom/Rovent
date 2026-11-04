@@ -11,7 +11,7 @@ from unittest import mock
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from managed_process import ProcessNotSpawned, run_group
+from managed_process import OwnedProcessGroup, ProcessNotSpawned, run_group
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux process-group FD handoff only")
@@ -275,6 +275,197 @@ class ManagedProcessSpawnTests(unittest.TestCase):
                 run_group([self.python], self.root, os.environ.copy(), 10,
                           lambda: None, on_tick=1)
             popen.assert_not_called()
+
+    def test_unresolved_owner_retains_original_unreaped_child_then_reobserves(self):
+        owner = OwnedProcessGroup()
+        child = mock.Mock(pid=123456, returncode=None)
+        child.wait.return_value = 7
+        clock = {"now": 10.0}
+
+        def advance(seconds):
+            clock["now"] += seconds
+
+        with mock.patch("managed_process.subprocess.Popen", return_value=child), \
+             mock.patch("managed_process.time.monotonic", side_effect=lambda: clock["now"]), \
+             mock.patch("managed_process.time.sleep", side_effect=advance), \
+             mock.patch("managed_process.os.waitid", return_value=object()), \
+             mock.patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
+             mock.patch("managed_process._group_has_live_members", return_value=True):
+            result = run_group([self.python], self.root, os.environ.copy(), 10,
+                               lambda: None, owned_group=owner)
+        self.assertEqual(result, (125, False, None))
+        self.assertIsNone(child.returncode)
+        child.wait.assert_not_called()
+
+        ticks = []
+        with mock.patch("managed_process.time.monotonic", return_value=20.0), \
+             mock.patch("managed_process.os.waitid", return_value=object()), \
+             mock.patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
+             mock.patch("managed_process._group_has_live_members", return_value=False):
+            observed = owner.reobserve_and_drain(absolute_deadline=25.0,
+                                                 on_tick=lambda: ticks.append(1))
+            repeated = owner.reobserve_and_drain(absolute_deadline=25.0)
+        self.assertEqual(observed, (True, 7, None))
+        self.assertEqual(repeated, observed)
+        self.assertTrue(ticks)
+        child.wait.assert_called_once_with()
+        with self.assertRaises(ValueError):
+            run_group([self.python], self.root, os.environ.copy(), 10,
+                      lambda: None, owned_group=owner)
+
+    def test_reobserve_errors_never_signal_reconstructed_identity(self):
+        owner = OwnedProcessGroup()
+        child = mock.Mock(pid=123456, returncode=None)
+        owner._bind(child)
+        with mock.patch("managed_process.time.monotonic", return_value=10.0), \
+             mock.patch("managed_process.os.waitid", side_effect=ChildProcessError("not a child")), \
+             mock.patch("managed_process.os.killpg") as killpg:
+            gone, code, error = owner.reobserve_and_drain(absolute_deadline=15.0)
+        self.assertFalse(gone)
+        self.assertIsNone(code)
+        self.assertEqual(error["error_type"], "ChildProcessError")
+        killpg.assert_not_called()
+        child.wait.assert_not_called()
+
+    def test_reobserve_expiry_and_callback_error_keep_owner(self):
+        owner = OwnedProcessGroup()
+        child = mock.Mock(pid=123456, returncode=None)
+        owner._bind(child)
+        with mock.patch("managed_process.time.monotonic", return_value=20.0), \
+             mock.patch("managed_process.os.killpg") as killpg:
+            gone, code, error = owner.reobserve_and_drain(absolute_deadline=15.0)
+        self.assertEqual((gone, code, error["kind"]), (False, None, "deadline"))
+        killpg.assert_not_called()
+        with mock.patch("managed_process.time.monotonic", return_value=10.0), \
+             mock.patch("managed_process.os.waitid", return_value=None), \
+             mock.patch("managed_process.os.killpg") as killpg:
+            gone, code, error = owner.reobserve_and_drain(
+                absolute_deadline=15.0, on_tick=lambda: (_ for _ in ()).throw(ValueError("broken")))
+        self.assertEqual((gone, code, error["kind"], error["message"]),
+                         (False, None, "callback", "broken"))
+        killpg.assert_not_called()
+        child.wait.assert_not_called()
+
+    def test_owned_drain_polls_and_preserves_original_and_cleanup_errors(self):
+        owner = OwnedProcessGroup()
+        child = mock.Mock(pid=123456, returncode=None)
+        child.wait.return_value = -15
+        calls = []
+
+        def tick():
+            calls.append(1)
+            if len(calls) == 1:
+                raise ValueError("original")
+            raise RuntimeError("cleanup")
+
+        with mock.patch("managed_process.subprocess.Popen", return_value=child), \
+             mock.patch("managed_process.os.waitid", side_effect=[None, object()]), \
+             mock.patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
+             mock.patch("managed_process._group_has_live_members", return_value=False):
+            result = run_group([self.python], self.root, os.environ.copy(), 10,
+                               lambda: None, on_tick=tick, owned_group=owner)
+        self.assertEqual(result, (125, True, "original"))
+        self.assertEqual(owner.cleanup_error["message"], "cleanup")
+        self.assertEqual(len(calls), 2)
+
+    def test_owned_graceful_cleanup_does_not_signal_and_keeps_original_timeout(self):
+        owner = OwnedProcessGroup()
+        child = mock.Mock(pid=123456, returncode=None)
+        child.wait.return_value = 7
+        clock = {"now": 10.0}
+        ticks = []
+
+        def tick():
+            ticks.append(1)
+            if len(ticks) == 1:
+                clock["now"] = 11.0
+
+        def advance(seconds):
+            clock["now"] += seconds
+
+        with mock.patch("managed_process.subprocess.Popen", return_value=child), \
+             mock.patch("managed_process.time.monotonic", side_effect=lambda: clock["now"]), \
+             mock.patch("managed_process.time.sleep", side_effect=advance), \
+             mock.patch("managed_process.os.waitid", side_effect=[None, None, object()]), \
+             mock.patch("managed_process.os.killpg") as killpg, \
+             mock.patch("managed_process._group_has_live_members", side_effect=[True, False]):
+            result = run_group([self.python], self.root, os.environ.copy(), 0.5,
+                               lambda: None, on_tick=tick, owned_group=owner,
+                               absolute_deadline=15.0, graceful_drain_deadline=14.0)
+        self.assertEqual(result, (124, True, None))
+        self.assertGreaterEqual(len(ticks), 3)
+        killpg.assert_not_called()
+        child.wait.assert_called_once_with()
+        self.assertEqual(owner.reobserve_and_drain(absolute_deadline=15.0), (True, 7, None))
+
+    def test_owned_graceful_deadline_expiry_never_adds_signals(self):
+        owner = OwnedProcessGroup()
+        child = mock.Mock(pid=123456, returncode=None)
+        clock = {"now": 10.0}
+
+        def advance(seconds):
+            clock["now"] += seconds
+
+        def tick():
+            clock["now"] = min(12.0, clock["now"] + 0.5)
+
+        with mock.patch("managed_process.subprocess.Popen", return_value=child), \
+             mock.patch("managed_process.time.monotonic", side_effect=lambda: clock["now"]), \
+             mock.patch("managed_process.time.sleep", side_effect=advance), \
+             mock.patch("managed_process.os.waitid", return_value=None), \
+             mock.patch("managed_process.os.killpg") as killpg, \
+             mock.patch("managed_process._group_has_live_members", return_value=True):
+            result = run_group([self.python], self.root, os.environ.copy(), 0.1,
+                               lambda: None, on_tick=tick, owned_group=owner,
+                               absolute_deadline=12.0, graceful_drain_deadline=12.0)
+        self.assertEqual(result, (124, False, None))
+        self.assertIsNone(child.returncode)
+        child.wait.assert_not_called()
+        killpg.assert_not_called()
+
+    def test_stop_closes_admission_before_cleanup_ticks_and_keeps_error(self):
+        owner = OwnedProcessGroup()
+        child = mock.Mock(pid=123456, returncode=None)
+        child.wait.return_value = -15
+        events = []
+
+        def tick():
+            events.append("tick")
+            if len(events) == 1:
+                raise ValueError("original")
+
+        with mock.patch("managed_process.subprocess.Popen", return_value=child), \
+             mock.patch("managed_process.os.waitid", side_effect=[None, object()]), \
+             mock.patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
+             mock.patch("managed_process._group_has_live_members", return_value=False):
+            result = run_group([self.python], self.root, os.environ.copy(), 10, lambda: None,
+                               owned_group=owner, on_tick=tick, on_stop=lambda: events.append("stop"))
+        self.assertEqual(result, (125, True, "original"))
+        self.assertEqual(events[:3], ["tick", "stop", "tick"])
+        self.assertIsNone(owner.stop_error)
+
+    def test_failed_stop_does_not_poll_uncertain_admission(self):
+        owner = OwnedProcessGroup()
+        child = mock.Mock(pid=123456, returncode=None)
+        child.wait.return_value = -15
+        ticks = []
+
+        def tick():
+            ticks.append(1)
+            raise ValueError("original")
+
+        def fail_stop():
+            raise RuntimeError("stop failed")
+
+        with mock.patch("managed_process.subprocess.Popen", return_value=child), \
+             mock.patch("managed_process.os.waitid", side_effect=[None, object()]), \
+             mock.patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
+             mock.patch("managed_process._group_has_live_members", return_value=False):
+            result = run_group([self.python], self.root, os.environ.copy(), 10, lambda: None,
+                               owned_group=owner, on_tick=tick, on_stop=fail_stop)
+        self.assertEqual(result, (125, True, "original"))
+        self.assertEqual(ticks, [1])
+        self.assertEqual(owner.stop_error["message"], "stop failed")
 
 
 if __name__ == "__main__":

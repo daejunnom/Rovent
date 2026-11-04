@@ -20,6 +20,7 @@ class CustodyTransport:
                       "native_authorization": "not_requested"}
         self._disabled = False
         self._send_disabled = False
+        self._native_admission_open = True
         self._unknown_seen = False
         self._native_ready_seen = False
         self._allow_native = allow_native
@@ -39,6 +40,11 @@ class CustodyTransport:
     def stop_sending(self, error):
         self.state["error"] = error
         self._send_disabled = True
+
+    def close_native_admission(self):
+        """Deny new native starts while keeping recovery transport open."""
+        self._native_admission_open = False
+        self.state["native_admission_closed"] = True
 
     def poll(self):
         if self._disabled:
@@ -91,7 +97,8 @@ class CustodyTransport:
                 self.state["native_authorization"] = "not_sent_child_moved_on"
             else:
                 try:
-                    allowed = self._allow_native is not None and self._allow_native()
+                    allowed = (self._native_admission_open and self._allow_native is not None
+                               and self._allow_native())
                 except Exception as error:
                     self.state["error"] = type(error).__name__
                     allowed = False

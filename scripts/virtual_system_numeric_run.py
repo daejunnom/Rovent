@@ -18,7 +18,7 @@ import time
 
 sys.dont_write_bytecode = True
 from managed_outputs import OutputLease
-from managed_process import ProcessNotSpawned, run_group
+from managed_process import OwnedProcessGroup, ProcessNotSpawned, run_group
 from managed_storage import checked
 from pals_followup_run import outside_git, sha, unique_object, observe_resources
 from virtual_custody_transport import CustodyTransport
@@ -57,6 +57,41 @@ def capture_process_status(code, gone, failure, observation, custody):
             or custody.get("error") is not None):
         return "capture_process_completed_custody_unknown"
     return "capture_process_completed"
+
+
+def output_lease_tree_observation(dispatch_attempted, proved_not_spawned):
+    """A group-only observation cannot rule out escaped descendants."""
+    return True if not dispatch_attempted or proved_not_spawned else "unknown"
+
+
+def capture_cleanup_partition(cleanup_seconds, deadline_ns):
+    """Divide the sealed cleanup allowance without increasing the deadline."""
+    if type(cleanup_seconds) is not int or not 1 <= cleanup_seconds <= 30:
+        raise ValueError("sealed capture cleanup deadline is invalid")
+    cleanup_ns = cleanup_seconds * 1_000_000_000
+    group_reserve_ns = cleanup_ns // 2
+    return cleanup_ns, group_reserve_ns, deadline_ns - group_reserve_ns
+
+
+def observe_unresolved_owned(group, transport_poll, deadline, *, clock=time.monotonic):
+    """Retain the original group and channel only until the registered deadline.
+
+    This observation cannot extend the registered window, or establish GPU
+    completion. A failed observation does not replace the original run result.
+    """
+    record = {"attempted": False, "tree_gone": "unknown", "reaped_exit_code": None,
+              "error": None, "scope": "original_group_and_channel_until_registered_deadline"}
+    if clock() >= deadline:
+        record["error"] = "registered_deadline_elapsed_before_reobservation"
+        return record
+    record["attempted"] = True
+    try:
+        gone, reaped, failure = group.reobserve_and_drain(
+            absolute_deadline=deadline, on_tick=transport_poll)
+        record.update(tree_gone=gone, reaped_exit_code=reaped, error=failure)
+    except Exception as error:
+        record["error"] = {"type": type(error).__name__, "message": str(error)}
+    return record
 
 
 def snapshot_file(path: Path, expected: str, maximum: int, deadline: float, *, content=False, exact_size=None, seal=True):
@@ -184,6 +219,9 @@ def main(argv=None):
         "schema": "rovezero.virtual-system-numeric-supervisor.v1",
         "status": "failed_before_dispatch", "producer_exit_code": None,
         "producer_result_observed": False, "producer_tree_gone": True,
+        "producer_group_gone": True,
+        "producer_group_gone_scope": "original_process_group_and_joined_leader_only_setsids_unobserved",
+        "producer_tree_gone_scope": "unknown_for_spawned_child_escaped_descendants_unobserved",
         "producer_supervisor_error": None, "dispatch_attempted": False,
         "native_binary_sha256": args.binary_sha256, "capture_config_sha256": args.config_sha256,
         "binary_identity_scope": "same_sha_sealed_anonymous_image_not_original_inode",
@@ -240,17 +278,30 @@ def main(argv=None):
         receipt["output_lease"]["acquired"] = True
         receipt["capture_window_dispatch"] = require_capture_window(config, deadline_ns)
         remaining = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
+        cleanup_ns, group_drain_reserve_ns, child_cleanup_deadline_ns = capture_cleanup_partition(
+            config["cleanup_seconds"], deadline_ns)
+        receipt["cleanup_partition"] = {
+            "policy": "registered_cleanup_half_for_group_drain_v1",
+            "child_cleanup_deadline_monotonic_ns": child_cleanup_deadline_ns,
+            "group_drain_reserve_ns": group_drain_reserve_ns,
+            "supervisor_deadline_monotonic_ns": deadline_ns,
+            "child_deadline_recheck_required": True,
+            "group_termination_is_gpu_fence": False,
+        }
         receipt["dispatch_attempted"] = True
         receipt["producer_tree_gone"] = "unknown"
+        receipt["producer_group_gone"] = "unknown"
         transport = CustodyTransport(
             allow_native=lambda: (time.monotonic_ns() + config["cleanup_seconds"] * 1_000_000_000 < deadline_ns),
-            reobserve_interval_ns=config["cleanup_seconds"] * 1_000_000_000 // 32,
+            reobserve_interval_ns=(cleanup_ns - group_drain_reserve_ns) // 32,
         )
         receipt["custody_transport"] = transport.state
         observation = {}
         receipt["producer_deadline_observation"] = observation
+        group = OwnedProcessGroup()
         env["ROVEZERO_CUSTODY_FD"] = str(transport.child_fd())
         env["ROVEZERO_SUPERVISOR_DEADLINE_MONOTONIC_NS"] = str(deadline_ns)
+        env["ROVEZERO_CHILD_CLEANUP_DEADLINE_MONOTONIC_NS"] = str(child_cleanup_deadline_ns)
         def producer_spawned():
             receipt["producer_spawned"] = True
             transport.child_started()
@@ -260,19 +311,41 @@ def main(argv=None):
             except Exception as error:
                 transport.stop_sending(f"poll:{type(error).__name__}")
         def producer_check():
-            lease.check_budget()
+            try:
+                lease.check_budget()
+            except BaseException:
+                transport.close_native_admission()
+                raise
         try:
             code, gone, failure = run_group([f"/proc/self/fd/{binary_fd}", f"/proc/self/fd/{config_image}"],
                                             args.binary.parent, env, remaining, producer_check,
                                             pass_fds=(binary_fd, config_image, transport.child_fd()), on_spawn=producer_spawned,
                                             verify_before_spawn=True, absolute_deadline=deadline,
-                                            deadline_observation=observation, on_tick=transport_poll)
+                                            deadline_observation=observation, on_tick=transport_poll,
+                                            on_stop=transport.close_native_admission, owned_group=group,
+                                            graceful_drain_deadline=child_cleanup_deadline_ns / 1_000_000_000)
             # Preserve the original tuple before any transport cleanup.
             receipt.update(producer_result_observed=True, producer_exit_code=code,
-                           producer_tree_gone=gone, producer_supervisor_error=failure,
+                           producer_group_gone=gone, producer_supervisor_error=failure,
+                           producer_initial_group_observation={
+                               "supervisor_return_code": code, "group_gone": gone,
+                               "supervisor_error": failure},
                            status="capture_process_result_observed")
+            if group.cleanup_error is not None:
+                receipt["producer_cleanup_error"] = group.cleanup_error
+            if group.stop_error is not None:
+                receipt["producer_admission_stop_error"] = group.stop_error
+                transport.stop_sending("native_admission_stop_failed")
+            if gone is not True:
+                extra = observe_unresolved_owned(group, transport_poll, deadline)
+                receipt["producer_owned_reobservation"] = extra
+                if (extra["tree_gone"] is True and type(extra["reaped_exit_code"]) is int
+                        and extra["error"] is None):
+                    receipt["producer_group_gone"] = True
         except ProcessNotSpawned as error:
             receipt["producer_tree_gone"] = True
+            receipt["producer_group_gone"] = True
+            receipt["producer_proved_not_spawned"] = True
             receipt["producer_not_spawned_cause"] = {
                 "type": type(error.__cause__).__name__, "message": str(error.__cause__)}
             raise
@@ -291,6 +364,14 @@ def main(argv=None):
         if not isinstance(error, Exception):
             pending = error
     finally:
+        receipt["producer_tree_gone"] = output_lease_tree_observation(
+            receipt["dispatch_attempted"], bool(receipt.get("producer_proved_not_spawned")))
+        if receipt.get("producer_spawned") and receipt["producer_group_gone"] is not True:
+            receipt["unresolved_owner_after_wrapper_exit"] = {
+                "status": "not_retained_by_this_process_after_exit",
+                "output_lease": "active_catalog_record_only_if_finish_succeeds",
+                "gpu_physical_completion": "unknown",
+            }
         if lease is not None:
             receipt["output_lease"]["finish_attempted"] = True
             try:

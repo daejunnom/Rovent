@@ -1187,6 +1187,25 @@ struct SystemCaptureWorker {
     quarantined: bool,
 }
 
+#[cfg(target_os = "linux")]
+fn report_late_completion(result: &std::result::Result<owned_worker::CaptureReply, BackendError>) {
+    let observation = match result {
+        Ok(owned_worker::CaptureReply::Started(_)) => serde_json::json!({
+            "status":"late_success", "reply":"startup", "on_time_success":false
+        }),
+        Ok(owned_worker::CaptureReply::Native(_)) => serde_json::json!({
+            "status":"late_success", "reply":"native", "on_time_success":false
+        }),
+        Err(error) => serde_json::json!({
+            "status":"late_failure", "backend_error":format!("{error:?}"), "on_time_success":false
+        }),
+    };
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "RZ_CUSTODY_LATE_COMPLETION={observation}"
+    );
+}
+
 /// Duplicate only the explicitly inherited supervisor descriptor. Ownership of
 /// the original worker, its lease and its recovery key remains in this process.
 #[cfg(target_os = "linux")]
@@ -1240,12 +1259,92 @@ fn system_supervisor_socket() -> Result<std::os::unix::net::UnixDatagram> {
     Ok(socket)
 }
 
+#[cfg(target_os = "linux")]
+struct PreNativeSupervisor {
+    socket: std::os::unix::net::UnixDatagram,
+    // False as soon as reservation/worker custody may exist; it can only be
+    // restored after the exact unpublished reservation is explicitly retired.
+    no_native_and_no_reservation: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl PreNativeSupervisor {
+    fn notify(&self, packet: &[u8]) {
+        if let Err(error) = self.socket.send(packet) {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "RZ_CUSTODY_TRANSPORT_ERROR={error}"
+            );
+        }
+    }
+
+    fn admit_native(&self, until: Instant) -> Result<()> {
+        self.socket.send(b"NATIVE_READY")?;
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .map(|value| value.min(until))
+            .unwrap_or(until);
+        let mut packet = [0u8; 64];
+        loop {
+            if Instant::now() >= deadline {
+                return Err("supervisor native-entry grant deadline expired".into());
+            }
+            match self.socket.recv(&mut packet) {
+                Ok(length) if &packet[..length] == b"ALLOW_NATIVE" => return Ok(()),
+                Ok(_) => return Err("invalid supervisor native-entry grant".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
 /// Check the parent's actual absolute deadline immediately before worker
 /// creation. Rust's Instant on Linux and CLOCK_MONOTONIC share the monotonic
 /// clock; computing remaining duration before reading the clock is deliberately
 /// conservative by the time spent reading it.
 #[cfg(target_os = "linux")]
-fn check_supervisor_deadline(work_until: Instant, cleanup: Duration) -> Result<()> {
+fn effective_cleanup_limit(
+    anchor: Instant,
+    now_ns: u128,
+    child_cap_ns: u128,
+    supervisor_ns: u128,
+    work_until: Instant,
+    original_limit: Instant,
+) -> Result<Instant> {
+    let effective_cap_ns = child_cap_ns.min(supervisor_ns);
+    let remaining_ns = effective_cap_ns
+        .checked_sub(now_ns)
+        .filter(|value| *value != 0)
+        .ok_or("child cleanup deadline elapsed before native admission")?;
+    let original_remaining_ns = original_limit
+        .checked_duration_since(anchor)
+        .ok_or("registered system cleanup deadline already elapsed")?
+        .as_nanos();
+    // A very distant child cap is harmless: clamp in nanoseconds before
+    // conversion so it cannot overflow an otherwise valid original window.
+    let remaining_ns = remaining_ns.min(original_remaining_ns);
+    let seconds = u64::try_from(remaining_ns / 1_000_000_000)
+        .map_err(|_| "child cleanup deadline duration overflows")?;
+    let nanos = (remaining_ns % 1_000_000_000) as u32;
+    let translated = anchor
+        .checked_add(Duration::new(seconds, nanos))
+        .ok_or("child cleanup deadline overflows Instant")?;
+    let effective = translated.min(original_limit);
+    if effective < work_until {
+        return Err("child cleanup deadline cannot contain the registered work window".into());
+    }
+    Ok(effective)
+}
+
+#[cfg(target_os = "linux")]
+fn check_supervisor_deadline(
+    work_until: Instant,
+    cleanup: Duration,
+    original_limit: Instant,
+) -> Result<Instant> {
     #[repr(C)]
     struct Timespec {
         tv_sec: std::os::raw::c_long,
@@ -1256,8 +1355,11 @@ fn check_supervisor_deadline(work_until: Instant, cleanup: Duration) -> Result<(
     }
     let supervisor_ns =
         std::env::var("ROVEZERO_SUPERVISOR_DEADLINE_MONOTONIC_NS")?.parse::<u128>()?;
+    let child_cap_ns =
+        std::env::var("ROVEZERO_CHILD_CLEANUP_DEADLINE_MONOTONIC_NS")?.parse::<u128>()?;
+    let anchor = Instant::now();
     let remaining = work_until
-        .checked_duration_since(Instant::now())
+        .checked_duration_since(anchor)
         .ok_or("work deadline expired before supervisor admission")?;
     let mut now = Timespec {
         tv_sec: 0,
@@ -1271,10 +1373,12 @@ fn check_supervisor_deadline(work_until: Instant, cleanup: Duration) -> Result<(
     if now.tv_sec < 0 || !(0..1_000_000_000).contains(&now.tv_nsec) {
         return Err("invalid monotonic clock reading".into());
     }
-    let required_ns = (now.tv_sec as u128)
+    let now_ns = (now.tv_sec as u128)
         .checked_mul(1_000_000_000)
         .and_then(|value| value.checked_add(now.tv_nsec as u128))
-        .and_then(|value| value.checked_add(remaining.as_nanos()))
+        .ok_or("supervisor monotonic reading overflows")?;
+    let required_ns = now_ns
+        .checked_add(remaining.as_nanos())
         .and_then(|value| value.checked_add(cleanup.as_nanos()))
         .ok_or("supervisor deadline conversion overflow")?;
     if required_ns > supervisor_ns {
@@ -1282,7 +1386,30 @@ fn check_supervisor_deadline(work_until: Instant, cleanup: Duration) -> Result<(
             "supervisor deadline cannot contain the original work and cleanup windows".into(),
         );
     }
-    Ok(())
+    let effective = effective_cleanup_limit(
+        anchor,
+        now_ns,
+        child_cap_ns,
+        supervisor_ns,
+        work_until,
+        original_limit,
+    )?;
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "RZ_NUMERIC_CLEANUP_WINDOW={}",
+        serde_json::json!({
+            "scope":"same_child_monotonic_deadlines_before_native",
+            "supervisor_deadline_monotonic_ns":supervisor_ns.to_string(),
+            "child_cleanup_deadline_monotonic_ns":child_cap_ns.to_string(),
+            "sample_monotonic_ns":now_ns.to_string(),
+            "registered_work_remaining_at_anchor_ns":remaining.as_nanos().to_string(),
+            "registered_cleanup_window_ns":cleanup.as_nanos().to_string(),
+            "effective_cleanup_remaining_at_anchor_ns":effective.duration_since(anchor).as_nanos().to_string(),
+            "child_or_supervisor_cap_shortened_cleanup":effective < original_limit,
+            "physical_completion":"not_inferred"
+        })
+    );
+    Ok(effective)
 }
 
 #[cfg(target_os = "linux")]
@@ -1508,6 +1635,7 @@ impl SystemCaptureWorker {
                     PhysicalPoll::Ready(result) => {
                         // Preserve a late result separately; it does not turn
                         // the earlier deadline or request error into success.
+                        report_late_completion(&result);
                         self.late_completion = Some(result);
                         self.pending.take();
                     }
@@ -1540,6 +1668,7 @@ impl SystemCaptureWorker {
                     if let Some(lease) = self.pending.as_mut() {
                         match lease.poll() {
                             PhysicalPoll::Ready(result) => {
+                                report_late_completion(&result);
                                 self.late_completion = Some(result);
                                 self.pending.take();
                             }
@@ -1862,7 +1991,10 @@ fn identity(
         anchor_history_seals: anchors,
     })
 }
-fn execute(config: Config) -> Result<()> {
+fn execute(
+    config: Config,
+    #[cfg(target_os = "linux")] supervisor: &mut Option<PreNativeSupervisor>,
+) -> Result<()> {
     let selected = config.execution_config()?;
     let is_cuda = matches!(selected.provider, Provider::Cuda { .. });
     let system_cuda = config.provider == "cuda-system";
@@ -1898,7 +2030,7 @@ fn execute(config: Config) -> Result<()> {
         return Err("capture requires registered finite execution/cleanup windows".into());
     }
     let until = Instant::now() + Duration::from_secs(config.deadline_seconds);
-    let system_cleanup_limit = if system_cuda {
+    let mut system_cleanup_limit = if system_cuda {
         Some(
             until
                 .checked_add(Duration::from_secs(config.cleanup_seconds))
@@ -2253,19 +2385,35 @@ fn execute(config: Config) -> Result<()> {
         PreparedRuntime::System(runtime) => {
             // Admission must establish the supervisor channel before any
             // reservation, worker creation, or ORT entry.
-            let supervisor = system_supervisor_socket()?;
-            check_supervisor_deadline(until, Duration::from_secs(config.cleanup_seconds))?;
+            let supervisor_control = supervisor.as_mut().ok_or("system supervisor is required")?;
+            let original_cleanup_limit =
+                system_cleanup_limit.ok_or("system cleanup limit absent")?;
+            system_cleanup_limit = Some(check_supervisor_deadline(
+                until,
+                Duration::from_secs(config.cleanup_seconds),
+                original_cleanup_limit,
+            )?);
             let custody = system_startup_custody(
                 &config.export_manifest,
                 &summary,
                 &output_owner,
                 system_control,
             )?;
-            let (mut reservation, key) = PhysicalRecoveryReservation::reserve()?;
+            let expected_runtime_sha256 = pin(&b.runtime_library_sha256)?;
+            supervisor_control.admit_native(until)?;
+            let supervisor = supervisor_control.socket.try_clone()?;
+            supervisor_control.no_native_and_no_reservation = false;
+            let (mut reservation, key) = match PhysicalRecoveryReservation::reserve() {
+                Ok(value) => value,
+                Err(error) => {
+                    supervisor_control.no_native_and_no_reservation = true;
+                    return Err(Box::new(error));
+                }
+            };
             let mut original = Some(custody);
             let startup = owned_worker::Startup {
                 runtime,
-                expected_runtime_sha256: pin(&b.runtime_library_sha256)?,
+                expected_runtime_sha256,
                 expected_manifest_sha256: b.export_manifest_sha256.clone(),
                 config: selected,
                 mode,
@@ -2289,6 +2437,7 @@ fn execute(config: Config) -> Result<()> {
                                 detail: "unpublished original reservation could not be canceled",
                             }));
                         }
+                        supervisor_control.no_native_and_no_reservation = true;
                     } else {
                         return Err(Box::new(UnpublishedReservationFailure {
                             primary: error,
@@ -2748,24 +2897,192 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
-    if args.len() != 1 {
-        return Err(
-            "usage: virtual_review_numeric_capture --source-pins | --model-registry | ABSOLUTE_CAPTURE_CONFIG.json"
-                .into(),
-        );
+    #[cfg(target_os = "linux")]
+    let mut supervisor = if std::env::var_os("ROVEZERO_CUSTODY_FD").is_some() {
+        let control = PreNativeSupervisor {
+            socket: system_supervisor_socket()?,
+            no_native_and_no_reservation: true,
+        };
+        control.notify(b"PENDING");
+        Some(control)
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let supervised = supervisor.is_some();
+    let mut run = || -> Result<()> {
+        if args.len() != 1 {
+            return Err(
+                "usage: virtual_review_numeric_capture --source-pins | --model-registry | ABSOLUTE_CAPTURE_CONFIG.json"
+                    .into(),
+            );
+        }
+        let path = Path::new(&args[0]);
+        if !path.is_absolute() {
+            return Err("capture config must be absolute".into());
+        }
+        let bytes = asset::read_bounded(path, 64 * 1024)?;
+        let config: Config = decode_unique(&bytes)?;
+        #[cfg(target_os = "linux")]
+        {
+            if supervised && config.provider != "cuda-system" {
+                return Err("custody supervisor is reserved for system CUDA capture".into());
+            }
+            execute(config, &mut supervisor)
+        }
+        #[cfg(not(target_os = "linux"))]
+        execute(config)
+    };
+    #[cfg(target_os = "linux")]
+    let result = if supervised {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|payload| {
+            Err(Box::new(CapturePanicFailure {
+                stage: "preflight_or_supervisor",
+                _original_payload: payload,
+            }))
+        })
+    } else {
+        run()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let result = run();
+    #[cfg(target_os = "linux")]
+    if result.is_err() {
+        if let Some(control) = supervisor.as_ref() {
+            if control.no_native_and_no_reservation {
+                control.notify(b"NO_NATIVE_ENTRY");
+            }
+        }
     }
-    let path = Path::new(&args[0]);
-    if !path.is_absolute() {
-        return Err("capture config must be absolute".into());
-    }
-    let bytes = asset::read_bounded(path, 64 * 1024)?;
-    let config: Config = decode_unique(&bytes)?;
-    execute(config)
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_cleanup_cap_respects_work_and_original_window() {
+        let anchor = Instant::now();
+        let work = anchor + Duration::from_secs(2);
+        let original = anchor + Duration::from_secs(10);
+        let sample = 1_000_000_000u128;
+        let capped = effective_cleanup_limit(
+            anchor,
+            sample,
+            sample + 4_000_000_000,
+            sample + 20_000_000_000,
+            work,
+            original,
+        )
+        .unwrap();
+        assert_eq!(capped, anchor + Duration::from_secs(4));
+        let generous =
+            effective_cleanup_limit(anchor, sample, u128::MAX, u128::MAX, work, original).unwrap();
+        assert_eq!(generous, original);
+        let supervisor_cap = effective_cleanup_limit(
+            anchor,
+            sample,
+            sample + 8_000_000_000,
+            sample + 3_000_000_000,
+            work,
+            original,
+        )
+        .unwrap();
+        assert_eq!(supervisor_cap, anchor + Duration::from_secs(3));
+        let exact_work = effective_cleanup_limit(
+            anchor,
+            sample,
+            sample + 2_000_000_000,
+            sample + 20_000_000_000,
+            work,
+            original,
+        )
+        .unwrap();
+        assert_eq!(exact_work, work);
+        assert!(effective_cleanup_limit(
+            anchor,
+            sample,
+            sample + 1_000_000_000,
+            sample + 20_000_000_000,
+            work,
+            original,
+        )
+        .is_err());
+        assert!(
+            effective_cleanup_limit(anchor, sample, sample, u128::MAX, work, original).is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn custody_test_pair() -> (
+        std::os::unix::net::UnixDatagram,
+        std::os::unix::net::UnixDatagram,
+    ) {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        extern "C" {
+            fn socketpair(domain: i32, kind: i32, protocol: i32, pair: *mut i32) -> i32;
+        }
+        let mut fds = [-1; 2];
+        // SAFETY: writable array has room for both returned descriptors; Linux
+        // AF_UNIX and SOCK_SEQPACKET are 1 and 5 respectively.
+        assert_eq!(unsafe { socketpair(1, 5, 0, fds.as_mut_ptr()) }, 0);
+        // SAFETY: successful socketpair returns two distinct owned descriptors.
+        let child = std::os::unix::net::UnixDatagram::from(unsafe { OwnedFd::from_raw_fd(fds[0]) });
+        let parent =
+            std::os::unix::net::UnixDatagram::from(unsafe { OwnedFd::from_raw_fd(fds[1]) });
+        child.set_nonblocking(true).unwrap();
+        parent
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        (child, parent)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_entry_requires_matching_supervisor_grant() {
+        let (child, parent) = custody_test_pair();
+        let mock = std::thread::spawn(move || {
+            let mut buffer = [0; 64];
+            let n = parent.recv(&mut buffer).unwrap();
+            assert_eq!(&buffer[..n], b"NATIVE_READY");
+            parent.send(b"ALLOW_NATIVE").unwrap();
+        });
+        let owner = PreNativeSupervisor {
+            socket: child,
+            no_native_and_no_reservation: true,
+        };
+        assert!(owner
+            .admit_native(Instant::now() + Duration::from_secs(2))
+            .is_ok());
+        assert!(owner.no_native_and_no_reservation);
+        mock.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_or_invalid_grant_does_not_admit_native_entry() {
+        let (child, parent) = custody_test_pair();
+        parent.send(b"WRONG_GRANT").unwrap();
+        let owner = PreNativeSupervisor {
+            socket: child,
+            no_native_and_no_reservation: true,
+        };
+        assert!(owner
+            .admit_native(Instant::now() + Duration::from_secs(1))
+            .is_err());
+        assert!(owner.no_native_and_no_reservation);
+        let (child, _parent) = custody_test_pair();
+        let owner = PreNativeSupervisor {
+            socket: child,
+            no_native_and_no_reservation: true,
+        };
+        assert!(owner
+            .admit_native(Instant::now() + Duration::from_millis(20))
+            .is_err());
+        assert!(owner.no_native_and_no_reservation);
+    }
 
     #[test]
     fn joined_capture_policy_failure_keeps_the_required_raw_publication() {

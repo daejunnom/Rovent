@@ -13,6 +13,181 @@ class ProcessNotSpawned(RuntimeError):
     """Opt-in preflight failed before Popen was invoked; retains original cause."""
 
 
+def _group_has_live_members(pgid):
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdecimal():
+            continue
+        try:
+            with open(f"{entry.path}/stat", encoding="utf-8") as stream:
+                fields = stream.read().rsplit(")", 1)[1].split()
+            if int(fields[2]) == pgid and fields[0] not in {"Z", "X"}:
+                return True
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except (OSError, ValueError, IndexError):
+            return True
+    return False
+
+
+def _finish_owned_group(child, on_tick, graceful_deadline, absolute_deadline):
+    """Drain this unreaped group while retaining the first cleanup error."""
+    tick_enabled = on_tick is not None
+    cleanup_error = None
+
+    def tick():
+        nonlocal tick_enabled, cleanup_error
+        if not tick_enabled:
+            return
+        try:
+            on_tick()
+        except BaseException as exc:
+            tick_enabled = False
+            cleanup_error = {"kind": "callback", "error_type": type(exc).__name__,
+                             "message": str(exc)}
+
+    deadline = absolute_deadline if absolute_deadline is not None else time.monotonic() + 3
+    try:
+        # The V3 child may need the registered cleanup window to finish the
+        # original native owner. Keep servicing its channel before signaling.
+        while graceful_deadline is not None and time.monotonic() < graceful_deadline:
+            tick()
+            if not _group_has_live_members(child.pid):
+                status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                if status is not None:
+                    return True, child.wait(), cleanup_error
+            time.sleep(min(0.05, max(0.0, graceful_deadline - time.monotonic())))
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            if time.monotonic() >= deadline:
+                return False, None, cleanup_error
+            tick()
+            if time.monotonic() >= deadline:
+                return False, None, cleanup_error
+            try:
+                os.killpg(child.pid, sig)
+            except ProcessLookupError:
+                break
+            if sig == signal.SIGTERM:
+                time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+        while time.monotonic() < deadline:
+            tick()
+            if not _group_has_live_members(child.pid):
+                status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                if status is not None:
+                    return True, child.wait(), cleanup_error
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        return False, None, cleanup_error
+    except BaseException as exc:
+        error = {"kind": "observation", "error_type": type(exc).__name__, "message": str(exc)}
+        if cleanup_error is not None:
+            cleanup_error["additional_observation_error"] = error
+            return False, None, cleanup_error
+        return False, None, error
+
+
+class OwnedProcessGroup:
+    """Keep the original Popen and unreaped group identity across an unknown drain.
+
+    This is process-local ownership, not a serializable PID-based recovery token.
+    A caller must retain this object and any associated transport and leases.
+    """
+
+    def __init__(self):
+        self._owner_pid = os.getpid()
+        self._child = None
+        self._completed = False
+        self._exit_code = None
+        self.cleanup_error = None
+        self.stop_error = None
+
+    def _assert_available(self):
+        if os.getpid() != self._owner_pid or self._child is not None or self._completed:
+            raise ValueError("process group owner is not available in this process")
+
+    def _bind(self, child):
+        self._child = child
+
+    def _mark_completed(self, exit_code):
+        self._exit_code = exit_code
+        self._completed = True
+
+    def reobserve_and_drain(self, *, absolute_deadline, on_tick=None, terminate=False):
+        """Bounded same-owner drain; return (group_gone, reaped_exit, error).
+
+        Absolute deadline uses time.monotonic(). A gone process group is not
+        itself proof of completion of asynchronous GPU work. The /proc scan
+        is limited to the owned process group, not escaped descendants.
+        Individual OS
+        observations cannot be preempted and can exceed the deadline.
+        """
+        try:
+            valid = (type(absolute_deadline) in (int, float)
+                     and math.isfinite(absolute_deadline) and absolute_deadline > 0)
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ValueError("absolute deadline must be finite positive monotonic seconds")
+        if on_tick is not None and not callable(on_tick):
+            raise ValueError("on_tick must be callable")
+        if type(terminate) is not bool:
+            raise ValueError("terminate must be bool")
+        if os.getpid() != self._owner_pid:
+            raise RuntimeError("process group belongs to a different owner process")
+        if self._completed:
+            return True, self._exit_code, None
+        child = self._child
+        if child is None:
+            raise RuntimeError("no original process has been attached")
+        if time.monotonic() >= absolute_deadline:
+            return False, None, {"kind": "deadline", "error_type": "TimeoutError",
+                                 "message": "reobservation deadline expired"}
+        def tick():
+            if on_tick is None:
+                return None
+            try:
+                on_tick()
+                return None
+            except BaseException as exc:
+                return {"kind": "callback", "error_type": type(exc).__name__, "message": str(exc)}
+        try:
+            # A waitable leader, not a reconstructed PID, pins the group ID.
+            os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            for sig in ((signal.SIGTERM, signal.SIGKILL) if terminate else ()):
+                if time.monotonic() >= absolute_deadline:
+                    return False, None, {"kind": "deadline", "error_type": "TimeoutError",
+                                         "message": "reobservation deadline expired"}
+                error = tick()
+                if error is not None:
+                    return False, None, error
+                if time.monotonic() >= absolute_deadline:
+                    return False, None, {"kind": "deadline", "error_type": "TimeoutError",
+                                         "message": "reobservation deadline expired"}
+                try:
+                    os.killpg(child.pid, sig)
+                except ProcessLookupError:
+                    break
+                if sig == signal.SIGTERM:
+                    time.sleep(min(0.2, max(0.0, absolute_deadline - time.monotonic())))
+            while time.monotonic() < absolute_deadline:
+                error = tick()
+                if error is not None:
+                    return False, None, error
+                if time.monotonic() >= absolute_deadline:
+                    return False, None, {"kind": "deadline", "error_type": "TimeoutError",
+                                         "message": "reobservation deadline expired"}
+                if not _group_has_live_members(child.pid):
+                    status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    if status is not None:
+                        result = child.wait()
+                        self._mark_completed(result)
+                        return True, result, None
+                time.sleep(min(0.05, max(0.0, absolute_deadline - time.monotonic())))
+            return False, None, {"kind": "deadline", "error_type": "TimeoutError",
+                                 "message": "reobservation deadline expired"}
+        except (OSError, ValueError, IndexError) as exc:
+            return False, None, {"kind": "observation", "error_type": type(exc).__name__,
+                                 "message": str(exc)}
+
+
 def _check_before_spawn(argv, cwd, pass_fds, stdout):
     try:
         if not argv or not os.path.isabs(os.fspath(argv[0])):
@@ -34,17 +209,34 @@ def _check_before_spawn(argv, cwd, pass_fds, stdout):
 
 def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=None, on_spawn=None,
               verify_before_spawn=False, absolute_deadline=None, deadline_observation=None,
-              on_tick=None):
+              on_tick=None, owned_group=None, graceful_drain_deadline=None, on_stop=None):
     if os.name == "nt":
         if (pass_fds or stdout is not None or on_spawn is not None or verify_before_spawn
                 or absolute_deadline is not None or deadline_observation is not None
-                or on_tick is not None):
+                or on_tick is not None or owned_group is not None or graceful_drain_deadline is not None
+                or on_stop is not None):
             raise RuntimeError("explicit descriptor handoff requires Linux")
         return _run_windows(argv, cwd, env, timeout, admission_check)
     if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
         raise RuntimeError("non-reaping process supervision requires Linux waitid")
     if on_tick is not None and not callable(on_tick):
         raise ValueError("on_tick must be callable")
+    if on_stop is not None and (owned_group is None or not callable(on_stop)):
+        raise ValueError("on_stop must be callable and requires owned_group")
+    if owned_group is not None:
+        if type(owned_group) is not OwnedProcessGroup:
+            raise ValueError("owned_group must be an OwnedProcessGroup")
+        owned_group._assert_available()
+    if graceful_drain_deadline is not None:
+        try:
+            valid_grace = (owned_group is not None and absolute_deadline is not None
+                           and type(graceful_drain_deadline) in (int, float)
+                           and math.isfinite(graceful_drain_deadline)
+                           and 0 < graceful_drain_deadline <= absolute_deadline)
+        except (TypeError, OverflowError):
+            valid_grace = False
+        if not valid_grace:
+            raise ValueError("graceful drain needs an owner and a deadline within the absolute deadline")
     if deadline_observation is not None:
         if type(deadline_observation) is not dict or absolute_deadline is None:
             raise ValueError("deadline observation requires a dict and an absolute deadline")
@@ -68,13 +260,15 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
         _check_before_spawn(argv, cwd, pass_fds, stdout)
     if absolute_deadline is not None and time.monotonic() >= absolute_deadline:
         raise ProcessNotSpawned("absolute deadline expired before process spawn") from TimeoutError()
-    child = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True,
-                             pass_fds=tuple(pass_fds), stdout=stdout)
-    started = time.monotonic()
-    next_check = started
     requested_exit = None
     failure = None
+    child = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True,
+                             pass_fds=tuple(pass_fds), stdout=stdout)
     try:
+        if owned_group is not None:
+            owned_group._bind(child)
+        started = time.monotonic()
+        next_check = started
         if on_spawn is not None:
             on_spawn()
         while True:
@@ -157,9 +351,37 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
     except BaseException as exc:
         # Child ownership already exists: even an uncommon control-flow
         # exception must pass through the original group drain below.
-        if on_spawn is None and on_tick is None:
+        if on_spawn is None and on_tick is None and owned_group is None:
             raise
         requested_exit, failure = 125, f"{type(exc).__name__}: {exc}"
+    if owned_group is not None:
+        # Bind again after an exceptional setup path if its first attempt was
+        # interrupted; do not infer anything about a Popen that raised itself.
+        if owned_group._child is None:
+            owned_group._bind(child)
+        if requested_exit is not None and on_stop is not None:
+            try:
+                on_stop()
+            except BaseException as exc:
+                owned_group.stop_error = {"kind": "callback", "error_type": type(exc).__name__,
+                                          "message": str(exc)}
+                # A failed stop hook cannot establish that admission closed.
+                # Never run another transport tick on that uncertain channel.
+                on_tick = None
+        gone, result, cleanup_error = _finish_owned_group(
+            child, on_tick, graceful_drain_deadline, absolute_deadline)
+        owned_group.cleanup_error = cleanup_error
+        if cleanup_error is not None and failure is None:
+            failure = f"{cleanup_error['error_type']}: {cleanup_error['message']}"
+            if requested_exit is None:
+                requested_exit = 125
+        if gone:
+            owned_group._mark_completed(result)
+            if deadline_observation is not None:
+                deadline_observation["reaped_exit_code"] = result
+        else:
+            result = 125
+        return requested_exit if requested_exit is not None else result, gone, failure
     # Popen and individual observations cannot be preempted. The finite
     # SIGTERM/SIGKILL drain below may extend beyond the work deadline.
     # The unreaped leader reserves this exact process/group ID while signaling.
@@ -174,23 +396,7 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
     deadline = time.monotonic() + 3
     gone = False
     while time.monotonic() < deadline:
-        live = False
-        for entry in os.scandir("/proc"):
-            if not entry.name.isdecimal():
-                continue
-            try:
-                with open(f"{entry.path}/stat", encoding="utf-8") as stream:
-                    fields = stream.read().rsplit(")", 1)[1].split()
-                # /proc stat: state, ppid, pgrp after the closing comm parenthesis.
-                if int(fields[2]) == child.pid and fields[0] not in {"Z", "X"}:
-                    live = True
-                    break
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-            except (OSError, ValueError, IndexError):
-                live = True
-                break
-        if not live:
+        if not _group_has_live_members(child.pid):
             gone = True
             break
         time.sleep(0.05)

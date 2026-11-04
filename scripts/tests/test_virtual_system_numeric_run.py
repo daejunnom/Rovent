@@ -16,7 +16,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 if sys.platform == "linux":
     import fcntl
     from managed_process import ProcessNotSpawned, run_group
-    from virtual_system_numeric_run import capture_process_status, require_capture_window, snapshot_file
+    from virtual_system_numeric_run import (capture_cleanup_partition, capture_process_status, observe_unresolved_owned,
+                                            output_lease_tree_observation,
+                                            require_capture_window, snapshot_file)
     from virtual_custody_transport import CustodyTransport
 
 
@@ -47,6 +49,12 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
             require_capture_window(config, 20_000_000_000, now_ns=8_000_000_001)
         self.assertTrue(result["child_startup_recheck_required"])
 
+    def test_cleanup_partition_does_not_extend_registered_deadline(self):
+        cleanup, group_reserve, child_deadline = capture_cleanup_partition(1, 20_000_000_000)
+        self.assertEqual((cleanup, group_reserve, child_deadline),
+                         (1_000_000_000, 500_000_000, 19_500_000_000))
+        self.assertEqual(child_deadline + group_reserve, 20_000_000_000)
+
     def test_late_exit_observation_preserves_exit_without_claiming_deadline(self):
         custody = {"status": "session_released", "native_authorization": "sent", "error": None}
         self.assertEqual(capture_process_status(0, True, None, {"exit_observation_timing": "before_deadline"}, custody),
@@ -68,6 +76,37 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
                        {"deadline_seconds": 0, "cleanup_seconds": 1}):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 require_capture_window(config, 100_000_000_000, now_ns=0)
+
+    def test_unresolved_reobservation_keeps_original_owner_and_registered_deadline(self):
+        original = mock.Mock()
+        original.reobserve_and_drain.return_value = (True, 17, None)
+        poll = mock.Mock()
+        record = observe_unresolved_owned(original, poll, 12.0, clock=lambda: 11.0)
+        original.reobserve_and_drain.assert_called_once_with(absolute_deadline=12.0, on_tick=poll)
+        self.assertEqual((record["tree_gone"], record["reaped_exit_code"]), (True, 17))
+        self.assertEqual(record["scope"], "original_group_and_channel_until_registered_deadline")
+
+    def test_unresolved_reobservation_never_extends_expired_window(self):
+        original = mock.Mock()
+        record = observe_unresolved_owned(original, lambda: None, 12.0, clock=lambda: 12.0)
+        original.reobserve_and_drain.assert_not_called()
+        self.assertFalse(record["attempted"])
+        self.assertEqual(record["tree_gone"], "unknown")
+        self.assertEqual(record["error"], "registered_deadline_elapsed_before_reobservation")
+
+    def test_group_completion_does_not_prove_escaped_tree_completion(self):
+        self.assertEqual(output_lease_tree_observation(True, False), "unknown")
+        self.assertIs(output_lease_tree_observation(False, False), True)
+        self.assertIs(output_lease_tree_observation(True, True), True)
+
+    def test_unresolved_reobservation_keeps_failure_separate_from_original_result(self):
+        original = mock.Mock()
+        original.reobserve_and_drain.return_value = (
+            False, None, {"kind": "deadline", "error_type": "TimeoutError", "message": "elapsed"})
+        record = observe_unresolved_owned(original, lambda: None, 12.0, clock=lambda: 11.0)
+        self.assertIs(record["tree_gone"], False)
+        self.assertIsNone(record["reaped_exit_code"])
+        self.assertEqual(record["error"]["kind"], "deadline")
 
     def test_custody_transport_reobserves_same_child_without_device_fence(self):
         channel = CustodyTransport(allow_native=lambda: True)
@@ -144,6 +183,22 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
         channel.child.send(b"NO_NATIVE_ENTRY")
         channel.poll()
         self.assertEqual(channel.state["status"], "no_native_entry")
+
+    def test_stop_closes_native_admission_but_keeps_recovery_channel(self):
+        channel = CustodyTransport(allow_native=lambda: True)
+        self.addCleanup(channel.close)
+        channel.child.send(b"PENDING")
+        channel.poll()
+        channel.close_native_admission()
+        channel.child.send(b"NATIVE_READY")
+        channel.poll()
+        self.assertEqual(channel.state["native_authorization"], "not_sent_deadline_or_policy")
+        channel.child.setblocking(False)
+        with self.assertRaises(BlockingIOError):
+            channel.child.recv(64)
+        channel.child.send(b"UNKNOWN")
+        channel.poll()
+        self.assertEqual(channel.child.recv(64), b"REOBSERVE")
 
     def test_pending_reobservation_is_spread_across_cleanup_window(self):
         now = [100]
