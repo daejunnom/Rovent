@@ -74,7 +74,8 @@ class OriginalCollectionProcess:
             raise RuntimeError("original child time namespace differs")
 
     def run(self, native_arguments, cwd, env, admission_check, on_stop, *, stdout=None,
-            cleanup_signal_ns=None):
+            cleanup_signal_ns=None, long_game_preflight=None):
+        """Optionally select a pinned profile for preflight only, not native execution."""
         if (self._attempted or self.handoff is None or not callable(admission_check)
                 or not callable(on_stop) or not isinstance(native_arguments, (tuple, list))
                 or any(not isinstance(value, str) or value.startswith("--v3-")
@@ -83,6 +84,24 @@ class OriginalCollectionProcess:
                     (type(cleanup_signal_ns) is not int or
                      not self._work_ns <= cleanup_signal_ns <= self._cleanup_ns))):
             raise ValueError("one original collector execution and explicit stop owner required")
+        preflight_args = []
+        if long_game_preflight is not None:
+            if (type(long_game_preflight) is not dict
+                    or set(long_game_preflight) != {"path", "sha256", "bytes"}):
+                raise ValueError("long-game preflight requires a complete pin")
+            path, sha256, size = (long_game_preflight[key] for key in ("path", "sha256", "bytes"))
+            if (type(path) is not str or not path.startswith("inputs/")
+                    or len(path.encode("utf-8")) > 4096
+                    or any(char in path for char in "\\:")
+                    or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in path)
+                    or any(not part or part.startswith(".") for part in path.split("/"))
+                    or type(sha256) is not str or len(sha256) != 64
+                    or any(char not in "0123456789abcdef" for char in sha256)
+                    or type(size) is not int or not 0 < size < 1 << 64):
+                raise ValueError("invalid long-game preflight pin")
+            preflight_args = ["--v3-long-game-preflight-path=" + path,
+                              "--v3-long-game-preflight-sha256=" + sha256,
+                              "--v3-long-game-preflight-bytes=" + str(size)]
         self._check_namespace()
         work, cleanup = _seconds_not_later(self._work_ns), _seconds_not_later(self._cleanup_ns)
         remaining = work - time.monotonic()
@@ -101,6 +120,7 @@ class OriginalCollectionProcess:
                      "--v3-bootstrap-budget-ms=" + str(self._bootstrap_budget_ms),
                      "--v3-work-deadline-monotonic-ns=" + str(self._work_ns),
                      "--v3-cleanup-deadline-monotonic-ns=" + str(self._cleanup_ns)]
+        arguments.extend(preflight_args)
         command = entry_command(self._binary_fd, self._barrier_read, arguments)
         inherited = (self._binary_fd, self._barrier_read, channel, output, input_dir, plan)
 

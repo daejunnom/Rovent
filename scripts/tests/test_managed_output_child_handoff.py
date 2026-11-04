@@ -1,4 +1,5 @@
 """Private lease/direct-child protocol; cgroup observations are test fixtures."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -229,6 +230,13 @@ print("ok")
         finally:
             os.close(executable_fd)
         self.group, self.handoff = owner.group, owner.handoff
+        profile_data = b"preflight profile"
+        profile = {"path": "inputs/profile.json", "sha256": hashlib.sha256(profile_data).hexdigest(),
+                   "bytes": len(profile_data)}
+        with self.assertRaises(ValueError):
+            owner.run([], self.root, os.environ.copy(), lambda: None, lambda: False,
+                      long_game_preflight={"path": profile["path"]})
+        self.assertFalse(owner._attempted)
 
         def admit(pid, fd):
             self.assertEqual(pid, self.group._child.pid)
@@ -246,14 +254,20 @@ reply = json.loads(s.recv(4096))
 assert reply["session_id"] == nonce
 assert reply["plan"]["path"] == args["--v3-plan"]
 assert args["--v3-bootstrap-budget-ms"] == args["--expected-budget"]
+for part in ("path", "sha256", "bytes"):
+    assert args["--v3-long-game-preflight-" + part] == args["--expected-preflight-" + part]
 assert int(args["--v3-work-deadline-monotonic-ns"]) < int(args["--v3-cleanup-deadline-monotonic-ns"])
 assert time.monotonic_ns() < int(args["--v3-work-deadline-monotonic-ns"])
 print("ok")
 '''
         with tempfile.TemporaryFile(mode="w+b", dir=self.root) as output:
-            result = owner.run(["-c", source, "--expected-budget=" + str(bootstrap_budget_ms)],
+            expected = ["--expected-preflight-" + key + "=" + str(value)
+                        for key, value in profile.items()]
+            result = owner.run(["-c", source, "--expected-budget=" + str(bootstrap_budget_ms),
+                                *expected],
                                self.root, os.environ.copy(),
-                               lambda: None, lambda: False, stdout=output)
+                               lambda: None, lambda: False, stdout=output,
+                               long_game_preflight=profile)
             output.seek(0)
             payload = output.read()
         if result[1]:
