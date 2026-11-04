@@ -1543,6 +1543,14 @@ impl PcWorkerSupervisorV3 {
                 .map_err(|error| error.to_string())?;
                 self.pipeline = Some(PolicyRowPipelineOwnerV3::new(writer));
             }
+            match self.bridge.game_authority().try_bind_pipeline(
+                self.pipeline.as_ref().expect("pipeline retained"),
+            ) {
+                super::game_authority_v3::GameStepV3::Ready
+                | super::game_authority_v3::GameStepV3::Existing => {}
+                super::game_authority_v3::GameStepV3::Busy => return Ok(()),
+                _ => return Err("P-C V3 game pipeline binding rejected".into()),
+            }
             if !self.output_installed {
                 if let Some(output) = self.managed_output.as_ref() {
                     if !self.try_install_output(output)? {

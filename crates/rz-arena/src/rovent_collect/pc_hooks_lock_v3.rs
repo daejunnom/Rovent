@@ -340,6 +340,7 @@ struct PcBridgeStateV3 {
 pub(crate) struct RoventPcCollectionBridgeV3 {
     self_weak: Weak<RoventPcCollectionBridgeV3>,
     inputs: Arc<PreparedPcCollectionInputsV3>,
+    game: Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>>,
     registration: RoventNativeCaptureRegistration,
     ledger: Arc<Mutex<PcRootQuotaLedgerV3>>,
     startup: OnceLock<RoventStartupControl>,
@@ -388,16 +389,18 @@ impl RoventPcCollectionBridgeV3 {
         roots.try_reserve_exact(max).map_err(|_| "P-C V3 root allocation")?;
         deferred.try_reserve_exact(max).map_err(|_| "P-C V3 cleanup allocation")?;
         let (requests, receiver) = mpsc::sync_channel(max);
+        let game = super::game_authority_v3::GameAuthorityV3::new_candidate(Arc::clone(&inputs));
         Ok(Arc::new_cyclic(|self_weak| Self {
             self_weak: self_weak.clone(),
             ledger: Arc::new(Mutex::new(PcRootQuotaLedgerV3::new(Arc::clone(&inputs)))),
-            inputs, registration, startup: OnceLock::new(), native_owner: OnceLock::new(), supervisor: OnceLock::new(),
+            inputs, game, registration, startup: OnceLock::new(), native_owner: OnceLock::new(), supervisor: OnceLock::new(),
             state: Mutex::new(PcBridgeStateV3 { roots, deferred }), requests,
             request_receiver: Mutex::new(receiver),
         }))
     }
 
     pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> { &self.inputs }
+    pub(super) fn game_authority(&self) -> &Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>> { &self.game }
     pub(crate) fn startup(&self) -> Option<&RoventStartupControl> { self.startup.get() }
     pub(crate) fn capture_registration(&self) -> &RoventNativeCaptureRegistration { &self.registration }
 
@@ -409,6 +412,10 @@ impl RoventPcCollectionBridgeV3 {
         {
             let owner = supervisor.try_lock().map_err(|_| "P-C V3 supervisor unavailable")?;
             if !owner.matches_original_bridge(self) { return Err("P-C V3 supervisor bridge differs"); }
+        }
+        match self.game.try_bind_supervisor(supervisor) {
+            super::game_authority_v3::GameStepV3::Ready | super::game_authority_v3::GameStepV3::Existing => {},
+            _ => return Err("P-C V3 game supervisor binding unavailable"),
         }
         if let Some(original) = self.supervisor.get() {
             return if original.upgrade().is_some_and(|old| Arc::ptr_eq(&old, supervisor)) {
