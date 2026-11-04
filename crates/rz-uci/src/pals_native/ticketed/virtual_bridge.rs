@@ -144,6 +144,17 @@ pub trait VirtualReviewCollectionObserver: Send + 'static {
     ) -> bool {
         false
     }
+    /// A successfully retained failure may be scoped to one original root.
+    /// The observer must independently verify that exact ticket and stage are
+    /// in its original owner ledger; a busy or unknown ledger returns false.
+    /// Legacy observers keep the historical removal behavior by default.
+    fn retain_after_observation_failure(
+        &mut self,
+        _: VirtualReviewCaptureFailureStage,
+        _: &RoleTicketEnvelope,
+    ) -> bool {
+        false
+    }
     fn completed(
         &mut self,
         ticket: &RoleTicketEnvelope,
@@ -226,7 +237,12 @@ fn isolate_capture_failure(
     {
         return Err(failure);
     }
-    *observer = None;
+    let retain = observer
+        .as_mut()
+        .is_some_and(|o| o.retain_after_observation_failure(stage, ticket));
+    if !retain {
+        *observer = None;
+    }
     Ok(())
 }
 
@@ -1762,6 +1778,7 @@ mod tests {
 
     struct FailureObserver {
         preserve: bool,
+        retain: bool,
         seen: Arc<std::sync::Mutex<Vec<(VirtualReviewCaptureFailureStage, RoleFailure)>>>,
     }
     impl VirtualReviewCollectionObserver for FailureObserver {
@@ -1796,6 +1813,13 @@ mod tests {
                 self.seen.lock().unwrap().push((stage, failure.clone()));
             }
             self.preserve
+        }
+        fn retain_after_observation_failure(
+            &mut self,
+            _: VirtualReviewCaptureFailureStage,
+            _: &RoleTicketEnvelope,
+        ) -> bool {
+            self.retain
         }
     }
 
@@ -1889,6 +1913,7 @@ mod tests {
             let mut observer: Option<Box<dyn VirtualReviewCollectionObserver>> =
                 Some(Box::new(FailureObserver {
                     preserve: true,
+                    retain: false,
                     seen: Arc::clone(&seen),
                 }));
             assert_eq!(
@@ -1902,9 +1927,36 @@ mod tests {
             );
             assert!(observer.is_none());
             assert_eq!(*seen.lock().unwrap(), vec![(stage, cause)]);
+            let mut scoped: Option<Box<dyn VirtualReviewCollectionObserver>> =
+                Some(Box::new(FailureObserver {
+                    preserve: true,
+                    retain: true,
+                    seen: Arc::clone(&seen),
+                }));
+            assert_eq!(
+                isolate_capture_failure(
+                    &mut scoped,
+                    stage,
+                    &ticket,
+                    VirtualReviewCaptureFailure::Observation(RoleFailure::InvalidOutput),
+                ),
+                Ok(())
+            );
+            assert!(scoped.is_some());
+            assert_eq!(
+                isolate_capture_failure(
+                    &mut scoped,
+                    stage,
+                    &ticket,
+                    VirtualReviewCaptureFailure::Observation(RoleFailure::PhysicalUnknown),
+                ),
+                Err(RoleFailure::PhysicalUnknown)
+            );
+            assert!(scoped.is_some());
             let mut unpreserved: Option<Box<dyn VirtualReviewCollectionObserver>> =
                 Some(Box::new(FailureObserver {
                     preserve: false,
+                    retain: false,
                     seen: Arc::clone(&seen),
                 }));
             assert_eq!(
@@ -1930,6 +1982,7 @@ mod tests {
             let mut optional: Option<Box<dyn VirtualReviewCollectionObserver>> =
                 Some(Box::new(FailureObserver {
                     preserve: true,
+                    retain: false,
                     seen: Arc::clone(&seen),
                 }));
             assert_eq!(
