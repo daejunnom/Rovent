@@ -1,5 +1,6 @@
 """CPU-only lifecycle checks; no model, CUDA, or completion claim."""
 import hashlib
+import json
 import os
 from pathlib import Path
 import select
@@ -7,6 +8,7 @@ import selectors
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -14,6 +16,42 @@ from unittest import mock
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import lc0_process_admission_owner as module
+
+
+class ScriptedWriter(module.AsyncOutputSpool):
+    """No worker; exercise only the owner's offer/custody protocol."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.received = []
+        self.indeterminate_error = None
+        self.prefix = None
+        self.last_prefix = None
+
+    def bind_prefix(self, token):
+        if self.prefix is not None and self.prefix is not token:
+            return False
+        self.prefix = token
+        return True
+
+    def end_prefix(self, token):
+        if self.prefix is token:
+            self.last_prefix, self.prefix = token, None
+            return True
+        return self.prefix is None and self.last_prefix is token
+
+    def offer(self, data, *, prefix_token=None):
+        if self.prefix is not prefix_token:
+            return "unavailable"
+        self.received.append(data)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    def note_offer_indeterminate(self, error):
+        self.indeterminate_error = error
+        return "marked"
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux direct-child owner")
@@ -142,6 +180,268 @@ class OwnerFixtureTests(unittest.TestCase):
                 owner.new_observation(control, sequence=1, deadline=time.monotonic() + 1)
         self.assertIs(owner._observations[0].failure, error)
         self.assertIs(owner._observations[0].value.socket, marker)
+
+    def test_split_notice_preserves_each_original_read_chunk(self):
+        owner = self.owner()
+        owner._process = mock.Mock(pid=123)
+        owner._state = "awaiting_first_notice"
+        notice = json.dumps({"schema": module.NOTICE_SCHEMA, "process_id": 123,
+                             "process_epoch": owner._epoch, "lock_sha256": owner._lock_sha256,
+                             "cuda_ordinal": owner._ordinal, "native_started": False,
+                             "control_path": "/proc/123/fd/5/lc0-system-control.sock"}).encode()
+        first = b"x" * module.FRAME_LIMIT
+        second = b"\n" + notice[:17]
+        third = notice[17:] + b"\nremaining diagnostics\n"
+
+        class StubHandshake:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        with mock.patch.object(module.os, "read", side_effect=[first, second, third]), \
+                mock.patch.object(owner, "_observe_child_image"), \
+                mock.patch.object(module, "NonblockingParentHandshake", StubHandshake):
+            self.assertEqual(owner.advance_stderr(), "awaiting_first_notice")
+            self.assertEqual(owner.advance_stderr(), "awaiting_first_notice")
+            self.assertEqual(owner.advance_stderr(), "first_authentication")
+        self.assertIs(owner._stderr_chunks[0], first)
+        self.assertIs(owner._stderr_chunks[1], second)
+        self.assertIs(owner._stderr_chunks[2], third)
+        self.assertEqual(owner.stderr_bytes, first + second + third)
+        owner._process = None
+
+    def test_maximum_notice_body_is_accepted_across_reads(self):
+        owner = self.owner()
+        owner._process = mock.Mock(pid=123)
+        owner._state = "awaiting_first_notice"
+        body = json.dumps({"schema": module.NOTICE_SCHEMA, "process_id": 123,
+                           "process_epoch": owner._epoch, "lock_sha256": owner._lock_sha256,
+                           "cuda_ordinal": owner._ordinal, "native_started": False,
+                           "control_path": "/proc/123/fd/5/lc0-system-control.sock"}).encode()
+        body += b" " * (module.FRAME_LIMIT - 1 - len(body))
+
+        class StubHandshake:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        with mock.patch.object(module.os, "read", side_effect=[body[:3000], body[3000:] + b"\n"]), \
+                mock.patch.object(owner, "_observe_child_image"), \
+                mock.patch.object(module, "NonblockingParentHandshake", StubHandshake):
+            self.assertEqual(owner.advance_stderr(), "awaiting_first_notice")
+            self.assertEqual(owner.advance_stderr(), "first_authentication")
+        self.assertEqual(owner.stderr_bytes, body + b"\n")
+        owner._process = None
+
+    def stderr_owner(self):
+        owner = self.owner()
+        owner._process = mock.Mock(pid=123)
+        owner._state = "admitted"
+        owner._stderr_chunks = [b"first original chunk", b"second original chunk"]
+        owner._stderr_length = sum(map(len, owner._stderr_chunks))
+        self.addCleanup(setattr, owner, "_process", None)
+        return owner
+
+    def test_stderr_prefix_is_offered_once_in_order_to_same_writer(self):
+        owner = self.stderr_owner()
+        writer = ScriptedWriter(["backpressure", "accepted", "accepted"])
+        first, second = owner._stderr_chunks
+        self.assertEqual(owner.handoff_stderr_prefix(writer), "backpressure")
+        self.assertEqual(owner.stderr_prefix_handoff_observation()["accepted_chunks"], 0)
+        self.assertEqual(owner.handoff_stderr_prefix(writer), "accepted")
+        with self.assertRaises(ValueError):
+            owner.handoff_stderr_prefix(ScriptedWriter([]))
+        self.assertEqual(owner.handoff_stderr_prefix(writer), "accepted")
+        self.assertEqual(owner.handoff_stderr_prefix(writer), "complete")
+        self.assertIs(writer.received[0], first)
+        self.assertIs(writer.received[1], first)
+        self.assertIs(writer.received[2], second)
+        self.assertEqual(owner.stderr_bytes, first + second)
+        self.assertEqual(owner.stderr_prefix_handoff_observation()["accepted_chunks"], 2)
+        with self.assertRaises(ValueError):
+            owner.handoff_stderr_prefix(ScriptedWriter([]))
+
+    def test_raised_offer_retains_original_chunk_and_never_retries_it(self):
+        owner = self.stderr_owner()
+        failure = OSError("private offer detail")
+        writer = ScriptedWriter([failure, "accepted"])
+        self.assertEqual(owner.handoff_stderr_prefix(writer), "indeterminate")
+        self.assertIs(owner.original_stderr_handoff_error, failure)
+        self.assertIs(writer.indeterminate_error, failure)
+        self.assertEqual(owner.stderr_prefix_handoff_observation()["writer_indeterminate_mark"], "marked")
+        self.assertIs(owner._stderr_offer.chunk, owner._stderr_chunks[0])
+        self.assertEqual(owner.handoff_stderr_prefix(writer), "indeterminate")
+        self.assertEqual(len(writer.received), 1)
+        self.assertEqual(owner.stderr_prefix_handoff_observation()["accepted_chunks"], 0)
+
+    def test_definitive_first_rejection_allows_another_writer(self):
+        owner = self.stderr_owner()
+        too_small = ScriptedWriter(["oversized"])
+        suitable = ScriptedWriter(["accepted", "accepted"])
+        self.assertEqual(owner.handoff_stderr_prefix(too_small), "oversized")
+        self.assertEqual(owner.handoff_stderr_prefix(suitable), "accepted")
+        self.assertEqual(owner.handoff_stderr_prefix(suitable), "accepted")
+        self.assertEqual(owner.handoff_stderr_prefix(suitable), "complete")
+        self.assertEqual(suitable.received, owner._stderr_chunks)
+
+    def test_concurrent_handoff_does_not_offer_a_chunk_twice(self):
+        owner = self.stderr_owner()
+        entered, release = threading.Event(), threading.Event()
+
+        class SlowOffer(ScriptedWriter):
+            def offer(self, data, *, prefix_token=None):
+                if self.prefix is not prefix_token:
+                    return "unavailable"
+                self.received.append(data)
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError("fixture release timed out")
+                return "accepted"
+
+        writer = SlowOffer([])
+        result = []
+        thread = threading.Thread(target=lambda: result.append(owner.handoff_stderr_prefix(writer)))
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            self.assertEqual(owner.handoff_stderr_prefix(writer), "busy")
+            self.assertEqual(owner.stderr_prefix_handoff_observation(), {"state": "busy"})
+            with self.assertRaises(BlockingIOError):
+                _ = owner.original_stderr_handoff_error
+        finally:
+            release.set()
+            thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, ["accepted"])
+        self.assertEqual(len(writer.received), 1)
+        self.assertIs(writer.received[0], owner._stderr_chunks[0])
+
+    def test_previously_accepted_attempt_commits_without_second_offer(self):
+        owner = self.stderr_owner()
+        writer = ScriptedWriter(["accepted"])
+        owner._stderr_writer = writer
+        self.assertTrue(writer.bind_prefix(owner._stderr_prefix_token))
+        attempt = module._StderrOffer(0, owner._stderr_chunks[0])
+        attempt.result = "accepted"
+        owner._stderr_offer = attempt
+        self.assertEqual(owner.handoff_stderr_prefix(writer), "accepted")
+        self.assertEqual(writer.received, [owner._stderr_chunks[1]])
+        self.assertEqual(owner.handoff_stderr_prefix(writer), "complete")
+
+    def test_real_async_writer_receives_original_prefix_in_order(self):
+        owner = self.stderr_owner()
+        expected = owner.stderr_bytes
+        with tempfile.TemporaryFile() as output:
+            writer = module.AsyncOutputSpool(output.fileno(), max_bytes=len(expected),
+                                             max_queue_bytes=len(expected), max_queue_items=2)
+            try:
+                until = time.monotonic() + 3
+                result = None
+                while result != "complete" and time.monotonic() < until:
+                    result = owner.handoff_stderr_prefix(writer)
+                    if result == "backpressure":
+                        time.sleep(0.01)
+                    else:
+                        self.assertIn(result, ("accepted", "complete"))
+                self.assertEqual(result, "complete")
+            finally:
+                if writer.observation()["source_terminal"] == "unknown":
+                    writer.observe_eof()
+                writer.request_finish()
+                writer._thread.join(timeout=3)
+                if not writer._thread.is_alive() and writer.observation()["writer_state"] == "stopped":
+                    writer.release_notification()
+            self.assertFalse(writer._thread.is_alive())
+            self.assertEqual(writer.observation()["writer_state"], "stopped")
+            self.assertEqual(os.pread(output.fileno(), len(expected), 0), expected)
+            self.assertEqual(owner.stderr_bytes, expected)
+
+    def test_eof_and_other_offer_wait_for_prefix_commit(self):
+        owner = self.stderr_owner()
+        owner._stderr_chunks = owner._stderr_chunks[:1]
+        entered, release = threading.Event(), threading.Event()
+
+        class HoldAfterAcceptance(module.AsyncOutputSpool):
+            def offer(self, data, *, prefix_token=None):
+                result = super().offer(data, prefix_token=prefix_token)
+                if result == "accepted":
+                    entered.set()
+                    if not release.wait(3):
+                        raise TimeoutError("fixture handoff timed out")
+                return result
+
+        with tempfile.TemporaryFile() as output:
+            writer = HoldAfterAcceptance(output.fileno(), max_bytes=64,
+                                         max_queue_bytes=64, max_queue_items=2)
+            result = []
+            worker = threading.Thread(target=lambda: result.append(owner.handoff_stderr_prefix(writer)))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                with self.assertRaises(BlockingIOError):
+                    writer.observe_eof()
+                with self.assertRaises(ValueError):
+                    writer.request_finish()
+                self.assertEqual(writer.offer(b"later"), "unavailable")
+                self.assertTrue(writer.observation()["prefix_transfer_active"])
+            finally:
+                release.set()
+                worker.join(timeout=3)
+                # Fixture-only cleanup after the known mocked offer returns.
+                if not worker.is_alive() and not writer.observation()["offer_accounting"] == "unknown":
+                    writer.end_prefix(owner._stderr_prefix_token)
+                try:
+                    writer.observe_eof()
+                except (ValueError, BlockingIOError):
+                    pass
+                try:
+                    writer.request_finish()
+                except ValueError:
+                    pass
+                writer._thread.join(3)
+                if not writer._thread.is_alive() and writer.observation()["writer_state"] == "stopped":
+                    writer.release_notification()
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result, ["accepted"])
+            self.assertFalse(writer._thread.is_alive())
+
+    def test_lost_release_result_does_not_claim_closed_writer_was_sealed(self):
+        owner = self.stderr_owner()
+        owner._stderr_chunks = owner._stderr_chunks[:1]
+        released, proceed = threading.Event(), threading.Event()
+        failure = RuntimeError("fixture lost prefix release result")
+
+        class LostRelease(module.AsyncOutputSpool):
+            def end_prefix(self, token):
+                result = super().end_prefix(token)
+                if result:
+                    released.set()
+                    if not proceed.wait(3):
+                        raise TimeoutError("fixture release timed out")
+                    raise failure
+                return result
+
+        with tempfile.TemporaryFile() as output:
+            writer = LostRelease(output.fileno(), max_bytes=64,
+                                 max_queue_bytes=64, max_queue_items=2)
+            self.assertEqual(owner.handoff_stderr_prefix(writer), "accepted")
+            result = []
+            worker = threading.Thread(target=lambda: result.append(owner.handoff_stderr_prefix(writer)))
+            worker.start()
+            try:
+                self.assertTrue(released.wait(3))
+                writer.observe_eof()
+                self.assertTrue(writer.request_finish())
+                writer._thread.join(3)
+                self.assertFalse(writer._thread.is_alive())
+            finally:
+                proceed.set()
+                worker.join(3)
+                if not writer._thread.is_alive() and writer.observation()["writer_state"] == "stopped":
+                    writer.release_notification()
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result, ["indeterminate"])
+            self.assertIs(owner.original_stderr_handoff_error, failure)
+            self.assertEqual(owner.stderr_prefix_handoff_observation()["writer_indeterminate_mark"], "too_late")
+            self.assertEqual(owner.handoff_stderr_prefix(writer), "indeterminate")
 
 
 _CHILD = r'''

@@ -59,6 +59,12 @@ class AsyncOutputSpool:
         self._reserved_bytes = 0
         self._reserved_items = 0
         self._inflight = None
+        self._offer_inflight = None
+        self._offer_unknown = False
+        self._original_offer_error = None
+        self._any_data_accepted = False
+        self._prefix_token = None
+        self._last_prefix_token = None
         self._state = "initializing"
         self._spool = None
         self._last_spool = None
@@ -125,16 +131,46 @@ class AsyncOutputSpool:
                 raise AsyncSpoolInitializationCleanupError(original, self._initialization_cleanup_failures) from original
             raise
 
-    def offer(self, data):
+    def bind_prefix(self, token):
+        """Reserve this writer for one original prefix; no bytes are offered."""
+        if token is None:
+            raise ValueError("prefix token is required")
+        with self._condition:
+            if self._prefix_token is token:
+                return True
+            if (self._prefix_token is not None or self._offer_unknown or self._any_data_accepted
+                    or self._terminal is not None or self._finish_requested
+                    or self._state in ("write_blocked", "writer_fault", "init_failed",
+                                       "closing", "close_unknown", "stopped")):
+                return False
+            self._prefix_token = token
+            return True
+
+    def end_prefix(self, token):
+        """Release a fully transferred prefix; safe to repeat for this token."""
+        with self._condition:
+            if self._offer_unknown:
+                return False
+            if self._prefix_token is token:
+                self._last_prefix_token = token
+                self._prefix_token = None
+                return True
+            return self._prefix_token is None and self._last_prefix_token is token
+
+    def offer(self, data, *, prefix_token=None):
         """Return ``accepted``, ``backpressure``, ``oversized`` or ``unavailable``.
 
         A refused byte string remains entirely owned by the caller.  No disk
-        operation is made under the queue lock or on the caller's thread.
+        operation is made under the queue lock or on the caller's thread. The
+        caller must reobserve this owner after an exception; notification is
+        not proof that an indeterminate offer was processed.
         """
         if not isinstance(data, bytes):
             raise TypeError("output data must be bytes")
         with self._condition:
-            if (self._terminal is not None or self._finish_requested
+            if (self._offer_unknown or self._terminal is not None or self._finish_requested
+                    or (self._prefix_token is not None and self._prefix_token is not prefix_token)
+                    or (prefix_token is not None and self._prefix_token is not prefix_token)
                     or self._state in ("write_blocked", "writer_fault", "init_failed",
                                        "closing", "close_unknown", "stopped")):
                 return "unavailable"
@@ -146,11 +182,43 @@ class AsyncOutputSpool:
                     or self._reserved_bytes + len(data) > self._max_queue_bytes):
                 self._backpressure_count += 1
                 return "backpressure"
-            self._queue.append(data)
-            self._reserved_bytes += len(data)
-            self._reserved_items += 1
-            self._condition.notify()
-            return "accepted"
+            # This slot is installed before queue/accounting mutation. If any
+            # operation raises, the exact chunk and partial queue remain owned
+            # and this writer cannot claim normal drain or automatically close.
+            self._offer_inflight = data
+            try:
+                self._queue.append(data)
+                self._reserved_bytes += len(data)
+                self._reserved_items += 1
+                self._any_data_accepted = True
+                self._condition.notify()
+                self._offer_inflight = None
+                return "accepted"
+            except BaseException as error:
+                self._offer_unknown = True
+                if self._original_offer_error is None:
+                    self._original_offer_error = error
+                try:
+                    self._condition.notify_all()
+                except BaseException:
+                    pass
+                raise
+
+    def note_offer_indeterminate(self, error):
+        """Freeze this writer when the caller could not observe an offer result.
+
+        This does not undo a queue insertion, cancel an in-flight write, or
+        establish completion. The original output owner must retain the writer.
+        """
+        if not isinstance(error, BaseException):
+            raise TypeError("offer uncertainty requires its original exception")
+        with self._condition:
+            too_late = self._state in ("closing", "close_unknown", "stopped")
+            self._offer_unknown = True
+            if self._original_offer_error is None:
+                self._original_offer_error = error
+            self._condition.notify_all()
+            return "too_late" if too_late else "marked"
 
     def observe_eof(self):
         self._mark_terminal(("eof", None))
@@ -162,6 +230,8 @@ class AsyncOutputSpool:
 
     def _mark_terminal(self, terminal):
         with self._condition:
+            if self._prefix_token is not None:
+                raise BlockingIOError("original stderr prefix transfer is still active")
             if self._terminal is not None:
                 raise ValueError("source stream already ended")
             self._terminal = terminal
@@ -174,7 +244,7 @@ class AsyncOutputSpool:
     def request_retry(self):
         """Request one retry of known pending bytes, never uncertain writes."""
         with self._condition:
-            if self._state != "write_blocked" or self._retry_requested:
+            if self._offer_unknown or self._state != "write_blocked" or self._retry_requested:
                 return False
             self._retry_requested = True
             self._condition.notify()
@@ -185,7 +255,8 @@ class AsyncOutputSpool:
         with self._condition:
             if self._terminal is None:
                 raise ValueError("source EOF or read failure must be observed first")
-            if self._finish_requested or self._state in ("init_failed", "writer_fault", "close_unknown", "stopped"):
+            if (self._offer_unknown or self._prefix_token is not None or self._finish_requested
+                    or self._state in ("init_failed", "writer_fault", "close_unknown", "stopped")):
                 return False
             self._finish_requested = True
             self._condition.notify()
@@ -201,6 +272,10 @@ class AsyncOutputSpool:
                 "queued_bytes_including_inflight": self._reserved_bytes,
                 "inflight_bytes": len(self._inflight) if self._inflight is not None else 0,
                 "inflight_write_progress": "unknown" if self._inflight is not None else "not_applicable",
+                "offer_accounting": "unknown" if self._offer_unknown else "known",
+                "offer_chunk_retained": self._offer_inflight is not None,
+                "original_offer_error_retained": self._original_offer_error is not None,
+                "prefix_transfer_active": self._prefix_token is not None,
                 "backpressure_count": self._backpressure_count,
                 "logical_cancel_observed": self._cancel_observed,
                 "source_terminal": self._terminal[0] if self._terminal else "unknown",
@@ -251,6 +326,10 @@ class AsyncOutputSpool:
         with self._condition:
             return (self._original_failure, *self._last_errors)
 
+    def original_offer_error(self):
+        with self._condition:
+            return self._original_offer_error
+
     def original_initialization_cleanup_failures(self):
         """Return the exact one-shot FD cleanup failures, if any."""
         with self._condition:
@@ -296,7 +375,11 @@ class AsyncOutputSpool:
         while True:
             with self._condition:
                 while True:
-                    if self._state == "write_blocked":
+                    if self._offer_unknown:
+                        self._state = "offer_unknown"
+                        self._condition.wait()
+                        continue
+                    elif self._state == "write_blocked":
                         if self._retry_requested:
                             self._retry_requested = False
                             self._state = "writing"
@@ -347,7 +430,13 @@ class AsyncOutputSpool:
             with self._condition:
                 self._last_spool = spool.observation()
                 self._last_errors = spool.original_errors()
-                if operation == "close":
+                if self._offer_unknown:
+                    # An older in-flight write may have finished, but the
+                    # following queue/accounting state is not known to be
+                    # consistent. Retain the original chunk and writer.
+                    self._state = "offer_unknown"
+                    stop = False
+                elif operation == "close":
                     self._state = "stopped"
                     stop = True
                 elif operation == "terminal":

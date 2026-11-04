@@ -18,9 +18,11 @@ import re
 import select
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
+from lc0_async_output_spool import AsyncOutputSpool
 from lc0_parent_observation import NonblockingSessionObservation, OriginalAdmission
 from lc0_parent_preflight import (
     FRAME_LIMIT,
@@ -41,6 +43,18 @@ class _AttemptSlot:
 
     def __init__(self):
         self.value = None
+        self.failure = None
+
+
+class _StderrOffer:
+    """Retain one original chunk before calling an asynchronous writer."""
+
+    __slots__ = ("index", "chunk", "result", "failure")
+
+    def __init__(self, index, chunk):
+        self.index = index
+        self.chunk = chunk
+        self.result = "offering"
         self.failure = None
 
 
@@ -109,11 +123,22 @@ class Lc0FirstAdmissionOwner:
         self._original_admission = None
         self._controls = []
         self._observations = []
-        self._stderr = bytearray()
+        # Keep the exact immutable objects returned by os.read; the notice
+        # parser retains at most one bounded line separately.
+        self._stderr_chunks = []
+        self._stderr_length = 0
+        self._stderr_line = bytearray()
+        self._stderr_line_oversized = False
         self._pending_stderr = None
-        self._scan_at = 0
-        self._search_from = 0
         self._stderr_eof = False
+        self._stderr_writer = None
+        self._stderr_prefix_token = object()
+        self._stderr_offered = 0
+        self._stderr_offer = None
+        self._stderr_handoff_error = None
+        self._stderr_handoff_mark_error = None
+        self._stderr_writer_mark = "not_needed"
+        self._stderr_handoff_lock = threading.Lock()
         self._image_observations = 0
 
     @property
@@ -149,7 +174,7 @@ class Lc0FirstAdmissionOwner:
         """A copy of retained bytes, never a complete-output claim."""
         if self._pending_stderr is not None:
             raise RuntimeError("LC0 pending stderr attachment is unresolved")
-        return bytes(self._stderr)
+        return b"".join(self._stderr_chunks)
 
     @property
     def pending_stderr(self):
@@ -263,7 +288,7 @@ class Lc0FirstAdmissionOwner:
         if time.monotonic() >= self._deadline:
             self._fail("first_notice_unknown", TimeoutError("LC0 notice deadline expired"))
             return self._state
-        remaining = self._stderr_cap - len(self._stderr)
+        remaining = self._stderr_cap - self._stderr_length
         if remaining <= 0:
             self._fail("first_notice_unknown", RuntimeError("LC0 retained stderr bound reached"))
             return self._state
@@ -281,28 +306,36 @@ class Lc0FirstAdmissionOwner:
         # Hold the just-read object before any allocation that might fail.
         self._pending_stderr = chunk
         try:
-            self._stderr.extend(chunk)
+            self._stderr_chunks.append(chunk)
+            self._stderr_length += len(chunk)
             self._pending_stderr = None
-            self._scan_notice()
+            self._scan_notice(chunk)
         except BaseException as error:
             self._fail("first_notice_unknown", error)
         return self._state
 
-    def _scan_notice(self):
-        while True:
-            end = self._stderr.find(b"\n", self._search_from)
+    def _scan_notice(self, chunk):
+        offset = 0
+        while offset < len(chunk):
+            end = chunk.find(b"\n", offset)
+            piece = chunk[offset:] if end < 0 else chunk[offset:end]
+            if not self._stderr_line_oversized:
+                if len(self._stderr_line) + len(piece) >= FRAME_LIMIT:
+                    self._stderr_line_oversized = True
+                    self._stderr_line.clear()
+                else:
+                    self._stderr_line.extend(piece)
             if end < 0:
-                self._search_from = len(self._stderr)
                 return
-            line_length = end - self._scan_at
-            line = self._stderr[self._scan_at:end] if line_length < FRAME_LIMIT else b""
-            self._scan_at = end + 1
-            self._search_from = self._scan_at
-            # Ignore unrelated/oversized diagnostic lines while retaining them.
-            if not line.startswith(b"{") or len(line) >= FRAME_LIMIT:
+            offset = end + 1
+            line = bytes(self._stderr_line) if not self._stderr_line_oversized else b""
+            self._stderr_line.clear()
+            self._stderr_line_oversized = False
+            # Ignore unrelated/oversized diagnostic lines while retaining raw chunks.
+            if not line.startswith(b"{"):
                 continue
             try:
-                notice = _decode(bytes(line))
+                notice = _decode(line)
             except PreflightError:
                 continue
             if notice.get("schema") != NOTICE_SCHEMA:
@@ -321,6 +354,164 @@ class Lc0FirstAdmissionOwner:
                 deadline=self._deadline)
             self._state = "first_authentication"
             return
+
+    def handoff_stderr_prefix(self, writer):
+        """Offer at most one exact original stderr read to the same writer.
+
+        The caller must not read later stderr bytes before ``complete``. An
+        exception or unknown offer result is indeterminate: retain the writer,
+        attempt and bytes, and never retry that chunk automatically. Acceptance
+        is only ownership transfer to the writer, not EOF, durability or a
+        completed output receipt. The caller must bind the writer's file to the
+        original managed output owner; this component cannot establish that
+        identity. ``busy`` means another handoff call owns this boundary and
+        this call made no offer. The caller remains responsible for retaining
+        and finishing any writer that rejected the first offer, even if a later
+        writer is selected. No child/process state is changed here.
+        """
+        if not self._stderr_handoff_lock.acquire(blocking=False):
+            return "busy"
+        try:
+            return self._handoff_stderr_prefix_owned(writer)
+        finally:
+            self._stderr_handoff_lock.release()
+
+    def _handoff_stderr_prefix_owned(self, writer):
+        if not isinstance(writer, AsyncOutputSpool):
+            raise TypeError("LC0 stderr requires its original async output writer")
+        if self._process is None:
+            raise RuntimeError("LC0 original process is not owned")
+        if self._state in ("new", "opening", "spawning", "child_owned", "awaiting_first_notice"):
+            raise RuntimeError("LC0 first stderr prefix is still being captured")
+        if self._pending_stderr is not None:
+            raise RuntimeError("LC0 original stderr read remains unresolved")
+        if self._stderr_writer_mark != "not_needed":
+            return "indeterminate"
+        if not self._stderr_chunks:
+            return "complete"
+        if self._stderr_writer is None:
+            self._stderr_writer = writer
+            try:
+                if not writer.bind_prefix(self._stderr_prefix_token):
+                    self._stderr_writer = None
+                    return "unavailable"
+            except BaseException as error:
+                if self._stderr_handoff_error is None:
+                    self._stderr_handoff_error = error
+                self._mark_stderr_writer_indeterminate(writer, error)
+                return "indeterminate"
+        elif self._stderr_writer is not writer:
+            raise ValueError("LC0 stderr prefix belongs to another writer")
+        attempt = self._stderr_offer
+        if attempt is not None and attempt.result == "offering":
+            # Interruption can happen after an offer accepted but before the
+            # caller received its result. Never issue that chunk a second time.
+            attempt.result = "indeterminate"
+            self._mark_stderr_writer_indeterminate(
+                writer, RuntimeError("LC0 stderr offer result was not observed")
+            )
+        if attempt is not None and attempt.result == "indeterminate":
+            return "indeterminate"
+        if attempt is not None and attempt.result == "accepted":
+            # A prior call may have been interrupted after receiving accepted.
+            # Commit the same attempt without invoking the writer again.
+            try:
+                self._stderr_offered = attempt.index + 1
+                self._stderr_offer = None
+            except BaseException as error:
+                attempt.failure = error
+                if self._stderr_handoff_error is None:
+                    self._stderr_handoff_error = error
+                return "indeterminate"
+        if self._stderr_offered == len(self._stderr_chunks):
+            try:
+                if not writer.end_prefix(self._stderr_prefix_token):
+                    raise RuntimeError("LC0 original stderr prefix release is unknown")
+            except BaseException as error:
+                if self._stderr_handoff_error is None:
+                    self._stderr_handoff_error = error
+                self._mark_stderr_writer_indeterminate(writer, error)
+                return "indeterminate"
+            return "complete"
+        chunk = self._stderr_chunks[self._stderr_offered]
+        attempt = _StderrOffer(self._stderr_offered, chunk)
+        self._stderr_offer = attempt
+        try:
+            result = writer.offer(chunk, prefix_token=self._stderr_prefix_token)
+            if type(result) is not str or result not in ("accepted", "backpressure", "oversized", "unavailable"):
+                raise ValueError("LC0 stderr writer returned an unknown offer result")
+            attempt.result = result
+            if result == "accepted":
+                self._stderr_offered = attempt.index + 1
+                self._stderr_offer = None
+            elif self._stderr_offered == 0:
+                # No bytes have been accepted and this was a definitive
+                # rejection. A suitably sized original-output writer may be
+                # selected later without replaying an accepted chunk.
+                if not writer.end_prefix(self._stderr_prefix_token):
+                    raise RuntimeError("LC0 rejected stderr prefix release is unknown")
+                self._stderr_writer = None
+                self._stderr_offer = None
+            return result
+        except BaseException as error:
+            attempt.failure = error
+            if self._stderr_handoff_error is None:
+                self._stderr_handoff_error = error
+            if attempt.result != "accepted":
+                attempt.result = "indeterminate"
+                self._mark_stderr_writer_indeterminate(writer, error)
+            return "indeterminate"
+
+    def _mark_stderr_writer_indeterminate(self, writer, error):
+        try:
+            result = writer.note_offer_indeterminate(error)
+            if result not in ("marked", "too_late"):
+                raise ValueError("LC0 stderr writer returned an unknown mark result")
+        except BaseException as mark_error:
+            if self._stderr_handoff_mark_error is None:
+                self._stderr_handoff_mark_error = mark_error
+            self._stderr_writer_mark = "unknown"
+        else:
+            self._stderr_writer_mark = result
+
+    def stderr_prefix_handoff_observation(self):
+        """Observe transfer scope, or busy without inferring a partial state."""
+        if not self._stderr_handoff_lock.acquire(blocking=False):
+            return {"state": "busy"}
+        try:
+            attempt = self._stderr_offer
+            return {
+                "state": "observed",
+                "original_chunks": len(self._stderr_chunks),
+                "accepted_chunks": self._stderr_offered,
+                "attempt": None if attempt is None else attempt.result,
+                "original_offer_error_retained": self._stderr_handoff_error is not None,
+                "writer_indeterminate_mark": self._stderr_writer_mark,
+                "original_mark_error_retained": self._stderr_handoff_mark_error is not None,
+                "output_eof": "not_established_by_prefix_handoff",
+                "durability": "not_established_by_prefix_handoff",
+            }
+        finally:
+            self._stderr_handoff_lock.release()
+
+    @property
+    def original_stderr_handoff_error(self):
+        """Original offer error for the same owner; never render private text."""
+        if not self._stderr_handoff_lock.acquire(blocking=False):
+            raise BlockingIOError("LC0 stderr handoff owner is busy")
+        try:
+            return self._stderr_handoff_error
+        finally:
+            self._stderr_handoff_lock.release()
+
+    @property
+    def original_stderr_writer_mark_error(self):
+        if not self._stderr_handoff_lock.acquire(blocking=False):
+            raise BlockingIOError("LC0 stderr handoff owner is busy")
+        try:
+            return self._stderr_handoff_mark_error
+        finally:
+            self._stderr_handoff_lock.release()
 
     def advance_first_admission(self, events):
         if self._state != "first_authentication":

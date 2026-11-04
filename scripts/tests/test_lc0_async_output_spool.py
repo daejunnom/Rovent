@@ -1,5 +1,6 @@
 import os
 import errno
+from collections import deque
 import selectors
 from pathlib import Path
 import sys
@@ -28,6 +29,80 @@ def wait_state(spool, wanted, timeout=3):
 
 @unittest.skipUnless(sys.platform == "linux", "requires Linux positional writes and selector pipe")
 class AsyncOutputSpoolTests(unittest.TestCase):
+    def test_prefix_cannot_bind_after_prior_data_was_accepted(self):
+        with tempfile.TemporaryFile() as output:
+            spool = async_spool.AsyncOutputSpool(output.fileno(), max_bytes=64,
+                                                  max_queue_bytes=16, max_queue_items=2)
+            try:
+                self.assertEqual(spool.offer(b"earlier"), "accepted")
+                wait_state(spool, "idle")
+                self.assertFalse(spool.bind_prefix(object()))
+                spool.observe_eof()
+                self.assertTrue(spool.request_finish())
+            finally:
+                try:
+                    spool.observe_eof()
+                except ValueError:
+                    pass
+                try:
+                    spool.request_finish()
+                except ValueError:
+                    pass
+                spool._thread.join(3)
+                if not spool._thread.is_alive() and spool.observation()["writer_state"] == "stopped":
+                    spool.release_notification()
+            self.assertFalse(spool._thread.is_alive())
+            self.assertEqual(os.pread(output.fileno(), 64, 0), b"earlier")
+
+    def test_offer_exception_after_queue_insert_retains_unknown_owner(self):
+        failure = RuntimeError("fixture interrupted queue update")
+
+        class AppendThenFail(deque):
+            def append(self, value):
+                super().append(value)
+                raise failure
+
+        with tempfile.TemporaryFile() as output:
+            spool = async_spool.AsyncOutputSpool(output.fileno(), max_bytes=64,
+                                                  max_queue_bytes=16, max_queue_items=2)
+            try:
+                wait_state(spool, "idle")
+                with spool._condition:
+                    spool._queue = AppendThenFail()
+                with self.assertRaises(RuntimeError) as caught:
+                    spool.offer(b"source")
+                self.assertIs(caught.exception, failure)
+                observed = wait_state(spool, "offer_unknown")
+                self.assertEqual(observed["offer_accounting"], "unknown")
+                self.assertTrue(observed["offer_chunk_retained"])
+                self.assertIs(spool.original_offer_error(), failure)
+                spool.note_offer_indeterminate(RuntimeError("later fixture observation"))
+                self.assertIs(spool.original_offer_error(), failure)
+                self.assertEqual(spool.offer(b"next"), "unavailable")
+                spool.observe_eof()
+                self.assertFalse(spool.request_finish())
+            finally:
+                # Fixture-only cleanup: this injected queue failure is known
+                # to have occurred before the writer could consume the chunk.
+                # Production has no authority to make that inference.
+                with spool._condition:
+                    spool._queue.clear()
+                    spool._offer_inflight = None
+                    spool._offer_unknown = False
+                    spool._reserved_bytes = 0
+                    spool._reserved_items = 0
+                    spool._state = "idle"
+                    spool._condition.notify_all()
+                try:
+                    spool.observe_eof()
+                except ValueError:
+                    pass
+                spool.request_finish()
+                spool._thread.join(3)
+                if not spool._thread.is_alive() and spool.observation()["writer_state"] == "stopped":
+                    spool.release_notification()
+            self.assertFalse(spool._thread.is_alive())
+
     def test_non_io_notification_setup_failure_closes_unstarted_output_dup(self):
         original_dup = os.dup
         duplicated = []
