@@ -263,6 +263,8 @@ fn service_failure(error: &EngineError) -> &'static str {
         EngineError::Session(_) => "session",
         EngineError::Transport(_) => "transport",
         EngineError::WorkerPanic => "worker_panic",
+        EngineError::TimerSpawn(_) => "timer_spawn",
+        EngineError::StartupPanic(_) => "startup_panic",
         EngineError::DrainTimeout => "drain_timeout",
         EngineError::UndeliveredDiagnostics(_) => "undelivered_diagnostics",
         EngineError::UndeliveredWorkerFailure(_) => "undelivered_worker_failure",
