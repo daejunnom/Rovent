@@ -27,6 +27,7 @@ struct ObjectIdentity {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PlanIdentity {
+    path: String,
     device: u64,
     inode: u64,
     size: u64,
@@ -78,6 +79,7 @@ pub(super) struct ObservedManagedPlanLeaseV2 {
     output_identity: (u64, u64),
     input_identity: (u64, u64),
     plan_original: PlanMetadata,
+    expected_plan_path: String,
     expected_plan_sha256: String,
     original_peer: ManagedOutputPeerCredentials,
     session_id: String,
@@ -116,12 +118,17 @@ impl OriginalInputBindingV2 {
 impl ObservedManagedPlanLeaseV2 {
     pub(super) fn bind(
         fds: ManagedCollectionInheritedFds,
+        expected_plan_path: String,
         expected_plan_bytes: u64,
         expected_plan_sha256: String,
         maximum_plan_bytes: u64,
         deadline: Instant,
     ) -> Result<Self, ManagedPlanLeaseRejectionV2> {
-        if expected_plan_bytes == 0
+        if !expected_plan_path.starts_with("inputs/")
+            || expected_plan_path
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == ".." || part.contains('\\'))
+            || expected_plan_bytes == 0
             || maximum_plan_bytes == 0
             || expected_plan_bytes > maximum_plan_bytes
             || expected_plan_sha256.len() != 64
@@ -187,6 +194,7 @@ impl ObservedManagedPlanLeaseV2 {
             output_identity,
             input_identity,
             plan_original,
+            expected_plan_path,
             expected_plan_sha256,
             original_peer: peer,
             session_id,
@@ -214,8 +222,10 @@ impl ObservedManagedPlanLeaseV2 {
         self.original_binding.clone()
     }
 
-    pub(super) fn matches_plan(&self, bytes: u64, sha256: &str) -> bool {
-        self.plan_original.size == bytes && self.expected_plan_sha256 == sha256
+    pub(super) fn matches_plan(&self, path: &str, bytes: u64, sha256: &str) -> bool {
+        self.expected_plan_path == path
+            && self.plan_original.size == bytes
+            && self.expected_plan_sha256 == sha256
     }
 
     /// This is only a duplicate of the original output descriptor. Callers
@@ -306,6 +316,7 @@ impl ObservedManagedPlanLeaseV2 {
                     self.plan_original.size,
                 )
             || reply.plan.sha256 != self.expected_plan_sha256
+            || reply.plan.path != self.expected_plan_path
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
