@@ -115,7 +115,91 @@ impl OriginalInputBindingV2 {
     }
 }
 
+/// A bounded observation for this /2 owner only; it does not rule out a
+/// later namespace change or prove where the supplied deadline was created.
+pub(super) struct ManagedTimeNamespaceObservationV2 {
+    owner: OriginalInputBindingV2,
+    observed_at: Instant,
+    thread: std::thread::ThreadId,
+}
+
+impl ManagedTimeNamespaceObservationV2 {
+    pub(super) fn matches_original(&self, owner: &ObservedManagedPlanLeaseV2) -> bool {
+        self.owner.same_original(&owner.original_binding)
+            && self.thread == std::thread::current().id()
+    }
+
+    pub(super) fn observed_at(&self) -> Instant {
+        self.observed_at
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum ManagedTimeNamespaceErrorV2 {
+    OwnerUncertain(io::Error),
+    Unavailable(io::Error),
+    ChangedOrDifferent,
+}
+
+fn time_namespace_identity(handle: &std::fs::File) -> io::Result<(u64, u64)> {
+    let metadata = handle.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
 impl ObservedManagedPlanLeaseV2 {
+    /// Bracket current parent/child namespace observations with the same live
+    /// authenticated parent. The caller must use an independent local
+    /// bootstrap deadline, not the unvalidated absolute parent deadline.
+    pub(super) fn observe_same_time_namespace(
+        &mut self,
+        local_deadline: Instant,
+    ) -> Result<ManagedTimeNamespaceObservationV2, ManagedTimeNamespaceErrorV2> {
+        self.verify_live(local_deadline)
+            .map_err(ManagedTimeNamespaceErrorV2::OwnerUncertain)?;
+        let parent_path =
+            std::path::PathBuf::from(format!("/proc/{}/ns/time", self.original_peer.pid));
+        let current_path = std::path::Path::new("/proc/thread-self/ns/time");
+        // Proc namespace entries are intentional magic links. Retain all
+        // four handles so inode reuse cannot disguise a changed namespace.
+        let parent_before_fd =
+            std::fs::File::open(&parent_path).map_err(ManagedTimeNamespaceErrorV2::Unavailable)?;
+        let current_before_fd =
+            std::fs::File::open(current_path).map_err(ManagedTimeNamespaceErrorV2::Unavailable)?;
+        self.verify_live(local_deadline)
+            .map_err(ManagedTimeNamespaceErrorV2::OwnerUncertain)?;
+        let parent_after_fd =
+            std::fs::File::open(&parent_path).map_err(ManagedTimeNamespaceErrorV2::Unavailable)?;
+        let current_after_fd =
+            std::fs::File::open(current_path).map_err(ManagedTimeNamespaceErrorV2::Unavailable)?;
+        let parent_before = time_namespace_identity(&parent_before_fd)
+            .map_err(ManagedTimeNamespaceErrorV2::Unavailable)?;
+        let current_before = time_namespace_identity(&current_before_fd)
+            .map_err(ManagedTimeNamespaceErrorV2::Unavailable)?;
+        let parent_after = time_namespace_identity(&parent_after_fd)
+            .map_err(ManagedTimeNamespaceErrorV2::Unavailable)?;
+        let current_after = time_namespace_identity(&current_after_fd)
+            .map_err(ManagedTimeNamespaceErrorV2::Unavailable)?;
+        self.check_original_parent_and_fds()
+            .map_err(ManagedTimeNamespaceErrorV2::OwnerUncertain)?;
+        if Instant::now() >= local_deadline {
+            return Err(ManagedTimeNamespaceErrorV2::Unavailable(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "time namespace observation expired",
+            )));
+        }
+        if parent_before != current_before
+            || parent_before != parent_after
+            || current_before != current_after
+        {
+            return Err(ManagedTimeNamespaceErrorV2::ChangedOrDifferent);
+        }
+        Ok(ManagedTimeNamespaceObservationV2 {
+            owner: self.original_binding(),
+            observed_at: Instant::now(),
+            thread: std::thread::current().id(),
+        })
+    }
+
     pub(super) fn bind(
         fds: ManagedCollectionInheritedFds,
         expected_plan_path: String,
