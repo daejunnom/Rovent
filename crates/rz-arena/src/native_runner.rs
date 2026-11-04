@@ -743,11 +743,9 @@ struct NativeRunBundle<S: NativeProviderDeclaration> {
 /// unresolved. Construction alone neither starts a child nor applies resources.
 #[cfg(target_os = "linux")]
 struct IndependentNoGameOwners {
-    _snapshot: Arc<crate::pals_adaptive_launch::ProxyEntrySmokeSnapshotOwnerV1>,
-    _execution: Arc<crate::pals_adaptive_launch::NoGameExecutionStartV1>,
-    _sockets: Arc<crate::pals_adaptive_launch::NoGameRoleSocketsV1>,
-    // The control itself owns these same original Arcs and selected proxy FD.
-    _control: Arc<Mutex<crate::pals_adaptive_launch::SmokeDeadlineControl>>,
+    // One binding is moved into one custody owner. Its control owns the same
+    // snapshot/execution/socket Arcs and the selected proxy FD.
+    _binding: crate::pals_adaptive_launch::DirectNoGameBinding,
 }
 
 #[cfg(target_os = "linux")]
@@ -764,34 +762,25 @@ pub(crate) struct PreparedIndependentNoGameOwner {
 
 #[cfg(target_os = "linux")]
 impl PreparedIndependentNoGameOwner {
-    /// All inputs are borrowed: on rejection the caller still owns the exact
-    /// original Arcs. There is intentionally no process-dispatch method yet.
-    #[allow(clippy::too_many_arguments)]
+    /// A rejected binding is returned intact. Moving the binding prevents it
+    /// from being reused to construct a second custody owner.
     pub(crate) fn prepare(
-        snapshot: &Arc<crate::pals_adaptive_launch::ProxyEntrySmokeSnapshotOwnerV1>,
-        execution: &Arc<crate::pals_adaptive_launch::NoGameExecutionStartV1>,
-        sockets: &Arc<crate::pals_adaptive_launch::NoGameRoleSocketsV1>,
-        proxy_pin: &Arc<std::fs::File>,
-        owner_id: [u8; 16],
-        owner_epoch: u64,
-        request_ids: [u64; 2],
-    ) -> Result<Self, ArenaError> {
-        let control = crate::pals_adaptive_launch::SmokeDeadlineControl::new_no_game(
-            snapshot,
-            execution,
-            sockets,
-            proxy_pin,
-            owner_id,
-            owner_epoch,
-            request_ids,
-        )?;
+        binding: crate::pals_adaptive_launch::DirectNoGameBinding,
+    ) -> Result<Self, (ArenaError, crate::pals_adaptive_launch::DirectNoGameBinding)> {
+        let checked = binding
+            .execution()
+            .require_running()
+            .and_then(|()| {
+                binding
+                    .sockets()
+                    .verify_original(binding.snapshot(), binding.execution())
+            })
+            .and_then(|()| binding.execution().require_running());
+        if let Err(error) = checked {
+            return Err((error, binding));
+        }
         Ok(Self {
-            owners: Some(IndependentNoGameOwners {
-                _snapshot: Arc::clone(snapshot),
-                _execution: Arc::clone(execution),
-                _sockets: Arc::clone(sockets),
-                _control: Arc::new(Mutex::new(control)),
-            }),
+            owners: Some(IndependentNoGameOwners { _binding: binding }),
             process: None,
             spawn_custody: crate::process::SpawnCustody::default(),
             physical_fence_confirmed: true,

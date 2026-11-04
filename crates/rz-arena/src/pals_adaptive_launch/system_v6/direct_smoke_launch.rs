@@ -5,10 +5,155 @@
 //! The caller retains all original owners, including the child custody slot.
 
 use super::{
-    LockedPalsSystemArenaPairV6, PalsV6ExecutionStart, SmokeDeadlineControl,
+    LockedPalsSystemArenaPairV6, NoGameExecutionStartV1, NoGameRoleSocketsV1, PalsV6ExecutionStart,
+    ProxyEntrySmokeSnapshotOwnerV1, SmokeDeadlineControl,
     endpoint_snapshot::PalsV6EndpointSnapshot, invocation::PalsV6RoleSockets,
     proxy_entry_smoke::ProxyEntryFunctionalSmokeOwnerV1,
 };
+
+/// Independent selected-role input and control owner. It only prepares argv:
+/// a later guarded runner must supervise the exact child and physical lifetime.
+pub(crate) struct DirectNoGameBinding {
+    snapshot: Arc<ProxyEntrySmokeSnapshotOwnerV1>,
+    execution: Arc<NoGameExecutionStartV1>,
+    sockets: Arc<NoGameRoleSocketsV1>,
+    proxy: Arc<File>,
+    control: Arc<Mutex<SmokeDeadlineControl>>,
+    arguments: Vec<OsString>,
+}
+
+impl DirectNoGameBinding {
+    pub(crate) fn prepare(
+        snapshot: &Arc<ProxyEntrySmokeSnapshotOwnerV1>,
+        execution: &Arc<NoGameExecutionStartV1>,
+        sockets: &Arc<NoGameRoleSocketsV1>,
+        owner_id: [u8; 16],
+        owner_epoch: u64,
+        request_ids: [u64; 2],
+    ) -> Result<Self, ArenaError> {
+        execution.require_running()?;
+        if !execution.matches(&snapshot.plan, owner_id, owner_epoch) {
+            return Err(ArenaError::Integrity(
+                "NoGame execution identity differs".into(),
+            ));
+        }
+        let proxy_pin =
+            crate::native_launch::linux::pin(&snapshot.pins, &snapshot.plan.input().proxy_binary)?;
+        let proxy = Arc::new(
+            proxy_pin
+                .file
+                .try_clone()
+                .map_err(|_| ArenaError::Io("NoGame original proxy FD duplicate failed".into()))?,
+        );
+        let control = Arc::new(Mutex::new(SmokeDeadlineControl::new_no_game(
+            snapshot,
+            execution,
+            sockets,
+            &proxy,
+            owner_id,
+            owner_epoch,
+            request_ids,
+        )?));
+        let plan = snapshot.plan.input();
+        let selected = &plan.endpoint;
+        let path = |relative: &str| -> Result<String, ArenaError> {
+            snapshot
+                .path
+                .join(relative)
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| ArenaError::Invalid("NoGame input path is not UTF-8".into()))
+        };
+        let owner_hex = owner_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join("");
+        let role = match snapshot.role {
+            NativeEngineRole::Baseline => "baseline",
+            NativeEngineRole::Candidate => "candidate",
+        };
+        let arguments = vec![
+            "--pals-system-proxy=true".into(),
+            "--pals-proxy-entry-functional-smoke=true".into(),
+            format!(
+                "--pals-system-child-binary={}",
+                path(&selected.binary_snapshot_path)?
+            )
+            .into(),
+            format!(
+                "--pals-system-startup-lock={}",
+                path(&selected.startup_snapshot_path)?
+            )
+            .into(),
+            format!(
+                "--pals-system-startup-lock-sha256={}",
+                selected.startup_lock.canonical_sha256
+            )
+            .into(),
+            format!(
+                "--pals-system-startup-ms={}",
+                selected.startup_lock.config.native_options.startup_ms
+            )
+            .into(),
+            format!("--pals-system-parent-abstract={}", sockets.child_name()).into(),
+            format!(
+                "--pals-arena-grant-socket=abstract:{}",
+                sockets.grant_name()
+            )
+            .into(),
+            format!(
+                "--pals-arena-cancel-socket=abstract:{}",
+                sockets.cancel_name()
+            )
+            .into(),
+            "--pals-smoke-policy=proxy-entry-v1".into(),
+            format!("--pals-smoke-owner-id={owner_hex}").into(),
+            format!("--pals-smoke-owner-epoch={owner_epoch}").into(),
+            format!("--pals-smoke-role={role}").into(),
+            format!(
+                "--pals-smoke-generation={}",
+                selected.startup_lock.config.process_generation
+            )
+            .into(),
+            format!(
+                "--pals-smoke-lock-sha256={}",
+                selected.startup_lock.canonical_sha256
+            )
+            .into(),
+            format!("--pals-smoke-plan-sha256={}", snapshot.plan.sha256()).into(),
+            format!("--pals-smoke-proxy-sha256={}", plan.proxy_binary.sha256).into(),
+        ];
+        execution.require_running()?;
+        Ok(Self {
+            snapshot: Arc::clone(snapshot),
+            execution: Arc::clone(execution),
+            sockets: Arc::clone(sockets),
+            proxy,
+            control,
+            arguments,
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> &Arc<ProxyEntrySmokeSnapshotOwnerV1> {
+        &self.snapshot
+    }
+    pub(crate) fn execution(&self) -> &Arc<NoGameExecutionStartV1> {
+        &self.execution
+    }
+    pub(crate) fn sockets(&self) -> &Arc<NoGameRoleSocketsV1> {
+        &self.sockets
+    }
+    pub(crate) fn proxy(&self) -> &Arc<File> {
+        &self.proxy
+    }
+    pub(crate) fn control(&self) -> &Arc<Mutex<SmokeDeadlineControl>> {
+        &self.control
+    }
+    pub(crate) fn arguments(&self) -> &[OsString] {
+        &self.arguments
+    }
+}
 use crate::{ArenaError, NativeLaunchOwner, process::SpawnCustody};
 use rz_experiments::NativeEngineRole;
 use std::{
