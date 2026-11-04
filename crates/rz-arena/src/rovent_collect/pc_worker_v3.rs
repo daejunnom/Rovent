@@ -92,6 +92,7 @@ pub(crate) struct PcRootRecoveryV3 {
     // cancellation, an aggregate acknowledgement, or permission to reuse it.
     abort_before_route: bool,
     sealed_abort_before_route: bool,
+    sealed_abort_no_scope: bool,
     aborted_pre_route_release: Option<Result<(), &'static str>>,
     diagnostics: Vec<(String, TeacherDiagnostics)>,
     prepared: Option<PcPreparedRootV3>,
@@ -149,6 +150,7 @@ impl PcRootRecoveryV3 {
             aggregate: None,
             abort_before_route: false,
             sealed_abort_before_route: false,
+            sealed_abort_no_scope: false,
             aborted_pre_route_release: None,
             diagnostics: Vec::new(),
             prepared: None,
@@ -178,6 +180,32 @@ impl PcRootRecoveryV3 {
     pub(crate) fn aborted_pre_route_aggregate(&self) -> Option<&RoventTeacherScopeAggregateAckV3> {
         if self.sealed_abort_before_route { self.aggregate.as_ref() } else { None }
     }
+
+    /// Seal this exact aborted recovery before any stage/issuer was created.
+    /// Issuing the original no-scope acknowledgement and returning any
+    /// reserved quota remain the bridge ledger's separate responsibilities.
+    pub(crate) fn seal_aborted_no_scope(&mut self) -> bool {
+        if !self.abort_before_route || self.stage.is_some() || self.preflight_failure.is_some()
+            || self.stage_claim_failure.is_some() || self.claimed_unstarted.is_some()
+            || self.unmatched_claim_owner.is_some() || self.route.is_some() || self.receiver.is_some()
+            || self.owner.is_some() || self.pump.is_some() || self.closed_custody.is_some()
+            || self.closed_custody_setup_unknown || self.pump_setup_unknown
+            || self.pump_setup_failure.is_some() || self.processed.is_some()
+            || self.retained.is_some() || self.consumer.is_some() || self.consumer_setup_unknown
+            || self.worker.is_some() || self.worker_key.is_some() || self.worker_spawn_failure.is_some()
+            || self.handoff.is_some() || self.aggregate.is_some() || !self.diagnostics.is_empty()
+            || self.prepared.is_some() || self.published || self.next_actor != 0
+            || self.actor_start_failure.is_some() || !self.custodian.keys().is_empty()
+            || self.panic.is_some() || self.sealed_abort_before_route
+        {
+            return false;
+        }
+        self.sealed_abort_no_scope = true;
+        true
+    }
+
+    pub(crate) fn is_sealed_abort_no_scope(&self) -> bool { self.sealed_abort_no_scope }
+    pub(crate) fn has_teacher_reservation(&self) -> bool { self.teacher_reserved }
 
     /// Seal only a known pre-route root whose own session physically retired.
     /// The ledger must separately validate this same recovery and aggregate.
