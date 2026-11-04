@@ -460,8 +460,15 @@ impl V6Pipeline {
         if self.checker_start.is_none() {
             let (until, cancelled) = self.source.original_startup_control();
             let lifecycle = self.lifecycle.as_mut().expect("original lifecycle");
+            if let Err(error) = require_original_startup_window(until, &cancelled) {
+                self.failure = Some(V6PipelineFailure::Bootstrap(error));
+                self.pre_service_finish =
+                    Some(lifecycle.finish_before_service(self.original_cleanup_until));
+                self.state = V6PipelineObservation::Failed;
+                return self.state;
+            }
             let result = match catch_unwind(AssertUnwindSafe(|| {
-                lifecycle.start_checker(until, cancelled)
+                lifecycle.start_checker(until, Arc::clone(&cancelled))
             })) {
                 Ok(result) => result,
                 Err(payload) => {
@@ -475,6 +482,14 @@ impl V6Pipeline {
             };
             if let Err(error) = &result {
                 self.failure = Some(V6PipelineFailure::CheckerStartup(error.clone()));
+                self.pre_service_finish =
+                    Some(lifecycle.finish_before_service(self.original_cleanup_until));
+                self.checker_start = Some(result);
+                self.state = V6PipelineObservation::Failed;
+                return self.state;
+            }
+            if let Err(error) = require_original_startup_window(until, &cancelled) {
+                self.failure = Some(V6PipelineFailure::Bootstrap(error));
                 self.pre_service_finish =
                     Some(lifecycle.finish_before_service(self.original_cleanup_until));
                 self.checker_start = Some(result);

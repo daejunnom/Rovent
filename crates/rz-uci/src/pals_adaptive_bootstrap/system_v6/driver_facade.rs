@@ -212,7 +212,14 @@ impl SearchSessionDriver for V6DriverFacade {
         if !matches!(&*state, FinishState::Pending) {
             return Err(SearchSessionFailure::physical_completion_unknown());
         }
-        self.driver.start_checker(deadline, cancel)
+        // Retain the original panic while dropping only this facade's guard
+        // normally; a separately poisoned driver remains unknown.
+        let result = catch_unwind(AssertUnwindSafe(|| self.driver.start_checker(deadline, cancel)));
+        drop(state);
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
     fn checker_attempts(&self) -> Result<Option<Vec<CheckerAttempt>>, SearchSessionFailure> {
         self.driver.checker_attempts()
