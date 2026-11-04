@@ -20,6 +20,7 @@ import struct
 import subprocess
 import sys
 import time
+import uuid
 
 from lc0_parent_preflight import (
     ACK_SCHEMA, ACK_SCOPE, REQUEST_SCHEMA, PreflightError, _decode, _open_pinned_binary, _unique_object,
@@ -80,8 +81,8 @@ def _exit_observed(pid):
     return status is not None and status.si_pid == pid
 
 
-def run(args):
-    started = time.monotonic()
+def run(args, *, containment=None, started=None, outcome=None):
+    started = time.monotonic() if started is None else started
     run_until = started + args.seconds
     cleanup_until = run_until + args.cleanup_seconds
     raw_arguments = args.native_args[1:] if args.native_args[:1] == ["--"] else args.native_args
@@ -110,10 +111,12 @@ def run(args):
     authenticated = False
     image_verified = False
     quarantine_notice = False
+    barrier_not_released = False
     error = None
     quarantine_reported = False
     exited = False
     owner_reaped = False
+    output_drain_unknown = False
     quit_queued = False
     state = "waiting_for_notice"
     input_buffer = bytearray()
@@ -168,6 +171,7 @@ def run(args):
                     error = error or (str(exc) if isinstance(exc, PreflightError) else type(exc).__name__)
             elif value and value.get("schema") == QUARANTINE_SCHEMA:
                 quarantine_notice = True
+                product_finish = None
                 error = error or "child_quarantine"
             elif value and value.get("schema") in ("rz-rovent-native-system-resource-run/3", "rz-rovent-native-system-resource-run-failure/3"):
                 failed_receipt = value.get("schema") == "rz-rovent-native-system-resource-run-failure/3"
@@ -194,7 +198,7 @@ def run(args):
         elif state == "ready" and text == "readyok":
             evidence["readyok"] = True
             state = "search"
-            add_input(b"position startpos\ngo movetime 1000\n")
+            add_input(f"position startpos\ngo nodes {args.go_nodes}\n".encode("ascii"))
         elif state == "search" and text.startswith("bestmove "):
             words = text.split()
             move = words[1] if len(words) >= 2 else ""
@@ -218,10 +222,40 @@ def run(args):
             previous_handlers[sig] = signal.signal(sig, request_cancel)
         if cancelled or time.monotonic() >= run_until:
             raise InterruptedError("cancelled or deadline elapsed before child spawn")
-        process = subprocess.Popen(
-            [str(args.binary), *raw_arguments], executable=f"/proc/self/fd/{binary_fd}",
-            pass_fds=(binary_fd,), cwd=args.cwd, env=env, start_new_session=True,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        native_argv = [str(args.binary), *raw_arguments]
+        barrier_read = barrier_write = None
+        try:
+            if containment is None:
+                process = subprocess.Popen(
+                    native_argv, executable=f"/proc/self/fd/{binary_fd}",
+                    pass_fds=(binary_fd,), cwd=args.cwd, env=env, start_new_session=True,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+                if outcome is not None:
+                    outcome["spawned"] = True
+            else:
+                from rovent_cgroup_owner import entry_command
+                barrier_read, barrier_write = os.pipe2(os.O_CLOEXEC)
+                process = subprocess.Popen(
+                    entry_command(binary_fd, barrier_read, native_argv),
+                    pass_fds=(binary_fd, barrier_read), cwd=args.cwd, env=env, start_new_session=True,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+                if outcome is not None:
+                    outcome["spawned"] = True
+                os.close(barrier_read)
+                barrier_read = None
+                if cancelled or time.monotonic() >= run_until:
+                    os.close(barrier_write)
+                    barrier_write = None
+                    barrier_not_released = True
+                    raise InterruptedError("native cancelled before barrier release")
+                release_fd, barrier_write = barrier_write, None
+                containment.admit_waiting_child(process.pid, release_fd)
+        finally:
+            if barrier_read is not None:
+                os.close(barrier_read)
+            if barrier_write is not None:
+                os.close(barrier_write)
+                barrier_not_released = True
         for stream, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ, name)
@@ -280,14 +314,21 @@ def run(args):
                 readers_open = any(key.data in ("stdout", "stderr") for key in selector.get_map().values())
                 if not readers_open or now >= cleanup_until:
                     if readers_open:
-                        error = error or "output_drain_incomplete"
+                        # Preserve the already observed session claim while
+                        # marking trailing pipe content unobserved. This is
+                        # not proof that no later diagnostic was written.
+                        output_drain_unknown = True
                     # Child output alone is a reported session observation,
                     # not a GPU fence. The PID reservation is released only
                     # after this original product reports session finish and
                     # the same process group has no live members.
-                    if product_finish is not None and not _group_has_live_members(process.pid):
+                    workload_empty = containment is None or containment.workload_empty()
+                    if product_finish is not None and not _group_has_live_members(process.pid) and workload_empty:
                         process.wait()
                         owner_reaped = True
+                        if outcome is not None:
+                            outcome.update(session_reported=True, group_gone=True,
+                                           workload_empty=workload_empty)
                         break
                     if not quarantine_reported:
                         quarantine_reported = True
@@ -405,6 +446,7 @@ def run(args):
                  "parent_authenticated": authenticated, "child_image_observed": image_verified,
                  "uci": evidence, "stdout_bytes": bytes_seen["stdout"], "stderr_bytes": bytes_seen["stderr"],
                  "quarantine_observed": quarantine_notice,
+                 "output_drain": "unknown_trailing_bytes" if output_drain_unknown else "eof_observed",
                  "physical_completion": "session_reported_by_original_product",
                  "move_legality": "not_evaluated", "log_truncated": log_truncated,
                  "line_overflow": line_overflow, "log_write_errors": log_write_errors,
@@ -428,13 +470,22 @@ def run(args):
                     pass
             while True:
                 try:
-                    if (_exit_observed(process.pid) and product_finish is not None
-                            and not _group_has_live_members(process.pid)):
+                    before_native = (containment is not None and
+                                     (barrier_not_released or
+                                      containment.admission_outcome == "rejected_before_grant"))
+                    workload_empty = containment is None or containment.workload_empty()
+                    if (_exit_observed(process.pid) and (product_finish is not None or before_native)
+                            and not _group_has_live_members(process.pid) and workload_empty):
                         process.wait()
+                        if outcome is not None:
+                            outcome.update(session_reported=product_finish is not None,
+                                           before_native=before_native, group_gone=True,
+                                           workload_empty=workload_empty)
                         break
-                except (ChildProcessError, OSError):
+                except BaseException:
                     # An unverified/reaped wait relationship is not proof
-                    # that the native operation physically completed.
+                    # that the native operation physically completed. This
+                    # also retains the owner on cgroup observation failure.
                     pass
                 for pipe in (process.stdout, process.stderr):
                     try:
@@ -469,7 +520,473 @@ def run(args):
         os.close(output)
 
 
+def _managed_control(path, maximum=1024 * 1024):
+    from rovent_before_native_owner import open_directory, read_control, relative
+    path = Path(path)
+    if not path.is_absolute() or _secret_name(path.name):
+        raise ValueError("explicit non-secret absolute control file required")
+    directory = open_directory(path.parent)
+    try:
+        data = read_control(directory, relative(path.name))
+    finally:
+        os.close(directory)
+    if len(data) > maximum:
+        raise ValueError("control file exceeds bound")
+    return data
+
+
+def _secret_name(name):
+    lower = name.lower()
+    return (lower.startswith(".env") or "credential" in lower or "service-account" in lower
+            or "service_account" in lower or lower in {"id_rsa", "id_ed25519", "id_ecdsa"}
+            or "api_key" in lower or "api-key" in lower)
+
+
+def _failed_acquire_retained(lease):
+    """Recognize only this exact durably retained, never-dispatched lease."""
+    from managed_outputs import _read, identity, lifetime
+    try:
+        record = lease.record
+        return (record is not None and record.get("state") == "retained"
+                and record.get("status") == "acquire_failed_before_dispatch"
+                and record.get("pid") == os.getpid() and record.get("lifetime") == lifetime()
+                and lease.guard.stream is None and identity(lease.output) == record.get("identity")
+                and _read(lease.catalog / (lease.key + ".json")) == record
+                and _read(lease.output / ".rovezero-output.json") == record)
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+        return False
+
+
+def _scope_observation(owner, stage):
+    """Optional readback; absence never substitutes for a configured limit."""
+    value = {"schema": "rz-rovent-v3-managed-scope-observation/1", "stage": stage,
+             "scope": "original_manager_common_scope", "limits": {}, "affinity": "unknown"}
+    try:
+        owner._check_owner()
+        for name in ("cpu.max", "memory.high", "memory.max", "pids.max", "cpuset.cpus.effective"):
+            try:
+                value["limits"][name] = (owner.scope / name).read_text(encoding="ascii").strip()
+            except (OSError, UnicodeError):
+                value["limits"][name] = "unknown"
+        value["affinity"] = sorted(os.sched_getaffinity(0))
+    except (OSError, RuntimeError, ValueError):
+        value["owner_identity"] = "unknown"
+    return value
+
+
+def run_managed(plan_path):
+    """Own the fresh output, snapshots, registration and V3 child together.
+
+    This entry is opt-in. It never accepts a draft request as executable and
+    never converts a group-only observation into a device-wide GPU fence.
+    """
+    import hashlib
+    from managed_outputs import OutputLease
+    from managed_process import OwnedProcessGroup, ProcessNotSpawned, run_group
+    from rovent_before_native_owner import copy_pin, open_directory, protect_output, relative, unique_json
+    from rovent_cgroup_owner import CgroupOwner, CgroupSetupError, entry_command
+
+    started = time.monotonic()
+    plan = unique_json(_managed_control(plan_path))
+    if not isinstance(plan, dict) or plan.get("schema") != "rz-rovent-v3-managed-parent-plan/1":
+        raise ValueError("explicit managed V3 plan required")
+    seconds, cleanup_seconds = plan["seconds"], plan["cleanup_seconds"]
+    epoch, ordinal = plan["process_epoch"], plan["cuda_ordinal"]
+    reserve = plan["reserve_bytes"]
+    if (type(seconds) is not int or not 1 <= seconds <= 7200
+            or type(cleanup_seconds) is not int or not 1 <= cleanup_seconds <= 30
+            or type(epoch) is not int or not 1 <= epoch <= 2**64 - 1
+            or type(ordinal) is not int or not 0 <= ordinal <= 2**31 - 1
+            or type(reserve) is not int or reserve <= 0
+            or type(plan["go_nodes"]) is not int or not 1 <= plan["go_nodes"] <= 1_000_000):
+        raise ValueError("invalid finite managed plan limits")
+    run_until = started + seconds
+    cleanup_until = run_until + cleanup_seconds
+    output = Path(plan["output"])
+    checkout = Path(plan["checkout_root"])
+    asset_root = Path(plan["asset_root"])
+    if not all(path.is_absolute() and ".." not in path.parts for path in (output, checkout, asset_root)):
+        raise ValueError("absolute managed roots required")
+    request_pin, native_pin, registration_pin = (plan[key] for key in ("request", "native_binary", "registration_binary"))
+    request_source = Path(request_pin["path"])
+    request_bytes = _managed_control(request_source)
+    if (len(request_bytes) != request_pin["bytes"]
+            or hashlib.sha256(request_bytes).hexdigest() != request_pin["sha256"]):
+        raise ValueError("request source bytes differ")
+    source_request_bytes = request_bytes
+    document = unique_json(source_request_bytes)
+    if not isinstance(document, dict):
+        raise ValueError("request document must be an object")
+    from_draft = document.get("status") == "draft_incomplete_do_not_execute"
+    if from_draft:
+        if plan.get("request_resolution") != "validate_under_original_owner":
+            raise ValueError("draft resolution must be explicitly selected")
+        request = document.get("request")
+    else:
+        request = document
+    if not isinstance(request, dict):
+        raise ValueError("request declaration is unavailable")
+    engine = request["engine"]
+    if (request["purpose"] != "validation" or engine["mode"] != "hybrid_pc"
+            or request["position_command"] != "position startpos"
+            or engine["search"]["requested_nodes"] != plan["go_nodes"]):
+        raise ValueError("managed smoke question differs from request")
+    if (request["wall_time_max_ms"] != seconds * 1000
+            or request["cleanup_max_ms"] != cleanup_seconds * 1000):
+        raise ValueError("managed window differs from registration")
+    if request["system_runtime"].get("cuda_device_id") != ordinal:
+        raise ValueError("declared CUDA ordinal differs from managed plan")
+    binary_path = Path(native_pin["path"])
+    registration_path = Path(registration_pin["path"])
+    if (not binary_path.is_absolute() or not registration_path.is_absolute()
+            or _secret_name(binary_path.name) or _secret_name(registration_path.name)):
+        raise ValueError("absolute registered binaries required")
+    binary_declaration = engine["binary"]
+    if (binary_declaration["path"] != "inputs/bin/" + binary_path.name
+            or binary_declaration["bytes"] != native_pin["bytes"]
+            or binary_declaration["sha256"] != native_pin["sha256"]):
+        raise ValueError("native binary differs from registration")
+    artifacts = list(request["provenance"])
+    for role in ("proposer", "critic"):
+        artifacts.extend((engine["pc"][role]["weights"], engine["pc"][role]["provenance"]))
+    unique = {}
+    for artifact in artifacts:
+        path = str(relative(artifact["path"]))
+        if not path.startswith("inputs/") or _secret_name(Path(path).name):
+            raise ValueError("invalid artifact snapshot path")
+        identity = (artifact["bytes"], artifact["sha256"])
+        if path in unique and unique[path] != identity:
+            raise ValueError("conflicting artifact snapshot")
+        unique[path] = identity
+    total = sum(size for size, _ in unique.values()) + native_pin["bytes"] + registration_pin["bytes"]
+    if total > reserve:
+        raise ValueError("declared snapshots exceed original reservation")
+
+    owner = None
+    lease = None
+    suspended = False
+    original_child_unsettled = False
+    native_outcome = {}
+    native_attempted = False
+    registration_group = None
+    native_leaf = "rovent-" + uuid.uuid4().hex
+    acquired = False
+    partial_publication_unknown = False
+    finish_attempted = False
+    cancel_requested = [False]
+    previous_handlers = {}
+
+    def request_cancel(_signum, _frame):
+        cancel_requested[0] = True
+
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[sig] = signal.signal(sig, request_cancel)
+        if cancel_requested[0] or time.monotonic() >= run_until:
+            raise InterruptedError("managed run cancelled before owner setup")
+        # Scope and output remain held by this exact manager process.
+        try:
+            owner = CgroupOwner.prepare()
+        except CgroupSetupError as error:
+            recovered = False
+            for _ in range(3):
+                try:
+                    error.recovery.retry()
+                    recovered = True
+                    break
+                except BaseException:
+                    time.sleep(0.1)
+            if recovered:
+                raise error.original from error
+            _report({"schema": REPORT_SCHEMA, "status": "cgroup_setup_owner_retained",
+                     "reason": type(error.original).__name__, "physical_completion": "not_started"})
+            # The exception retains the original rollback capability. These
+            # bounded retries are bookkeeping only, never a new native run.
+            while not recovered:
+                time.sleep(5)
+                try:
+                    error.recovery.retry()
+                    recovered = True
+                except BaseException:
+                    pass
+            raise error.original from error
+        _report(_scope_observation(owner, "before_snapshots"))
+        parent_fd = open_directory(output.parent)
+        try:
+            lease = OutputLease(output, checkout, reserve=reserve, retention_days=14)
+            try:
+                lease.acquire()
+                acquired = True
+            except BaseException:
+                # A partially published active row still belongs to this
+                # original object; failed acquire is not finish authority.
+                partial_publication_unknown = (lease.record is not None and not _failed_acquire_retained(lease))
+                raise
+            protect_output(lease, output, parent_fd)
+        finally:
+            os.close(parent_fd)
+        lease.prepare_live_handoff()
+        lease.suspend_live()
+        suspended = True
+        if from_draft:
+            # Resolving a draft is an explicit plan action, performed only
+            # after this process owns both output and workload cgroup. The
+            # original draft bytes stay alongside the independently generated
+            # request; typed registration still validates the declaration.
+            draft_target = output / "inputs" / "system-v3-request-draft-source.json"
+            draft_target.parent.mkdir(parents=True, mode=0o700)
+            draft_fd = os.open(draft_target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(draft_fd, "wb") as stream:
+                stream.write(source_request_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+            request_bytes = json.dumps(request, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        (output / "inputs" / "bin").mkdir(parents=True, mode=0o700)
+        progress = [0, total]
+        asset_fd = open_directory(asset_root)
+        try:
+            for path, (size, sha256) in unique.items():
+                if cancel_requested[0]:
+                    raise InterruptedError("managed snapshot cancelled")
+                copy_pin(asset_fd, output, {"path": path, "bytes": size, "sha256": sha256}, run_until, progress)
+        finally:
+            os.close(asset_fd)
+        for pin, source in ((native_pin, binary_path), (registration_pin, registration_path)):
+            if cancel_requested[0]:
+                raise InterruptedError("managed snapshot cancelled")
+            source_fd = open_directory(source.parent)
+            try:
+                copy_pin(source_fd, output / "inputs" / "bin",
+                         {"path": source.name, "bytes": pin["bytes"], "sha256": pin["sha256"]},
+                         run_until, progress)
+            finally:
+                os.close(source_fd)
+            executable_fd = os.open(output / "inputs" / "bin" / source.name, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                os.fchmod(executable_fd, 0o700)
+            finally:
+                os.close(executable_fd)
+        if progress[0] != total:
+            raise ValueError("managed snapshot byte count differs")
+        request_target = output / "inputs" / "system-v3-registration-request.json"
+        request_fd = os.open(request_target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(request_fd, "wb") as stream:
+            stream.write(request_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+        resource = {"schema": "rz-rovent-native-resource-launch/1",
+                    "delegated_cgroup_path": str(owner.delegated_path), "leaf_name": native_leaf,
+                    "options": plan["resource_options"], "profile": "functional_validation",
+                    "evidence_directory": "resource-evidence"}
+        resource_bytes = json.dumps(resource, separators=(",", ":"), sort_keys=True).encode()
+        resource_path = output / "inputs" / "system-v3-resource-plan.json"
+        resource_fd = os.open(resource_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(resource_fd, "wb") as stream:
+            stream.write(resource_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+        lease.resume_live(deadline=run_until)
+        suspended = False
+        lease.check_budget()
+        lease.suspend_live()
+        suspended = True
+        if cancel_requested[0] or time.monotonic() >= run_until:
+            raise TimeoutError("managed window expired before registration")
+
+        registration_image = output / "inputs" / "bin" / registration_path.name
+        reg_fd, _ = _open_pinned_binary(registration_image, registration_pin["bytes"], registration_pin["sha256"], run_until)
+        barrier_read, barrier_write = os.pipe2(os.O_CLOEXEC)
+        group = OwnedProcessGroup()
+        registration_group = group
+        registration_stdout = os.open(output / "registration.stdout", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            argv = entry_command(reg_fd, barrier_read, [str(registration_image), str(request_target), str(output)])
+            def admit_registration():
+                nonlocal barrier_read, barrier_write, original_child_unsettled
+                original_child_unsettled = True
+                os.close(barrier_read)
+                barrier_read = None
+                if cancel_requested[0] or time.monotonic() >= run_until:
+                    os.close(barrier_write)
+                    barrier_write = None
+                    raise InterruptedError("registration cancelled before barrier release")
+                release_fd, barrier_write = barrier_write, None
+                owner.admit_waiting_child(group._child.pid, release_fd)
+            def registration_tick():
+                if cancel_requested[0]:
+                    raise InterruptedError("registration cancelled")
+                if os.fstat(registration_stdout).st_size > 1024 * 1024:
+                    raise RuntimeError("registration stdout exceeds bound")
+            original_child_unsettled = True
+            try:
+                code, gone, failure = run_group(
+                    argv, output, {"PATH": "/usr/bin:/bin", "LANG": "C"},
+                    max(0.001, run_until - time.monotonic()), lambda: None,
+                    pass_fds=(reg_fd, barrier_read), stdout=registration_stdout,
+                    on_spawn=admit_registration, owned_group=group,
+                    absolute_deadline=cleanup_until, graceful_drain_deadline=run_until,
+                    on_tick=registration_tick)
+            except ProcessNotSpawned:
+                original_child_unsettled = False
+                raise
+            if not gone or not owner.workload_empty():
+                raise RuntimeError("original registration process scope remains unknown")
+            original_child_unsettled = False
+            if code != 0 or failure is not None or time.monotonic() >= run_until:
+                raise RuntimeError("registration failed or exceeded the original window")
+        finally:
+            for fd in (barrier_read, barrier_write, reg_fd, registration_stdout):
+                if fd is not None:
+                    os.close(fd)
+
+        lock_relative = str(relative(request["outputs"]["input_lock"]))
+        if not lock_relative.startswith("inputs/"):
+            raise ValueError("registered lock is outside inputs")
+        lock = unique_json(_managed_control(output / lock_relative))
+        lock_sha = lock.get("canonical_sha256")
+        if not isinstance(lock_sha, str) or re.fullmatch(r"[0-9a-f]{64}", lock_sha) is None:
+            raise ValueError("registered input lock digest missing")
+        asset_arguments = plan["native_asset_arguments"]
+        allowed_assets = ("--native-export=", "--native-rules=", "--native-public-graph=",
+                          "--native-shared-pc-graph=", "--native-cuda-control-inventory=")
+        if (not isinstance(asset_arguments, list) or not asset_arguments
+                or any(not isinstance(item, str) or not item.startswith(allowed_assets)
+                       or not item.split("=", 1)[1].startswith("inputs/")
+                       or _secret_name(Path(item.split("=", 1)[1]).name)
+                       for item in asset_arguments)):
+            raise ValueError("explicit native asset arguments required")
+        arguments = ["--resource-system-runtime-v3", "--custody-control",
+                     "--resource-plan=inputs/system-v3-resource-plan.json",
+                     "--resource-plan-sha256=" + hashlib.sha256(resource_bytes).hexdigest(),
+                     "--resource-plan-bytes=" + str(len(resource_bytes)),
+                     "--input-lock=" + lock_relative, "--process-epoch=" + str(epoch),
+                     "--startup-ms=" + str(plan["startup_ms"]), "--source-verification=observe",
+                     "--root-policy=exact-registered", *asset_arguments]
+        smoke = argparse.Namespace(binary=output / binary_declaration["path"], binary_bytes=native_pin["bytes"],
+                                   binary_sha256=native_pin["sha256"], cwd=output, output_dir=output,
+                                   epoch=epoch, lock_sha256=lock_sha, cuda_ordinal=ordinal,
+                                   seconds=seconds, cleanup_seconds=cleanup_seconds,
+                                   numeric_observation=plan.get("numeric_observation") is True,
+                                   go_nodes=plan["go_nodes"], native_args=arguments)
+        original_child_unsettled = True
+        native_attempted = True
+        native_outcome["spawned"] = False
+        result = run(smoke, containment=owner, started=started, outcome=native_outcome)
+        original_child_unsettled = not (native_outcome.get("session_reported") is True
+                                        and native_outcome.get("group_gone") is True
+                                        and native_outcome.get("workload_empty") is True)
+        if original_child_unsettled:
+            raise RuntimeError("original native session remains unknown")
+        owner.close(native_leaf)
+        owner = None
+        # This finite catalog operation happens after native/session closure;
+        # it is not extra native or GPU execution time.
+        lease.resume_live(deadline=time.monotonic() + 2.0)
+        suspended = False
+        finish_attempted = True
+        lease.finish(status="v3_parent_smoke_complete" if result == 0 else "v3_parent_smoke_failed",
+                     tree_gone=True)
+        lease = None
+        return result
+    except BaseException as error:
+        # Before child start or after the exact scope closes, normal cleanup
+        # can finish this lease. Unknown original child/cgroup retains owners.
+        if native_attempted and (native_outcome.get("spawned") is False or
+                (native_outcome.get("before_native") is True
+                 and native_outcome.get("group_gone") is True
+                 and native_outcome.get("workload_empty") is True)):
+            original_child_unsettled = False
+        if owner is not None and not original_child_unsettled:
+            try:
+                if owner.workload_empty():
+                    owner.close(native_leaf)
+                    owner = None
+            except BaseException:
+                pass
+        if lease is not None and acquired and finish_attempted:
+            try:
+                phase = lease.live_finish_observation()["phase"]
+                if phase == "terminal_pending":
+                    lease.recover_live_terminal()
+                    lease = None
+                elif phase == "terminal_verified_released":
+                    lease = None
+            except BaseException:
+                pass
+        if (lease is not None and acquired and not finish_attempted
+                and owner is None and not original_child_unsettled):
+            try:
+                if suspended:
+                    lease.resume_live(deadline=time.monotonic() + 2.0)
+                    suspended = False
+                finish_attempted = True
+                lease.finish(status="v3_parent_cleanup_failed" if native_attempted else "v3_parent_prepare_failed",
+                             tree_gone=True)
+                lease = None
+            except BaseException:
+                pass
+        if owner is not None or partial_publication_unknown or (lease is not None and acquired):
+            _report({"schema": REPORT_SCHEMA, "status": "managed_owner_retained",
+                     "reason": type(error).__name__, "physical_completion": "unknown",
+                     "group_scope": "owned_workload_cgroup", "output": str(output)})
+            while owner is not None or partial_publication_unknown or (lease is not None and acquired):
+                # Only bookkeeping on the same retained owners is retried.
+                # An unresolved child never receives another registration,
+                # native request, signal, or extended execution deadline.
+                time.sleep(5)
+                if (original_child_unsettled and not native_attempted and registration_group is not None
+                        and owner is not None):
+                    try:
+                        gone, _, failure = registration_group.reobserve_and_drain(
+                            absolute_deadline=time.monotonic() + 0.25, terminate=False)
+                        if gone and failure is None and owner.workload_empty():
+                            original_child_unsettled = False
+                    except BaseException:
+                        pass
+                if partial_publication_unknown and _failed_acquire_retained(lease):
+                    partial_publication_unknown = False
+                    if not acquired:
+                        lease = None
+                if owner is not None and not original_child_unsettled:
+                    try:
+                        if owner.workload_empty():
+                            owner.close(native_leaf)
+                            owner = None
+                    except BaseException:
+                        pass
+                if lease is not None and acquired and owner is None and not original_child_unsettled:
+                    try:
+                        if finish_attempted:
+                            phase = lease.live_finish_observation()["phase"]
+                            if phase == "terminal_pending":
+                                lease.recover_live_terminal()
+                                lease = None
+                            elif phase == "terminal_verified_released":
+                                lease = None
+                        else:
+                            if suspended:
+                                lease.resume_live(deadline=time.monotonic() + 2.0)
+                                suspended = False
+                            finish_attempted = True
+                            lease.finish(status="v3_parent_cleanup_failed" if native_attempted else "v3_parent_prepare_failed",
+                                         tree_gone=True)
+                            lease = None
+                    except BaseException:
+                        pass
+        raise
+    finally:
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--managed-plan":
+        try:
+            return run_managed(Path(sys.argv[2]))
+        except Exception as exc:
+            _report({"schema": REPORT_SCHEMA, "status": "managed_failed_before_owner",
+                     "error_type": type(exc).__name__, "physical_completion": "unknown"})
+            return 1
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--binary-bytes", type=int, required=True)
@@ -482,6 +999,7 @@ def main():
     parser.add_argument("--seconds", type=int, required=True)
     parser.add_argument("--cleanup-seconds", type=int, default=30)
     parser.add_argument("--numeric-observation", action="store_true")
+    parser.add_argument("--go-nodes", type=int, default=64)
     parser.add_argument("native_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if (sys.platform != "linux" or not all(path.is_absolute() for path in (args.binary, args.cwd, args.output_dir))
@@ -489,7 +1007,8 @@ def main():
             or not re.fullmatch(r"[0-9a-f]{64}", args.binary_sha256)
             or not re.fullmatch(r"[0-9a-f]{64}", args.lock_sha256)
             or not (1 <= args.epoch <= 2**64 - 1) or not (0 <= args.cuda_ordinal <= 2**31 - 1)
-            or not (1 <= args.seconds <= 7200) or not (1 <= args.cleanup_seconds <= 30)):
+            or not (1 <= args.seconds <= 7200) or not (1 <= args.cleanup_seconds <= 30)
+            or not (1 <= args.go_nodes <= 1_000_000)):
         parser.error("invalid bounded Linux V3 smoke configuration")
     try:
         return run(args)

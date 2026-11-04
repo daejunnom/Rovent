@@ -60,11 +60,11 @@ for command in sys.stdin:
         print("uciok", flush=True)
     elif command == "isready":
         print("readyok", flush=True)
-    elif command == "go movetime 1000":
+    elif command == "go nodes 64":
         assert commands[-2] == "position startpos"
         print("bestmove e2e4", flush=True)
     elif command == "quit":
-        assert commands[:4] == ["uci", "isready", "position startpos", "go movetime 1000"]
+        assert commands[:4] == ["uci", "isready", "position startpos", "go nodes 64"]
         if variant == "unknown":
             break
         finish = {"schema":"rz-rovent-product-finish-observation/1", "process_id":pid,
@@ -77,6 +77,10 @@ for command in sys.stdin:
             value = {"schema":"rz-rovent-native-system-resource-run/3", "process_id":pid,
                 "process_generation":epoch, "product_finish":finish}
         print(json.dumps(value), file=sys.stderr, flush=True)
+        if variant == "late_quarantine":
+            print(json.dumps({"schema":"rz-rovent-direct-custody-quarantined/1",
+                              "process_id":pid, "physical_completion":"unknown"}),
+                  file=sys.stderr, flush=True)
         break
 channel.close()
 listener.close()
@@ -99,6 +103,24 @@ class NoticeTests(unittest.TestCase):
             changed = dict(notice, **{field: replacement})
             with self.subTest(field=field), self.assertRaises(parent.PreflightError):
                 parent._notice_route(changed, pid, epoch, lock, 0)
+
+    def test_failed_acquire_recognizes_only_same_durable_retained_owner(self):
+        import managed_outputs
+        token = hashlib.sha256(os.urandom(32)).hexdigest()
+        record = {"state": "retained", "status": "acquire_failed_before_dispatch",
+                  "pid": os.getpid(), "lifetime": token, "identity": [7, 11]}
+        lease = mock.Mock(record=record, output=Path("/fixture/output"),
+                          catalog=Path("/fixture/catalog"), key="fixture")
+        lease.guard.stream = None
+        with mock.patch.object(managed_outputs, "lifetime", return_value=token), \
+             mock.patch.object(managed_outputs, "identity", return_value=[7, 11]), \
+             mock.patch.object(managed_outputs, "_read", return_value=record):
+            self.assertTrue(parent._failed_acquire_retained(lease))
+            lease.guard.stream = object()
+            self.assertFalse(parent._failed_acquire_retained(lease))
+            lease.guard.stream = None
+            with mock.patch.object(managed_outputs, "_read", return_value={**record, "state": "active"}):
+                self.assertFalse(parent._failed_acquire_retained(lease))
 
 
 @unittest.skipUnless(sys.platform == "linux", "requires Linux procfs and Unix peer credentials")
@@ -155,23 +177,24 @@ class ParentCpuFixtureTests(unittest.TestCase):
     def test_unobserved_session_keeps_original_owner_after_cpu_fixture_exits(self):
         # The child here is a CPU-only Python fixture. Forced test cleanup is
         # confined to this fixture and is not a GPU completion procedure.
-        with tempfile.TemporaryDirectory() as temporary:
-            command, _ = self.command(Path(temporary), "unknown")
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            try:
-                import selectors
-                selector = selectors.DefaultSelector()
-                selector.register(process.stdout, selectors.EVENT_READ)
-                self.assertTrue(selector.select(15), "fixture did not report retained owner")
-                record = json.loads(process.stdout.readline())
-                self.assertEqual(record["status"], "quarantined_original_owner_retained")
-                self.assertEqual(record["physical_completion"], "unknown")
-                self.assertIsNone(process.poll(), "owner must remain alive for unknown scope")
-                selector.close()
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                process.communicate(timeout=5)
+        for variant in ("unknown", "late_quarantine"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
+                command, _ = self.command(Path(temporary), variant)
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    import selectors
+                    selector = selectors.DefaultSelector()
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    self.assertTrue(selector.select(15), "fixture did not report retained owner")
+                    record = json.loads(process.stdout.readline())
+                    self.assertEqual(record["status"], "quarantined_original_owner_retained")
+                    self.assertEqual(record["physical_completion"], "unknown")
+                    self.assertIsNone(process.poll(), "owner must remain alive for unknown scope")
+                    selector.close()
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
 
     def test_cancelled_before_spawn_never_creates_child(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -199,7 +222,7 @@ def argparse_namespace_for_cancel(binary, root, output):
     return argparse.Namespace(
         binary=binary, binary_bytes=1, binary_sha256="unused", cwd=root, output_dir=output,
         epoch=1, lock_sha256="unused", cuda_ordinal=0, seconds=3, cleanup_seconds=1,
-        numeric_observation=False,
+        numeric_observation=False, go_nodes=64,
         native_args=["--resource-system-runtime-v3", "--custody-control", "--process-epoch=1",
                      "--input-lock=inputs/lock", "--resource-plan=inputs/plan",
                      "--resource-plan-sha256=unused", "--resource-plan-bytes=1"],
