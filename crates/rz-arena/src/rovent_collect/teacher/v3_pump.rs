@@ -43,6 +43,14 @@ pub(crate) enum TeacherPumpCancelV3 {
     NotObserved,
 }
 
+/// Physical terminal observation only; this does not attest policy or GPU settlement.
+pub(crate) enum TeacherPendingDrainV3 {
+    Drained,
+    Pending,
+    Full,
+    Unknown,
+}
+
 pub(crate) struct TeacherPumpSetupErrorV3 {
     pub error: String,
     pub receiver: Arc<Mutex<SpeculativeReceiverV3>>,
@@ -61,6 +69,7 @@ pub(crate) struct TeacherPumpV3 {
     pending_delivery_ack: bool,
     held: Option<Arc<SubmittedTeacherQueryV3>>,
     completed: Option<TeacherCompletedV3>,
+    terminal_backlog: Vec<TeacherCompletedV3>,
     rejected: Option<Box<TeacherRejectedV3>>,
     input_disconnected: bool,
     closed: bool,
@@ -114,6 +123,7 @@ impl TeacherPumpV3 {
             pending_delivery_ack: false,
             held: None,
             completed: None,
+            terminal_backlog: Vec::new(),
             rejected: None,
             input_disconnected: false,
             closed: false,
@@ -175,6 +185,42 @@ impl TeacherPumpV3 {
         &self.observation_errors
     }
 
+    /// Retain one original terminal even when semantic output is occupied.
+    /// The caller separately handles policy, route and physical completion.
+    pub(crate) fn try_drain_pending(&mut self) -> Result<TeacherPendingDrainV3, String> {
+        if self.terminal_backlog.len() >= self.dispatchers.len() {
+            return Ok(TeacherPendingDrainV3::Full);
+        }
+        self.terminal_backlog
+            .try_reserve(1)
+            .map_err(|_| "V3 teacher terminal custody allocation failed".to_string())?;
+        let mut unknown = false;
+        for (actor, dispatcher) in &mut self.dispatchers {
+            if !dispatcher.has_pending() {
+                continue;
+            }
+            match dispatcher.take_completed() {
+                Ok(Some(completed)) => {
+                    self.observation_errors.remove(actor);
+                    self.terminal_backlog.push(completed);
+                    return Ok(TeacherPendingDrainV3::Drained);
+                }
+                Ok(None) => {
+                    unknown |= dispatcher.submission_unknown();
+                }
+                Err(error) => {
+                    self.observation_errors.insert(actor.clone(), error);
+                    unknown = true;
+                }
+            }
+        }
+        Ok(if unknown {
+            TeacherPendingDrainV3::Unknown
+        } else {
+            TeacherPendingDrainV3::Pending
+        })
+    }
+
     /// A same-route queue observation only. The caller must separately hold
     /// the native callback fence and same-root worker/physical evidence.
     pub(crate) fn try_retirement_ready(
@@ -185,6 +231,7 @@ impl TeacherPumpV3 {
             || self.pending_delivery_ack
             || self.held.is_some()
             || self.completed.is_some()
+            || !self.terminal_backlog.is_empty()
             || self.rejected.is_some()
             || self.has_pending()
             || self.receiver_failure.is_some()
@@ -390,11 +437,14 @@ impl TeacherPumpV3 {
         &mut self,
         destination: &mut Option<TeacherCompletedV3>,
     ) -> bool {
-        if destination.is_some() || self.completed.is_none() {
+        if destination.is_some() {
             return false;
         }
-        *destination = self.completed.take();
-        true
+        *destination = self
+            .completed
+            .take()
+            .or_else(|| self.terminal_backlog.pop());
+        destination.is_some()
     }
     pub(crate) fn take_rejected(&mut self) -> Option<Box<TeacherRejectedV3>> {
         self.rejected.take()
