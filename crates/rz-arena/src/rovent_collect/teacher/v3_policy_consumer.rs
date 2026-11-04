@@ -100,6 +100,18 @@ pub(crate) enum TeacherPolicyConsumerStartV3 {
     NotReady,
 }
 
+/// Failure-only observation of the same retained consumer; none of these
+/// fields confers permission to retry, release owners, or claim completion.
+pub(crate) struct TeacherPolicyConsumerRetentionV3 {
+    pub(crate) poisoned: bool,
+    pub(crate) completed_held: bool,
+    pub(crate) sealed_held: bool,
+    pub(crate) rejection_held: bool,
+    pub(crate) panic_held: bool,
+    pub(crate) seal_state: TeacherPolicySealStepV3,
+    pub(crate) authority_unknown: bool,
+}
+
 impl TeacherPolicyConsumerOwnerV3 {
     /// Verify the exact pump/session/receiver/root/pipeline owners before
     /// constructing a consumer. None is transient lock contention. The
@@ -241,6 +253,25 @@ impl TeacherPolicyConsumerOwnerV3 {
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Poisoned(_)) => Err("V3 teacher consumer owner poisoned"),
         }
+    }
+
+    /// Even a poisoned mutex retains its original slots. Observe them without
+    /// clearing poison or handing out mutable recovery authority.
+    pub(crate) fn try_observe_retention(&self) -> Option<TeacherPolicyConsumerRetentionV3> {
+        let (owner, poisoned) = match self.0.try_lock() {
+            Ok(guard) => (guard, false),
+            Err(TryLockError::WouldBlock) => return None,
+            Err(TryLockError::Poisoned(error)) => (error.into_inner(), true),
+        };
+        Some(TeacherPolicyConsumerRetentionV3 {
+            poisoned,
+            completed_held: owner.completed.is_some(),
+            sealed_held: owner.sealed.is_some(),
+            rejection_held: owner.rejection.is_some(),
+            panic_held: owner.panic.is_some(),
+            seal_state: owner.seal_state,
+            authority_unknown: owner.authority_unknown,
+        })
     }
 }
 
