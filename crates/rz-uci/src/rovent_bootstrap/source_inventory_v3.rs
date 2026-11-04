@@ -36,6 +36,10 @@ const SYSTEM_RUNTIME_V3_FILES: &[(&str, &[u8])] = &[
         include_bytes!("launch/collection_v3.rs"),
     ),
     (
+        "crates/rz-uci/src/rovent_bootstrap/launch/own_collection_v3.rs",
+        include_bytes!("launch/own_collection_v3.rs"),
+    ),
+    (
         "crates/rz-uci/src/rovent_bootstrap/pc_collection_v3.rs",
         include_bytes!("pc_collection_v3.rs"),
     ),
@@ -54,6 +58,14 @@ const SYSTEM_RUNTIME_V3_FILES: &[(&str, &[u8])] = &[
     (
         "crates/rz-uci/src/pals_adaptive/session_driver/collection_v3_root.rs",
         include_bytes!("../pals_adaptive/session_driver/collection_v3_root.rs"),
+    ),
+    (
+        "crates/rz-uci/src/pals_adaptive/manager/collection/no_capture_v3.rs",
+        include_bytes!("../pals_adaptive/manager/collection/no_capture_v3.rs"),
+    ),
+    (
+        "crates/rz-uci/src/pals_adaptive/manager/collection/versioned.rs",
+        include_bytes!("../pals_adaptive/manager/collection/versioned.rs"),
     ),
     (
         "crates/rz-uci/src/rovent_bootstrap/launch/v3_scope.rs",
