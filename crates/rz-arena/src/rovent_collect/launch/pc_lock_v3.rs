@@ -5,7 +5,9 @@
 use super::*;
 use crate::rovent_collect::capture_router_v3::CaptureRouterV3;
 use crate::rovent_collect::pc_hooks_lock_v3::RoventPcCollectionBridgeV3;
-use crate::rovent_collect::pc_worker_v3::{PcWorkerSupervisorV3, SupervisorStartCustodyV3};
+use crate::rovent_collect::pc_worker_v3::{
+    PcDriverEvidenceErrorV3, PcDriverPollV3, PcWorkerSupervisorV3, SupervisorStartCustodyV3,
+};
 use crate::rovent_collect::teacher::v3_session::TeacherRosterEntryV3;
 use rz_experiments::rovent_corpus_lock_v3::record::RoventCorpusManifestLockV3;
 use rz_experiments::{RoventActor, RoventInputLockV3, RoventPurpose, RoventResearcher};
@@ -396,6 +398,84 @@ pub(crate) struct PcCollectionRunV3 {
 }
 
 impl PcCollectionRunV3 {
+    /// Bounded recovery step for a driver that never admitted a root. A busy
+    /// owner is Pending, not failure; no native or resource result is inferred.
+    pub(crate) fn poll_pre_native_driver(
+        &mut self,
+    ) -> Result<PcDriverPollV3<bool>, PcDriverEvidenceErrorV3> {
+        if self.unstarted_released || self.before_admission_released {
+            return Ok(PcDriverPollV3::Ready(true));
+        }
+        if self.unstarted_proof.is_none() && self.before_admission_join.is_none() {
+            match SupervisorStartCustodyV3::try_seal_no_worker(
+                &self.owners.driver_custody,
+                &self.owners.native,
+            )? {
+                PcDriverPollV3::Pending => return Ok(PcDriverPollV3::Pending),
+                PcDriverPollV3::Ready(proof) => self.unstarted_proof = proof,
+            }
+        }
+        if let Some(proof) = self.unstarted_proof.as_ref() {
+            if !proof.matches_original(
+                &self.owners.driver_custody,
+                &self.owners.supervisor,
+                &self.owners.native,
+            ) {
+                return Err(PcDriverEvidenceErrorV3::Invalid(
+                    "original no-worker proof differs",
+                ));
+            }
+            return match SupervisorStartCustodyV3::try_release_no_worker(
+                &self.owners.driver_custody,
+            )? {
+                PcDriverPollV3::Pending => Ok(PcDriverPollV3::Pending),
+                PcDriverPollV3::Ready(released) => {
+                    self.unstarted_released = released;
+                    Ok(PcDriverPollV3::Ready(released))
+                }
+            };
+        }
+        if self.before_admission_join.is_none() {
+            {
+                let mut custody = match self.owners.driver_custody.try_lock() {
+                    Ok(custody) => custody,
+                    Err(std::sync::TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(PcDriverEvidenceErrorV3::Poisoned("custody"));
+                    }
+                };
+                custody.try_join();
+            }
+            match SupervisorStartCustodyV3::try_before_admission_join_proof(
+                &self.owners.driver_custody,
+            )? {
+                PcDriverPollV3::Pending => return Ok(PcDriverPollV3::Pending),
+                PcDriverPollV3::Ready(proof) => self.before_admission_join = proof,
+            }
+        }
+        let Some(proof) = self.before_admission_join.as_ref() else {
+            return Ok(PcDriverPollV3::Ready(false));
+        };
+        if !proof.matches_original(
+            &self.owners.driver_custody,
+            &self.owners.supervisor,
+            &self.owners.native,
+        ) {
+            return Err(PcDriverEvidenceErrorV3::Invalid(
+                "original before-admission proof differs",
+            ));
+        }
+        match SupervisorStartCustodyV3::try_release_before_admission_join(
+            &self.owners.driver_custody,
+            proof,
+        )? {
+            PcDriverPollV3::Pending => Ok(PcDriverPollV3::Pending),
+            PcDriverPollV3::Ready(released) => {
+                self.before_admission_released = released;
+                Ok(PcDriverPollV3::Ready(released))
+            }
+        }
+    }
     /// A created driver may be retired independently only if its original
     /// join proves it never crossed the root-admission barrier. A panic is
     /// kept in the original custody and remains observable in the proof.
@@ -463,6 +543,15 @@ impl PcCollectionRunV3 {
         Option<crate::rovent_resource_scope::launch::RoventPcCollectionSettledOutcomeV3>,
         &'static str,
     > {
+        if !self.joined_offered {
+            match self.poll_pre_native_driver().map_err(|error| match error {
+                PcDriverEvidenceErrorV3::Poisoned(reason)
+                | PcDriverEvidenceErrorV3::Invalid(reason) => reason,
+            })? {
+                PcDriverPollV3::Pending | PcDriverPollV3::Ready(true) => return Ok(None),
+                PcDriverPollV3::Ready(false) => {}
+            }
+        }
         if !self.joined_offered && self.pending_joined.is_none() {
             self.pending_joined = self.try_join_driver()?;
         }
