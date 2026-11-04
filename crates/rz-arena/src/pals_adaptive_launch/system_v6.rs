@@ -36,7 +36,7 @@ mod deadline_sources;
 #[cfg(target_os = "linux")]
 mod direct_smoke_launch;
 #[cfg(target_os = "linux")]
-pub(crate) use direct_smoke_launch::DirectSmokeBinding;
+pub(crate) use direct_smoke_launch::{DirectNoGameBinding, DirectSmokeBinding};
 mod execution_start;
 #[cfg(target_os = "linux")]
 mod no_game_plan;
