@@ -12,13 +12,11 @@ pub(crate) enum ManagedDeadlineErrorV3 {
     Namespace(super::managed_output_fd_v2::ManagedTimeNamespaceErrorV2),
     OriginalPlanDiffers,
     NamespaceOwnerDiffers,
-    Clock(ArenaError),
-}
-
-impl From<ArenaError> for ManagedDeadlineErrorV3 {
-    fn from(error: ArenaError) -> Self {
-        Self::Clock(error)
-    }
+    ClockUnavailable(nix::errno::Errno),
+    ClockInvalid,
+    WorkExpired,
+    CleanupExpired,
+    Overflow,
 }
 
 /// Raw proposed descriptors in the supervisor's /2 handoff order. They are
@@ -56,29 +54,29 @@ impl ManagedCollectionCliV3 {
         }
         let entry = Instant::now();
         let now = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
-            .map_err(|_| invalid("managed V3 monotonic clock unavailable"))?;
+            .map_err(ManagedDeadlineErrorV3::ClockUnavailable)?;
         let seconds =
-            u64::try_from(now.tv_sec()).map_err(|_| invalid("managed V3 clock seconds"))?;
+            u64::try_from(now.tv_sec()).map_err(|_| ManagedDeadlineErrorV3::ClockInvalid)?;
         let nanos =
-            u64::try_from(now.tv_nsec()).map_err(|_| invalid("managed V3 clock nanoseconds"))?;
+            u64::try_from(now.tv_nsec()).map_err(|_| ManagedDeadlineErrorV3::ClockInvalid)?;
         let now_ns = seconds
             .checked_mul(1_000_000_000)
             .and_then(|value| value.checked_add(nanos))
-            .ok_or_else(|| invalid("managed V3 clock overflow"))?;
+            .ok_or(ManagedDeadlineErrorV3::Overflow)?;
         let work_ns = self
             .work_deadline_ns
             .checked_sub(now_ns)
             .filter(|remaining| *remaining > 0)
-            .ok_or_else(|| invalid("managed V3 original work deadline expired"))?;
+            .ok_or(ManagedDeadlineErrorV3::WorkExpired)?;
         let cleanup_ns = self
             .cleanup_deadline_ns
             .checked_sub(now_ns)
             .filter(|remaining| *remaining > 0)
-            .ok_or_else(|| invalid("managed V3 original cleanup deadline expired"))?;
+            .ok_or(ManagedDeadlineErrorV3::CleanupExpired)?;
         let deadline = |remaining| {
             entry
                 .checked_add(Duration::from_nanos(remaining))
-                .ok_or_else(|| invalid("managed V3 deadline overflow"))
+                .ok_or(ManagedDeadlineErrorV3::Overflow)
         };
         Ok((deadline(work_ns)?, deadline(cleanup_ns)?))
     }
