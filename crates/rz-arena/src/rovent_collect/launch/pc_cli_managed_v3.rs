@@ -96,7 +96,18 @@ impl ManagedCollectionCliV3 {
 pub(crate) fn parse_managed_collection_cli_v3(
     arguments: Vec<String>,
 ) -> Result<Option<ManagedCollectionCliV3>, ArenaError> {
-    if !arguments.iter().any(|arg| arg.starts_with("--v3-")) {
+    // Unrelated native V3 arguments do not select Collection. A partial
+    // Collection selector still enters this parser and reports its own error.
+    if !arguments.iter().any(|arg| {
+        arg.starts_with("--v3-mode=")
+            || arg.starts_with("--v3-plan=")
+            || arg.starts_with("--v3-plan-sha256=")
+            || arg.starts_with("--v3-plan-bytes=")
+            || arg.starts_with("--v3-managed-")
+            || arg.starts_with("--v3-bootstrap-budget-")
+            || arg.starts_with("--v3-work-deadline-")
+            || arg.starts_with("--v3-cleanup-deadline-")
+    }) {
         return Ok(None);
     }
     let mut managed = BTreeMap::new();
@@ -219,6 +230,15 @@ mod tests {
             "--v3-bootstrap-budget-ms=250".into(),
             "--native-argument=kept".into(),
         ]
+    }
+
+    #[test]
+    fn unrelated_native_v3_arguments_do_not_select_collection() {
+        assert!(parse_managed_collection_cli_v3(vec!["--v3-native-option=enabled".into()])
+            .unwrap()
+            .is_none());
+        assert!(parse_managed_collection_cli_v3(vec!["--v3-managed-plan-fd=3".into()])
+            .is_err());
     }
 
     #[test]
