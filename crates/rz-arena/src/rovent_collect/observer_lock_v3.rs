@@ -239,7 +239,13 @@ impl RoventCollectionOwnerLockV3 {
         } else if slot.is_uncertain() {
             Ok(PipelinePreparationV3::Unknown)
         } else if slot.failure().is_some() {
-            Ok(PipelinePreparationV3::Failed)
+            if slot.scope_matches(&admission, ticket) == Some(false) {
+                Ok(PipelinePreparationV3::NotReady)
+            } else {
+                // No row scope means a game-wide writer failure. An exact
+                // scope is the present ticket's own recorded failure.
+                Ok(PipelinePreparationV3::Failed)
+            }
         } else {
             Ok(PipelinePreparationV3::NotReady)
         }
