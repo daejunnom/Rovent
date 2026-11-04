@@ -710,6 +710,21 @@ impl Lc0SupervisedSession {
         &mut self,
         inputs: Lc0AsyncInputs,
     ) -> Result<Lc0AsyncAdmission, (NativeBootstrapError, Lc0AsyncInputs)> {
+        // `start_async` can unwind after taking its input owners. Until the
+        // same-owner in-place start can retain them, do not enter native
+        // service through a public library caller either.
+        Err((
+            NativeBootstrapError::Config("LC0 async start custody is not available"),
+            inputs,
+        ))
+    }
+
+    // Prepared implementation; intentionally not called while start-unwind
+    // custody remains unknown. It must not become an alternate public entry.
+    fn start_async_service_with_pending_custody(
+        &mut self,
+        inputs: Lc0AsyncInputs,
+    ) -> Result<Lc0AsyncAdmission, (NativeBootstrapError, Lc0AsyncInputs)> {
         if self.endpoint_retirement_started
             || self.receipt_token.is_none()
             || self.async_custody.is_some()
