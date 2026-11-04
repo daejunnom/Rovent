@@ -35,6 +35,8 @@ pub use numerical::*;
 pub use numerical::{pals_numerical_input_tensors_v5, pals_numerical_tensor_digest_v5};
 pub use storage::*;
 #[cfg(target_os = "linux")]
+pub(crate) use system_v6::PalsV6RoleSockets;
+#[cfg(target_os = "linux")]
 pub(crate) use system_v6::verify_original_proxy_snapshots;
 pub use system_v6::*;
 #[cfg(target_os = "linux")]

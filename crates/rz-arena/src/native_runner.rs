@@ -546,6 +546,13 @@ pub(crate) trait NativeV6Control: Send {
     ) -> Option<&Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>> {
         None
     }
+    /// The same original role listeners must be retained by this control on
+    /// every completion or quarantine path; names alone grant no authority.
+    fn original_role_sockets(
+        &self,
+    ) -> Option<&Arc<crate::pals_adaptive_launch::PalsV6RoleSockets>> {
+        None
+    }
     fn poll_run(
         &mut self,
         custody: &crate::process::SpawnCustody,
@@ -578,6 +585,7 @@ pub(crate) trait NativeV6Control: Send {
 pub(crate) struct NativeV6Supervisor {
     execution: Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>,
     control: Arc<Mutex<Box<dyn NativeV6Control>>>,
+    role_sockets: Option<Arc<crate::pals_adaptive_launch::PalsV6RoleSockets>>,
     // If pinned input inspection fails, retain the same owner/control in the
     // normal failure bundle without starting preflight or a child.
     original_pin_error: Option<ArenaError>,
@@ -619,9 +627,10 @@ impl NativeV6Supervisor {
                     .original_execution()
                     .is_some_and(|original| Arc::ptr_eq(original, execution)),
                 control.pre_signal_enabled(),
+                control.original_role_sockets().cloned(),
             )
         }));
-        let (same_owner, pre_signal_enabled) = match capabilities {
+        let (same_owner, pre_signal_enabled, role_sockets) = match capabilities {
             Ok(value) => value,
             Err(_) => {
                 return Err(NativeV6SupervisorRejection {
@@ -641,6 +650,7 @@ impl NativeV6Supervisor {
         Ok(Self {
             execution: Arc::clone(execution),
             control: Arc::new(Mutex::new(control)),
+            role_sockets,
             original_pin_error: None,
             pre_signal_enabled,
             pre_signal_observation: crate::process::PreSignalObservation::default(),
@@ -1816,15 +1826,30 @@ pub(crate) fn run_native_pair_for<S: NativeProviderDeclaration>(
 /// no deadline is created from dispatch time and no physical fence is implied.
 #[cfg(target_os = "linux")]
 pub(crate) fn run_native_pair_for_v6_controlled(
-    owner: NativeLaunchOwner<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>,
+    mut owner: NativeLaunchOwner<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>,
     cancel: Option<&AtomicBool>,
     mut supervisor: NativeV6Supervisor,
 ) -> Result<
     NativePairOutput<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>,
     Box<NativePairFailure<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>>,
 > {
-    supervisor.original_pin_error =
-        crate::pals_adaptive_launch::verify_original_proxy_snapshots(&owner).err();
+    supervisor.original_pin_error = match supervisor.role_sockets.as_ref() {
+        Some(sockets) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sockets.build_invocation(&owner, &supervisor.execution)
+        })) {
+            Ok(Ok(invocation)) => {
+                owner.snapshot.invocation = invocation;
+                None
+            }
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some(ArenaError::Io(
+                "V6 original invocation preparation panicked".into(),
+            )),
+        },
+        None => Some(ArenaError::Invalid(
+            "V6 original role listeners unavailable".into(),
+        )),
+    };
     run_native_pair_inner(owner, cancel, Some(supervisor))
 }
 
@@ -2925,6 +2950,15 @@ pub(crate) mod linux {
             status.emit();
         }
         checked?;
+        if let Some(supervisor) = bundle.v6_supervisor.as_ref() {
+            supervisor
+                .role_sockets
+                .as_ref()
+                .ok_or_else(|| {
+                    ArenaError::Invalid("V6 original role listeners unavailable".into())
+                })?
+                .verify_listeners()?;
+        }
         let mut cache_hints: Vec<_> = owner
             .snapshot
             .preparation_cache_hint

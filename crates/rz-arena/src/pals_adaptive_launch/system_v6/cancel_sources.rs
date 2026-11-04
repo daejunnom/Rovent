@@ -18,10 +18,15 @@ pub(crate) struct CancelSourceObservation {
 fn sources() -> &'static [(&'static str, &'static [u8])] {
     &[
         ("cancel_sources", include_bytes!("cancel_sources.rs")),
+        (
+            "v6_parent_boundary",
+            include_bytes!("../../pals_adaptive_launch.rs"),
+        ),
         ("v6_boundary", include_bytes!("../system_v6.rs")),
         ("v6_pair", include_bytes!("pair.rs")),
         ("v6_pair_native", include_bytes!("pair_native.rs")),
         ("v6_proxy_inputs", include_bytes!("proxy_inputs.rs")),
+        ("v6_invocation", include_bytes!("invocation.rs")),
         (
             "v6_endpoint_snapshot",
             include_bytes!("endpoint_snapshot.rs"),
@@ -52,6 +57,10 @@ fn sources() -> &'static [(&'static str, &'static [u8])] {
         (
             "uci_arena_grant_channel",
             include_bytes!("../../../../rz-uci/src/pals_system_proxy/arena_grant_channel.rs"),
+        ),
+        (
+            "uci_arena_launch_inputs",
+            include_bytes!("../../../../rz-uci/src/pals_system_proxy/arena_launch_inputs.rs"),
         ),
         (
             "uci_deadline_grant",

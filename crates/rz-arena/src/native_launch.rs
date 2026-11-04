@@ -1576,6 +1576,23 @@ pub(crate) mod linux {
         cwd: &Path,
         roots: &[PathBuf; 2],
     ) -> Result<FastchessInvocation, ArenaError> {
+        build_invocation_with_v6_overrides(spec, pins, cwd, roots, None)
+    }
+
+    /// Already verified pins and finite arguments belonging to the same V6
+    /// owner. This is an invocation projection, never a running-process proof.
+    pub(crate) struct V6EngineInvocation<'a> {
+        pub binary: &'a InputPin,
+        pub arguments: Vec<OsString>,
+    }
+
+    pub(crate) fn build_invocation_with_v6_overrides<S: NativeLaunchDeclaration>(
+        spec: &S,
+        pins: &[InputPin],
+        cwd: &Path,
+        roots: &[PathBuf; 2],
+        overrides: Option<&[V6EngineInvocation<'_>; 2]>,
+    ) -> Result<FastchessInvocation, ArenaError> {
         let input = spec.view();
         validate_native_runner(input.runner, input.clock)?;
         let prefix = u32::try_from(input.opening.moves.len())
@@ -1604,13 +1621,24 @@ pub(crate) mod linux {
                     NativeEngineRole::Baseline => 0,
                     NativeEngineRole::Candidate => 1,
                 }];
-                let tokens = external_arguments(
-                    spec,
-                    role,
-                    external,
-                    pins,
-                    ExternalArgumentMode::Runtime(root),
-                )?;
+                let (binary, tokens) = if let Some(overrides) = overrides {
+                    let selected = &overrides[match role {
+                        NativeEngineRole::Baseline => 0,
+                        NativeEngineRole::Candidate => 1,
+                    }];
+                    (selected.binary, selected.arguments.clone())
+                } else {
+                    (
+                        binary,
+                        external_arguments(
+                            spec,
+                            role,
+                            external,
+                            pins,
+                            ExternalArgumentMode::Runtime(root),
+                        )?,
+                    )
+                };
                 let variables = external
                     .environment
                     .as_ref()
@@ -1656,6 +1684,11 @@ pub(crate) mod linux {
                     args.push(format!("option.{name}={value}").into());
                 }
                 continue;
+            }
+            if overrides.is_some() {
+                return Err(ArenaError::Invalid(
+                    "V6 override requires an external engine declaration".into(),
+                ));
             }
             let root = &roots[match role {
                 NativeEngineRole::Baseline => 0,

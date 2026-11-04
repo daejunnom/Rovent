@@ -12,9 +12,13 @@ mod cancel_sources;
 #[cfg(target_os = "linux")]
 mod endpoint_snapshot;
 #[cfg(target_os = "linux")]
+mod invocation;
+#[cfg(target_os = "linux")]
 pub(crate) use cancel_sources::{CancelSourceObservation, compiled_cancel_source_observation};
 #[cfg(target_os = "linux")]
 pub(crate) use endpoint_snapshot::verify_original_proxy_snapshots;
+#[cfg(target_os = "linux")]
+pub(crate) use invocation::PalsV6RoleSockets;
 #[cfg(target_os = "linux")]
 mod deadline_control;
 mod deadline_grant;
