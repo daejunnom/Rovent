@@ -765,6 +765,8 @@ impl RoventBoardCollectionWorkerV3 {
         self.admission.same_original_admission(admission)
     }
 
+    /// Historical direct path. It does not publish a recovery key before
+    /// spawn; new supervisor integrations must use the staged owner instead.
     pub fn spawn(
         admission: RoventCollectionRootAdmissionV3,
         task: RoventBoardRootWorkerTaskV3,
