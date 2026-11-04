@@ -8,8 +8,8 @@ use super::{Command, LoadedPolicyObservation, Outcome};
 use rz_eval::error::{BackendError, CauseCode, FailureKind, FailureStage};
 use rz_eval::onnx::{OrtRuntime, SystemRuntime};
 use rz_eval::pals_onnx::virtual_review::{
-    PalsVirtualReviewOnnxBackend, VirtualReviewArtifactKind, VirtualReviewExecutionMode,
-    VirtualReviewStartupCustody,
+    PalsVirtualReviewOnnxBackend, SystemCudaCaptureLoadFailure, VirtualReviewArtifactKind,
+    VirtualReviewExecutionMode, VirtualReviewStartupCustody,
 };
 use rz_eval::pals_onnx::{PalsCudaControlPolicy, PalsOnnxConfig};
 use rz_eval::worker::{PhysicalLease, PhysicalRecoveryReservation, PhysicalRun, SingleWorker};
@@ -123,24 +123,20 @@ pub(super) fn spawn(
                             "system capture expired before native startup",
                         )));
                     }
-                    // This is the first ORT native boundary. `startup.runtime`
-                    // remains held by the worker closure on error or unwind.
-                    // The same custody marks entry before invoking its loader,
-                    // including the branch with a reused runtime latch.
-                    let runtime =
-                        match custody.load_system_cuda_for_capture(&startup.runtime, || {
-                            if Instant::now() >= startup.until {
-                                Err(error(
-                                    FailureKind::BackendUnavailable,
-                                    "system capture expired immediately before ORT entry",
-                                ))
-                            } else {
-                                Ok(())
-                            }
-                        }) {
-                            Ok(runtime) => runtime,
-                            Err(cause) => return PhysicalRun::Quarantined(cause),
-                        };
+                    // The original runtime remains in this worker. Only the
+                    // loader's typed rejection of this pure deadline check
+                    // proves that this owner did not enter native code.
+                    let runtime = match custody
+                        .load_system_cuda_for_capture_until(&startup.runtime, startup.until)
+                    {
+                        Ok(runtime) => runtime,
+                        Err(SystemCudaCaptureLoadFailure::RejectedBeforeNative(cause)) => {
+                            return PhysicalRun::Complete(Err(cause));
+                        }
+                        Err(SystemCudaCaptureLoadFailure::PhysicalStateUnknown(cause)) => {
+                            return PhysicalRun::Quarantined(cause);
+                        }
+                    };
                     let actual_runtime_sha256 = runtime.binary_digest();
                     if let Err((cause, returned)) = custody.install_runtime(runtime) {
                         rejected_runtime = Some(returned);

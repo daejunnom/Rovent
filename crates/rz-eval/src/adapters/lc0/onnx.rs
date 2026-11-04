@@ -259,9 +259,60 @@ fn with_checked_system_ort_entry<T>(
     )
 }
 
+/// Observe rejection only if the complete entry attempt returns normally.
+#[cfg(target_os = "linux")]
+fn catch_checked_system_ort_entry<T>(
+    path: Option<&str>,
+    before_native: impl FnOnce() -> Result<(), BackendError>,
+    entered: &std::cell::Cell<bool>,
+    initialize: impl FnOnce(&str) -> Result<T, BackendError>,
+) -> (Result<T, BackendError>, bool) {
+    let rejected = std::cell::Cell::new(false);
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_checked_system_ort_entry(
+            path,
+            || {
+                let outcome = before_native();
+                if outcome.is_err() {
+                    rejected.set(true);
+                }
+                outcome
+            },
+            entered,
+            initialize,
+        )
+    }));
+    match attempt {
+        Ok(result) => (result, rejected.get()),
+        Err(payload) => {
+            let unavailable = system_runtime_unavailable;
+            let error = if let Some(message) = payload.downcast_ref::<&str>() {
+                unavailable().with_external_cause(CauseCode::RuntimePanic, message)
+            } else if let Some(message) = payload.downcast_ref::<String>() {
+                unavailable().with_external_cause(CauseCode::RuntimePanic, message)
+            } else {
+                unavailable().with_external_cause(
+                    CauseCode::RuntimePanic,
+                    &"non-string native initialization panic",
+                )
+            };
+            (Err(error), false)
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn should_latch_system_attempt(entered: bool, latch_before_entry_failure: bool) -> bool {
     entered || latch_before_entry_failure
+}
+
+/// Local evidence from the checked loader, not a process or device fence.
+/// Only a normally returned error from the actual pre-entry callback can be
+/// classified as a rejection. Latch reuse and all other failures are unknown.
+#[cfg(target_os = "linux")]
+pub(crate) enum CheckedSystemCudaLoadFailure {
+    CallbackRejected(BackendError),
+    Unknown(BackendError),
 }
 
 impl OrtRuntime {
@@ -464,6 +515,7 @@ impl OrtRuntime {
                 Ok(())
             },
             true,
+            None,
         )
     }
 
@@ -477,7 +529,25 @@ impl OrtRuntime {
         runtime: &SystemRuntime,
         before_native: impl FnOnce() -> Result<(), BackendError>,
     ) -> Result<Self, BackendError> {
-        Self::load_system_cuda_with_entry_impl(runtime, before_native, false)
+        Self::load_system_cuda_with_entry_impl(runtime, before_native, false, None)
+    }
+
+    /// Preserve a checked callback rejection from this exact loader call.
+    /// This does not attest previous work, a latch reuse, or a device fence.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn load_system_cuda_with_checked_entry_observed(
+        runtime: &SystemRuntime,
+        before_native: impl FnOnce() -> Result<(), BackendError>,
+    ) -> Result<Self, CheckedSystemCudaLoadFailure> {
+        let rejected = std::cell::Cell::new(false);
+        match Self::load_system_cuda_with_entry_impl(runtime, before_native, false, Some(&rejected))
+        {
+            Ok(runtime) => Ok(runtime),
+            Err(error) if rejected.get() => {
+                Err(CheckedSystemCudaLoadFailure::CallbackRejected(error))
+            }
+            Err(error) => Err(CheckedSystemCudaLoadFailure::Unknown(error)),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -485,6 +555,7 @@ impl OrtRuntime {
         runtime: &SystemRuntime,
         before_native: impl FnOnce() -> Result<(), BackendError>,
         latch_before_entry_failure: bool,
+        observed_callback_rejection: Option<&std::cell::Cell<bool>>,
     ) -> Result<Self, BackendError> {
         let unavailable = system_runtime_unavailable;
         let libraries = runtime.libraries();
@@ -534,8 +605,8 @@ impl OrtRuntime {
         // Existing latch reuse retains its historical validation order.
         let core_path = core.canonical_path.to_str().ok_or_else(unavailable)?;
         let entered = std::cell::Cell::new(false);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_checked_system_ort_entry(Some(core_path), before_native, &entered, |path| {
+        let (result, callback_rejected) =
+            catch_checked_system_ort_entry(Some(core_path), before_native, &entered, |path| {
                 if !ort::init_from(path)
                     .with_name("RoveZero-C-system")
                     .commit()
@@ -571,21 +642,12 @@ impl OrtRuntime {
                     ort_libraries: None,
                     loading_profile: None,
                 })
-            })
-        }))
-        .unwrap_or_else(|payload| {
-            let error = if let Some(message) = payload.downcast_ref::<&str>() {
-                unavailable().with_external_cause(CauseCode::RuntimePanic, message)
-            } else if let Some(message) = payload.downcast_ref::<String>() {
-                unavailable().with_external_cause(CauseCode::RuntimePanic, message)
-            } else {
-                unavailable().with_external_cause(
-                    CauseCode::RuntimePanic,
-                    &"non-string native initialization panic",
-                )
-            };
-            Err(error)
-        });
+            });
+        if callback_rejected {
+            if let Some(observation) = observed_callback_rejection {
+                observation.set(true);
+            }
+        }
         if !should_latch_system_attempt(entered.get(), latch_before_entry_failure) {
             return result;
         }
@@ -931,6 +993,62 @@ fn cuda_loading_profile(
 #[cfg(test)]
 mod native_loading_profile_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn checked_capture_observation_requires_a_normal_callback_rejection() {
+        let entered = std::cell::Cell::new(false);
+        let called = std::cell::Cell::new(false);
+        let original = BackendError::new(K::InvalidInput, S::Admission, "deadline rejected");
+        let (result, rejected) = catch_checked_system_ort_entry(
+            Some("/not-opened"),
+            || Err(original.clone()),
+            &entered,
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err(), original);
+        assert!(rejected);
+        assert!(!entered.get());
+        assert!(!called.get());
+
+        let (result, rejected) = catch_checked_system_ort_entry::<()>(
+            None,
+            || {
+                called.set(true);
+                Ok(())
+            },
+            &entered,
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(!rejected);
+        assert!(!called.get());
+        assert!(!entered.get());
+
+        let (result, rejected) = catch_checked_system_ort_entry::<()>(
+            Some("/not-opened"),
+            || panic!("callback panic"),
+            &entered,
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(!rejected);
+        assert!(!entered.get());
+
+        let native_error = BackendError::new(K::InvalidInput, S::Backend, "native failure");
+        let (result, rejected) = catch_checked_system_ort_entry::<()>(
+            Some("/not-opened"),
+            || Ok(()),
+            &entered,
+            |_| Err(native_error.clone()),
+        );
+        assert_eq!(result.unwrap_err(), native_error);
+        assert!(!rejected);
+        assert!(entered.get());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

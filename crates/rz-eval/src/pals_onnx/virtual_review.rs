@@ -744,6 +744,33 @@ pub enum VirtualSessionLoadFailureObservation {
     SessionInterfaceRejected,
 }
 
+/// The result of one capture owner's checked ORT load. A rejected deadline
+/// means this owner did not enter native code in that attempt; it is not a
+/// process-wide or device-wide completion claim.
+#[cfg(target_os = "linux")]
+pub enum SystemCudaCaptureLoadFailure {
+    RejectedBeforeNative(BackendError),
+    PhysicalStateUnknown(BackendError),
+}
+
+/// Mark every unclassified return or unwind as an attempted native entry.
+/// The shared flag is monotonic: an older no-native proof can never revive.
+#[cfg(target_os = "linux")]
+struct CaptureEntryAttempt {
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    callback_rejection_confirmed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CaptureEntryAttempt {
+    fn drop(&mut self) {
+        if !self.callback_rejection_confirmed {
+            self.entered
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 impl VirtualReviewStartupCustody {
     pub fn new(
         sources: Arc<dyn VirtualReviewOwnedSources>,
@@ -824,6 +851,58 @@ impl VirtualReviewStartupCustody {
     ) -> Result<OrtRuntime, BackendError> {
         self.mark_native_entry();
         OrtRuntime::load_system_cuda_with_checked_entry(runtime, before_native)
+    }
+
+    /// Capture-only first-entry path. Its callback is exclusively this pure
+    /// deadline check: callers cannot substitute a callback with side effects.
+    /// A confirmed rejection can release only this still-unentered owner.
+    /// Latch reuse, callback panic/non-invocation and all other failures remain
+    /// unknown, even if some of them happened before the native call.
+    #[cfg(target_os = "linux")]
+    pub fn load_system_cuda_for_capture_until(
+        &mut self,
+        runtime: &crate::onnx::SystemRuntime,
+        until: Instant,
+    ) -> Result<OrtRuntime, SystemCudaCaptureLoadFailure> {
+        let previously_unentered = !self
+            .native_entry_started
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.runtime.is_none()
+            && self.backend.is_none()
+            && self.sessions.len() == 0
+            && self.serialized.is_none()
+            && self.session_load_failure.is_none();
+        let entered = Arc::clone(&self.native_entry_started);
+        let mut attempt = CaptureEntryAttempt {
+            entered: Arc::clone(&entered),
+            callback_rejection_confirmed: false,
+        };
+        let result = OrtRuntime::load_system_cuda_with_checked_entry_observed(runtime, || {
+            if Instant::now() >= until {
+                return Err(fail(
+                    K::BackendUnavailable,
+                    S::Admission,
+                    "system capture expired immediately before ORT entry",
+                ));
+            }
+            // This mark is immediately before the loader's native entry and
+            // never reverts, invalidating every earlier no-native proof.
+            entered.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        });
+        match result {
+            Ok(runtime) => Ok(runtime),
+            Err(crate::onnx::CheckedSystemCudaLoadFailure::CallbackRejected(error))
+                if previously_unentered && !entered.load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                attempt.callback_rejection_confirmed = true;
+                Err(SystemCudaCaptureLoadFailure::RejectedBeforeNative(error))
+            }
+            Err(crate::onnx::CheckedSystemCudaLoadFailure::CallbackRejected(error))
+            | Err(crate::onnx::CheckedSystemCudaLoadFailure::Unknown(error)) => {
+                Err(SystemCudaCaptureLoadFailure::PhysicalStateUnknown(error))
+            }
+        }
     }
     pub fn session_load_failure(&self) -> Option<VirtualSessionLoadFailureObservation> {
         self.session_load_failure
@@ -2986,6 +3065,44 @@ mod tests {
         ));
         assert!(custody.synchronous_shutdown_proof().is_some());
         custody.mark_native_entry();
+        assert!(custody.synchronous_shutdown_proof().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_entry_attempt_only_preserves_proof_for_confirmed_rejection() {
+        use crate::worker::SynchronousPhysicalOwner;
+
+        let source = VirtualReviewHeldFileSources::new(
+            std::fs::File::open(std::env::current_exe().unwrap()).unwrap(),
+            Vec::new(),
+        );
+        let custody = VirtualReviewStartupCustody::new_for_system_cuda_capture(source, None);
+        let flag = Arc::clone(&custody.native_entry_started);
+        {
+            let mut attempt = CaptureEntryAttempt {
+                entered: Arc::clone(&flag),
+                callback_rejection_confirmed: false,
+            };
+            attempt.callback_rejection_confirmed = true;
+        }
+        assert!(custody.synchronous_shutdown_proof().is_some());
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _attempt = CaptureEntryAttempt {
+                entered: Arc::clone(&flag),
+                callback_rejection_confirmed: false,
+            };
+            panic!("unclassified attempt");
+        }));
+        assert!(unwound.is_err());
+        assert!(custody.synchronous_shutdown_proof().is_none());
+        {
+            let mut later = CaptureEntryAttempt {
+                entered: Arc::clone(&flag),
+                callback_rejection_confirmed: false,
+            };
+            later.callback_rejection_confirmed = true;
+        }
         assert!(custody.synchronous_shutdown_proof().is_none());
     }
 
