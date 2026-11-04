@@ -2033,6 +2033,34 @@ impl RoventPcCollectionResourceOutcomeV3 {
         self.driver_joined = Some(proof);
         Ok(())
     }
+
+    /// Transfer only after checking the borrowed original proof and owner.
+    /// Missing evidence stays pending; any rejection leaves the slot intact.
+    #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+    pub(crate) fn offer_joined_driver_from_slot(
+        &mut self,
+        owners: &crate::rovent_collect::launch::PcCollectionOwnersV3,
+        slot: &mut Option<crate::rovent_collect::launch::PcSupervisorJoinedProofV3>,
+    ) -> Result<bool, &'static str> {
+        let Some(proof) = slot.as_ref() else {
+            return Ok(false);
+        };
+        if self.driver_joined.is_some()
+            || !self
+                .collection
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, owners.native()))
+            || !proof.matches_original(
+                owners.driver_custody(),
+                owners.supervisor(),
+                owners.native(),
+            )
+        {
+            return Err("Collection original joined proof or owner differs");
+        }
+        self.driver_joined = slot.take();
+        Ok(true)
+    }
     pub fn recovery_key(&self) -> RoventPcCollectionRecoveryKeyV3 {
         RoventPcCollectionRecoveryKeyV3(Arc::clone(&self.recovery))
     }

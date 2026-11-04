@@ -7,7 +7,6 @@ use crate::rovent_collect::capture_router_v3::CaptureRouterV3;
 use crate::rovent_collect::pc_hooks_lock_v3::RoventPcCollectionBridgeV3;
 use crate::rovent_collect::pc_worker_v3::{
     PcDriverEvidenceErrorV3, PcDriverPollV3, PcWorkerSupervisorV3, SupervisorStartCustodyV3,
-    SupervisorThreadStateV3,
 };
 use crate::rovent_collect::teacher::v3_session::TeacherRosterEntryV3;
 use rz_experiments::rovent_corpus_lock_v3::record::RoventCorpusManifestLockV3;
@@ -521,8 +520,6 @@ impl PcCollectionOwnersV3 {
             recovery,
             recovery_recorded,
             recovery_error,
-            pending_stop: None,
-            stop_authorized: false,
             pending_joined: None,
             joined_offered: false,
             unstarted_proof: None,
@@ -543,8 +540,6 @@ pub(crate) struct PcCollectionRunV3 {
     recovery: super::pc_recovery_v3::PcRunRecoveryKeyV3,
     recovery_recorded: bool,
     recovery_error: Option<&'static str>,
-    pending_stop: Option<crate::rovent_collect::pc_hooks_lock_v3::PcSupervisorStopAuthorizationV3>,
-    stop_authorized: bool,
     pending_joined: Option<crate::rovent_collect::pc_worker_v3::PcSupervisorJoinedProofV3>,
     joined_offered: bool,
     unstarted_proof: Option<crate::rovent_collect::pc_worker_v3::PcSupervisorNoWorkerProofV3>,
@@ -752,43 +747,18 @@ impl PcCollectionRunV3 {
         &mut self,
     ) -> Result<Option<crate::rovent_collect::pc_worker_v3::PcSupervisorJoinedProofV3>, &'static str>
     {
-        if !self.stop_authorized {
-            if self.pending_stop.is_none() {
-                let Some(fence) = self.owners.native.native_session_fence() else {
-                    return Ok(None);
-                };
-                self.pending_stop = self
-                    .owners
-                    .bridge
-                    .try_authorize_supervisor_stop(&fence, &self.owners.supervisor)?;
-            }
-            let Some(authorization) = self.pending_stop.take() else {
-                return Ok(None);
-            };
-            let mut custody = match self.owners.driver_custody.try_lock() {
-                Ok(custody) => custody,
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    self.pending_stop = Some(authorization);
-                    return Ok(None);
-                }
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    self.pending_stop = Some(authorization);
-                    return Err("P-C supervisor custody poisoned");
-                }
-            };
-            let authorization_result = match custody.state() {
-                SupervisorThreadStateV3::Joined | SupervisorThreadStateV3::JoinPanicked => {
-                    custody.authorize_already_joined(authorization)
-                }
-                _ => custody.authorize_stop(authorization),
-            };
-            match authorization_result {
-                Ok(()) => self.stop_authorized = true,
-                Err((authorization, reason)) => {
-                    self.pending_stop = Some(authorization);
-                    return Err(reason);
-                }
-            }
+        let Some(fence) = self.owners.native.native_session_fence() else {
+            return Ok(None);
+        };
+        if self
+            .recovery
+            .try_prepare_stop(&self.owners.bridge, &fence)?
+            == super::pc_recovery_v3::PcStopStepV3::Pending
+        {
+            return Ok(None);
+        }
+        if self.recovery.try_handoff_stop()? == super::pc_recovery_v3::PcStopStepV3::Pending {
+            return Ok(None);
         }
         {
             let mut custody = match self.owners.driver_custody.try_lock() {
