@@ -344,6 +344,24 @@ fn smoke_sources() -> &'static [(&'static str, &'static [u8])] {
                 "../../../../rz-uci/src/pals_adaptive_bootstrap/system_v6/child_entry.rs"
             ),
         ),
+        (
+            "child_v6_reobserve_control",
+            include_bytes!(
+                "../../../../rz-uci/src/pals_adaptive_bootstrap/system_v6/child_reobserve_control.rs"
+            ),
+        ),
+        (
+            "child_v6_before_native_recovery",
+            include_bytes!(
+                "../../../../rz-uci/src/pals_adaptive_bootstrap/system_v6/before_native_recovery.rs"
+            ),
+        ),
+        (
+            "child_v6_failed_startup_drain",
+            include_bytes!(
+                "../../../../rz-uci/src/pals_adaptive_bootstrap/system_v6/failed_startup_drain.rs"
+            ),
+        ),
     ]
 }
 
