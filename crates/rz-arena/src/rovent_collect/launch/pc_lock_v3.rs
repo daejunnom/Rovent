@@ -115,14 +115,22 @@ pub struct RoventCollectionLockV3LaunchPlan {
 /// The actual file descriptor and exact verified bytes remain alive with the
 /// decoded object. Descriptor retention is not a claim that another process
 /// cannot mutate the file; the product's private-input rules still apply.
-struct OriginalPinnedFile {
+pub(super) struct OriginalPinnedFile {
     _file: cap_std::fs::File,
     bytes: Vec<u8>,
     pin: RoventPublicationFile,
 }
 
 impl OriginalPinnedFile {
-    fn read(
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(super) fn pin(&self) -> &RoventPublicationFile {
+        &self.pin
+    }
+
+    pub(super) fn read(
         directory: &Dir,
         pin: &RoventPublicationFile,
         maximum: u64,
