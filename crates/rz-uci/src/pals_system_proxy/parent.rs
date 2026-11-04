@@ -151,6 +151,25 @@ fn require_child(
             "original child already exited",
         ));
     }
+    require_bound_child_peer(stream, child, expected_pid, expected_uid)
+}
+
+/// Check the held child's ID and this same socket's kernel peer identity
+/// without reaping the child. Finish authentication has already checked the
+/// live direct child before the handshake; its buffered final frame remains
+/// attributable to that socket even if the child exits after sending it.
+fn require_bound_child_peer(
+    stream: &UnixStream,
+    child: &Child,
+    expected_pid: u32,
+    expected_uid: u32,
+) -> io::Result<()> {
+    if child.id() != expected_pid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "original child identity differs",
+        ));
+    }
     let peer = getsockopt(stream, PeerCredentials).map_err(io::Error::other)?;
     if peer.pid() <= 0 || peer.pid() as u32 != expected_pid || peer.uid() != expected_uid {
         return Err(io::Error::new(
@@ -174,6 +193,24 @@ fn require_live(stream: &UnixStream) -> io::Result<()> {
         )),
         Ok(_) => Err(invalid("unexpected data on child liveness channel")),
         Err(Errno::EAGAIN) => Ok(()),
+        Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+    }
+}
+
+/// A finish sender may queue its first frame immediately after its ACK.
+/// Peek without consuming it; only EOF is a closed control channel.
+fn require_finish_open(stream: &UnixStream) -> io::Result<()> {
+    let mut probe = [0u8; 1];
+    match recv(
+        stream.as_raw_fd(),
+        &mut probe,
+        MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT,
+    ) {
+        Ok(0) => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "child finish channel closed",
+        )),
+        Ok(_) | Err(Errno::EAGAIN) => Ok(()),
         Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
     }
 }
@@ -324,6 +361,30 @@ impl AuthenticatedChildChannel {
     /// retained without a competing waiter or another owner reaping its PID.
     /// Same UID and the original peer PID are checked before and after ACK.
     pub(super) fn authenticate(
+        stream: UnixStream,
+        child: &mut Child,
+        epoch: u64,
+        lock_sha256: &str,
+        cuda_ordinal: i32,
+        until: Instant,
+        cancelled: &AtomicBool,
+    ) -> io::Result<Self> {
+        Self::authenticate_inner(
+            stream,
+            child,
+            epoch,
+            lock_sha256,
+            cuda_ordinal,
+            until,
+            cancelled,
+            false,
+        )
+    }
+
+    /// A separate finish channel can carry its first payload immediately
+    /// after the ACK. The initial and post-image paths still reject data.
+    #[allow(clippy::too_many_arguments)]
+    fn authenticate_inner(
         mut stream: UnixStream,
         child: &mut Child,
         epoch: u64,
@@ -331,6 +392,7 @@ impl AuthenticatedChildChannel {
         cuda_ordinal: i32,
         until: Instant,
         cancelled: &AtomicBool,
+        finish: bool,
     ) -> io::Result<Self> {
         let child_pid = child.id();
         if child_pid == 0 || epoch == 0 || !valid_lock(lock_sha256) || cuda_ordinal < 0 {
@@ -356,8 +418,13 @@ impl AuthenticatedChildChannel {
         next_poll(until, cancelled)?;
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(None)?;
-        require_child(&stream, child, child_pid, child_uid)?;
-        require_live(&stream)?;
+        if finish {
+            require_bound_child_peer(&stream, child, child_pid, child_uid)?;
+            require_finish_open(&stream)?;
+        } else {
+            require_child(&stream, child, child_pid, child_uid)?;
+            require_live(&stream)?;
+        }
         next_poll(until, cancelled)?;
         Ok(Self {
             stream,
@@ -382,6 +449,54 @@ impl AuthenticatedChildChannel {
             && self.lock_sha256 == lock_sha256
             && self.cuda_ordinal == cuda_ordinal
     }
+
+    /// Transfer this dedicated channel to a single finish-frame reader after
+    /// rechecking the same directly held child and original launch identity.
+    /// The original channel is returned on refusal; no new stream is minted.
+    /// Callers must not use the initial liveness or post-image grant channel.
+    pub(super) fn into_finish_stream(
+        self,
+        initial: &AuthenticatedChildChannel,
+        image_grant: &PalsPostImageParentV6,
+        child: &mut Child,
+        epoch: u64,
+        lock_sha256: &str,
+        cuda_ordinal: i32,
+    ) -> Result<UnixStream, (io::Error, Self)> {
+        if !Arc::ptr_eq(&initial.scope, &image_grant.initial_scope)
+            || Arc::ptr_eq(&self.scope, &initial.scope)
+            || Arc::ptr_eq(&self.scope, &image_grant.control.scope)
+            || !initial.matches(epoch, lock_sha256, cuda_ordinal)
+            || !image_grant
+                .control
+                .matches(epoch, lock_sha256, cuda_ordinal)
+        {
+            return Err((
+                invalid("finish channel is not distinct from the original parent channels"),
+                self,
+            ));
+        }
+        if !self.matches(epoch, lock_sha256, cuda_ordinal) {
+            return Err((
+                invalid("finish channel differs from original child scope"),
+                self,
+            ));
+        }
+        // Earlier liveness/grant channel EOF is not a reason to discard a
+        // separately authenticated finish frame already sent by the child.
+        if let Err(error) =
+            require_bound_child_peer(&initial.stream, child, initial.child_pid, initial.child_uid)
+        {
+            return Err((error, self));
+        }
+        if let Err(error) =
+            require_bound_child_peer(&self.stream, child, self.child_pid, self.child_uid)
+                .and_then(|_| require_finish_open(&self.stream))
+        {
+            return Err((error, self));
+        }
+        Ok(self.stream)
+    }
 }
 
 /// Accept only the actual directly spawned child from the executor's exclusive
@@ -398,6 +513,52 @@ pub(super) fn accept_and_authenticate_child(
     cuda_ordinal: i32,
     until: Instant,
     cancelled: &AtomicBool,
+) -> io::Result<AuthenticatedChildChannel> {
+    accept_and_authenticate_child_inner(
+        listener,
+        child,
+        epoch,
+        lock_sha256,
+        cuda_ordinal,
+        until,
+        cancelled,
+        false,
+    )
+}
+
+/// Accept a distinct finish transport; a queued finish frame is preserved.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn accept_and_authenticate_finish_child(
+    listener: &UnixListener,
+    child: &mut Child,
+    epoch: u64,
+    lock_sha256: &str,
+    cuda_ordinal: i32,
+    until: Instant,
+    cancelled: &AtomicBool,
+) -> io::Result<AuthenticatedChildChannel> {
+    accept_and_authenticate_child_inner(
+        listener,
+        child,
+        epoch,
+        lock_sha256,
+        cuda_ordinal,
+        until,
+        cancelled,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accept_and_authenticate_child_inner(
+    listener: &UnixListener,
+    child: &mut Child,
+    epoch: u64,
+    lock_sha256: &str,
+    cuda_ordinal: i32,
+    until: Instant,
+    cancelled: &AtomicBool,
+    finish: bool,
 ) -> io::Result<AuthenticatedChildChannel> {
     if epoch == 0 || !valid_lock(lock_sha256) || cuda_ordinal < 0 {
         return Err(invalid("invalid original child admission identity"));
@@ -419,15 +580,28 @@ pub(super) fn accept_and_authenticate_child(
         match listener.accept() {
             Ok((stream, _)) => match require_child(&stream, child, pid, uid) {
                 Ok(()) => {
-                    return AuthenticatedChildChannel::authenticate(
-                        stream,
-                        child,
-                        epoch,
-                        lock_sha256,
-                        cuda_ordinal,
-                        until,
-                        cancelled,
-                    );
+                    return if finish {
+                        AuthenticatedChildChannel::authenticate_inner(
+                            stream,
+                            child,
+                            epoch,
+                            lock_sha256,
+                            cuda_ordinal,
+                            until,
+                            cancelled,
+                            true,
+                        )
+                    } else {
+                        AuthenticatedChildChannel::authenticate(
+                            stream,
+                            child,
+                            epoch,
+                            lock_sha256,
+                            cuda_ordinal,
+                            until,
+                            cancelled,
+                        )
+                    };
                 }
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                     // Avoid a busy loop on repeated unrelated peers; no
@@ -589,6 +763,22 @@ impl PalsPostImageParentV6 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finish_channel_preserves_a_frame_queued_after_ack() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"finish\n").unwrap();
+        assert!(require_live(&reader).is_err());
+        assert!(require_finish_open(&reader).is_ok());
+        let mut actual = [0u8; 7];
+        reader.read_exact(&mut actual).unwrap();
+        assert_eq!(&actual, b"finish\n");
+        drop(writer);
+        assert_eq!(
+            require_finish_open(&reader).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
 
     #[test]
     fn image_ack_cannot_change_the_original_child_scope() {

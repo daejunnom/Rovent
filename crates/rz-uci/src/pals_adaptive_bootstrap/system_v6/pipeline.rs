@@ -67,6 +67,15 @@ pub(super) struct V6Pipeline {
     pre_admission: Option<V6PreAdmissionOwner>,
     lifecycle: Option<PalsSystemDriverLifecycleV6>,
     service_panic: Option<Box<dyn Any + Send>>,
+    release_delivery: Option<
+        Result<
+            Result<
+                crate::pals_system_proxy::finish::PalsSessionReleaseAckV6,
+                crate::pals_system_proxy::finish::PalsReleaseSendFailureV6,
+            >,
+            std::io::Error,
+        >,
+    >,
     failure: Option<V6PipelineFailure>,
     failed_native_drain: Option<V6FailedStartupDrain>,
     first_failed_native_drain: Option<FailedNativeDrainObservation>,
@@ -109,6 +118,7 @@ impl V6Pipeline {
             pre_admission: None,
             lifecycle: None,
             service_panic: None,
+            release_delivery: None,
             failure: None,
             failed_native_drain: None,
             first_failed_native_drain: None,
@@ -140,6 +150,64 @@ impl V6Pipeline {
     }
     pub(super) fn service_panic(&self) -> Option<&(dyn Any + Send)> {
         self.service_panic.as_deref()
+    }
+    pub(super) fn release_delivery(
+        &self,
+    ) -> Option<
+        &Result<
+            Result<
+                crate::pals_system_proxy::finish::PalsSessionReleaseAckV6,
+                crate::pals_system_proxy::finish::PalsReleaseSendFailureV6,
+            >,
+            std::io::Error,
+        >,
+    > {
+        self.release_delivery.as_ref()
+    }
+
+    /// Deliver the exact producer-only session-release claim to the same
+    /// original parent. The transport outcome is independent of the actual
+    /// finish receipt and is never a device-wide GPU fence.
+    pub(super) fn deliver_release_once(&mut self, cleanup_cancelled: &AtomicBool) {
+        if self.release_delivery.is_some() {
+            return;
+        }
+        let result = (|| {
+            let lifecycle = self
+                .lifecycle
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("original lifecycle unavailable"))?;
+            let receipt = lifecycle
+                .closed_receipt()
+                .ok_or_else(|| std::io::Error::other("original session release unavailable"))?;
+            let parent = self
+                .parent
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("original parent unavailable"))?;
+            let admission = self
+                .admission
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("original admission unavailable"))?;
+            let stream = self.source.open_cleanup_parent_stream(
+                &self.parent_socket,
+                self.parent_pid,
+                parent,
+                admission,
+                self.original_cleanup_until,
+                cleanup_cancelled,
+            )?;
+            Ok(
+                crate::pals_system_proxy::finish::send_original_release_event(
+                    &self.source,
+                    parent,
+                    receipt,
+                    stream,
+                    self.original_cleanup_until,
+                    cleanup_cancelled,
+                ),
+            )
+        })();
+        self.release_delivery = Some(result);
     }
     pub(super) fn first_failed_native_drain(&self) -> Option<FailedNativeDrainObservation> {
         self.first_failed_native_drain
@@ -403,10 +471,18 @@ impl V6Pipeline {
 
     /// Only reports the original lifecycle observation; it does not attempt
     /// a second shutdown or treat a service return as a GPU completion fence.
-    pub(super) fn finish_observation(&mut self, until: Instant) -> FinishObservationV6 {
-        match self.lifecycle.as_mut() {
+    pub(super) fn finish_observation(
+        &mut self,
+        until: Instant,
+        cleanup_cancelled: &AtomicBool,
+    ) -> FinishObservationV6 {
+        let observation = match self.lifecycle.as_mut() {
             Some(lifecycle) => lifecycle.finish_until(until),
             None => FinishObservationV6::ServiceNotReturned,
+        };
+        if observation == FinishObservationV6::OwnerScopesClosed {
+            self.deliver_release_once(cleanup_cancelled);
         }
+        observation
     }
 }

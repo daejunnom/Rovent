@@ -13,6 +13,7 @@ use nix::{
 };
 use rz_experiments::SystemRuntimeReceiptV6;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::{
     io::{self, Read, Write},
     os::{fd::AsRawFd, unix::net::UnixStream},
@@ -23,6 +24,7 @@ use std::{
 const MAX_FINISH_FRAME: usize = 256 << 10;
 const IO_QUANTUM: Duration = Duration::from_millis(50);
 const RELEASE_DOMAIN: &str = "rz-pals-session-release-event/1";
+const RELEASE_ACK_DOMAIN: &str = "rz-pals-session-release-ack/1";
 
 /// A wire event is a claim until the parent ties it to its exact live child,
 /// original process owner and registered executable. It is session-scoped and
@@ -37,6 +39,71 @@ pub(super) struct PalsSessionReleaseEventV6 {
     completed_synchronous_runs: u64,
     source: String,
     scope: String,
+}
+
+/// The exact event bytes and any partial response remain available to the
+/// caller on every failed send or acknowledgement read.
+#[derive(Debug)]
+pub(crate) struct PalsReleaseSendFailureV6 {
+    pub(crate) reason: String,
+    pub(crate) stage: PalsReleaseSendFailureStageV6,
+    pub(crate) io_error: Option<io::Error>,
+    pub(crate) event_bytes: Vec<u8>,
+    pub(crate) event_frame_bytes_written: usize,
+    pub(crate) acknowledgement_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PalsReleaseSendFailureStageV6 {
+    Prepare,
+    Authenticate,
+    SendFrame,
+    ReadAcknowledgement,
+    ValidateAcknowledgement,
+}
+
+impl std::fmt::Display for PalsReleaseSendFailureV6 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PALS release acknowledgement failed: {}", self.reason)
+    }
+}
+
+impl std::error::Error for PalsReleaseSendFailureV6 {}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PalsSessionReleaseAckV6 {
+    domain: String,
+    process_id: u32,
+    process_generation: u64,
+    startup_lock_sha256: String,
+    event_sha256: String,
+    scope: String,
+}
+
+fn release_ack(event: &PalsSessionReleaseEventV6, event_bytes: &[u8]) -> PalsSessionReleaseAckV6 {
+    PalsSessionReleaseAckV6 {
+        domain: RELEASE_ACK_DOMAIN.into(),
+        process_id: event.process_id,
+        process_generation: event.process_generation,
+        startup_lock_sha256: event.startup_lock_sha256.clone(),
+        event_sha256: format!("{:x}", Sha256::digest(event_bytes)),
+        scope: "claim_received_not_physical_fence".into(),
+    }
+}
+
+fn acknowledgement_matches(
+    ack: &PalsSessionReleaseAckV6,
+    event: &PalsSessionReleaseEventV6,
+    event_bytes: &[u8],
+) -> bool {
+    let expected = release_ack(event, event_bytes);
+    ack.domain == expected.domain
+        && ack.process_id == expected.process_id
+        && ack.process_generation == expected.process_generation
+        && ack.startup_lock_sha256 == expected.startup_lock_sha256
+        && ack.event_sha256 == expected.event_sha256
+        && ack.scope == expected.scope
 }
 
 /// Create a wire event only from the existing producer-only process receipt.
@@ -86,10 +153,10 @@ fn event_from_original_process(
 }
 
 /// Authenticate an independent original-parent control stream before writing
-/// this one event. It never writes to the parent's liveness-only socket. This
-/// does not mark a parent-owned child as released; a successful write also
-/// does not prove receipt or consumption. Do not retry a partial write on a
-/// different stream as though it were a completed event.
+/// this one event. It never writes to the parent's liveness-only socket. A
+/// matching ACK establishes only that the parent accepted this claim frame;
+/// it does not establish GPU completion or a parent-owned physical release.
+/// Do not retry a partial exchange on a different stream.
 pub(crate) fn send_original_release_event(
     owner: &crate::pals_adaptive_startup::PinnedPalsSystemStartupV6,
     parent: &crate::rovent_bootstrap::launch::ConnectedParent,
@@ -97,75 +164,93 @@ pub(crate) fn send_original_release_event(
     control: UnixStream,
     until: Instant,
     cancelled: &AtomicBool,
-) -> io::Result<()> {
+) -> Result<PalsSessionReleaseAckV6, PalsReleaseSendFailureV6> {
+    let empty_failure = |error: io::Error| PalsReleaseSendFailureV6 {
+        reason: error.to_string(),
+        stage: PalsReleaseSendFailureStageV6::Prepare,
+        io_error: Some(error),
+        event_bytes: Vec::new(),
+        event_frame_bytes_written: 0,
+        acknowledgement_bytes: Vec::new(),
+    };
     if cancelled.load(Ordering::Acquire) {
-        return Err(io::Error::new(
+        return Err(empty_failure(io::Error::new(
             io::ErrorKind::Interrupted,
             "PALS release send cancelled",
-        ));
+        )));
     }
-    let event = event_from_original_process(owner, parent, process)?;
-    let mut stream = parent.authenticate_separate_control(control, until)?;
-    let mut bytes = serde_json::to_vec(&event).map_err(io::Error::other)?;
+    let event = event_from_original_process(owner, parent, process).map_err(empty_failure)?;
+    let bytes =
+        serde_json::to_vec(&event).map_err(|error| empty_failure(io::Error::other(error)))?;
     if bytes.len() >= MAX_FINISH_FRAME {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "PALS release event exceeds bound",
-        ));
+        return Err(PalsReleaseSendFailureV6 {
+            reason: "PALS release event exceeds bound".into(),
+            stage: PalsReleaseSendFailureStageV6::Prepare,
+            io_error: None,
+            event_bytes: bytes,
+            event_frame_bytes_written: 0,
+            acknowledgement_bytes: Vec::new(),
+        });
     }
-    bytes.push(b'\n');
-    let mut offset = 0;
-    while offset < bytes.len() {
-        if cancelled.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                format!("PALS release send cancelled after {offset} bytes"),
-            ));
-        }
-        let remaining = until
-            .checked_duration_since(Instant::now())
-            .filter(|time| !time.is_zero())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("PALS release send deadline expired after {offset} bytes"),
-                )
-            })?;
-        stream
-            .set_write_timeout(Some(remaining.min(IO_QUANTUM)))
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("PALS release timeout failed after {offset} bytes: {error}"),
-                )
-            })?;
-        match stream.write(&bytes[offset..]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    format!("PALS release event stopped after {offset} bytes"),
-                ));
-            }
-            Ok(count) => offset += count,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::Interrupted
-                        | io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                ) =>
-            {
-                continue;
-            }
-            Err(error) => {
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("PALS release send failed after {offset} bytes: {error}"),
-                ));
-            }
-        }
+    let mut stream = parent
+        .authenticate_separate_control_with_cancel(control, until, cancelled)
+        .map_err(|error| PalsReleaseSendFailureV6 {
+            reason: error.to_string(),
+            stage: PalsReleaseSendFailureStageV6::Authenticate,
+            io_error: Some(error),
+            event_bytes: bytes.clone(),
+            event_frame_bytes_written: 0,
+            acknowledgement_bytes: Vec::new(),
+        })?;
+    let mut framed = bytes.clone();
+    framed.push(b'\n');
+    if let Err((offset, error)) = write_frame(&mut stream, &framed, until, cancelled) {
+        return Err(PalsReleaseSendFailureV6 {
+            reason: error.to_string(),
+            stage: PalsReleaseSendFailureStageV6::SendFrame,
+            io_error: Some(error),
+            event_bytes: bytes,
+            event_frame_bytes_written: offset,
+            acknowledgement_bytes: Vec::new(),
+        });
     }
-    Ok(())
+    let acknowledgement_bytes = match read_frame_detailed(&mut stream, until, cancelled) {
+        Ok(bytes) => bytes,
+        Err((partial, error)) => {
+            return Err(PalsReleaseSendFailureV6 {
+                reason: error.to_string(),
+                stage: PalsReleaseSendFailureStageV6::ReadAcknowledgement,
+                io_error: Some(error),
+                event_bytes: bytes,
+                event_frame_bytes_written: framed.len(),
+                acknowledgement_bytes: partial,
+            });
+        }
+    };
+    let decoded = serde_json::from_slice::<PalsSessionReleaseAckV6>(&acknowledgement_bytes);
+    let valid = decoded
+        .as_ref()
+        .is_ok_and(|ack| acknowledgement_matches(ack, &event, &bytes));
+    let timely = !cancelled.load(Ordering::Acquire) && Instant::now() < until;
+    match decoded {
+        Ok(ack) if timely && valid => Ok(ack),
+        decoded => Err(PalsReleaseSendFailureV6 {
+            reason: match (timely, decoded) {
+                (false, _) => {
+                    "PALS release acknowledgement observed after deadline or cancellation".into()
+                }
+                (true, Ok(_)) => {
+                    "PALS release acknowledgement differs from the original claim".into()
+                }
+                (true, Err(error)) => format!("invalid PALS release acknowledgement: {error}"),
+            },
+            stage: PalsReleaseSendFailureStageV6::ValidateAcknowledgement,
+            io_error: None,
+            event_bytes: bytes,
+            event_frame_bytes_written: framed.len(),
+            acknowledgement_bytes,
+        }),
+    }
 }
 
 /// Even a well-formed `Confirmed` field is a claim from the child, not an
@@ -191,6 +276,7 @@ pub(super) enum PalsSessionReleaseClaimV6 {
     Reported {
         bytes: Vec<u8>,
         event: PalsSessionReleaseEventV6,
+        acknowledgement: Result<(), PalsReleaseAckWriteFailureV6>,
     },
     Invalid {
         bytes: Vec<u8>,
@@ -200,6 +286,15 @@ pub(super) enum PalsSessionReleaseClaimV6 {
         bytes: Vec<u8>,
         reason: String,
     },
+}
+
+/// A valid claim is still preserved when acknowledgement delivery fails.
+#[derive(Debug)]
+pub(super) struct PalsReleaseAckWriteFailureV6 {
+    pub(super) bytes: Vec<u8>,
+    pub(super) bytes_written: usize,
+    pub(super) reason: String,
+    pub(super) io_error: Option<io::Error>,
 }
 
 fn event_matches(event: &PalsSessionReleaseEventV6, pid: u32, epoch: u64, lock: &str) -> bool {
@@ -232,6 +327,97 @@ fn require_original_child_peer(
     Ok(())
 }
 
+/// Send an already framed message without renewing the supplied deadline.
+/// Partial writes and timeout-restoration failures retain their exact offset.
+fn write_frame(
+    stream: &mut UnixStream,
+    framed: &[u8],
+    until: Instant,
+    cancelled: &AtomicBool,
+) -> Result<(), (usize, io::Error)> {
+    let prior = stream.write_timeout().map_err(|error| (0, error))?;
+    let mut offset = 0;
+    let result = loop {
+        if cancelled.load(Ordering::Acquire) {
+            break Err((
+                offset,
+                io::Error::new(io::ErrorKind::Interrupted, "PALS finish write cancelled"),
+            ));
+        }
+        let Some(remaining) = until
+            .checked_duration_since(Instant::now())
+            .filter(|time| !time.is_zero())
+        else {
+            break Err((
+                offset,
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "PALS finish write deadline expired",
+                ),
+            ));
+        };
+        if let Err(error) = stream.set_write_timeout(Some(remaining.min(IO_QUANTUM))) {
+            break Err((offset, error));
+        }
+        match stream.write(&framed[offset..]) {
+            Ok(0) => {
+                break Err((
+                    offset,
+                    io::Error::new(io::ErrorKind::WriteZero, "PALS finish write returned zero"),
+                ));
+            }
+            Ok(count) => {
+                offset += count;
+                if offset == framed.len() {
+                    if cancelled.load(Ordering::Acquire) {
+                        break Err((
+                            offset,
+                            io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "PALS finish write completed after cancellation",
+                            ),
+                        ));
+                    }
+                    if Instant::now() >= until {
+                        break Err((
+                            offset,
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "PALS finish write completed after deadline",
+                            ),
+                        ));
+                    }
+                    break Ok(());
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => break Err((offset, error)),
+        }
+    };
+    match stream.set_write_timeout(prior) {
+        Ok(()) => result,
+        Err(error) => match result {
+            Ok(()) => Err((offset, error)),
+            Err((written, original)) => Err((
+                written,
+                io::Error::new(
+                    original.kind(),
+                    format!("{original}; PALS finish write timeout restore failed: {error}"),
+                ),
+            )),
+        },
+    }
+}
+
 /// Read exactly one bounded newline-delimited frame. The stream must be the
 /// original supervisor-owned, dedicated control connection, not the separate
 /// liveness channel or a shared file descriptor. Timeout and cancellation
@@ -242,23 +428,28 @@ fn read_frame(
     until: Instant,
     cancelled: &AtomicBool,
 ) -> Result<Vec<u8>, (Vec<u8>, String)> {
-    let prior = stream.read_timeout().map_err(|error| {
-        (
-            Vec::new(),
-            format!("PALS finish timeout unavailable: {error}"),
-        )
-    })?;
+    read_frame_detailed(stream, until, cancelled)
+        .map_err(|(bytes, error)| (bytes, error.to_string()))
+}
+
+fn read_frame_detailed(
+    stream: &mut UnixStream,
+    until: Instant,
+    cancelled: &AtomicBool,
+) -> Result<Vec<u8>, (Vec<u8>, io::Error)> {
+    let prior = stream.read_timeout().map_err(|error| (Vec::new(), error))?;
     let result = read_frame_inner(stream, until, cancelled);
     match stream.set_read_timeout(prior) {
         Ok(()) => result,
         Err(error) => match result {
-            Ok(bytes) => Err((
+            Ok(bytes) => Err((bytes, error)),
+            Err((bytes, original)) => Err((
                 bytes,
-                format!("PALS finish timeout restore failed: {error}"),
+                io::Error::new(
+                    original.kind(),
+                    format!("{original}; timeout restore failed: {error}"),
+                ),
             )),
-            Err((bytes, reason)) => {
-                Err((bytes, format!("{reason}; timeout restore failed: {error}")))
-            }
         },
     }
 }
@@ -267,44 +458,90 @@ fn read_frame_inner(
     stream: &mut UnixStream,
     until: Instant,
     cancelled: &AtomicBool,
-) -> Result<Vec<u8>, (Vec<u8>, String)> {
+) -> Result<Vec<u8>, (Vec<u8>, io::Error)> {
     let mut result = Vec::new();
     loop {
         if cancelled.load(Ordering::Acquire) {
-            return Err((result, "PALS finish observation cancelled".into()));
+            return Err((
+                result,
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "PALS finish observation cancelled",
+                ),
+            ));
         }
         let Some(remaining) = until
             .checked_duration_since(Instant::now())
             .filter(|time| !time.is_zero())
         else {
-            return Err((result, "PALS finish observation deadline expired".into()));
+            return Err((
+                result,
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "PALS finish observation deadline expired",
+                ),
+            ));
         };
         if let Err(error) = stream.set_read_timeout(Some(remaining.min(IO_QUANTUM))) {
-            return Err((result, format!("PALS finish timeout setup failed: {error}")));
+            return Err((result, error));
         }
         // Peek only as far as the next delimiter, then consume no bytes from
         // a later frame. The owner guarantees a single control-stream reader.
         let mut buffer = [0u8; 4096];
         let limit = buffer.len().min(MAX_FINISH_FRAME + 1 - result.len());
         let count = match recv(stream.as_raw_fd(), &mut buffer[..limit], MsgFlags::MSG_PEEK) {
-            Ok(0) => return Err((result, "PALS finish frame incomplete".into())),
+            Ok(0) => {
+                return Err((
+                    result,
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "PALS finish frame incomplete"),
+                ));
+            }
             Ok(count) => count,
             Err(Errno::EINTR | Errno::EAGAIN) => continue,
-            Err(error) => return Err((result, error.to_string())),
+            Err(error) => return Err((result, io::Error::from_raw_os_error(error as i32))),
         };
         let take = buffer[..count]
             .iter()
             .position(|byte| *byte == b'\n')
             .map_or(count, |index| index + 1);
         match stream.read(&mut buffer[..take]) {
-            Ok(0) => return Err((result, "PALS finish frame incomplete".into())),
+            Ok(0) => {
+                return Err((
+                    result,
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "PALS finish frame incomplete"),
+                ));
+            }
             Ok(count) => {
                 let complete = buffer[count - 1] == b'\n';
                 result.extend_from_slice(&buffer[..count - usize::from(complete)]);
                 if result.len() > MAX_FINISH_FRAME {
-                    return Err((result, "PALS finish frame exceeds bound".into()));
+                    return Err((
+                        result,
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "PALS finish frame exceeds bound",
+                        ),
+                    ));
                 }
                 if complete {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err((
+                            result,
+                            io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "PALS finish frame completed after cancellation",
+                            ),
+                        ));
+                    }
+                    if Instant::now() >= until {
+                        return Err((
+                            result,
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "PALS finish frame completed after deadline",
+                            ),
+                        ));
+                    }
                     return Ok(result);
                 }
             }
@@ -318,7 +555,7 @@ fn read_frame_inner(
             {
                 continue;
             }
-            Err(error) => return Err((result, error.to_string())),
+            Err(error) => return Err((result, error)),
         }
     }
 }
@@ -402,13 +639,96 @@ pub(super) fn observe_session_release_claim(
             reason: "PALS session release claim differs from original scope".into(),
         });
     }
-    Ok(PalsSessionReleaseClaimV6::Reported { bytes, event })
+    let acknowledgement = match serde_json::to_vec(&release_ack(&event, &bytes)) {
+        Ok(mut ack) if ack.len() < MAX_FINISH_FRAME => {
+            ack.push(b'\n');
+            match write_frame(stream, &ack, until, cancelled) {
+                Ok(()) => Ok(()),
+                Err((bytes_written, error)) => Err(PalsReleaseAckWriteFailureV6 {
+                    bytes: ack,
+                    bytes_written,
+                    reason: error.to_string(),
+                    io_error: Some(error),
+                }),
+            }
+        }
+        Ok(ack) => Err(PalsReleaseAckWriteFailureV6 {
+            bytes: ack,
+            bytes_written: 0,
+            reason: "PALS release acknowledgement exceeds bound".into(),
+            io_error: None,
+        }),
+        Err(error) => Err(PalsReleaseAckWriteFailureV6 {
+            bytes: Vec::new(),
+            bytes_written: 0,
+            reason: error.to_string(),
+            io_error: Some(io::Error::other(error)),
+        }),
+    };
+    Ok(PalsSessionReleaseClaimV6::Reported {
+        bytes,
+        event,
+        acknowledgement,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn release_event() -> PalsSessionReleaseEventV6 {
+        PalsSessionReleaseEventV6 {
+            domain: RELEASE_DOMAIN.into(),
+            process_id: 23,
+            process_generation: 8,
+            startup_lock_sha256: format!("{:x}", Sha256::digest(b"registered lock")),
+            completed_synchronous_runs: 7,
+            source: "original_report".into(),
+            scope: "reported_session_only_not_device_fence".into(),
+        }
+    }
+
+    #[test]
+    fn release_ack_binds_exact_event_and_sender_waits_for_parent() {
+        let (mut child, mut parent) = UnixStream::pair().unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        let child_event = release_event();
+        let child_task = std::thread::spawn(move || {
+            let event_bytes = serde_json::to_vec(&child_event).unwrap();
+            let mut frame = event_bytes.clone();
+            frame.push(b'\n');
+            write_frame(&mut child, &frame, until, &AtomicBool::new(false)).unwrap();
+            let raw = read_frame(&mut child, until, &AtomicBool::new(false)).unwrap();
+            let ack: PalsSessionReleaseAckV6 = serde_json::from_slice(&raw).unwrap();
+            assert!(acknowledgement_matches(&ack, &child_event, &event_bytes));
+        });
+        let bytes = read_frame(&mut parent, until, &AtomicBool::new(false)).unwrap();
+        let event: PalsSessionReleaseEventV6 = serde_json::from_slice(&bytes).unwrap();
+        let ack = release_ack(&event, &bytes);
+        let mut changed = bytes.clone();
+        changed.push(b' ');
+        assert!(!acknowledgement_matches(&ack, &event, &changed));
+        let mut frame = serde_json::to_vec(&ack).unwrap();
+        frame.push(b'\n');
+        write_frame(&mut parent, &frame, until, &AtomicBool::new(false)).unwrap();
+        child_task.join().unwrap();
+    }
+
+    #[test]
+    fn incomplete_release_ack_keeps_received_bytes() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(br#"{"domain":"partial"#).unwrap();
+        drop(writer);
+        let (bytes, error) = read_frame_detailed(
+            &mut reader,
+            Instant::now() + Duration::from_secs(1),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(bytes, br#"{"domain":"partial"#);
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
 
     #[test]
     fn reads_only_one_frame_and_preserves_remaining_bytes() {

@@ -396,6 +396,35 @@ impl PinnedPalsSystemStartupV6 {
         socket_path: &Path,
         original_parent_pid: i32,
     ) -> std::io::Result<std::os::unix::net::UnixStream> {
+        if original_parent_pid <= 0 || socket_path.parent() != Some(self.private_cwd()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PALS direct parent socket differs from private root",
+            ));
+        }
+        self.verify_source_unchanged()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.open_direct_parent_stream_bounded(
+            socket_path,
+            original_parent_pid,
+            self.original_until,
+            || {
+                self.source_window()
+                    .map_err(|error| std::io::Error::other(error.to_string()))
+            },
+        )
+    }
+
+    /// Shared transport mechanics; the caller supplies the original phase's
+    /// deadline and checks. The returned socket is not yet authenticated.
+    #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+    fn open_direct_parent_stream_bounded(
+        &self,
+        socket_path: &Path,
+        original_parent_pid: i32,
+        until: Instant,
+        check: impl Fn() -> std::io::Result<()>,
+    ) -> std::io::Result<std::os::unix::net::UnixStream> {
         use nix::errno::Errno;
         use nix::poll::{PollFd, PollFlags, poll};
         use nix::sys::socket::{
@@ -413,8 +442,6 @@ impl PinnedPalsSystemStartupV6 {
                 "PALS direct parent socket differs from private root",
             ));
         }
-        self.verify_source_unchanged()
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
         let metadata = std::fs::symlink_metadata(socket_path)?;
         if !metadata.file_type().is_socket() || metadata.uid() != nix::unistd::geteuid().as_raw() {
             return Err(invalid("PALS direct parent socket owner differs"));
@@ -428,8 +455,7 @@ impl PinnedPalsSystemStartupV6 {
         )
         .map_err(std::io::Error::other)?;
         loop {
-            self.source_window()
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            check()?;
             if nix::unistd::getppid().as_raw() != original_parent_pid {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -440,8 +466,7 @@ impl PinnedPalsSystemStartupV6 {
                 Ok(()) | Err(Errno::EISCONN) => break,
                 Err(Errno::EINPROGRESS) | Err(Errno::EALREADY) => {
                     let mut poll_fd = [PollFd::new(descriptor.as_fd(), PollFlags::POLLOUT)];
-                    let wait_ms = self
-                        .original_until
+                    let wait_ms = until
                         .saturating_duration_since(Instant::now())
                         .as_millis()
                         .min(50) as u16;
@@ -449,8 +474,7 @@ impl PinnedPalsSystemStartupV6 {
                         Ok(0) | Err(Errno::EINTR) => continue,
                         Err(error) => return Err(std::io::Error::other(error)),
                         Ok(_) => {
-                            self.source_window()
-                                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                            check()?;
                             let socket_error = getsockopt(&descriptor, sockopt::SocketError)
                                 .map_err(std::io::Error::other)?;
                             if socket_error != 0 {
@@ -462,18 +486,87 @@ impl PinnedPalsSystemStartupV6 {
                 }
                 Err(Errno::EAGAIN) | Err(Errno::EINTR) => {
                     std::thread::sleep(
-                        std::time::Duration::from_millis(5).min(
-                            self.original_until
-                                .saturating_duration_since(Instant::now()),
-                        ),
+                        std::time::Duration::from_millis(5)
+                            .min(until.saturating_duration_since(Instant::now())),
                     );
                 }
                 Err(error) => return Err(std::io::Error::other(error)),
             }
         }
-        self.source_window()
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        check()?;
         Ok(UnixStream::from(descriptor))
+    }
+
+    /// Open a distinct cleanup control transport for the held startup owner.
+    /// The caller must pass the same retained parent used for this attempt;
+    /// this checks its authenticated identity and liveness, but is not a
+    /// post-image grant or physical completion. Startup cancellation and
+    /// unrelated model asset validity do not cancel the separate cleanup.
+    #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+    pub(crate) fn open_cleanup_parent_stream(
+        &self,
+        socket_path: &Path,
+        original_parent_pid: i32,
+        parent: &Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+        admission: &crate::rovent_bootstrap::launch::PalsPostImageAdmissionV6,
+        cleanup_until: Instant,
+        cleanup_cancelled: &AtomicBool,
+    ) -> std::io::Result<std::os::unix::net::UnixStream> {
+        let rz_experiments::NativeRuntimeSourceV6::SystemCuda(runtime) =
+            &self.lock.config.system_runtime_lock.runtime
+        else {
+            return Err(std::io::Error::other("PALS cleanup requires system CUDA"));
+        };
+        if !admission.belongs_to_parent(parent)
+            || !parent.matches(
+                self.lock.config.process_generation,
+                &self.lock.canonical_sha256,
+                runtime.cuda_device_id,
+            )
+        {
+            return Err(std::io::Error::other(
+                "PALS cleanup parent differs from original lock",
+            ));
+        }
+        let window = &self.lock.config.window;
+        let registered_until = self
+            .original_started
+            .checked_add(std::time::Duration::from_millis(window.wall_time_max_ms))
+            .and_then(|end| {
+                end.checked_add(std::time::Duration::from_millis(window.cleanup_max_ms))
+            })
+            .ok_or_else(|| std::io::Error::other("PALS cleanup deadline is unrepresentable"))?;
+        let until = cleanup_until.min(registered_until);
+        let check = || {
+            if cleanup_cancelled.load(Ordering::Acquire) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "PALS cleanup cancelled",
+                ));
+            }
+            if Instant::now() >= until {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "PALS cleanup deadline expired",
+                ));
+            }
+            Ok(())
+        };
+        check()?;
+        verify_root_identity(&self.root, &self.root_path)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        parent.ensure_live()?;
+        let stream = self.open_direct_parent_stream_bounded(
+            socket_path,
+            original_parent_pid,
+            until,
+            &check,
+        )?;
+        verify_root_identity(&self.root, &self.root_path)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        parent.ensure_live()?;
+        check()?;
+        Ok(stream)
     }
 
     /// Authenticate the captured original parent with the actual peer and the

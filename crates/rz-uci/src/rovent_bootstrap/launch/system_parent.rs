@@ -528,6 +528,33 @@ impl ConnectedParent {
         Ok(control.stream)
     }
 
+    /// The cleanup caller owns a separate cancellation token and its original
+    /// cleanup deadline; neither the startup token nor its expired window is
+    /// substituted for this handshake. The stream still grants no fence.
+    #[cfg(feature = "onnx-cuda")]
+    pub(crate) fn authenticate_separate_control_with_cancel(
+        &self,
+        stream: UnixStream,
+        until: Instant,
+        cancelled: &AtomicBool,
+    ) -> io::Result<UnixStream> {
+        self.ensure_live()?;
+        let control = Self::authenticate_inner(
+            stream,
+            getpid().as_raw() as u32,
+            self.parent_pid,
+            self.process_epoch,
+            &self.lock_sha256,
+            self.cuda_ordinal,
+            until,
+            true,
+            Some(cancelled),
+        )?;
+        self.ensure_live()?;
+        checked_wait(until, Some(cancelled))?;
+        Ok(control.stream)
+    }
+
     /// A distinct control stream is authenticated to the same direct parent
     /// and V6 identity before receiving a bounded post-image grant. The grant
     /// only authorizes a later native-entry attempt; it is not a GPU fence.
@@ -598,6 +625,12 @@ impl ConnectedParent {
 
 #[cfg(feature = "onnx-cuda")]
 impl PalsPostImageAdmissionV6 {
+    /// Compare the original in-process owner, not only its claimed PID or
+    /// launch values. This observation grants no new admission or fence.
+    pub(crate) fn belongs_to_parent(&self, parent: &Arc<ConnectedParent>) -> bool {
+        Arc::ptr_eq(&self.parent, parent)
+    }
+
     /// Recheck this exact parent and dedicated control stream immediately
     /// before each native entry using the original deadline/cancel token.
     pub(crate) fn ensure_permitted(

@@ -59,6 +59,22 @@ pub fn compiled_pals_system_v6_execution_source_digest() -> String {
             "parent_transport",
             include_bytes!("../rovent_bootstrap/launch/system_parent.rs"),
         ),
+        (
+            "release_transport",
+            include_bytes!("../pals_system_proxy/finish.rs"),
+        ),
+        (
+            "proxy_owner_source",
+            include_bytes!("../pals_system_proxy.rs"),
+        ),
+        (
+            "proxy_parent_source",
+            include_bytes!("../pals_system_proxy/parent.rs"),
+        ),
+        (
+            "proxy_runner_source",
+            include_bytes!("../pals_system_proxy/runner_v6.rs"),
+        ),
     ];
     let mut hash = Sha256::new();
     hash.update(b"rz-pals-system-v6-execution-source/1");

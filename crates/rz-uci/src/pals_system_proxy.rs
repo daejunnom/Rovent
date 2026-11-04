@@ -11,6 +11,7 @@ mod parent;
 #[allow(dead_code)]
 mod protocol;
 pub mod relay;
+mod runner_v6;
 
 use rz_experiments::{ArtifactRef, NativeRuntimeSourceV6, PalsSystemStartupLockV6};
 use std::{
@@ -259,6 +260,8 @@ pub struct DirectPalsChildV6 {
     startup_until: Instant,
     startup_cancelled: Arc<AtomicBool>,
     image_grant: ImageGrantState,
+    finish_channel_attempted: bool,
+    finish_channel_rejected: Option<parent::AuthenticatedChildChannel>,
 }
 
 // Failed and partial grants are retained by the same child owner. Even a
@@ -449,6 +452,8 @@ impl DirectPalsChildV6 {
             startup_until: launch.startup_until,
             startup_cancelled: launch.startup_cancelled,
             image_grant: ImageGrantState::NotAttempted,
+            finish_channel_attempted: false,
+            finish_channel_rejected: None,
         })
     }
 
@@ -562,6 +567,55 @@ impl DirectPalsChildV6 {
             Err(failure) => {
                 let error = io::Error::new(failure.error.kind(), failure.error.to_string());
                 self.image_grant = ImageGrantState::Failed(failure);
+                Err(error)
+            }
+        }
+    }
+
+    /// Accept one dedicated finish channel for this same direct child.
+    /// Neither its handshake nor its eventual claim is a physical fence.
+    /// A failed or ambiguous handshake is sticky and cannot be retried.
+    fn accept_original_finish_stream(
+        &mut self,
+        until: Instant,
+        cancelled: &AtomicBool,
+    ) -> io::Result<std::os::unix::net::UnixStream> {
+        if self.finish_channel_attempted {
+            return Err(invalid("PALS finish channel already attempted"));
+        }
+        let initial = self
+            .channel
+            .as_ref()
+            .ok_or_else(|| invalid("PALS original parent channel unavailable"))?;
+        let ImageGrantState::Acknowledged(grant) = &self.image_grant else {
+            return Err(invalid("PALS original image grant unavailable"));
+        };
+        let NativeRuntimeSourceV6::SystemCuda(runtime) =
+            &self.lock.config.system_runtime_lock.runtime
+        else {
+            return Err(invalid("PALS direct child has no CUDA registration"));
+        };
+        self.finish_channel_attempted = true;
+        let channel = parent::accept_and_authenticate_finish_child(
+            &self.listener,
+            &mut self.child,
+            self.lock.config.process_generation,
+            &self.lock.canonical_sha256,
+            runtime.cuda_device_id,
+            until,
+            cancelled,
+        )?;
+        match channel.into_finish_stream(
+            initial,
+            grant,
+            &mut self.child,
+            self.lock.config.process_generation,
+            &self.lock.canonical_sha256,
+            runtime.cuda_device_id,
+        ) {
+            Ok(stream) => Ok(stream),
+            Err((error, channel)) => {
+                self.finish_channel_rejected = Some(channel);
                 Err(error)
             }
         }
