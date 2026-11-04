@@ -46,12 +46,16 @@ def require_capture_window(config, supervisor_deadline_ns, *, now_ns=None):
             "child_startup_recheck_required": True}
 
 
-def capture_process_status(code, gone, failure, observation):
+def capture_process_status(code, gone, failure, observation, custody):
     """Keep exit evidence even when its observation does not establish timing."""
     if code != 0 or gone is not True or failure is not None:
         return "capture_process_failed_or_incomplete"
     if observation.get("exit_observation_timing") != "before_deadline":
         return "capture_process_completed_deadline_unknown"
+    if (custody.get("status") != "session_released"
+            or custody.get("native_authorization") != "sent"
+            or custody.get("error") is not None):
+        return "capture_process_completed_custody_unknown"
     return "capture_process_completed"
 
 
@@ -238,7 +242,10 @@ def main(argv=None):
         remaining = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
         receipt["dispatch_attempted"] = True
         receipt["producer_tree_gone"] = "unknown"
-        transport = CustodyTransport()
+        transport = CustodyTransport(
+            allow_native=lambda: (time.monotonic_ns() + config["cleanup_seconds"] * 1_000_000_000 < deadline_ns),
+            reobserve_interval_ns=config["cleanup_seconds"] * 1_000_000_000 // 32,
+        )
         receipt["custody_transport"] = transport.state
         observation = {}
         receipt["producer_deadline_observation"] = observation
@@ -247,26 +254,37 @@ def main(argv=None):
         def producer_spawned():
             receipt["producer_spawned"] = True
             transport.child_started()
+        def transport_poll():
+            try:
+                transport.poll()
+            except Exception as error:
+                transport.stop_sending(f"poll:{type(error).__name__}")
         def producer_check():
-            transport.poll()
             lease.check_budget()
         try:
             code, gone, failure = run_group([f"/proc/self/fd/{binary_fd}", f"/proc/self/fd/{config_image}"],
                                             args.binary.parent, env, remaining, producer_check,
                                             pass_fds=(binary_fd, config_image, transport.child_fd()), on_spawn=producer_spawned,
                                             verify_before_spawn=True, absolute_deadline=deadline,
-                                            deadline_observation=observation)
+                                            deadline_observation=observation, on_tick=transport_poll)
+            # Preserve the original tuple before any transport cleanup.
+            receipt.update(producer_result_observed=True, producer_exit_code=code,
+                           producer_tree_gone=gone, producer_supervisor_error=failure,
+                           status="capture_process_result_observed")
         except ProcessNotSpawned as error:
             receipt["producer_tree_gone"] = True
             receipt["producer_not_spawned_cause"] = {
                 "type": type(error.__cause__).__name__, "message": str(error.__cause__)}
             raise
         finally:
-            transport.poll()
-            transport.close()
-        receipt.update(producer_result_observed=True, producer_exit_code=code,
-                       producer_tree_gone=gone, producer_supervisor_error=failure,
-                       status=capture_process_status(code, gone, failure, observation))
+            for label, operation in (("poll", transport.poll), ("close", transport.close)):
+                try:
+                    operation()
+                except BaseException as error:
+                    receipt.setdefault("transport_cleanup_errors", []).append({
+                        "operation": label, "type": type(error).__name__, "message": str(error)})
+                    transport.state["error"] = f"{label}:{type(error).__name__}"
+        receipt["status"] = capture_process_status(code, gone, failure, observation, transport.state)
     except BaseException as error:
         first_error = error
         receipt.update(status="supervisor_error", wrapper_error={"type": type(error).__name__, "message": str(error)})

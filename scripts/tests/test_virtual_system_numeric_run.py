@@ -48,14 +48,17 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
         self.assertTrue(result["child_startup_recheck_required"])
 
     def test_late_exit_observation_preserves_exit_without_claiming_deadline(self):
-        self.assertEqual(capture_process_status(0, True, None, {"exit_observation_timing": "before_deadline"}),
+        custody = {"status": "session_released", "native_authorization": "sent", "error": None}
+        self.assertEqual(capture_process_status(0, True, None, {"exit_observation_timing": "before_deadline"}, custody),
                          "capture_process_completed")
-        self.assertEqual(capture_process_status(0, True, None, {"exit_observation_timing": "at_or_after_deadline"}),
+        self.assertEqual(capture_process_status(0, True, None, {"exit_observation_timing": "at_or_after_deadline"}, custody),
                          "capture_process_completed_deadline_unknown")
-        self.assertEqual(capture_process_status(0, True, None, {}),
+        self.assertEqual(capture_process_status(0, True, None, {}, custody),
                          "capture_process_completed_deadline_unknown")
-        self.assertEqual(capture_process_status(17, True, None, {"exit_observation_timing": "at_or_after_deadline"}),
+        self.assertEqual(capture_process_status(17, True, None, {"exit_observation_timing": "at_or_after_deadline"}, custody),
                          "capture_process_failed_or_incomplete")
+        self.assertEqual(capture_process_status(0, True, None, {"exit_observation_timing": "before_deadline"}, {}),
+                         "capture_process_completed_custody_unknown")
 
     def test_capture_window_rejects_noninteger_or_out_of_range_values(self):
         for config in ({"deadline_seconds": True, "cleanup_seconds": 1},
@@ -67,11 +70,14 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
                 require_capture_window(config, 100_000_000_000, now_ns=0)
 
     def test_custody_transport_reobserves_same_child_without_device_fence(self):
-        channel = CustodyTransport()
+        channel = CustodyTransport(allow_native=lambda: True)
         self.addCleanup(channel.close)
         channel.child.send(b"PENDING")
         channel.poll()
         self.assertEqual(channel.state["requests"], 0)
+        channel.child.send(b"NATIVE_READY")
+        channel.poll()
+        self.assertEqual(channel.child.recv(64), b"ALLOW_NATIVE")
         channel.child.send(b"UNKNOWN")
         channel.poll()
         self.assertEqual(channel.child.recv(64), b"REOBSERVE")
@@ -80,8 +86,8 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
         self.assertEqual(channel.child.recv(64), b"REOBSERVE")
         channel.child.send(b"SESSION_RELEASED")
         channel.poll()
-        self.assertEqual(channel.state["events"], ["PENDING", "UNKNOWN", "PENDING", "SESSION_RELEASED"])
-        self.assertEqual(channel.state["scope"], "same_child_process_only")
+        self.assertEqual(channel.state["events"], ["PENDING", "NATIVE_READY", "UNKNOWN", "PENDING", "SESSION_RELEASED"])
+        self.assertEqual(channel.state["scope"], "per_spawn_private_channel_peer_pid_unverified")
         self.assertNotIn("gpu_physical_completion", channel.state)
 
     def test_custody_transport_rejects_oversize_and_unrecognized_messages(self):
@@ -112,7 +118,92 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
         channel.poll()
         self.assertEqual(channel.state["status"], "no_native_entry")
         self.assertEqual(channel.state["requests"], 0)
-        self.assertEqual(channel.state["scope"], "same_child_process_only")
+        self.assertEqual(channel.state["scope"], "per_spawn_private_channel_peer_pid_unverified")
+
+        recovered = CustodyTransport()
+        self.addCleanup(recovered.close)
+        recovered.child.send(b"PENDING")
+        recovered.child.send(b"UNKNOWN")
+        recovered.poll()
+        self.assertEqual(recovered.child.recv(64), b"REOBSERVE")
+        recovered.child.send(b"OWNER_RECOVERED")
+        recovered.poll()
+        self.assertEqual(recovered.state["status"], "owner_recovered")
+        self.assertNotEqual(recovered.state["status"], "session_released")
+
+    def test_native_ack_is_denied_when_supervisor_window_expired(self):
+        channel = CustodyTransport(allow_native=lambda: False)
+        self.addCleanup(channel.close)
+        channel.child.send(b"PENDING")
+        channel.child.send(b"NATIVE_READY")
+        channel.poll()
+        self.assertEqual(channel.state["native_authorization"], "not_sent_deadline_or_policy")
+        channel.child.setblocking(False)
+        with self.assertRaises(BlockingIOError):
+            channel.child.recv(64)
+        channel.child.send(b"NO_NATIVE_ENTRY")
+        channel.poll()
+        self.assertEqual(channel.state["status"], "no_native_entry")
+
+    def test_pending_reobservation_is_spread_across_cleanup_window(self):
+        now = [100]
+        channel = CustodyTransport(reobserve_interval_ns=25, clock_ns=lambda: now[0])
+        self.addCleanup(channel.close)
+        channel.child.send(b"UNKNOWN")
+        channel.poll()
+        self.assertEqual(channel.child.recv(64), b"REOBSERVE")
+        channel.child.send(b"PENDING")
+        channel.poll()
+        channel.child.setblocking(False)
+        with self.assertRaises(BlockingIOError):
+            channel.child.recv(64)
+        now[0] += 25
+        channel.poll()
+        self.assertEqual(channel.child.recv(64), b"REOBSERVE")
+        self.assertEqual(channel.state["requests"], 2)
+
+    def test_terminal_packet_is_drained_before_control_write_to_closed_peer(self):
+        channel = CustodyTransport(allow_native=lambda: True)
+        self.addCleanup(channel.close)
+        channel.child.send(b"PENDING")
+        channel.child.send(b"NATIVE_READY")
+        channel.poll()
+        self.assertEqual(channel.child.recv(64), b"ALLOW_NATIVE")
+        channel.child.send(b"UNKNOWN")
+        channel.child.send(b"SESSION_RELEASED")
+        channel.child.close()
+        channel.poll()
+        self.assertEqual(channel.state["status"], "session_released")
+        self.assertIsNone(channel.state["error"])
+        self.assertEqual(channel.state["requests"], 0)
+
+    def test_private_channel_child_handshake_uses_lightweight_supervisor_tick(self):
+        channel = CustodyTransport(allow_native=lambda: True)
+        self.addCleanup(channel.close)
+        environment = os.environ.copy()
+        environment["TEST_CUSTODY_FD"] = str(channel.child_fd())
+        program = (
+            "import os,socket\n"
+            "s=socket.socket(fileno=int(os.environ['TEST_CUSTODY_FD']))\n"
+            "s.settimeout(3)\n"
+            "s.send(b'PENDING'); s.send(b'NATIVE_READY')\n"
+            "assert s.recv(64)==b'ALLOW_NATIVE'\n"
+            "s.send(b'SESSION_RELEASED')\n"
+        )
+        observation = {}
+        deadline = time.monotonic() + 10
+        code, gone, failure = run_group(
+            [str(Path(sys.executable).resolve()), "-c", program], self.root, environment,
+            10, lambda: None, pass_fds=(channel.child_fd(),),
+            on_spawn=channel.child_started, on_tick=channel.poll,
+            verify_before_spawn=True, absolute_deadline=deadline,
+            deadline_observation=observation,
+        )
+        channel.poll()
+        self.assertEqual((code, gone, failure), (0, True, None))
+        self.assertEqual(channel.state["events"], ["PENDING", "NATIVE_READY", "SESSION_RELEASED"])
+        self.assertEqual(channel.state["native_authorization"], "sent")
+        self.assertEqual(observation["exit_observation_timing"], "before_deadline")
 
     def test_sealed_snapshot_keeps_actual_bytes_when_source_changes(self):
         source, image_fd, data = self.snapshot()
