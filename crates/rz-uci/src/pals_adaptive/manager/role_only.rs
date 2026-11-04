@@ -1140,25 +1140,37 @@ where
                 .ok_or(AdaptiveManagerError::Invalid(
                     "P/C no-capture native verifier unavailable",
                 ))?;
-        let capability =
-            super::collection::RoventNoCaptureRootCapabilityV3::new(admission.clone(), verifier)
-                .map_err(|error| match error {
-                    super::collection::RoventNoCaptureIssueErrorV3::Busy(_) => {
-                        AdaptiveManagerError::AuxiliaryPending
-                    }
-                    super::collection::RoventNoCaptureIssueErrorV3::Rejected(error) => error.into(),
-                })?;
+        if let Some(original) = self.no_capture_original_v3.get() {
+            if !original.same_original_admission(admission)
+                || !original.same_native_owner(&verifier)
+            {
+                return Err(AdaptiveManagerError::Invalid(
+                    "P/C V3 no-capture capability differs from original owner",
+                ));
+            }
+            return Ok(original.clone());
+        }
+        let capability = super::collection::RoventNoCaptureRootCapabilityV3::new(
+            admission.clone(),
+            verifier.clone(),
+        )
+        .map_err(|error| match error {
+            super::collection::RoventNoCaptureIssueErrorV3::Busy(_) => {
+                AdaptiveManagerError::AuxiliaryPending
+            }
+            super::collection::RoventNoCaptureIssueErrorV3::Rejected(error) => error.into(),
+        })?;
         let _ = self.no_capture_original_v3.set(capability.clone());
-        if !self
+        let original = self
             .no_capture_original_v3
             .get()
-            .is_some_and(|original| original.same_original_capability(&capability))
-        {
+            .expect("original capability set");
+        if !original.same_original_admission(admission) || !original.same_native_owner(&verifier) {
             return Err(AdaptiveManagerError::Invalid(
                 "P/C V3 no-capture capability differs from original owner",
             ));
         }
-        Ok(capability)
+        Ok(original.clone())
     }
 
     /// Observe the exact capability retained by this manager after a pending
@@ -1206,6 +1218,7 @@ where
         {
             return Err(AdaptiveManagerError::PhysicalUnknown);
         }
+        original.close_install();
         Ok(RoventRoleOnlyNoCaptureFenceV3 {
             capability: original.clone(),
             receipt,

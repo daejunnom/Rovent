@@ -11,6 +11,7 @@ use rz_search::pals::coordinator::NativeAcceptanceVerifier;
 pub struct RoventNoCaptureRootCapabilityV3 {
     admission: RoventCollectionRootAdmissionV3,
     verifier: NativeAcceptanceVerifier,
+    install_open: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub(crate) enum RoventNoCaptureIssueErrorV3 {
@@ -53,6 +54,7 @@ impl RoventNoCaptureRootCapabilityV3 {
         Ok(Self {
             admission,
             verifier,
+            install_open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
@@ -78,6 +80,18 @@ impl RoventNoCaptureRootCapabilityV3 {
     pub fn same_original_capability(&self, other: &Self) -> bool {
         self.admission.same_original_admission(&other.admission)
             && self.verifier.same_owner(&other.verifier)
+            && Arc::ptr_eq(&self.install_open, &other.install_open)
+    }
+
+    /// The native marker owner checks this while holding its installation lock.
+    /// Closure is only an installation fence; it is not physical completion.
+    pub fn is_install_open(&self) -> bool {
+        self.install_open.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(in crate::pals_adaptive::manager) fn close_install(&self) {
+        self.install_open
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     pub(in crate::pals_adaptive::manager) fn same_native_owner(
