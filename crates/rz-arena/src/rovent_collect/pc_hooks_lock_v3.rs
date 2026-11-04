@@ -615,6 +615,7 @@ pub(crate) struct RoventPcCollectionBridgeV3 {
     startup: OnceLock<RoventStartupControl>,
     native_owner: OnceLock<Weak<RoventPcCollectionLaunchOwnerV3>>,
     game_admission_seal: OnceLock<PcGameAdmissionSealV3>,
+    input_lock_identity: OnceLock<rz_uci::rovent_bootstrap::launch::RoventPcCollectionInputLockIdentityV3>,
     supervisor: OnceLock<Weak<Mutex<PcWorkerSupervisorV3>>>,
     state: Mutex<PcBridgeStateV3>,
     requests: super::game_authority_v3::GameDispatchChannelV3<RoventCollectionRootAdmissionV3>,
@@ -693,7 +694,7 @@ impl RoventPcCollectionBridgeV3 {
         Ok(Arc::new_cyclic(|self_weak| Self {
             self_weak: self_weak.clone(),
             ledger: Arc::new(Mutex::new(PcRootQuotaLedgerV3::new(Arc::clone(&inputs)))),
-            inputs, game, registration, startup: OnceLock::new(), native_owner: OnceLock::new(), game_admission_seal: OnceLock::new(), supervisor: OnceLock::new(),
+            inputs, game, registration, startup: OnceLock::new(), native_owner: OnceLock::new(), game_admission_seal: OnceLock::new(), input_lock_identity: OnceLock::new(), supervisor: OnceLock::new(),
             state: Mutex::new(PcBridgeStateV3 { roots, deferred }), requests,
             request_receiver: Mutex::new(receiver),
         }))
@@ -701,6 +702,18 @@ impl RoventPcCollectionBridgeV3 {
 
     pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> { &self.inputs }
     pub(super) fn game_authority(&self) -> &Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>> { &self.game }
+    /// Bind the lock identity issued by this launch's authenticated gate
+    /// before the native driver or any root can be started.
+    pub(super) fn bind_input_lock_identity(
+        &self,
+        identity: rz_uci::rovent_bootstrap::launch::RoventPcCollectionInputLockIdentityV3,
+    ) -> Result<(), &'static str> {
+        match self.input_lock_identity.set(identity) {
+            Ok(()) => Ok(()),
+            Err(candidate) if self.input_lock_identity.get().is_some_and(|old| old.same_original(&candidate)) => Ok(()),
+            Err(_) => Err("P-C V3 original input lock identity changed"),
+        }
+    }
     /// Fence only new admission on this original native launch. Root drain,
     /// teacher custody and durable publication remain independent.
     pub(super) fn try_game_admission_seal(
@@ -1337,6 +1350,12 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
         let failure = |error, admission| RoventPcCollectionAdmissionFailureV3 { error, admission, owners: Box::new(()) };
         if self.native_owner.get().and_then(Weak::upgrade).is_none() {
             return Err(failure(AdaptiveManagerError::Invalid("P-C V3 native owner not bound"), admission));
+        }
+        let Some(input_identity) = self.input_lock_identity.get() else {
+            return Err(failure(AdaptiveManagerError::Invalid("P-C V3 input lock identity not bound"), admission));
+        };
+        if !input_identity.matches_origin(admission.native_origin()) {
+            return Err(failure(AdaptiveManagerError::Invalid("P-C V3 native origin input lock differs"), admission));
         }
         let mut state = match pc_state(&self.state) {
             Ok(value) => value,
