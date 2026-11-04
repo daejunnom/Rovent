@@ -2,7 +2,10 @@
 //!
 //! Parsing file-descriptor numbers grants no authority. The authenticated
 //! handoff and original supervisor must separately validate all four owners.
-use super::{ArenaError, check, invalid, pc_lock_v3::PcCollectionCliV3};
+use super::{
+    ArenaError, RoventPublicationFile, check, invalid, pc_lock_v3::PcCollectionCliV3,
+    valid_relative,
+};
 use std::collections::BTreeMap;
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
@@ -27,6 +30,7 @@ pub(crate) struct ManagedCollectionCliV3 {
     pub(crate) output: RawFd,
     pub(crate) input: RawFd,
     pub(crate) plan: RawFd,
+    pub(crate) long_game_preflight: Option<RoventPublicationFile>,
     bootstrap_budget_ms: u64,
     pub(crate) work_deadline_ns: u64,
     pub(crate) cleanup_deadline_ns: u64,
@@ -105,6 +109,7 @@ pub(crate) fn parse_managed_collection_cli_v3(
             || arg.starts_with("--v3-plan-bytes=")
             || arg.starts_with("--v3-managed-")
             || arg.starts_with("--v3-bootstrap-budget-")
+            || arg.starts_with("--v3-long-game-preflight-")
             || arg.starts_with("--v3-work-deadline-")
             || arg.starts_with("--v3-cleanup-deadline-")
     }) {
@@ -115,6 +120,7 @@ pub(crate) fn parse_managed_collection_cli_v3(
     for argument in arguments {
         if argument.starts_with("--v3-managed-")
             || argument.starts_with("--v3-bootstrap-")
+            || argument.starts_with("--v3-long-game-preflight-")
             || argument.starts_with("--v3-work-deadline-")
             || argument.starts_with("--v3-cleanup-deadline-")
         {
@@ -129,6 +135,9 @@ pub(crate) fn parse_managed_collection_cli_v3(
                         | "--v3-managed-input-dir-fd"
                         | "--v3-managed-plan-fd"
                         | "--v3-bootstrap-budget-ms"
+                        | "--v3-long-game-preflight-path"
+                        | "--v3-long-game-preflight-sha256"
+                        | "--v3-long-game-preflight-bytes"
                         | "--v3-work-deadline-monotonic-ns"
                         | "--v3-cleanup-deadline-monotonic-ns"
                 ) && !value.is_empty()
@@ -199,12 +208,40 @@ pub(crate) fn parse_managed_collection_cli_v3(
         work_deadline_ns > 0 && work_deadline_ns <= cleanup_deadline_ns,
         "managed V3 deadlines must be positive and ordered",
     )?;
+    let long_game_preflight = match (
+        managed.remove("--v3-long-game-preflight-path"),
+        managed.remove("--v3-long-game-preflight-sha256"),
+        managed.remove("--v3-long-game-preflight-bytes"),
+    ) {
+        (None, None, None) => None,
+        (Some(path), Some(sha256), Some(bytes)) => {
+            let pin = RoventPublicationFile {
+                path,
+                sha256,
+                bytes: bytes
+                    .parse()
+                    .map_err(|_| invalid("long-game preflight bytes"))?,
+            };
+            pin.validate()?;
+            check(
+                pin.path.starts_with("inputs/") && valid_relative(&pin.path),
+                "long-game preflight input path",
+            )?;
+            Some(pin)
+        }
+        _ => {
+            return Err(invalid(
+                "long-game preflight requires path, sha256 and bytes",
+            ));
+        }
+    };
     Ok(Some(ManagedCollectionCliV3 {
         selection,
         channel,
         output,
         input,
         plan,
+        long_game_preflight,
         bootstrap_budget_ms,
         work_deadline_ns,
         cleanup_deadline_ns,
@@ -234,11 +271,12 @@ mod tests {
 
     #[test]
     fn unrelated_native_v3_arguments_do_not_select_collection() {
-        assert!(parse_managed_collection_cli_v3(vec!["--v3-native-option=enabled".into()])
-            .unwrap()
-            .is_none());
-        assert!(parse_managed_collection_cli_v3(vec!["--v3-managed-plan-fd=3".into()])
-            .is_err());
+        assert!(
+            parse_managed_collection_cli_v3(vec!["--v3-native-option=enabled".into()])
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_managed_collection_cli_v3(vec!["--v3-managed-plan-fd=3".into()]).is_err());
     }
 
     #[test]
@@ -246,6 +284,7 @@ mod tests {
         let selected = parse_managed_collection_cli_v3(arguments())
             .unwrap()
             .unwrap();
+        assert!(selected.long_game_preflight.is_none());
         assert_eq!(
             [
                 selected.channel,
@@ -285,5 +324,26 @@ mod tests {
         let mut missing_budget = arguments();
         missing_budget.remove(10);
         assert!(parse_managed_collection_cli_v3(missing_budget).is_err());
+    }
+
+    #[test]
+    fn long_game_preflight_selector_requires_one_complete_pin() {
+        let mut args = arguments();
+        args.push("--v3-long-game-preflight-path=inputs/profile.json".into());
+        assert!(parse_managed_collection_cli_v3(args.clone()).is_err());
+        args.push(format!(
+            "--v3-long-game-preflight-sha256={}",
+            "b".repeat(64)
+        ));
+        args.push("--v3-long-game-preflight-bytes=1".into());
+        let selected = parse_managed_collection_cli_v3(args.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.long_game_preflight.unwrap().path,
+            "inputs/profile.json"
+        );
+        args.push("--v3-long-game-preflight-bytes=1".into());
+        assert!(parse_managed_collection_cli_v3(args).is_err());
     }
 }
