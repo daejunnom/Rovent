@@ -944,12 +944,24 @@ impl PolicyRowPipelineV3 {
     /// The supervisor must retain this completed original evidence until its
     /// own separate game/teacher lifecycle permits release. This does not
     /// claim durable output or physical retirement.
-    pub(super) fn transfer_appended(&mut self) -> bool {
+    pub(super) fn transfer_appended(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV3,
+        ticket: &rz_contracts::pals_adaptive::RoleTicketEnvelope,
+    ) -> bool {
         if !self.appended
             || self.failure.is_some()
             || self.output_completed.is_some()
             || self.pending.is_none()
         {
+            return false;
+        }
+        if !self.pending.as_ref().is_some_and(|pending| {
+            pending
+                .original_admission()
+                .same_original_admission(admission)
+                && pending.ticket() == *ticket
+        }) {
             return false;
         }
         self.output_completed = self.pending.take();
@@ -963,10 +975,19 @@ impl PolicyRowPipelineV3 {
     pub(super) fn try_retain_completed(
         &mut self,
         target: &PolicyRootRetainedOwnerV3,
+        admission: &RoventCollectionRootAdmissionV3,
+        ticket: &rz_contracts::pals_adaptive::RoleTicketEnvelope,
     ) -> Result<PolicyRetentionOutcomeV3, ArenaError> {
         let Some(completed) = self.output_completed.as_ref() else {
             return Ok(PolicyRetentionOutcomeV3::NotReady);
         };
+        if !completed
+            .original_admission()
+            .same_original_admission(admission)
+            || completed.ticket() != *ticket
+        {
+            return Ok(PolicyRetentionOutcomeV3::NotReady);
+        }
         let mut target = match target.0.try_lock() {
             Ok(target) => target,
             Err(TryLockError::WouldBlock) => return Ok(PolicyRetentionOutcomeV3::Busy),
@@ -1004,6 +1025,8 @@ impl PolicyRowPipelineV3 {
     pub(super) fn try_retain_known_rejection(
         &mut self,
         target: &PolicyRootRetainedOwnerV3,
+        admission: &RoventCollectionRootAdmissionV3,
+        ticket: &rz_contracts::pals_adaptive::RoleTicketEnvelope,
     ) -> Result<PolicyRetentionOutcomeV3, ArenaError> {
         if self.is_uncertain() {
             return Ok(PolicyRetentionOutcomeV3::NotReady);
@@ -1023,13 +1046,16 @@ impl PolicyRowPipelineV3 {
         ) {
             return Ok(PolicyRetentionOutcomeV3::NotReady);
         }
-        let admission = if let Some(pending) = &self.pending {
-            pending.original_admission()
+        let (original_admission, original_ticket) = if let Some(pending) = &self.pending {
+            (pending.original_admission(), pending.ticket())
         } else if let Some(row) = &self.row {
-            row.admission()
+            (row.admission(), row.ticket())
         } else {
             return Ok(PolicyRetentionOutcomeV3::NotReady);
         };
+        if !original_admission.same_original_admission(admission) || original_ticket != *ticket {
+            return Ok(PolicyRetentionOutcomeV3::NotReady);
+        }
         let mut target = match target.0.try_lock() {
             Ok(target) => target,
             Err(TryLockError::WouldBlock) => return Ok(PolicyRetentionOutcomeV3::Busy),
@@ -1040,7 +1066,7 @@ impl PolicyRowPipelineV3 {
         if !Arc::ptr_eq(&self.identity, &target.pipeline_identity) {
             return Err(super::invalid("V3 policy retention pipeline differs"));
         }
-        if !admission.same_original_admission(&target.admission) {
+        if !original_admission.same_original_admission(&target.admission) {
             return Ok(PolicyRetentionOutcomeV3::OtherRoot);
         }
         if target.completed.len().saturating_add(target.rejected.len()) >= target.maximum {
