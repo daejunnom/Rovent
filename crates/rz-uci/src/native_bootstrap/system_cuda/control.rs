@@ -538,7 +538,7 @@ impl Lc0ControlSupervisor {
 
     // Keep admission and collection on the same supervisor. These operations
     // do not hand a completion token to an external caller.
-    fn begin_service(&mut self) -> Result<Arc<NativeCudaFactory>, NativeBootstrapError> {
+    pub(super) fn begin_service(&mut self) -> Result<Arc<NativeCudaFactory>, NativeBootstrapError> {
         if self.state != ServiceState::Prepared {
             return Err(NativeBootstrapError::Config(
                 "LC0 service already started or closed",

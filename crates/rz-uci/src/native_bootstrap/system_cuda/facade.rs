@@ -18,6 +18,55 @@ use std::{
     os::unix::{fs::MetadataExt, net::UnixListener},
 };
 
+use crate::{
+    engine::{
+        EngineProcess, PriorityCloseHandle, ProcessClock,
+        async_engine::{self, AsyncEngineRun, AsyncEngineStartFailure, EngineTimerJoinStatus},
+    },
+    native_profile::ProfiledWrite,
+    runner::{Event, async_events::AsyncServeStatus, async_output::AsyncOutputOwner},
+};
+use std::sync::mpsc::{Receiver, SyncSender};
+
+type Lc0Output = AsyncOutputOwner<ProfiledWrite<std::io::Stdout>, std::io::Stderr>;
+type Lc0Run = AsyncEngineRun<ProfiledWrite<std::io::Stdout>, std::io::Stderr>;
+type Lc0StartFailure = AsyncEngineStartFailure<ProfiledWrite<std::io::Stdout>, std::io::Stderr>;
+
+/// Inputs transferred only after this original supervisor accepts admission.
+/// The caller retains its original parent, listener, receipt owner and process.
+#[must_use]
+pub struct Lc0AsyncInputs {
+    pub events: Receiver<Event>,
+    pub sender: SyncSender<Event>,
+    pub output: Lc0Output,
+    pub max_output_bytes: usize,
+    pub poll_interval: std::time::Duration,
+}
+
+enum Lc0AsyncCustody {
+    // Installed before inputs move into the fallible engine start operation.
+    // An unwind here is unknown, never a completed service or a retry grant.
+    Starting,
+    StartPanicked(Box<dyn std::any::Any + Send>),
+    CloseSetupFailed {
+        _process: EngineProcess,
+        _inputs: Lc0AsyncInputs,
+        _error: rz_contracts::ContractError,
+    },
+    StartFailed(Lc0StartFailure),
+    Running {
+        run: Lc0Run,
+        close: PriorityCloseHandle,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Lc0AsyncAdmission {
+    Started,
+    RetainedFailure,
+    Unknown,
+}
+
 /// Exercise original parent and receipt plumbing without opening model assets,
 /// loading ORT, creating a CUDA session, or granting runtime authorization.
 /// The caller must already own the configured managed-output lease.
@@ -201,6 +250,7 @@ pub struct Lc0PendingSupervisor {
 #[must_use]
 pub struct Lc0SupervisedSession {
     supervisor: Lc0ControlSupervisor,
+    async_custody: Option<Lc0AsyncCustody>,
     lock: SystemRuntimeLockV6,
     config: NativeConfig,
     owners: Arc<OwnerRegistry>,
@@ -351,6 +401,7 @@ impl Lc0PendingSupervisor {
                 Lc0SystemSessionOwner::new(custody),
                 self.control_until,
             ),
+            async_custody: None,
             lock: self.lock,
             config: self.config,
             owners: Arc::new(OwnerRegistry::default()),
@@ -648,6 +699,113 @@ impl Lc0SupervisedSession {
             ));
         }
         self.supervisor.serve_until(until, serve)
+    }
+
+    /// Start the actual UCI engine using this session's original native
+    /// factory, registry and process epoch. Rejection before service returns
+    /// the same inputs; a later setup failure stays with this session.
+    /// The caller must retain this session and the original process across
+    /// pending or unknown outcomes. The CLI guard remains independent.
+    pub fn start_async_service(
+        &mut self,
+        inputs: Lc0AsyncInputs,
+    ) -> Result<Lc0AsyncAdmission, (NativeBootstrapError, Lc0AsyncInputs)> {
+        if self.endpoint_retirement_started
+            || self.receipt_token.is_none()
+            || self.async_custody.is_some()
+        {
+            return Err((
+                NativeBootstrapError::Config("LC0 async admission is unavailable"),
+                inputs,
+            ));
+        }
+        let factory = match self.supervisor.begin_service() {
+            Ok(factory) => factory,
+            Err(error) => return Err((error, inputs)),
+        };
+        let clock = ProcessClock::new(rz_contracts::ProcessEpoch(self.epoch));
+        let mut process = EngineProcess::new(factory, Arc::clone(&self.owners), clock);
+        let close = match process.install_priority_close() {
+            Ok(close) => close,
+            Err(error) => {
+                self.async_custody = Some(Lc0AsyncCustody::CloseSetupFailed {
+                    _process: process,
+                    _inputs: inputs,
+                    _error: error,
+                });
+                return Ok(Lc0AsyncAdmission::RetainedFailure);
+            }
+        };
+        self.async_custody = Some(Lc0AsyncCustody::Starting);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            async_engine::start_async(
+                inputs.events,
+                inputs.sender,
+                process,
+                self.config.engine_settings(),
+                inputs.output,
+                close.clone(),
+                inputs.max_output_bytes,
+                inputs.poll_interval,
+            )
+        }));
+        match outcome {
+            Ok(Ok(run)) => {
+                self.async_custody = Some(Lc0AsyncCustody::Running { run, close });
+                Ok(Lc0AsyncAdmission::Started)
+            }
+            Ok(Err(error)) => {
+                self.async_custody = Some(Lc0AsyncCustody::StartFailed(error));
+                Ok(Lc0AsyncAdmission::RetainedFailure)
+            }
+            Err(payload) => {
+                self.async_custody = Some(Lc0AsyncCustody::StartPanicked(payload));
+                Ok(Lc0AsyncAdmission::Unknown)
+            }
+        }
+    }
+
+    /// A bounded tick on the same UCI owner. OutputQueued is not a writer
+    /// join, session release, or physical-completion observation.
+    pub fn drive_async_until(&mut self, until: Instant) -> Option<AsyncServeStatus> {
+        match self.async_custody.as_mut()? {
+            Lc0AsyncCustody::Running { run, .. } => run.drive_until(until),
+            _ => None,
+        }
+    }
+
+    /// An interrupted transfer is not a completed admission. The marker does
+    /// not assert that values moved into a panicking start were recovered.
+    pub fn async_start_outcome_unknown(&self) -> bool {
+        matches!(
+            self.async_custody.as_ref(),
+            Some(Lc0AsyncCustody::Starting | Lc0AsyncCustody::StartPanicked(_))
+        )
+    }
+
+    /// Borrow the exact engine setup failure and its retained input owners.
+    pub fn async_start_failure(&self) -> Option<&Lc0StartFailure> {
+        match self.async_custody.as_ref()? {
+            Lc0AsyncCustody::StartFailed(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// The same original priority handle, not an acknowledgement of shutdown.
+    pub fn async_close_handle(&self) -> Option<PriorityCloseHandle> {
+        match self.async_custody.as_ref()? {
+            Lc0AsyncCustody::Running { close, .. } => Some(close.clone()),
+            _ => None,
+        }
+    }
+
+    /// Joins only confirmed-finished engine CPU workers and their timer. The
+    /// original writer, native worker and physical completion remain separate.
+    pub fn try_join_async_timer(&mut self) -> Option<EngineTimerJoinStatus> {
+        match self.async_custody.as_mut()? {
+            Lc0AsyncCustody::Running { run, .. } => Some(run.try_join_timer_after_workers()),
+            _ => None,
+        }
     }
 
     /// Required after setup failure before any service has begun. A session
