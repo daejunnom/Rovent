@@ -260,6 +260,23 @@ pub struct PreparedPcCollectionInputsV3 {
     managed_binding: Option<super::managed_output_fd_v2::OriginalInputBindingV2>,
 }
 
+/// The original input callback has accepted these exact owners. This is
+/// source-observation context, not execution or completion evidence.
+pub(super) struct ValidatedCallerBoundaryV3 {
+    inputs: Arc<PreparedPcCollectionInputsV3>,
+    lock: Arc<RoventInputLockV3>,
+}
+
+impl ValidatedCallerBoundaryV3 {
+    pub(super) fn inputs(&self) -> &PreparedPcCollectionInputsV3 {
+        &self.inputs
+    }
+
+    pub(super) fn lock(&self) -> &RoventInputLockV3 {
+        &self.lock
+    }
+}
+
 /// Original owners prepared before resource admission. Constructing this
 /// bundle starts no thread, model, GPU or teacher process. The supervisor is
 /// only a finite-step state owner; a separately verified resource-admitted
@@ -275,6 +292,7 @@ pub(crate) struct PcCollectionOwnersV3 {
     execution_ceiling: Instant,
     cleanup_ceiling: Instant,
     launch_claimed: std::sync::atomic::AtomicBool,
+    caller_boundary: std::sync::OnceLock<ValidatedCallerBoundaryV3>,
 }
 
 #[allow(dead_code)]
@@ -325,6 +343,7 @@ impl PcCollectionOwnersV3 {
             execution_ceiling,
             cleanup_ceiling,
             launch_claimed: std::sync::atomic::AtomicBool::new(false),
+            caller_boundary: std::sync::OnceLock::new(),
         })
     }
 
@@ -359,6 +378,16 @@ impl PcCollectionOwnersV3 {
     ) -> Result<(), ArenaError> {
         self.inputs
             .validate_original_boundary(lock, directory, lock_file)
+    }
+
+    /// Compute this run's optional source-only observation after the original
+    /// callback; hashing or reporting failures do not affect execution.
+    pub(crate) fn caller_source_receipt(
+        &self,
+    ) -> Option<Result<super::caller_source_v3::CallerSourceReceiptV3, ArenaError>> {
+        self.caller_boundary.get().map(
+            super::caller_source_v3::CallerSourceReceiptV3::from_validated_boundary,
+        )
     }
 
     /// Only an authenticated UCI gate and the same admitted arena resource
@@ -468,6 +497,10 @@ impl PcCollectionOwnersV3 {
                                 detail: error.to_string(),
                             },
                         )?;
+                    let _ = validate_owner.caller_boundary.set(ValidatedCallerBoundaryV3 {
+                        inputs: Arc::clone(&validate_owner.inputs),
+                        lock: Arc::clone(lock),
+                    });
                     validate_output
                         .authorize_original_boundary(&validate_owner.inputs)
                         .map_err(
