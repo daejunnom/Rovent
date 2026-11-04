@@ -300,6 +300,17 @@ impl PolicyRowPipelineV3 {
             return PolicyPrepareOutcomeV3::NotReady;
         }
         let row = self.row.as_ref().expect("checked original row");
+        let original = sealed.as_ref().expect("checked original sealed slot");
+        if !original
+            .capsule()
+            .admission()
+            .same_original_admission(row.admission())
+            || original.capsule().ticket().id != row.ticket().id
+        {
+            // A game pipeline can temporarily hold another root/ticket's
+            // legitimate row; do not label that as malformed evidence.
+            return PolicyPrepareOutcomeV3::NotReady;
+        }
         match prepare_teacher_policy_lock_v3_in_slots(row, sealed, &mut self.prepared) {
             Ok(()) => PolicyPrepareOutcomeV3::Prepared,
             Err(failure) => {
@@ -334,21 +345,23 @@ impl PolicyRowPipelineV3 {
     pub(super) fn try_take_target_capability(
         &mut self,
         route: &SpeculativeRootV3,
+        ticket: &rz_contracts::pals_adaptive::RoleTicketEnvelope,
     ) -> Result<Option<TargetCapabilityTakeV3>, ArenaError> {
         let Some(pending) = self.pending.as_ref() else {
             return Ok(None);
         };
         if !route.matches_admission(pending.original_admission()) {
-            return Err(super::invalid(
-                "policy route differs from original admission",
-            ));
+            // A different root may currently own the shared game pipeline.
+            return Ok(None);
         }
-        let ticket = pending.ticket();
+        if pending.ticket() != *ticket {
+            return Ok(None);
+        }
         let Some(slot) = self.empty_capability_slot() else {
             return Ok(None);
         };
         route
-            .try_take_target_capability_in_slot(&ticket, slot)
+            .try_take_target_capability_in_slot(ticket, slot)
             .map(Some)
     }
 
@@ -492,12 +505,20 @@ impl PolicyRowPipelineV3 {
 
     /// Called outside the native manager. The producer belongs to the same
     /// original observer and is only borrowed while the supervisor retains it.
-    pub(super) fn prepare(&mut self, producer: &mut RoventCorpusProducerLockV3) -> bool {
+    pub(super) fn prepare(
+        &mut self,
+        producer: &mut RoventCorpusProducerLockV3,
+        admission: &RoventCollectionRootAdmissionV3,
+        ticket: &rz_contracts::pals_adaptive::RoleTicketEnvelope,
+    ) -> bool {
         if self.failure.is_some() || self.appended {
             return false;
         }
-        if self.pending.is_some() {
-            return true;
+        if let Some(pending) = &self.pending {
+            return pending
+                .original_admission()
+                .same_original_admission(admission)
+                && pending.ticket() == *ticket;
         }
         // A teacher completion and retired row may arrive in either order.
         // Missing prepared evidence is ordinary asynchronous NotReady.
@@ -507,6 +528,9 @@ impl PolicyRowPipelineV3 {
         let Some(row) = self.row.as_mut() else {
             return false;
         };
+        if !row.admission().same_original_admission(admission) || row.ticket() != *ticket {
+            return false;
+        }
         if let Err(error) = producer.stage_prepared_teacher_policy(row, &mut self.prepared) {
             self.failure = Some(PolicyPipelineFailureV3::Stage(error));
             return false;
@@ -525,9 +549,22 @@ impl PolicyRowPipelineV3 {
 
     /// Runs only in the retained worker. It never takes an observer or
     /// registration lock while the target gate is held by the writer.
-    pub(super) fn try_append(&mut self) -> PolicyPipelineProgressV3 {
+    pub(super) fn try_append(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV3,
+        ticket: &rz_contracts::pals_adaptive::RoleTicketEnvelope,
+    ) -> PolicyPipelineProgressV3 {
         if self.is_uncertain() {
             return PolicyPipelineProgressV3::Unknown;
+        }
+        if self.pending.as_ref().is_some_and(|pending| {
+            !pending
+                .original_admission()
+                .same_original_admission(admission)
+                || pending.ticket() != *ticket
+        }) {
+            // Another root may legitimately occupy this game pipeline.
+            return PolicyPipelineProgressV3::NotReady;
         }
         if self.failure.is_some() || self.appended {
             return PolicyPipelineProgressV3::Failed;
