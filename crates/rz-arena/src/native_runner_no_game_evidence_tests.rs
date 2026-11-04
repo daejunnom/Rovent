@@ -4,8 +4,8 @@
 
 use super::*;
 use crate::pals_adaptive_launch::{
-    NO_GAME_SMOKE_PLAN_DOMAIN, NoGameExecutionStartV1, NoGameSmokeBudgetV1,
-    NoGameSmokeEndpointV1, NoGameSmokePlanV1, v6_test_pair_fixture,
+    NO_GAME_SMOKE_PLAN_DOMAIN, NoGameExecutionStartV1, NoGameSmokeBudgetV1, NoGameSmokeEndpointV1,
+    NoGameSmokePlanV1, v6_test_pair_fixture,
 };
 use rz_experiments::{ArtifactRef, NativeEngineRole, PalsSystemStartupLockV6};
 use sha2::{Digest as _, Sha256};
@@ -35,7 +35,11 @@ impl OwnedTestRoot {
         fs::create_dir(root.join("sources")).unwrap();
         fs::create_dir(root.join("outputs")).unwrap();
         let metadata = fs::symlink_metadata(&root).unwrap();
-        Self(root, Cell::new(true), (metadata.dev(), metadata.ino(), metadata.uid()))
+        Self(
+            root,
+            Cell::new(true),
+            (metadata.dev(), metadata.ino(), metadata.uid()),
+        )
     }
 }
 
@@ -44,7 +48,9 @@ impl Drop for OwnedTestRoot {
         if !self.1.get() {
             return;
         }
-        let Ok(metadata) = fs::symlink_metadata(&self.0) else { return };
+        let Ok(metadata) = fs::symlink_metadata(&self.0) else {
+            return;
+        };
         if !self.0.is_absolute()
             || !metadata.is_dir()
             || metadata.file_type().is_symlink()
@@ -54,9 +60,18 @@ impl Drop for OwnedTestRoot {
         }
         // Refuse cleanup if any existing ancestor is a link, not an owned
         // directory, or crosses devices. Never follow a replacement ancestor.
-        for rel in ["outputs", "outputs/attempt", "outputs/attempt/inputs", "outputs/attempt/inputs/test"] {
+        for rel in [
+            "outputs",
+            "outputs/attempt",
+            "outputs/attempt/inputs",
+            "outputs/attempt/inputs/test",
+        ] {
             match fs::symlink_metadata(self.0.join(rel)) {
-                Ok(m) if m.is_dir() && !m.file_type().is_symlink() && m.uid() == self.2.2 && m.dev() == self.2.0 => {}
+                Ok(m)
+                    if m.is_dir()
+                        && !m.file_type().is_symlink()
+                        && m.uid() == self.2.2
+                        && m.dev() == self.2.0 => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
                 _ => return,
             }
@@ -65,7 +80,8 @@ impl Drop for OwnedTestRoot {
         // snapshot, after its original owner and lease have been dropped.
         for rel in ["outputs/attempt/inputs/test", "outputs/attempt/inputs"] {
             let path = self.0.join(rel);
-            if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+            if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+            {
                 let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
             }
         }
@@ -83,11 +99,15 @@ struct FixtureOwner<'a> {
 
 impl Deref for FixtureOwner<'_> {
     type Target = PreparedIndependentNoGameOwner;
-    fn deref(&self) -> &Self::Target { &self.owner }
+    fn deref(&self) -> &Self::Target {
+        &self.owner
+    }
 }
 
 impl DerefMut for FixtureOwner<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.owner }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.owner
+    }
 }
 
 impl Drop for FixtureOwner<'_> {
@@ -117,7 +137,11 @@ fn prepared_original(root: &OwnedTestRoot) -> PreparedIndependentNoGameOwner {
     let mut endpoint = pair.endpoints[0].clone();
     let mut config = endpoint.startup_lock.config.clone();
     config.window.wall_time_max_ms = 60_000;
-    materialize(&source, &mut config.endpoint.binary, b"fixture-child-binary");
+    materialize(
+        &source,
+        &mut config.endpoint.binary,
+        b"fixture-child-binary",
+    );
     for asset in &mut config.assets {
         let payload = format!("fixture-asset:{}", asset.artifact.path);
         materialize(&source, &mut asset.artifact, payload.as_bytes());
@@ -196,7 +220,10 @@ fn unresolved_test_payload() -> ProcessOutput {
 #[ignore = "exclusive native lease; run this test alone"]
 fn original_nogame_evidence_survives_callback_panic_and_partial_create_new() {
     let root = OwnedTestRoot::new();
-    let mut owner = FixtureOwner { owner: prepared_original(&root), root: &root };
+    let mut owner = FixtureOwner {
+        owner: prepared_original(&root),
+        root: &root,
+    };
     // Explicitly synthetic unverified bytes exercise borrowing and storage;
     // no process is spawned and no physical fence is manufactured.
     owner.process = Some(unresolved_test_payload());
@@ -218,8 +245,14 @@ fn original_nogame_evidence_survives_callback_panic_and_partial_create_new() {
     }
     let preserved: Result<Option<()>, ()> = owner.with_raw_evidence(|view| {
         assert!(view.physical_or_process_completion_unknown);
-        assert!(matches!(view.with_grants(|g| g.len()), IndependentNoGameBorrowResult::Observed(2)));
-        assert!(matches!(view.with_control(|c| c.progress().retained_grants), IndependentNoGameBorrowResult::Observed(0)));
+        assert!(matches!(
+            view.with_grants(|g| g.len()),
+            IndependentNoGameBorrowResult::Observed(2)
+        ));
+        assert!(matches!(
+            view.with_control(|c| c.progress().retained_grants),
+            IndependentNoGameBorrowResult::Observed(0)
+        ));
         assert_eq!(view.process.unwrap().stdout.as_ptr(), original_address);
         assert_eq!(view.process.unwrap().stdout, b"out");
         Ok(())
@@ -229,15 +262,37 @@ fn original_nogame_evidence_survives_callback_panic_and_partial_create_new() {
     let attempt = root.0.join("outputs/attempt");
     fs::write(attempt.join("evidence.stdout"), b"existing").unwrap();
     let saved = owner.persist_raw_evidence("evidence").unwrap();
-    assert!(saved.files.iter().any(|(name, result)| name == "evidence.stdout" && result.is_err()));
-    assert!(saved.files.iter().any(|(name, result)| name == "evidence.stderr" && result.is_ok()));
-    assert!(saved.files.iter().any(|(name, result)| name == "evidence.summary.json" && result.is_ok()));
-    assert_eq!(fs::read(attempt.join("evidence.stdout")).unwrap(), b"existing");
+    assert!(
+        saved
+            .files
+            .iter()
+            .any(|(name, result)| name == "evidence.stdout" && result.is_err())
+    );
+    assert!(
+        saved
+            .files
+            .iter()
+            .any(|(name, result)| name == "evidence.stderr" && result.is_ok())
+    );
+    assert!(
+        saved
+            .files
+            .iter()
+            .any(|(name, result)| name == "evidence.summary.json" && result.is_ok())
+    );
+    assert_eq!(
+        fs::read(attempt.join("evidence.stdout")).unwrap(),
+        b"existing"
+    );
     assert_eq!(fs::read(attempt.join("evidence.stderr")).unwrap(), b"err");
-    let summary: serde_json::Value = serde_json::from_slice(&fs::read(attempt.join("evidence.summary.json")).unwrap()).unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(attempt.join("evidence.summary.json")).unwrap()).unwrap();
     assert_eq!(summary["physical_or_process_completion_unknown"], true);
     assert!(owner.unresolved());
-    assert_eq!(owner.process.as_ref().unwrap().stdout.as_ptr(), original_address);
+    assert_eq!(
+        owner.process.as_ref().unwrap().stdout.as_ptr(),
+        original_address
+    );
     assert_eq!(owner.process.as_ref().unwrap().stderr, b"err");
     assert!(owner.persist_raw_evidence("second").is_err());
 
