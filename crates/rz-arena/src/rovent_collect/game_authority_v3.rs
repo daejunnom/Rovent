@@ -259,6 +259,7 @@ impl<S> GameAuthorityV3<S> {
             owner: Arc::clone(self),
             root: root.clone(),
             resolved: false,
+            committed_aborted: None,
             abort_receipt: None,
         })
     }
@@ -373,6 +374,7 @@ pub(super) struct GameRootReservationV3<S> {
     owner: Arc<GameAuthorityV3<S>>,
     root: RoventCollectionRootAdmissionV3,
     resolved: bool,
+    committed_aborted: Option<bool>,
     abort_receipt: Option<GameRootAbortReceiptV3<S>>,
 }
 
@@ -394,6 +396,16 @@ impl<S> GameRootReservationV3<S> {
     /// Call only after the exact root slot exists. If abort raced, the caller
     /// must retain the slot and propagate cancellation; it is never erased.
     pub(super) fn commit_registered(&mut self) -> GameStepV3 {
+        if let Some(aborted) = self.committed_aborted {
+            return if aborted {
+                GameStepV3::Aborted
+            } else {
+                GameStepV3::Ready
+            };
+        }
+        if self.resolved {
+            return GameStepV3::Unknown;
+        }
         let mut state = match self.owner.lock() {
             Ok(s) => s,
             Err(e) => return e,
@@ -407,14 +419,17 @@ impl<S> GameRootReservationV3<S> {
         };
         let root = state.pending.remove(index);
         state.admitted.push(root);
-        self.resolved = true;
         if (self.owner.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0) {
             self.abort_receipt = Some(GameRootAbortReceiptV3 {
                 owner: Arc::clone(&self.owner),
                 root: self.root.clone(),
             });
+            self.committed_aborted = Some(true);
+            self.resolved = true;
             GameStepV3::Aborted
         } else {
+            self.committed_aborted = Some(false);
+            self.resolved = true;
             GameStepV3::Ready
         }
     }
