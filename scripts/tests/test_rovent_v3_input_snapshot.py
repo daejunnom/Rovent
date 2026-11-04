@@ -57,6 +57,34 @@ class SnapshotOwnershipTests(unittest.TestCase):
         self.source_fd = snapshot.open_directory(self.source)
         self.addCleanup(os.close, self.source_fd)
 
+    @unittest.skipUnless(hasattr(os, "pread"), "position-independent read required")
+    def test_original_control_owner_retains_open_fds_and_read_offset(self):
+        plan = self.source / "plan.json"
+        original = os.urandom(64)
+        plan.write_bytes(original)
+        with snapshot.OriginalControlInput(self.source_fd, Path("plan.json")) as owner:
+            directory_fd, plan_fd = owner.borrowed_fds()
+            original_id = (os.fstat(plan_fd).st_dev, os.fstat(plan_fd).st_ino)
+            os.lseek(plan_fd, 7, os.SEEK_SET)
+            self.assertEqual(owner.bytes, original)
+            self.assertEqual(os.lseek(plan_fd, 0, os.SEEK_CUR), 7)
+            self.assertEqual((os.fstat(plan_fd).st_dev, os.fstat(plan_fd).st_ino), original_id)
+            self.assertEqual(os.fstat(directory_fd).st_ino, os.fstat(self.source_fd).st_ino)
+        with self.assertRaises(OSError):
+            os.fstat(plan_fd)
+
+    @unittest.skipUnless(hasattr(os, "pread"), "position-independent read required")
+    def test_original_control_owner_reports_mutation_and_rejects_symlinks(self):
+        plan = self.source / "plan.json"
+        plan.write_bytes(os.urandom(32))
+        with snapshot.OriginalControlInput(self.source_fd, Path("plan.json")) as owner:
+            plan.write_bytes(os.urandom(33))
+            with self.assertRaisesRegex(RuntimeError, "original control input changed"):
+                owner.recheck()
+        (self.source / "link.json").symlink_to(plan.name)
+        with self.assertRaises(OSError):
+            snapshot.OriginalControlInput(self.source_fd, Path("link.json"))
+
     def test_copy_uses_actual_bytes_and_never_overwrites(self):
         data = os.urandom(127)
         (self.source / "asset").write_bytes(data)

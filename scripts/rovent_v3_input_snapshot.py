@@ -95,6 +95,86 @@ def read_control(base, rel):
         os.close(fd)
 
 
+class OriginalControlInput:
+    """Retain the first no-follow control-file open and its source directory.
+
+    This is an input ownership primitive, not permission to write to an output
+    lease. The creating supervisor must retain it until its child has stopped.
+    Rechecking detects observed mutation but does not make the file immutable.
+    """
+
+    def __init__(self, base, rel):
+        self._directory = self._file = None
+        try:
+            self._directory = os.dup(base)
+            directory = os.fstat(self._directory)
+            require(stat.S_ISDIR(directory.st_mode), "control source is not a directory")
+            self._directory_id = (directory.st_dev, directory.st_ino)
+            self._file, before = open_source(self._directory, rel)
+            require(before.st_size <= MAX_CONTROL, "control input exceeds limit")
+            self._metadata = metadata(before)
+            self._bytes = self._read_stable()
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException as close_error:
+                error.add_note("control input cleanup also failed: " + str(close_error))
+            raise
+
+    def _read_stable(self):
+        require(self._file is not None, "original control input is closed")
+        before = os.fstat(self._file)
+        require(stat.S_ISREG(before.st_mode) and metadata(before) == self._metadata,
+                "original control input changed")
+        chunks, offset = [], 0
+        while offset < before.st_size:
+            chunk = os.pread(self._file, min(65536, before.st_size - offset), offset)
+            require(bool(chunk), "original control input was truncated")
+            chunks.append(chunk)
+            offset += len(chunk)
+        require(metadata(os.fstat(self._file)) == self._metadata,
+                "original control input changed while reading")
+        return b"".join(chunks)
+
+    def recheck(self):
+        require(self._directory is not None, "original control input is closed")
+        directory = os.fstat(self._directory)
+        require(stat.S_ISDIR(directory.st_mode) and
+                (directory.st_dev, directory.st_ino) == self._directory_id,
+                "original control source directory changed")
+        require(self._read_stable() == self._bytes, "original control input bytes changed")
+
+    @property
+    def bytes(self):
+        self.recheck()
+        return self._bytes
+
+    def borrowed_fds(self):
+        """Borrow original descriptors; the caller must retain this owner."""
+        self.recheck()
+        return self._directory, self._file
+
+    def close(self):
+        failure = None
+        for field in ("_file", "_directory"):
+            fd = getattr(self, field, None)
+            if fd is not None:
+                setattr(self, field, None)
+                try:
+                    os.close(fd)
+                except OSError as error:
+                    if failure is None:
+                        failure = error
+        if failure is not None:
+            raise failure
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _type, _value, _traceback):
+        self.close()
+
+
 def copy_pin(base, root, item, deadline, progress):
     """Copy one pinned regular file without replacing an existing output."""
     rel = relative(item["path"])
