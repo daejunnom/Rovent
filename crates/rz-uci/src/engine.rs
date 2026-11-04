@@ -2916,16 +2916,18 @@ struct PrepareEngineFailure {
     sender: SyncSender<Event>,
 }
 
-fn prepare_engine(
-    events: Receiver<Event>,
-    sender: SyncSender<Event>,
-    process: EngineProcess,
+fn engine_preflight(
+    process: &EngineProcess,
     settings: EngineSettings,
-) -> Result<PreparedEngine, PrepareEngineFailure> {
-    // No original process fields are moved until every fallible, pre-worker
-    // setup succeeds. On rejection the caller receives the same process and
-    // event endpoints; this does not attest native or output completion.
-    let setup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+) -> Result<
+    (
+        crate::contracts::SessionScope,
+        crate::contracts::ContractSessionOwner,
+        Session<RulesUciPort>,
+    ),
+    EngineError,
+> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<_, EngineError> {
             if settings.max_workers == 0
                 || settings.shutdown_limit.is_zero()
@@ -2994,22 +2996,24 @@ fn prepare_engine(
                 .map_err(EngineError::Session)?;
             Ok((scope, session_owner, session))
         },
-    ));
-    let (scope, session_owner, session) = match setup {
-        Ok(Ok(prepared)) => prepared,
-        Ok(Err(error)) => {
+    ))
+    .unwrap_or_else(|payload| Err(EngineError::StartupPanic(payload)))
+}
+
+fn prepare_engine(
+    events: Receiver<Event>,
+    sender: SyncSender<Event>,
+    process: EngineProcess,
+    settings: EngineSettings,
+) -> Result<PreparedEngine, PrepareEngineFailure> {
+    // No original process fields are moved until every fallible, pre-worker
+    // setup succeeds. On rejection the caller receives the same process and
+    // event endpoints; this does not attest native or output completion.
+    let (scope, session_owner, session) = match engine_preflight(&process, settings) {
+        Ok(prepared) => prepared,
+        Err(error) => {
             return Err(PrepareEngineFailure {
                 error,
-                process,
-                events,
-                sender,
-            });
-        }
-        Err(payload) => {
-            // Setup only borrowed the exact original process. Retain the
-            // original panic, process and event endpoints; do not retry it.
-            return Err(PrepareEngineFailure {
-                error: EngineError::StartupPanic(payload),
                 process,
                 events,
                 sender,
