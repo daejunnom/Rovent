@@ -412,7 +412,34 @@ fn main() -> std::process::ExitCode {
         run_rovent_utility_cohort_from_cli, run_rovent_utility_intervention_from_cli,
     };
     use std::io::Write;
+    let entry = std::time::Instant::now();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(mut result) =
+        rz_arena::rovent_collect::launch::pc_managed_entry_v3::try_run_managed_pc_entry_v3(
+            arguments.clone(),
+            entry,
+        )
+    {
+        use rz_arena::rovent_collect::launch::pc_managed_entry_v3::ManagedPcEntryProgressV3;
+        if let Some(until) = result.cleanup_until() {
+            loop {
+                match result.try_progress(until) {
+                    ManagedPcEntryProgressV3::Pending if std::time::Instant::now() < until => {
+                        std::thread::sleep(
+                            std::time::Duration::from_millis(5)
+                                .min(until.saturating_duration_since(std::time::Instant::now())),
+                        );
+                    }
+                    _ => break,
+                }
+            }
+        }
+        let exit = result.exit_code();
+        if writeln!(std::io::stderr().lock(), "{}", result.observation()).is_err() {
+            return std::process::ExitCode::FAILURE;
+        }
+        return std::process::ExitCode::from(exit);
+    }
     match parse_lock_v2(arguments.clone()) {
         Ok(Some(cli)) => {
             let _ = writeln!(

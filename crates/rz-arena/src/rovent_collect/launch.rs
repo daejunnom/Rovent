@@ -63,6 +63,8 @@ mod pc_lock_v3;
 #[allow(dead_code)]
 mod pc_managed_prepare_v3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+pub mod pc_managed_entry_v3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 #[allow(dead_code)]
 mod pc_recovery_v3;
 #[cfg(any(test, feature = "test-fixtures"))]
