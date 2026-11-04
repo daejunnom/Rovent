@@ -407,7 +407,7 @@ impl LockedPalsSystemArenaPairV6 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use rz_experiments::*;
     use std::collections::BTreeSet;
@@ -586,7 +586,7 @@ mod tests {
             source_files: BTreeMap::new(),
         }
     }
-    fn fixture() -> PalsSystemArenaPairV6 {
+    pub(in crate::pals_adaptive_launch::system_v6) fn fixture() -> PalsSystemArenaPairV6 {
         let pair = PalsPairPlanV5 {
             opening_id: "test-opening".into(),
             position_command: "position startpos".into(),
