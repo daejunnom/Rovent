@@ -15,9 +15,10 @@ use std::{
     net::Shutdown,
     os::{
         fd::{AsFd, AsRawFd},
+        linux::net::SocketAddrExt,
         unix::{
             fs::MetadataExt,
-            net::{UnixListener, UnixStream},
+            net::{SocketAddr, UnixListener, UnixStream},
         },
     },
     path::PathBuf,
@@ -57,7 +58,6 @@ impl Drop for Fixture {
         // Only remove our own named synthetic files; unexpected contents remain.
         let _ = fs::remove_file(self.root.join("inputs/startup.lock"));
         let _ = fs::remove_dir(self.root.join("inputs"));
-        let _ = fs::remove_file(self.root.join("channel.sock"));
         let _ = fs::remove_dir(&self.root);
     }
 }
@@ -82,7 +82,9 @@ fn real_parent_partial_challenge_preserves_original_owners() {
         lock.canonical_bytes().unwrap(),
     )
     .unwrap();
-    let listener = UnixListener::bind(fixture.root.join("channel.sock")).unwrap();
+    let socket_name = format!("rz-smoke-prepare-{nonce}");
+    let address = SocketAddr::from_abstract_name(socket_name.as_bytes()).unwrap();
+    let listener = UnixListener::bind_addr(&address).unwrap();
     listener.set_nonblocking(true).unwrap();
     let owner_hash = Sha256::digest(format!("owner-{nonce}").as_bytes());
     let mut owner_id = [0u8; 16];
@@ -97,6 +99,7 @@ fn real_parent_partial_challenge_preserves_original_owners() {
         .current_dir(&fixture.root)
         .env("RZ_SMOKE_PREPARE_CHILD", "1")
         .env("RZ_SMOKE_PREPARE_ROOT", &fixture.root)
+        .env("RZ_SMOKE_PREPARE_SOCKET", &socket_name)
         .env("RZ_SMOKE_PREPARE_OWNER", &owner_hex)
         .env("RZ_SMOKE_PREPARE_PLAN", &plan_sha)
         .env("RZ_SMOKE_PREPARE_PROXY", &proxy_sha)
@@ -211,7 +214,9 @@ fn partial_challenge_child() {
         &cleanup_cancelled,
     )
     .unwrap_or_else(|(e, _, _, _, _)| panic!("{e}"));
-    let channel = UnixStream::connect(root.join("channel.sock")).unwrap();
+    let socket_name = std::env::var("RZ_SMOKE_PREPARE_SOCKET").unwrap();
+    let address = SocketAddr::from_abstract_name(socket_name.as_bytes()).unwrap();
+    let channel = UnixStream::connect_addr(&address).unwrap();
     let socket_fd = channel.as_raw_fd();
     let socket_id = fd_identity(socket_fd);
     let until = Instant::now() + Duration::from_secs(15);
