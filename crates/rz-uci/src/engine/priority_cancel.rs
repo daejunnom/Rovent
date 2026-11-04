@@ -115,7 +115,14 @@ impl PriorityCancelHandle {
             Err(TryLockError::WouldBlock) => return Err(PriorityCancelPanicAccessError::Busy),
             Err(TryLockError::Poisoned(_)) => return Err(PriorityCancelPanicAccessError::Poisoned),
         };
-        Ok(guard.as_deref().map(inspect))
+        // A consumer's inspection panic is resumed only after the guard is
+        // dropped, so the original stored payload remains accessible.
+        let inspected = catch_unwind(AssertUnwindSafe(|| guard.as_deref().map(inspect)));
+        drop(guard);
+        match inspected {
+            Ok(value) => Ok(value),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 }
 
@@ -198,5 +205,19 @@ mod tests {
             );
         }
         assert!(!handle.observe().physical_completion_observed);
+    }
+
+    #[test]
+    fn inspection_panic_does_not_poison_original_payload() {
+        let (_owner, handle) = PriorityCancelOwner::new(ProcessEpoch(2));
+        *handle.0.original_panic.lock().unwrap() = Some(Box::new(9_u64));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = handle.with_original_cancel_panic(|_| panic!("fixture inspector"));
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            handle.with_original_cancel_panic(|value| value.downcast_ref::<u64>().copied()),
+            Ok(Some(Some(9)))
+        );
     }
 }
