@@ -269,6 +269,9 @@ impl PolicyRowPipelineOwnerV3 {
         {
             return PolicyFinalizationV3::Failed;
         }
+        if state.is_uncertain() {
+            return PolicyFinalizationV3::Unknown;
+        }
         if state.output_publication.is_some() {
             return PolicyFinalizationV3::Published;
         }
@@ -277,9 +280,6 @@ impl PolicyRowPipelineOwnerV3 {
         }
         if state.output_aborted {
             return PolicyFinalizationV3::Aborted;
-        }
-        if state.is_uncertain() {
-            return PolicyFinalizationV3::Unknown;
         }
         if state.failure.is_some() {
             return PolicyFinalizationV3::Failed;
