@@ -170,6 +170,23 @@ class SessionObservationTests(unittest.TestCase):
         duplicate._socket.close()
         duplicate._socket = None
 
+    def test_admission_fstat_failure_keeps_the_original_handshake_owner(self):
+        extra_socket, peer = socket.socketpair()
+        handshake = object.__new__(NonblockingParentHandshake)
+        handshake._pid, handshake._epoch, handshake._lock, handshake._ordinal = self.binding
+        handshake._state, handshake._socket = "authenticated", extra_socket
+        handshake._request_wire, handshake._response, handshake._sent = b"request\n", b"ack\n", 8
+        failure = OSError(errno.EIO, "private detail")
+        with mock.patch("lc0_parent_observation.os.fstat", side_effect=failure):
+            with self.assertRaises(OSError) as caught:
+                OriginalAdmission(handshake)
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(handshake.state, "authenticated")
+        self.assertIs(handshake._socket, extra_socket)
+        handshake._socket = None
+        extra_socket.close()
+        peer.close()
+
     def test_cancelled_handoff_retains_wire_and_original_owner(self):
         self.observe.advance(selectors.EVENT_WRITE)
         self.observe.cancel()

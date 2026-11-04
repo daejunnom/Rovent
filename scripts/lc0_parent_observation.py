@@ -37,13 +37,12 @@ class OriginalAdmission:
             raise ValueError("original LC0 admission is not authenticated")
         self._binding = handshake.binding
         self.authenticated_wire = handshake.authenticated_wire
+        # Inspect before transfer: an fstat failure must leave the exact socket
+        # and its authenticated wire in the caller's original handshake.
+        st = os.fstat(handshake.fileno())
+        self._identity = (st.st_dev, st.st_ino)
+        self._socket = None
         self._socket = handshake.take_authenticated_socket()
-        try:
-            st = os.fstat(self._socket.fileno())
-            self._identity = (st.st_dev, st.st_ino)
-        except BaseException:
-            _UNCLAIMED_CUSTODIES.append(self)
-            raise
 
     def check_control(self, handshake):
         if (not isinstance(handshake, NonblockingParentHandshake)
