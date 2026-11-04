@@ -31,7 +31,7 @@ use crate::{
     runner::{
         Event,
         async_events::AsyncServeStatus,
-        async_output::{AsyncOutputOwner, OutputRecovery},
+        async_output::{AsyncOutputOwner, OutputFailure, OutputRecovery},
     },
 };
 use std::sync::mpsc::{Receiver, SyncSender};
@@ -99,12 +99,20 @@ pub enum Lc0AsyncFinishStatus {
     ServiceFailed,
     CpuPending,
     CpuFailed,
-    WriterPending,
-    WriterFailed,
-    WriterUnknown,
     NativeCollected,
     NativeCollectionFailed,
     AlreadyAttempted,
+}
+
+/// Writer completion is independent of native session drain. A failed
+/// joined writer retains its original error; unknown does not prove release.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Lc0AsyncWriterStatus {
+    NoRun,
+    Pending,
+    Completed,
+    Failed,
+    Unknown,
 }
 
 /// Exercise original parent and receipt plumbing without opening model assets,
@@ -373,6 +381,7 @@ pub struct Lc0SupervisedSession {
     async_custody: Option<Lc0AsyncCustody>,
     slot_start_panic: Option<Box<dyn std::any::Any + Send>>,
     async_finish_attempted: bool,
+    async_writer_finished: bool,
     lock: SystemRuntimeLockV6,
     config: NativeConfig,
     owners: Arc<OwnerRegistry>,
@@ -606,6 +615,7 @@ impl Lc0PendingSupervisor {
             async_custody: None,
             slot_start_panic: None,
             async_finish_attempted: false,
+            async_writer_finished: false,
             lock: self.lock,
             config: self.config,
             owners: Arc::new(OwnerRegistry::default()),
@@ -1107,10 +1117,10 @@ impl Lc0SupervisedSession {
         }
     }
 
-    /// Advance the original normal UCI run's final collection once. All
-    /// output and CPU checks refer to that same run and its joined writer.
-    /// A failed or unknown stage remains retained and is never treated as
-    /// success. NativeCollected is not a physical-completion witness.
+    /// Advance the original normal UCI run's native collection once after
+    /// same-run CPU settlement. Writer settlement is independently polled and
+    /// is required before endpoint retirement. NativeCollected is not a GPU
+    /// fence or proof of successful output delivery.
     pub fn try_finish_async(&mut self, until: Instant) -> Lc0AsyncFinishStatus {
         if self.async_finish_attempted {
             return Lc0AsyncFinishStatus::AlreadyAttempted;
@@ -1147,41 +1157,67 @@ impl Lc0SupervisedSession {
             | EngineTimerJoinStatus::WaitingTimer => return Lc0AsyncFinishStatus::CpuPending,
             _ => return Lc0AsyncFinishStatus::CpuFailed,
         }
-        match run.try_recover_writer() {
-            EngineWriterRecoveryStatus::Recovered => {}
-            EngineWriterRecoveryStatus::DriverNotSealed | EngineWriterRecoveryStatus::Pending => {
-                return Lc0AsyncFinishStatus::WriterPending;
-            }
-            EngineWriterRecoveryStatus::WorkerPanicked => {
-                return Lc0AsyncFinishStatus::WriterFailed;
-            }
-            EngineWriterRecoveryStatus::OriginalRecoveryMissing => {
-                return Lc0AsyncFinishStatus::WriterUnknown;
-            }
-        }
-        let Some(Ok(recovery)) = run.output_recovery() else {
-            return Lc0AsyncFinishStatus::WriterUnknown;
-        };
-        if recovery.failure.is_some() || recovery.partial.is_some() {
-            return Lc0AsyncFinishStatus::WriterFailed;
-        }
-        let Some(snapshot) = run.final_output_observation() else {
-            return Lc0AsyncFinishStatus::WriterUnknown;
-        };
-        if snapshot.failed || snapshot.call_completion_unknown {
-            return Lc0AsyncFinishStatus::WriterFailed;
-        }
-        if !snapshot.worker_finished
-            || !snapshot.close_requested
-            || snapshot.accepted_batches != snapshot.completed_batches
-        {
-            return Lc0AsyncFinishStatus::WriterUnknown;
-        }
+        // The original writer is separately retained in this run. Its
+        // completion cannot start native work and must not delay native drain.
         self.async_finish_attempted = true;
         match self.supervisor.finish_service(until, Ok(())) {
             Ok(()) => Lc0AsyncFinishStatus::NativeCollected,
             Err(_) => Lc0AsyncFinishStatus::NativeCollectionFailed,
         }
+    }
+
+    /// Poll the same original writer independently from native collection.
+    /// Writer status is not a GPU fence and never erases output failures.
+    pub fn poll_async_writer(&mut self) -> Lc0AsyncWriterStatus {
+        let run = match self.async_custody.as_mut() {
+            Some(Lc0AsyncCustody::Running { run, .. }) => run,
+            Some(Lc0AsyncCustody::Slot { slot, .. }) => match slot.original_run_mut() {
+                Some(run) => run,
+                None => return Lc0AsyncWriterStatus::NoRun,
+            },
+            _ => return Lc0AsyncWriterStatus::NoRun,
+        };
+        let status = (|| {
+            match run.try_recover_writer() {
+                EngineWriterRecoveryStatus::Recovered => {}
+                EngineWriterRecoveryStatus::DriverNotSealed
+                | EngineWriterRecoveryStatus::Pending => {
+                    return Lc0AsyncWriterStatus::Pending;
+                }
+                EngineWriterRecoveryStatus::WorkerPanicked => {
+                    return Lc0AsyncWriterStatus::Failed;
+                }
+                EngineWriterRecoveryStatus::OriginalRecoveryMissing => {
+                    return Lc0AsyncWriterStatus::Unknown;
+                }
+            }
+            let Some(Ok(recovery)) = run.output_recovery() else {
+                return Lc0AsyncWriterStatus::Unknown;
+            };
+            if recovery.failure.is_some() || recovery.partial.is_some() {
+                return Lc0AsyncWriterStatus::Failed;
+            }
+            let Some(snapshot) = run.final_output_observation() else {
+                return Lc0AsyncWriterStatus::Unknown;
+            };
+            if snapshot.failed || snapshot.call_completion_unknown {
+                return Lc0AsyncWriterStatus::Failed;
+            }
+            if !snapshot.worker_finished
+                || !snapshot.close_requested
+                || snapshot.accepted_batches != snapshot.completed_batches
+            {
+                return Lc0AsyncWriterStatus::Unknown;
+            }
+            Lc0AsyncWriterStatus::Completed
+        })();
+        if matches!(
+            status,
+            Lc0AsyncWriterStatus::Completed | Lc0AsyncWriterStatus::Failed
+        ) {
+            self.async_writer_finished = true;
+        }
+        status
     }
 
     /// Joins only confirmed-finished engine CPU workers and their timer. The
@@ -1223,6 +1259,15 @@ impl Lc0SupervisedSession {
             Lc0AsyncCustody::Slot { slot, .. } => slot.original_run()?.output_recovery(),
             _ => None,
         }
+    }
+
+    /// Borrow the original joined writer failure, if one was recorded.
+    pub fn async_writer_failure(&self) -> Option<&OutputFailure> {
+        self.async_writer_recovery()?
+            .as_ref()
+            .ok()?
+            .failure
+            .as_ref()
     }
 
     /// Required after setup failure before any service has begun. A session
@@ -1306,6 +1351,7 @@ impl Lc0SupervisedSession {
         until: Instant,
     ) -> io::Result<()> {
         if !self.async_finish_attempted
+            || !self.async_writer_finished
             || self.supervisor.project_original().latest_release != Lc0ObservedRelease::Released
         {
             return Err(io::Error::other(

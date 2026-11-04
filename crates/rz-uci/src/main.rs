@@ -3748,6 +3748,7 @@ impl<O> std::error::Error for Lc0PreNativePreparationFailure<O> {
 struct Lc0SettledAuxiliaryFailure<O> {
     service_failed: bool,
     native_collection_failed: bool,
+    writer_failed: bool,
     cleanup: Option<io::Error>,
     receipt: Option<String>,
     control: Option<io::Error>,
@@ -3769,9 +3770,10 @@ impl<O> std::fmt::Display for Lc0SettledAuxiliaryFailure<O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "LC0 same-session release observed; failures: service={}, native_collection={}, cleanup={}, receipt={}, control={}, parent={}, renewal={}; device-wide completion remains unknown",
+            "LC0 same-session release observed; failures: service={}, native_collection={}, writer={}, cleanup={}, receipt={}, control={}, parent={}, renewal={}; device-wide completion remains unknown",
             self.service_failed,
             self.native_collection_failed,
+            self.writer_failed,
             self.cleanup.is_some(),
             self.receipt.is_some(),
             self.control.is_some(),
@@ -3787,6 +3789,10 @@ impl<O> std::error::Error for Lc0SettledAuxiliaryFailure<O> {
         self.session
             .original_run_error()
             .map(|error| error as &(dyn std::error::Error + 'static))
+            .or_else(|| match self.session.async_writer_failure() {
+                Some(rz_uci::runner::async_output::OutputFailure::Io(error)) => Some(error as _),
+                _ => None,
+            })
             .or_else(|| self.cleanup.as_ref().map(|error| error as _))
             .or_else(|| self.control.as_ref().map(|error| error as _))
             .or_else(|| self.parent.as_ref().map(|error| error as _))
@@ -3804,7 +3810,7 @@ fn hold_lc0_session<T: 'static>(
     cleanup_until: std::time::Instant,
     mut running: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use rz_uci::native_bootstrap::Lc0AsyncFinishStatus;
+    use rz_uci::native_bootstrap::{Lc0AsyncFinishStatus, Lc0AsyncWriterStatus};
     use rz_uci::runner::async_events::AsyncServeStatus;
     let mut original_panic: Option<Box<dyn std::any::Any + Send>> = None;
     let mut first_control_error: Option<io::Error> = None;
@@ -3820,6 +3826,7 @@ fn hold_lc0_session<T: 'static>(
     let mut failure_published = false;
     let mut normal_ready = false;
     let mut service_failed = false;
+    let mut writer_failed = false;
     loop {
         if original_panic.is_some() {
             thread::park_timeout(Duration::from_secs(1));
@@ -3892,9 +3899,7 @@ fn hold_lc0_session<T: 'static>(
                 let status = session.try_finish_async(until);
                 finish_terminal = !matches!(
                     status,
-                    Lc0AsyncFinishStatus::ServicePending
-                        | Lc0AsyncFinishStatus::CpuPending
-                        | Lc0AsyncFinishStatus::WriterPending
+                    Lc0AsyncFinishStatus::ServicePending | Lc0AsyncFinishStatus::CpuPending
                 );
                 finish_status = Some(status);
                 if status == Lc0AsyncFinishStatus::NativeCollected {
@@ -3915,6 +3920,7 @@ fn hold_lc0_session<T: 'static>(
                         | Lc0AsyncFinishStatus::NativeCollectionFailed
                 )
             ) {
+                let writer_status = session.poll_async_writer();
                 let now = std::time::Instant::now();
                 if !session.original_scope_settled() && now >= next_release_poll {
                     session.reobserve_original_release();
@@ -3926,7 +3932,13 @@ fn hold_lc0_session<T: 'static>(
                         observation.latest_release()
                             == rz_uci::native_bootstrap::Lc0ObservedRelease::Released
                     });
-                if released {
+                if released
+                    && matches!(
+                        writer_status,
+                        Lc0AsyncWriterStatus::Completed | Lc0AsyncWriterStatus::Failed
+                    )
+                {
+                    writer_failed = writer_status == Lc0AsyncWriterStatus::Failed;
                     service_failed = !session.original_service_succeeded();
                     if service_failed && !failure_published {
                         failure_published = true;
@@ -3979,6 +3991,7 @@ fn hold_lc0_session<T: 'static>(
                 }
             };
             if service_failed
+                || writer_failed
                 || finish_status == Some(Lc0AsyncFinishStatus::NativeCollectionFailed)
                 || cleanup.is_some()
                 || receipt_error.is_some()
@@ -3990,6 +4003,7 @@ fn hold_lc0_session<T: 'static>(
                     service_failed,
                     native_collection_failed: finish_status
                         == Some(Lc0AsyncFinishStatus::NativeCollectionFailed),
+                    writer_failed,
                     cleanup,
                     receipt: receipt_error,
                     control: first_control_error,
