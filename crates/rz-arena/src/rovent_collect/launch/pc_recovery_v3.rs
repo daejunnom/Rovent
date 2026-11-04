@@ -12,7 +12,8 @@
 use super::pc_lock_v3::{ManagedOutputOwnerV3, PcCollectionOwnersV3};
 use crate::rovent_collect::pc_worker_v3::PcWorkerSupervisorV3;
 use crate::rovent_resource_scope::launch::{
-    NativeResourceCustody, RoventPcCollectionResourceOutcomeV3,
+    NativeResourceCustody, RoventPcCollectionRecoveryKeyV3,
+    RoventPcCollectionResourceOutcomeV3,
 };
 use std::any::Any;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -30,6 +31,7 @@ struct OriginalPcRunV3 {
     output: Arc<ManagedOutputOwnerV3>,
     resource: Option<Arc<Mutex<NativeResourceCustody>>>,
     outcome: Option<RoventPcCollectionResourceOutcomeV3>,
+    outcome_key: Option<RoventPcCollectionRecoveryKeyV3>,
     panic: Option<Box<dyn Any + Send>>,
     state: PcRunRecoveryStateV3,
 }
@@ -78,6 +80,7 @@ impl PcRunRecoveryKeyV3 {
                 output,
                 resource: None,
                 outcome: None,
+                outcome_key: None,
                 panic: None,
                 state: PcRunRecoveryStateV3::Prepared,
             })),
@@ -156,6 +159,37 @@ impl PcRunRecoveryKeyV3 {
         original.outcome = Some(outcome);
         original.state = PcRunRecoveryStateV3::Returned;
         Ok(())
+    }
+
+    /// Retain the returned outcome's own recovery key without moving or
+    /// duplicating the outcome. The original outcome must still be retained
+    /// by its caller; dropping it transfers custody to that same key's slot.
+    /// This key is neither a result nor a completion/settlement proof.
+    /// Pending stop/join tokens must be retained independently by their owner.
+    pub(crate) fn record_outcome_key(
+        &self,
+        outcome: &RoventPcCollectionResourceOutcomeV3,
+    ) -> Result<(), &'static str> {
+        let mut guard = self.0.original.try_lock().map_err(|_| "P-C recovery slot unavailable")?;
+        let original = guard.as_mut().ok_or("P-C original custody missing")?;
+        if original.state != PcRunRecoveryStateV3::Executing
+            || !Arc::ptr_eq(outcome.original_collection(), original.owners.native())
+        {
+            return Err("P-C original outcome differs or was already recorded");
+        }
+        original.outcome_key = Some(outcome.recovery_key());
+        original.state = PcRunRecoveryStateV3::Returned;
+        Ok(())
+    }
+
+    /// Obtain the exact key issued by the original outcome. Recovering through
+    /// it returns None while that outcome is still owned by its caller.
+    pub(crate) fn original_outcome_key(
+        &self,
+    ) -> Result<Option<RoventPcCollectionRecoveryKeyV3>, &'static str> {
+        let guard = self.0.original.try_lock().map_err(|_| "P-C recovery slot unavailable")?;
+        let original = guard.as_ref().ok_or("P-C original custody missing")?;
+        Ok(original.outcome_key.clone())
     }
 
     /// The caller catches the launch panic and transfers the original payload.
