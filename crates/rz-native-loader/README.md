@@ -1,5 +1,10 @@
 # NVIDIA native loader의 소유 경계
 
+> **현재 CUDA 실행 경계:** 아래의 bundle 기반 실행·복사 설명은 과거 기록이다.
+> 신규 bundle 기반 제품 실행과 bundle 복사 API는 명시적으로 거절하며,
+> V1/V5 기록·metadata 읽기는 보존한다. 시스템 CUDA는 별도 V3/V6 경로로
+> 준비 중이고 실제 GPU 인수는 별도로 확인해야 한다.
+
 이 crate는 GPU bootstrap가 선택한 **Linux CUDA 12/cuDNN 9 profile의 16개
 NVIDIA runtime ELF**만 `RTLD_NOW | RTLD_GLOBAL`로 로딩하고, 실제 mapped
 path·device·inode를 확인한다. concrete model·tensor·ORT session·search를 소유하지

@@ -1,5 +1,10 @@
 # rz-arena — E02 pair·원장·fixture와 CPU 신경망 연결
 
+> **현재 CUDA 실행 경계:** 아래의 bundle 기반 실행·복사 설명은 과거 기록이다.
+> 신규 bundle 기반 제품 실행과 bundle 복사 API는 명시적으로 거절하며,
+> V1/V5 기록·metadata 읽기는 보존한다. 시스템 CUDA는 별도 V3/V6 경로로
+> 준비 중이고 실제 GPU 인수는 별도로 확인해야 한다.
+
 ## 폰더링과 동시 엔진 자원 배분
 
 `model-pair`의 잠긴 V2 `match_execution`은 `ponder` on/off와 CPU/GPU/Hybrid 역할별
