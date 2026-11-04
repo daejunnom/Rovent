@@ -61,6 +61,25 @@ pub fn start_async<O: Write + Send + 'static, D: Write + Send + 'static>(
     max_output_bytes: usize,
     poll_interval: Duration,
 ) -> Result<AsyncEngineRun<O, D>, AsyncEngineStartFailure<O, D>> {
+    // Until the original run's pending output, writer and timer survive an
+    // unexpected caller drop in a recoverable owner, this opt-in path is not
+    // admitted. Return every original input intact; the synchronous CPU engine
+    // and other independent paths do not consult this guard.
+    const ORIGINAL_CUSTODY_DROP_RECOVERY_IMPLEMENTED: bool = false;
+    if !ORIGINAL_CUSTODY_DROP_RECOVERY_IMPLEMENTED {
+        return Err(AsyncEngineStartFailure {
+            error: failure(
+                contract::ErrorCode::UnsupportedContract,
+                "async engine original custody recovery unavailable",
+            )
+            .into(),
+            process,
+            events,
+            sender,
+            output,
+            close,
+        });
+    }
     if max_output_bytes == 0
         || poll_interval.is_zero()
         || !process

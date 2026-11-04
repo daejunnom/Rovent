@@ -2,7 +2,7 @@
 //! Model loading and physical execution remain the injected factory's responsibility.
 
 #[cfg(feature = "pals-adaptive")]
-pub mod async_engine;
+pub(crate) mod async_engine;
 pub mod diagnostics;
 #[cfg(feature = "pals-adaptive")]
 mod priority_cancel;
