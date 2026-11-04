@@ -663,6 +663,38 @@ fn supervisor_registry_v3() -> &'static Mutex<Vec<SupervisorRegistryEntryV3>> {
 
 impl SupervisorStartCustodyV3 {
     /// Nonblocking versions retain the original owners on contention/error.
+    pub(crate) fn try_joined_proof(
+        owner: &Arc<Mutex<Self>>,
+    ) -> Result<PcDriverPollV3<Option<PcSupervisorJoinedProofV3>>, PcDriverEvidenceErrorV3> {
+        let registry = driver_evidence_lock!(supervisor_registry_v3(), "registry");
+        if !registry
+            .iter()
+            .any(|entry| Arc::ptr_eq(&entry.custody, owner))
+        {
+            return Err(PcDriverEvidenceErrorV3::Invalid(
+                "original owner is not registered",
+            ));
+        }
+        let custody = driver_evidence_lock!(owner, "custody");
+        let Some(native) = custody.native.as_ref() else {
+            return Ok(PcDriverPollV3::Ready(None));
+        };
+        if !matches!(
+            custody.state,
+            SupervisorThreadStateV3::Joined | SupervisorThreadStateV3::JoinPanicked
+        ) || custody.thread.is_some()
+            || custody.stop_authorization.is_none()
+        {
+            return Ok(PcDriverPollV3::Ready(None));
+        }
+        Ok(PcDriverPollV3::Ready(Some(PcSupervisorJoinedProofV3 {
+            custody: Arc::clone(owner),
+            supervisor: Arc::clone(&custody.supervisor),
+            native: Arc::clone(native),
+            panicked: custody.state == SupervisorThreadStateV3::JoinPanicked,
+        })))
+    }
+
     pub(crate) fn try_before_admission_join_proof(
         owner: &Arc<Mutex<Self>>,
     ) -> Result<
