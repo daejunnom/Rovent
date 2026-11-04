@@ -51,6 +51,22 @@ pub(crate) enum TeacherPendingDrainV3 {
     Unknown,
 }
 
+/// Closed-input custody progress, never a sender fence or physical receipt.
+pub(crate) enum TeacherClosedDrainV3 {
+    Retained,
+    InputHeld,
+    EmptyNow,
+    Busy,
+    PendingDispatch,
+    Capacity,
+    Disconnected,
+}
+
+// The route permits at most 16 queued capsules and one already held delivery.
+// If a still-live sender refills the queue, retain the backpressure and wait
+// for the separate sender/callback fence; do not discard any capsule.
+const CLOSED_CAPSULE_CAPACITY: usize = 17;
+
 pub(crate) struct TeacherPumpSetupErrorV3 {
     pub error: String,
     pub receiver: Arc<Mutex<SpeculativeReceiverV3>>,
@@ -68,6 +84,8 @@ pub(crate) struct TeacherPumpV3 {
     receiver_failure: Option<&'static str>,
     pending_delivery_ack: bool,
     held: Option<Arc<SubmittedTeacherQueryV3>>,
+    // Same root pump is retained by the supervisor throughout shutdown.
+    closed_capsules: Vec<Arc<SubmittedTeacherQueryV3>>,
     completed: Option<TeacherCompletedV3>,
     terminal_backlog: Vec<TeacherCompletedV3>,
     rejected: Option<Box<TeacherRejectedV3>>,
@@ -122,6 +140,7 @@ impl TeacherPumpV3 {
             receiver_failure: None,
             pending_delivery_ack: false,
             held: None,
+            closed_capsules: Vec::new(),
             completed: None,
             terminal_backlog: Vec::new(),
             rejected: None,
@@ -449,66 +468,80 @@ impl TeacherPumpV3 {
     pub(crate) fn take_rejected(&mut self) -> Option<Box<TeacherRejectedV3>> {
         self.rejected.take()
     }
-    /// Transfer one held or queued capsule. This is custody only: it does not
-    /// attest that senders, native callbacks, or a raced dispatch have stopped.
-    pub(crate) fn take_held_or_queued(&mut self) -> Option<Arc<SubmittedTeacherQueryV3>> {
+    /// Retain at most one original undispatched capsule per call after
+    /// closing admission. The same root supervisor must retain this pump;
+    /// these slots are evidence, not a sender fence or physical completion.
+    /// A delivery is acknowledged only while its original Arc remains held.
+    pub(crate) fn try_closed_drain(&mut self) -> Result<TeacherClosedDrainV3, String> {
         if !self.closed {
-            return None;
+            return Err("V3 teacher closed drain requires closed admission".into());
         }
+        if let Some(reason) = self.receiver_failure {
+            return Err(reason.into());
+        }
+        if self.closed_capsules.len() >= CLOSED_CAPSULE_CAPACITY {
+            return Ok(TeacherClosedDrainV3::Capacity);
+        }
+        // Reserve before receiving or moving the original delivery.
+        self.closed_capsules
+            .try_reserve(1)
+            .map_err(|_| "V3 teacher closed capsule custody allocation failed".to_string())?;
         if let Some(held) = &self.held {
             if self
                 .dispatchers
                 .values()
                 .any(|dispatcher| dispatcher.pending_ticket() == Some(held.ticket()))
             {
-                return None;
+                return Ok(TeacherClosedDrainV3::PendingDispatch);
             }
+            if !self.acknowledge_delivery()? {
+                return Ok(TeacherClosedDrainV3::Busy);
+            }
+            // No callback or fallible operation between take and push.
+            self.closed_capsules
+                .push(self.held.take().expect("held delivery retained"));
+            return Ok(TeacherClosedDrainV3::Retained);
         }
-        if !self.acknowledge_delivery().ok()? {
-            return None;
-        }
-        if self.held.is_some() {
-            return self.held.take();
-        }
-        if self.receiver_failure.is_some() {
-            return None;
+        if self.pending_delivery_ack {
+            self.receiver_failure = Some("V3 teacher delivery custody absent");
+            return Err("V3 teacher delivery custody absent".into());
         }
         let outcome = match self.receiver.try_lock() {
             Ok(mut receiver) => receiver.try_recv(),
-            Err(TryLockError::WouldBlock) => return None,
+            Err(TryLockError::WouldBlock) => return Ok(TeacherClosedDrainV3::Busy),
             Err(TryLockError::Poisoned(_)) => {
                 self.receiver_failure = Some("V3 teacher original receiver poisoned");
-                return None;
+                return Err("V3 teacher original receiver poisoned".into());
             }
         };
         match outcome {
             Ok(Some(capsule)) => {
                 self.held = Some(capsule);
                 self.pending_delivery_ack = true;
-                None
+                Ok(TeacherClosedDrainV3::InputHeld)
             }
-            Ok(None) => None,
+            Ok(None) => Ok(TeacherClosedDrainV3::EmptyNow),
             Err(SpeculativeReceiveErrorV3::Disconnected) => {
                 self.input_disconnected = true;
-                None
+                Ok(TeacherClosedDrainV3::Disconnected)
             }
             Err(SpeculativeReceiveErrorV3::CounterOverflow(capsule)) => {
-                self.receiver_failure = Some("V3 teacher receiver counter overflow");
                 self.held = Some(capsule);
-                None
+                self.receiver_failure = Some("V3 teacher receiver counter overflow");
+                Err("V3 teacher receiver counter overflow".into())
             }
             Err(SpeculativeReceiveErrorV3::ForeignRoot(capsule)) => {
-                self.receiver_failure = Some("V3 teacher receiver foreign root");
                 self.held = Some(capsule);
-                None
+                self.receiver_failure = Some("V3 teacher receiver foreign root");
+                Err("V3 teacher receiver foreign root".into())
             }
             Err(SpeculativeReceiveErrorV3::CounterExhausted) => {
                 self.receiver_failure = Some("V3 teacher receiver counter exhausted");
-                None
+                Err("V3 teacher receiver counter exhausted".into())
             }
             Err(SpeculativeReceiveErrorV3::PendingDelivery) => {
                 self.receiver_failure = Some("V3 teacher receiver has unacknowledged delivery");
-                None
+                Err("V3 teacher receiver has unacknowledged delivery".into())
             }
         }
     }
