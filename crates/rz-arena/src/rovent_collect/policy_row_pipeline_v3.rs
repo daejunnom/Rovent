@@ -17,7 +17,8 @@ use super::teacher::v3_policy::RoventSealedTeacherPolicyV3;
 use super::writer_lock_v3::{
     FinishedRoventCorpusLockV3, PolicyAppendResultV3, RoventCorpusWriterLockV3,
 };
-use super::{ArenaError, RoventChunkPacket};
+use super::{ArenaError, MAX_CORPUS_ROWS, RoventChunkPacket};
+use rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 /// A failure remains in the same owner; an uncertain append also retains the
@@ -61,6 +62,7 @@ pub(super) enum PolicyPrepareOutcomeV3 {
 }
 
 pub(super) struct PolicyRowPipelineV3 {
+    identity: Arc<()>,
     row: Option<RoventRetiredLockV3Record>,
     prepared: Option<PreparedTeacherPolicyLockV3>,
     pending: Option<PendingPolicyPublicationV3>,
@@ -81,6 +83,27 @@ pub(super) struct PolicyRowPipelineOwnerV3(Arc<Mutex<PolicyRowPipelineV3>>);
 #[derive(Clone)]
 pub(super) struct PolicyOutputOwnerV3(PolicyRowPipelineOwnerV3);
 
+struct PolicyRootRetainedV3 {
+    pipeline_identity: Arc<()>,
+    admission: RoventCollectionRootAdmissionV3,
+    maximum: usize,
+    completed: Vec<PendingPolicyPublicationV3>,
+}
+
+/// Original per-root retention, registered with the supervisor before the
+/// worker starts. Retention does not prove worker join or physical release.
+#[derive(Clone)]
+pub(super) struct PolicyRootRetainedOwnerV3(Arc<Mutex<PolicyRootRetainedV3>>);
+
+pub(super) enum PolicyRetentionOutcomeV3 {
+    Transferred,
+    Busy,
+    NotReady,
+    Capacity,
+    /// The shared game slot currently holds another legitimate root.
+    OtherRoot,
+}
+
 /// Retention observation only; none of these flags proves durable output,
 /// target validity, worker join, or permission to release an owner.
 pub(super) struct PolicyOutputStatusV3 {
@@ -92,6 +115,7 @@ pub(super) struct PolicyOutputStatusV3 {
 impl PolicyRowPipelineOwnerV3 {
     pub(super) fn new(writer: RoventCorpusWriterLockV3) -> Self {
         Self(Arc::new(Mutex::new(PolicyRowPipelineV3 {
+            identity: Arc::new(()),
             row: None,
             prepared: None,
             pending: None,
@@ -123,6 +147,55 @@ impl PolicyRowPipelineOwnerV3 {
 
     pub(super) fn output_owner(&self) -> PolicyOutputOwnerV3 {
         PolicyOutputOwnerV3(self.clone())
+    }
+}
+
+impl PolicyRootRetainedOwnerV3 {
+    /// `None` is temporary pipeline contention; no root owner is created.
+    pub(super) fn try_new(
+        pipeline: &PolicyRowPipelineOwnerV3,
+        admission: RoventCollectionRootAdmissionV3,
+        maximum: usize,
+    ) -> Result<Option<Self>, &'static str> {
+        if maximum == 0 || maximum > MAX_CORPUS_ROWS as usize {
+            return Err("V3 policy retention capacity invalid");
+        }
+        let Some(owner) = pipeline.try_lock()? else {
+            return Ok(None);
+        };
+        Ok(Some(Self(Arc::new(Mutex::new(PolicyRootRetainedV3 {
+            pipeline_identity: Arc::clone(&owner.identity),
+            admission,
+            maximum,
+            completed: Vec::new(),
+        })))))
+    }
+
+    pub(super) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Checks only identity of the pre-registered owners. None is Busy;
+    /// neither result proves worker or teacher completion.
+    pub(super) fn try_matches(
+        &self,
+        pipeline: &PolicyRowPipelineOwnerV3,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<Option<bool>, &'static str> {
+        // Follow the same pipeline -> root retention nonblocking order as
+        // transfer. No caller may hold retention and wait for pipeline.
+        let Some(pipeline) = pipeline.try_lock()? else {
+            return Ok(None);
+        };
+        let retained = match self.0.try_lock() {
+            Ok(retained) => retained,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err("V3 policy root retention poisoned"),
+        };
+        Ok(Some(
+            Arc::ptr_eq(&pipeline.identity, &retained.pipeline_identity)
+                && retained.admission.same_original_admission(admission),
+        ))
     }
 }
 
@@ -397,6 +470,47 @@ impl PolicyRowPipelineV3 {
         self.output_completed = self.pending.take();
         self.appended = false;
         true
+    }
+
+    /// Move completed evidence only to the supervisor's root-bound owner,
+    /// checking both the original game pipeline and original root. Both
+    /// owners remain separately retained; no physical completion is inferred.
+    pub(super) fn try_retain_completed(
+        &mut self,
+        target: &PolicyRootRetainedOwnerV3,
+    ) -> Result<PolicyRetentionOutcomeV3, ArenaError> {
+        let Some(completed) = self.output_completed.as_ref() else {
+            return Ok(PolicyRetentionOutcomeV3::NotReady);
+        };
+        let mut target = match target.0.try_lock() {
+            Ok(target) => target,
+            Err(TryLockError::WouldBlock) => return Ok(PolicyRetentionOutcomeV3::Busy),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(super::invalid("V3 policy root retention poisoned"));
+            }
+        };
+        if !Arc::ptr_eq(&self.identity, &target.pipeline_identity) {
+            return Err(super::invalid("V3 policy retention pipeline differs"));
+        }
+        if !completed
+            .original_admission()
+            .same_original_admission(&target.admission)
+        {
+            return Ok(PolicyRetentionOutcomeV3::OtherRoot);
+        }
+        if target.completed.len() >= target.maximum {
+            return Ok(PolicyRetentionOutcomeV3::Capacity);
+        }
+        target
+            .completed
+            .try_reserve(1)
+            .map_err(|_| super::invalid("V3 policy retention allocation"))?;
+        let original = self
+            .output_completed
+            .take()
+            .expect("validated original output");
+        target.completed.push(original);
+        Ok(PolicyRetentionOutcomeV3::Transferred)
     }
 
     /// A successful packet remains in this same original output owner.
