@@ -2042,7 +2042,15 @@ fn drive_pc_scope_effect_v3(
     let PcScopeEffectSlotsV3 { proof, teacher_source, game_source, claim, outcome,
         issue_error, source_error, claim_error, completion_error, source_step, claim_step,
         completion_step, finished } = &mut *slots;
-    if *finished { return PcScopeDriveV3::Finished; }
+    if *finished {
+        // Effect settlement and a successful scope claim are separate. Keep
+        // a known rejected original outcome rejected on every re-observation.
+        return if matches!(outcome.as_ref(), Some(Ok(_))) {
+            PcScopeDriveV3::Finished
+        } else {
+            PcScopeDriveV3::Failed
+        };
+    }
     if issue_error.is_some() || source_error.is_some() || claim_error.is_some() || completion_error.is_some() {
         return PcScopeDriveV3::Failed;
     }
