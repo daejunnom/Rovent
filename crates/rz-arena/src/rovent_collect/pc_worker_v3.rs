@@ -12,17 +12,22 @@ use super::pc_hooks_lock_v3::{
 use super::speculative_route_v3::{SpeculativeReceiverV3, SpeculativeRootV3};
 use super::teacher::v3_pump::{TeacherPumpSetupErrorV3, TeacherPumpStepV3, TeacherPumpV3};
 use super::teacher::v3_session::{
-    RoventCollectionTeacherSessionV3, TeacherPrepareErrorV3, TeacherSessionStagingV3,
+    RoventCollectionTeacherSessionV3, TeacherPrepareErrorV3, TeacherPrepareOwnerV3,
+    TeacherSessionClaimErrorV3, TeacherSessionStageStateV3, TeacherSessionStagingV3,
     TeacherStartErrorV3,
 };
 use rz_search::external_cpu::collection_teacher::TeacherDiagnostics;
-use rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3;
+use rz_uci::pals_adaptive::{
+    AdaptiveCollectionError, RoventCollectionRootAdmissionV3, RoventTeacherScopeCapabilityV3,
+    RoventTeacherScopePhysicalAckV3, RoventTeacherScopeWorkerAckV3,
+};
 use rz_uci::rovent_bootstrap::pc_collection_v3::{
     RootHandoffV3, RoventPcCollectionWorkerKeyV3, RoventPcCollectionWorkerSpawnFailureV3,
     RoventPcCollectionWorkerV3,
 };
 use rz_uci::rovent_external_launch::{
-    RoventTeacherScopeAggregateAckV3, TeacherRecoveryCustodianV3,
+    RoventTeacherScopeAggregateAckV3, RoventTeacherScopeAggregateFailureV3,
+    TeacherRecoveryCustodianV3,
 };
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use std::time::{Duration, Instant};
@@ -33,6 +38,11 @@ pub(crate) struct PcRootRecoveryV3 {
     admission: RoventCollectionRootAdmissionV3,
     stage: Option<Arc<Mutex<TeacherSessionStagingV3>>>,
     preflight_failure: Option<TeacherPrepareErrorV3>,
+    stage_claim_failure: Option<TeacherSessionClaimErrorV3>,
+    claimed_unstarted: Option<ClaimedUnstartedV3>,
+    claimed_unstarted_release: NoScopeRecoveryV3,
+    sealed_claimed_unstarted: bool,
+    unmatched_claim_owner: Option<TeacherPrepareOwnerV3>,
     route: Option<SpeculativeRootV3>,
     receiver: Option<Arc<Mutex<SpeculativeReceiverV3>>>,
     owner: Option<RoventCollectionOwnerLockV3>,
@@ -63,6 +73,11 @@ impl PcRootRecoveryV3 {
             admission,
             stage: None,
             preflight_failure: None,
+            stage_claim_failure: None,
+            claimed_unstarted: None,
+            claimed_unstarted_release: NoScopeRecoveryV3::Pending,
+            sealed_claimed_unstarted: false,
+            unmatched_claim_owner: None,
             route: None,
             receiver: None,
             owner: None,
@@ -171,6 +186,233 @@ pub(crate) enum NoScopeRecoveryV3 {
     Pending,
     Complete,
     Unknown,
+}
+
+struct ClaimedUnstartedV3 {
+    capability: RoventTeacherScopeCapabilityV3,
+    physical: Option<RoventTeacherScopePhysicalAckV3>,
+    workers: Option<RoventTeacherScopeWorkerAckV3>,
+    failure: Option<RoventTeacherScopeAggregateFailureV3>,
+    aggregate: Option<RoventTeacherScopeAggregateAckV3>,
+    closed: bool,
+    unknown: bool,
+    scope_error: Option<AdaptiveCollectionError>,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClaimedUnstartedPollV3 {
+    Pending,
+    Confirmed,
+    Ineligible,
+    Unknown,
+}
+
+impl PcRootRecoveryV3 {
+    /// Same-root, same-issuer no-child/no-thread evidence; not a no-scope
+    /// seal, native completion, corpus acceptance or a teacher result.
+    pub(crate) fn claimed_unstarted_aggregate(&self) -> Option<&RoventTeacherScopeAggregateAckV3> {
+        self.claimed_unstarted.as_ref()?.aggregate.as_ref()
+    }
+
+    pub(crate) fn seal_claimed_unstarted(&mut self) -> bool {
+        if !self
+            .claimed_unstarted
+            .as_ref()
+            .is_some_and(|owner| owner.aggregate.is_some())
+            || self.try_claimed_unstarted() != ClaimedUnstartedPollV3::Confirmed
+        {
+            return false;
+        }
+        self.sealed_claimed_unstarted = true;
+        true
+    }
+
+    pub(crate) fn is_sealed_claimed_unstarted(&self) -> bool {
+        self.sealed_claimed_unstarted
+    }
+
+    pub(crate) fn try_claimed_unstarted(&mut self) -> ClaimedUnstartedPollV3 {
+        use rz_search::external_cpu::process_scope::{
+            CollectionMemberPhysicalState as P, CollectionMemberWorkerState as W,
+        };
+        if self.failure.is_none()
+            || !self.teacher_reserved
+            || self.next_actor != 0
+            || self.actor_start_failure.is_some()
+            || self.preflight_failure.is_some()
+            || !self.custodian.keys().is_empty()
+            || self.route.is_some()
+            || self.receiver.is_some()
+            || self.owner.is_some()
+            || self.pump.is_some()
+            || self.pump_setup_failure.is_some()
+            || self.pump_setup_unknown
+            || self.worker.is_some()
+            || self.worker_spawn_failure.is_some()
+            || self.worker_key.is_some()
+            || self.handoff.is_some()
+            || self.aggregate.is_some()
+            || !self.diagnostics.is_empty()
+            || self.prepared.is_some()
+            || self.published
+            || self.panic.is_some()
+            || self.sealed_unstarted
+            || self.unmatched_claim_owner.is_some()
+        {
+            return ClaimedUnstartedPollV3::Ineligible;
+        }
+        if self.claimed_unstarted.is_none() {
+            let Some(stage_owner) = self.stage.as_ref().map(Arc::clone) else {
+                return ClaimedUnstartedPollV3::Ineligible;
+            };
+            let mut stage = match stage_owner.try_lock() {
+                Ok(stage) => stage,
+                Err(std::sync::TryLockError::WouldBlock) => return ClaimedUnstartedPollV3::Pending,
+                Err(_) => return ClaimedUnstartedPollV3::Unknown,
+            };
+            if stage.state() != TeacherSessionStageStateV3::AfterClaimRejected {
+                return ClaimedUnstartedPollV3::Ineligible;
+            }
+            let capability = match stage.take_rejected_owner() {
+                Some(TeacherPrepareOwnerV3::Claimed(capability)) => capability,
+                Some(original) => {
+                    self.unmatched_claim_owner = Some(original);
+                    return ClaimedUnstartedPollV3::Unknown;
+                }
+                None => return ClaimedUnstartedPollV3::Unknown,
+            };
+            self.claimed_unstarted = Some(ClaimedUnstartedV3 {
+                capability,
+                physical: None,
+                workers: None,
+                failure: None,
+                aggregate: None,
+                closed: false,
+                unknown: false,
+                scope_error: None,
+                panic: None,
+            });
+        }
+        let recovery = self
+            .claimed_unstarted
+            .as_mut()
+            .expect("original claimed scope retained");
+        if recovery.unknown {
+            return ClaimedUnstartedPollV3::Unknown;
+        }
+        if recovery.aggregate.is_some() {
+            return ClaimedUnstartedPollV3::Confirmed;
+        }
+        if !recovery.closed {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                recovery.capability.close()
+            }));
+            match result {
+                Ok(Ok(())) => recovery.closed = true,
+                Ok(Err(error)) => {
+                    if recovery.scope_error.is_none() {
+                        recovery.scope_error = Some(error);
+                    }
+                    return ClaimedUnstartedPollV3::Pending;
+                }
+                Err(payload) => {
+                    recovery.panic = Some(payload);
+                    recovery.unknown = true;
+                    return ClaimedUnstartedPollV3::Unknown;
+                }
+            }
+        }
+        if recovery.physical.is_none() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                recovery.capability.try_physical_retirement()
+            }));
+            match result {
+                Ok(Ok(Some(ack))) => recovery.physical = Some(ack),
+                Ok(Ok(None)) => return ClaimedUnstartedPollV3::Pending,
+                Ok(Err(error)) => {
+                    if recovery.scope_error.is_none() {
+                        recovery.scope_error = Some(error);
+                    }
+                    recovery.unknown = true;
+                    return ClaimedUnstartedPollV3::Unknown;
+                }
+                Err(payload) => {
+                    recovery.panic = Some(payload);
+                    recovery.unknown = true;
+                    return ClaimedUnstartedPollV3::Unknown;
+                }
+            }
+        }
+        if recovery.workers.is_none() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                recovery.capability.try_worker_retirement()
+            }));
+            match result {
+                Ok(Ok(Some(ack))) => recovery.workers = Some(ack),
+                Ok(Ok(None)) => return ClaimedUnstartedPollV3::Pending,
+                Ok(Err(error)) => {
+                    if recovery.scope_error.is_none() {
+                        recovery.scope_error = Some(error);
+                    }
+                    recovery.unknown = true;
+                    return ClaimedUnstartedPollV3::Unknown;
+                }
+                Err(payload) => {
+                    recovery.panic = Some(payload);
+                    recovery.unknown = true;
+                    return ClaimedUnstartedPollV3::Unknown;
+                }
+            }
+        }
+        let physical = recovery
+            .physical
+            .as_ref()
+            .expect("physical evidence retained");
+        let workers = recovery.workers.as_ref().expect("worker evidence retained");
+        let valid = physical.matches_admission(&self.admission)
+            && workers.matches_admission(&self.admission)
+            && physical.scope_outcome().is_some_and(|p| {
+                let w = workers.outcome();
+                p.same_issuer_as_worker(w)
+                    && !p.members().is_empty()
+                    && p.members().len() == w.members().len()
+                    && p.members()
+                        .iter()
+                        .zip(w.members())
+                        .all(|((pr, ps), (wr, ws))| {
+                            pr == wr && *ps == P::NeverIssuedNoChild && *ws == W::NoThread
+                        })
+            });
+        if !valid {
+            recovery.unknown = true;
+            return ClaimedUnstartedPollV3::Unknown;
+        }
+        let physical = recovery
+            .physical
+            .take()
+            .expect("physical evidence retained");
+        let workers = recovery.workers.take().expect("worker evidence retained");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            RoventTeacherScopeAggregateAckV3::try_build(physical, Some(workers), Vec::new())
+        }));
+        match result {
+            Ok(Ok(aggregate)) => {
+                recovery.aggregate = Some(aggregate);
+                ClaimedUnstartedPollV3::Confirmed
+            }
+            Ok(Err(failure)) => {
+                recovery.failure = Some(failure);
+                recovery.unknown = true;
+                ClaimedUnstartedPollV3::Unknown
+            }
+            Err(payload) => {
+                recovery.panic = Some(payload);
+                recovery.unknown = true;
+                ClaimedUnstartedPollV3::Unknown
+            }
+        }
+    }
 }
 
 /// Bounded supervisor; each original root remains owned even if a different
@@ -284,6 +526,19 @@ pub(crate) fn prepare_root_step_v3(
     if state.failure.is_some() {
         let unstarted =
             state.definitely_unstarted() && state.no_scope_recovery == NoScopeRecoveryV3::Pending;
+        let claimed = if !unstarted && state.claimed_unstarted_release == NoScopeRecoveryV3::Pending
+        {
+            match state.try_claimed_unstarted() {
+                ClaimedUnstartedPollV3::Confirmed | ClaimedUnstartedPollV3::Pending => true,
+                ClaimedUnstartedPollV3::Unknown => {
+                    state.claimed_unstarted_release = NoScopeRecoveryV3::Unknown;
+                    false
+                }
+                ClaimedUnstartedPollV3::Ineligible => false,
+            }
+        } else {
+            false
+        };
         drop(state);
         if unstarted {
             let result = bridge.try_release_unstarted_teacher(&admission, recovery);
@@ -294,9 +549,20 @@ pub(crate) fn prepare_root_step_v3(
                 Ok(Some(false)) | Err(_) => state.no_scope_recovery = NoScopeRecoveryV3::Unknown,
             }
         }
+        if claimed {
+            let result = bridge.try_release_claimed_unstarted_teacher(&admission, recovery);
+            let mut state = recovery.lock().map_err(|_| "P-C V3 recovery poisoned")?;
+            match result {
+                Ok(Some(true)) => state.claimed_unstarted_release = NoScopeRecoveryV3::Complete,
+                Ok(None) => {}
+                Ok(Some(false)) | Err(_) => {
+                    state.claimed_unstarted_release = NoScopeRecoveryV3::Unknown
+                }
+            }
+        }
         return Ok(PcPrepareStepV3::Failed);
     }
-    if state.sealed_unstarted {
+    if state.sealed_unstarted || state.sealed_claimed_unstarted {
         state.failure = Some("P-C V3 unstarted root was sealed".into());
         return Ok(PcPrepareStepV3::Failed);
     }
@@ -353,7 +619,8 @@ pub(crate) fn prepare_root_step_v3(
         use super::teacher::v3_session::TeacherSessionStageStateV3 as S;
         match staged.state() {
             S::Prepared => {
-                if staged.claim().is_err() {
+                if let Err(error) = staged.claim() {
+                    state.stage_claim_failure = Some(error);
                     state.failure = Some("teacher scope claim unresolved or rejected".into());
                     return Ok(PcPrepareStepV3::Failed);
                 }
