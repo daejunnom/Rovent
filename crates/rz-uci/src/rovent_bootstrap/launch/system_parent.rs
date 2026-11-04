@@ -29,6 +29,12 @@ const IMAGE_GRANT_SCHEMA: &str = "rz-pals-system-image-grant/1";
 const IMAGE_ACK_SCHEMA: &str = "rz-pals-system-image-grant-ack/1";
 #[cfg(feature = "onnx-cuda")]
 const IMAGE_SCOPE: &str = "same-child-image-observed-not-gpu-fence";
+#[cfg(feature = "onnx-cuda")]
+const CLEANUP_REQUEST_SCHEMA: &str = "rz-pals-child-cleanup-request/1";
+#[cfg(feature = "onnx-cuda")]
+const CLEANUP_GRANT_SCHEMA: &str = "rz-pals-child-cleanup-grant/1";
+#[cfg(feature = "onnx-cuda")]
+const CLEANUP_ACK_SCHEMA: &str = "rz-pals-child-cleanup-ack/1";
 const FRAME_LIMIT: usize = 4096;
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +80,19 @@ struct ImageGrantAck<'a> {
     scope: &'static str,
 }
 
+#[cfg(feature = "onnx-cuda")]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupFrame {
+    schema: String,
+    child_pid: u32,
+    process_epoch: u64,
+    lock_sha256: String,
+    cuda_ordinal: i32,
+    request_id: u64,
+    remaining_ns: u64,
+}
+
 /// Original socket and context. Only the parent launch module can construct it.
 /// An `Arc<ConnectedParent>` can retain this very stream in the launch scope.
 pub(crate) struct ConnectedParent {
@@ -94,6 +113,9 @@ pub(crate) struct ConnectedParent {
 pub(crate) struct PalsPostImageAdmissionV6 {
     parent: Arc<ConnectedParent>,
     control: UnixStream,
+    cleanup_exchange_started: bool,
+    cleanup_sent: Vec<u8>,
+    cleanup_received: Vec<u8>,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -272,6 +294,118 @@ fn read_image_grant(
         }
     }
     serde_json::from_slice(&frame).map_err(|_| invalid("invalid image grant frame"))
+}
+
+#[cfg(feature = "onnx-cuda")]
+fn read_cleanup_frame(
+    stream: &mut UnixStream,
+    until: Instant,
+    cancelled: &AtomicBool,
+    received: &mut Vec<u8>,
+) -> io::Result<CleanupFrame> {
+    let mut frame = Vec::with_capacity(256);
+    loop {
+        stream.set_read_timeout(Some(checked_wait(until, Some(cancelled))?))?;
+        let mut byte = [0u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "cleanup deadline channel closed",
+                ));
+            }
+            Ok(_) if byte[0] == b'\n' => {
+                received.push(byte[0]);
+                break;
+            }
+            Ok(_) if frame.len() < FRAME_LIMIT - 1 => {
+                frame.push(byte[0]);
+                received.push(byte[0]);
+            }
+            Ok(_) => {
+                received.push(byte[0]);
+                return Err(invalid("cleanup deadline frame exceeds bound"));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    serde_json::from_slice(&frame).map_err(|_| invalid("invalid cleanup deadline frame"))
+}
+
+#[cfg(feature = "onnx-cuda")]
+fn conservative_cleanup_deadline(
+    requested_at: Instant,
+    remaining_ns: u64,
+    local_cap: Instant,
+    now: Instant,
+) -> io::Result<Instant> {
+    if remaining_ns == 0 {
+        return Err(invalid("cleanup deadline grant has no remaining time"));
+    }
+    let deadline = requested_at
+        .checked_add(std::time::Duration::from_nanos(remaining_ns))
+        .ok_or_else(|| invalid("cleanup deadline overflow"))?
+        .min(local_cap);
+    if now >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "cleanup deadline expired",
+        ));
+    }
+    Ok(deadline)
+}
+
+#[cfg(feature = "onnx-cuda")]
+fn write_cleanup_frame(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    until: Instant,
+    cancelled: &AtomicBool,
+    sent: &mut Vec<u8>,
+) -> io::Result<()> {
+    if bytes.len() >= FRAME_LIMIT {
+        return Err(invalid("cleanup deadline frame exceeds bound"));
+    }
+    let mut frame = bytes.to_vec();
+    frame.push(b'\n');
+    let mut offset = 0;
+    while offset < frame.len() {
+        stream.set_write_timeout(Some(checked_wait(until, Some(cancelled))?))?;
+        match stream.write(&frame[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "cleanup deadline frame not written",
+                ));
+            }
+            Ok(count) => {
+                sent.extend_from_slice(&frame[offset..offset + count]);
+                offset += count;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "onnx-cuda")]
@@ -619,12 +753,130 @@ impl ConnectedParent {
         Ok(PalsPostImageAdmissionV6 {
             parent: Arc::clone(self),
             control,
+            cleanup_exchange_started: false,
+            cleanup_sent: Vec::new(),
+            cleanup_received: Vec::new(),
         })
     }
 }
 
 #[cfg(feature = "onnx-cuda")]
 impl PalsPostImageAdmissionV6 {
+    /// Transport progress only; an incomplete write can have reached the peer.
+    pub(crate) fn cleanup_exchange_progress(&self) -> (&[u8], &[u8]) {
+        (&self.cleanup_sent, &self.cleanup_received)
+    }
+    /// Derive a conservative local deadline from the original direct parent.
+    /// This exchange is optional and single-use; a failed exchange leaves the
+    /// same stream in this owner, with delivery potentially unknown.
+    pub(crate) fn receive_cleanup_deadline_once(
+        &mut self,
+        io_until: Instant,
+        local_cap: Instant,
+        cancelled: &Arc<AtomicBool>,
+    ) -> io::Result<Instant> {
+        if self.cleanup_exchange_started {
+            return Err(invalid("cleanup deadline exchange already attempted"));
+        }
+        self.cleanup_exchange_started = true;
+        let original = self
+            .parent
+            .original_cancelled
+            .as_ref()
+            .ok_or_else(|| invalid("original parent cancellation owner unavailable"))?;
+        if !Arc::ptr_eq(original, cancelled) {
+            return Err(invalid(
+                "cleanup deadline cancellation owner differs from original",
+            ));
+        }
+        let io_until = io_until.min(self.parent.original_until);
+        self.parent.ensure_live()?;
+        validate_peer(
+            &self.control,
+            self.parent.parent_pid,
+            self.parent.parent_uid,
+        )?;
+        let request = CleanupFrame {
+            schema: CLEANUP_REQUEST_SCHEMA.into(),
+            child_pid: getpid().as_raw() as u32,
+            process_epoch: self.parent.process_epoch,
+            lock_sha256: self.parent.lock_sha256.clone(),
+            cuda_ordinal: self.parent.cuda_ordinal,
+            request_id: 1,
+            remaining_ns: 0,
+        };
+        let bytes = serde_json::to_vec(&request)
+            .map_err(|_| invalid("cannot encode cleanup deadline request"))?;
+        let requested_at = Instant::now();
+        write_cleanup_frame(
+            &mut self.control,
+            &bytes,
+            io_until,
+            cancelled,
+            &mut self.cleanup_sent,
+        )?;
+        let grant = read_cleanup_frame(
+            &mut self.control,
+            io_until,
+            cancelled,
+            &mut self.cleanup_received,
+        )?;
+        if grant.schema != CLEANUP_GRANT_SCHEMA
+            || grant.child_pid != request.child_pid
+            || grant.process_epoch != request.process_epoch
+            || grant.lock_sha256 != request.lock_sha256
+            || grant.cuda_ordinal != request.cuda_ordinal
+            || grant.request_id != request.request_id
+            || grant.remaining_ns == 0
+        {
+            return Err(invalid(
+                "cleanup deadline grant differs from original request",
+            ));
+        }
+        let deadline = conservative_cleanup_deadline(
+            requested_at,
+            grant.remaining_ns,
+            local_cap,
+            Instant::now(),
+        )?;
+        self.parent.ensure_live()?;
+        validate_peer(
+            &self.control,
+            self.parent.parent_pid,
+            self.parent.parent_uid,
+        )?;
+        let ack = CleanupFrame {
+            schema: CLEANUP_ACK_SCHEMA.into(),
+            ..grant
+        };
+        let bytes = serde_json::to_vec(&ack)
+            .map_err(|_| invalid("cannot encode cleanup deadline acknowledgement"))?;
+        write_cleanup_frame(
+            &mut self.control,
+            &bytes,
+            io_until,
+            cancelled,
+            &mut self.cleanup_sent,
+        )?;
+        checked_wait(io_until, Some(cancelled))?;
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "cleanup deadline expired",
+            ));
+        }
+        self.parent.ensure_live()?;
+        validate_peer(
+            &self.control,
+            self.parent.parent_pid,
+            self.parent.parent_uid,
+        )?;
+        self.control.set_read_timeout(None)?;
+        self.control.set_write_timeout(None)?;
+        control_channel_is_open(&self.control)?;
+        Ok(deadline)
+    }
+
     /// Compare the original in-process owner, not only its claimed PID or
     /// launch values. This observation grants no new admission or fence.
     pub(crate) fn belongs_to_parent(&self, parent: &Arc<ConnectedParent>) -> bool {
@@ -668,6 +920,50 @@ impl PalsPostImageAdmissionV6 {
 mod tests {
     use super::*;
     use std::{io::Write, os::unix::net::UnixStream, time::Duration};
+
+    #[cfg(feature = "onnx-cuda")]
+    #[test]
+    fn cleanup_deadline_is_anchored_before_request_and_respects_local_cap() {
+        let start = Instant::now();
+        let local_cap = start + Duration::from_secs(8);
+        let now = start + Duration::from_secs(3);
+        assert_eq!(
+            conservative_cleanup_deadline(start, 10_000_000_000, local_cap, now).unwrap(),
+            local_cap
+        );
+        assert_eq!(
+            conservative_cleanup_deadline(start, 5_000_000_000, local_cap, now).unwrap(),
+            start + Duration::from_secs(5)
+        );
+        assert_eq!(
+            conservative_cleanup_deadline(start, 3_000_000_000, local_cap, now)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(conservative_cleanup_deadline(start, 0, local_cap, now).is_err());
+    }
+
+    #[cfg(feature = "onnx-cuda")]
+    #[test]
+    fn cleanup_deadline_partial_frame_is_retained_on_eof() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let partial = b"{\"schema\":\"incomplete";
+        writer.write_all(partial).unwrap();
+        drop(writer);
+        let mut received = Vec::new();
+        let error = match read_cleanup_frame(
+            &mut reader,
+            Instant::now() + Duration::from_secs(1),
+            &AtomicBool::new(false),
+            &mut received,
+        ) {
+            Ok(_) => panic!("incomplete frame was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(received, partial);
+    }
 
     #[cfg(feature = "onnx-cuda")]
     #[test]
