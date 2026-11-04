@@ -48,6 +48,7 @@ pub(super) enum PolicyPipelineFailureV3 {
     PublicationBeforeWrite(String),
     PublicationUnknown(String),
     PublicationPanic(Box<dyn std::any::Any + Send>),
+    ReceiptReadPanic(Box<dyn std::any::Any + Send>),
 }
 
 /// Pipeline-local result only; worker, native and parent lease termination
@@ -221,7 +222,7 @@ impl PolicyRowPipelineOwnerV3 {
     /// Return an immutable receipt observation for the same original game.
     /// The original receipt and finished writer stay in this pipeline owner.
     pub(super) fn try_read_receipt<S>(&self, guard: &GamePublishGuardV3<S>) -> PolicyReceiptReadV3 {
-        let state = match self.try_lock() {
+        let mut state = match self.try_lock() {
             Ok(Some(state)) => state,
             Ok(None) => return PolicyReceiptReadV3::Busy,
             Err(_) => return PolicyReceiptReadV3::Unknown,
@@ -235,9 +236,15 @@ impl PolicyRowPipelineOwnerV3 {
         if !guard.matches_original_game(origin) {
             return PolicyReceiptReadV3::Foreign;
         }
-        match state.output_publication.as_ref() {
-            Some(receipt) => PolicyReceiptReadV3::Available(receipt.clone()),
-            None => PolicyReceiptReadV3::NotReady,
+        let Some(receipt) = state.output_publication.as_ref() else {
+            return PolicyReceiptReadV3::NotReady;
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| receipt.clone())) {
+            Ok(receipt) => PolicyReceiptReadV3::Available(receipt),
+            Err(payload) => {
+                state.failure = Some(PolicyPipelineFailureV3::ReceiptReadPanic(payload));
+                PolicyReceiptReadV3::Unknown
+            }
         }
     }
 
@@ -608,6 +615,7 @@ impl PolicyRowPipelineV3 {
                     | PolicyPipelineFailureV3::ChunkPanic(_)
                     | PolicyPipelineFailureV3::PublicationUnknown(_)
                     | PolicyPipelineFailureV3::PublicationPanic(_)
+                    | PolicyPipelineFailureV3::ReceiptReadPanic(_)
             ) | Some(PolicyPipelineFailureV3::GateRejected(
                 TargetBeginRejectionV3::Uncertain
                     | TargetBeginRejectionV3::Poisoned
