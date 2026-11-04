@@ -277,6 +277,15 @@ pub trait AdaptiveCollectionObserverV3<Q, O>: Send {
         &mut self,
         admission: &RoventCollectionRootAdmissionV3,
     ) -> Result<(), AdaptiveCollectionError>;
+    /// Busy leaves this admission unapplied. The caller retains the same
+    /// original admission and observer and may retry without reissuing them.
+    fn try_admitted(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.admitted(admission)
+            .map(|()| AdaptiveCollectionBoundaryV2::Ready)
+    }
     /// `Captured` admits the original reservation for this exact ticket. The
     /// native capture occurs later and must be independently confirmed before
     /// the ticket's collection retirement.
