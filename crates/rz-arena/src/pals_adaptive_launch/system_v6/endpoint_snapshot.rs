@@ -73,6 +73,7 @@ impl<'a> PalsV6EndpointSnapshot<'a> {
         self.sidecar.validate_for_pair(pair)?;
         let endpoint = pair.endpoint(self.role);
         let snapshot = &self.owner.snapshot;
+        verify_snapshot_root(snapshot)?;
         linux::verify_input_directories(
             &snapshot.directory,
             &snapshot.input_directory,
@@ -90,6 +91,7 @@ impl<'a> PalsV6EndpointSnapshot<'a> {
         verify_held_bytes(&self.lock.file, &bytes)?;
         // Recheck names and ancestors after the read; this is an observation,
         // not a claim that an independently writable filesystem is immutable.
+        verify_snapshot_root(snapshot)?;
         linux::verify_input_directories(
             &snapshot.directory,
             &snapshot.input_directory,
@@ -121,6 +123,35 @@ impl<'a> PalsV6EndpointSnapshot<'a> {
     pub(crate) fn role(&self) -> NativeEngineRole {
         self.role
     }
+}
+
+fn verify_snapshot_root(snapshot: &Snapshot) -> Result<(), ArenaError> {
+    if !snapshot.path.is_absolute() {
+        return Err(invalid("PALS V6 snapshot root is not absolute"));
+    }
+    let held = snapshot
+        .cwd
+        .metadata()
+        .map_err(|_| invalid("PALS V6 original snapshot root unavailable"))?;
+    let capability = snapshot
+        .directory
+        .try_clone()
+        .map_err(|_| invalid("PALS V6 snapshot root capability unavailable"))?
+        .into_std_file()
+        .metadata()
+        .map_err(|_| invalid("PALS V6 snapshot root metadata unavailable"))?;
+    let named = std::fs::symlink_metadata(&snapshot.path)
+        .map_err(|_| invalid("PALS V6 snapshot root pathname unavailable"))?;
+    if !held.is_dir()
+        || !capability.is_dir()
+        || !named.is_dir()
+        || named.file_type().is_symlink()
+        || (held.dev(), held.ino()) != (capability.dev(), capability.ino())
+        || (held.dev(), held.ino()) != (named.dev(), named.ino())
+    {
+        return Err(invalid("PALS V6 snapshot root differs from original owner"));
+    }
+    Ok(())
 }
 
 fn verify_named_pin(
