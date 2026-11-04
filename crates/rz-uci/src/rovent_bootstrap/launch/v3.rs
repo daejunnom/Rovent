@@ -2575,7 +2575,10 @@ pub(super) fn run_native_admitted(
                         Ok(Ok(Some(
                             crate::search_driver::DriverPhysicalCompletion::Confirmed
                         )))
-                    ) && $driver.physical_close_observation().is_confirmed();
+                    ) && $driver.physical_close_observation().is_confirmed()
+                        // Native completion alone does not settle the separate
+                        // Collection teacher and observer custody.
+                        && collection.is_none();
                     if confirmed {
                         scope.settled_without_quarantine();
                         return Err(RoventV3LaunchFailure::Settled {
