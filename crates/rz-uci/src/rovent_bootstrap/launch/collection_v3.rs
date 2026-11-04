@@ -47,6 +47,40 @@ pub struct RoventPcCollectionNativeFenceV3 {
     owner: Arc<RoventPcCollectionLaunchOwnerV3>,
 }
 
+/// Original /3 resource admission and authenticated-parent gate, issued
+/// inside the registered launch scope before native worker entry. It is not
+/// a GPU, teacher, process-exit or collection-completion fence.
+pub struct RoventPcCollectionStartGateV3 {
+    pub(super) lock: Arc<RoventInputLockV3>,
+    pub(super) owner: Arc<RoventPcCollectionLaunchOwnerV3>,
+    pub(super) control: RoventStartupControl,
+    pub(super) scope_key: super::RoventV3ScopeKey,
+    pub(super) _parent: Arc<ConnectedParent>,
+}
+
+impl RoventPcCollectionStartGateV3 {
+    pub fn matches_original_lock(&self, lock: &Arc<RoventInputLockV3>) -> bool {
+        Arc::ptr_eq(&self.lock, lock)
+    }
+
+    pub fn matches_original_collection_owner(
+        &self,
+        owner: &Arc<RoventPcCollectionLaunchOwnerV3>,
+    ) -> bool {
+        Arc::ptr_eq(&self.owner, owner)
+    }
+
+    pub fn matches_startup_control(&self, control: &RoventStartupControl) -> bool {
+        self.control.until == control.until
+            && self.control.cleanup_until == control.cleanup_until
+            && Arc::ptr_eq(&self.control.cancellation, &control.cancellation)
+    }
+
+    pub fn scope_key(&self) -> &super::RoventV3ScopeKey {
+        &self.scope_key
+    }
+}
+
 /// An original hook's retained launch-wide proof, bound to this native owner.
 /// The hook implementation is the trusted boundary for the semantics of its
 /// opaque evidence; the native fence alone cannot issue this permit.

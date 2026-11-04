@@ -102,6 +102,12 @@ pub(super) struct BoundDirectControl {
 }
 
 impl BoundDirectControl {
+    /// Identity of the same original control owner only. This does not prove
+    /// parent authentication, worker completion or permission to release it.
+    pub(super) fn matches_original(&self, original: &Arc<Mutex<DirectControl>>) -> bool {
+        Arc::ptr_eq(&self.original, original)
+    }
+
     pub(super) fn from_bound(
         original: Arc<Mutex<DirectControl>>,
     ) -> Result<Self, Arc<Mutex<DirectControl>>> {

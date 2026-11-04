@@ -124,7 +124,8 @@ pub use collection::{
 #[cfg(target_os = "linux")]
 pub use collection_v3::{
     RoventPcCollectionLaunchOwnerV3, RoventPcCollectionNativeFenceV3,
-    RoventPcCollectionSettlementPermitV3, RoventPcObserverReclaimErrorV3,
+    RoventPcCollectionSettlementPermitV3, RoventPcCollectionStartGateV3,
+    RoventPcObserverReclaimErrorV3,
 };
 pub use evidence::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 #[cfg(target_os = "linux")]
@@ -1232,6 +1233,8 @@ pub fn run_with_v3_resource_admission<'a>(
             scope_reserved: None,
             #[cfg(target_os = "linux")]
             parent_stream: None,
+            #[cfg(target_os = "linux")]
+            post_auth: None,
             callback: Box::new(
                 move |lock, _root, _file, _until, _cleanup, _control, _path| admit_resource(lock),
             ),
@@ -1260,6 +1263,7 @@ pub fn run_with_v3_resource_admission_retaining<'a>(
             is_installed: None,
             scope_reserved: None,
             parent_stream: None,
+            post_auth: None,
             callback: Box::new(move |lock, root, file, until, _cleanup, _control, _path| {
                 admit_resource(lock, root, file, until)
             }),
@@ -1310,7 +1314,7 @@ pub fn run_with_v3_resource_admission_retaining_control_slot<'a, C: Send + 'stat
     ) -> Result<(), RoventLaunchError>
     + 'a,
 ) -> ControlledV3Result<C> {
-    run_with_v3_control_slot_inner(arguments, control, None, None, admit_resource)
+    run_with_v3_control_slot_inner(arguments, control, None, None, None, admit_resource)
 }
 
 /// The connected variant receives the very stream accepted by the original
@@ -1337,6 +1341,7 @@ pub fn run_with_v3_resource_admission_retaining_connected_control_slot<'a, C: Se
         arguments,
         control,
         Some(parent_stream),
+        None,
         None,
         admit_resource,
     )
@@ -1372,6 +1377,42 @@ pub fn run_pc_collection_v3_with_resource_admission_retaining_connected_control_
         control,
         Some(parent_stream),
         Some(v3::OriginalCollectionOwnerV3::Pc(Arc::clone(collection))),
+        None,
+        admit_resource,
+    )
+}
+
+/// Same P/C route with a one-shot post-auth callback. The caller must retain
+/// the original collection/supervisor worker custody across partial start,
+/// errors and panics. The callback is invoked before native model entry.
+#[cfg(target_os = "linux")]
+pub fn run_pc_collection_v3_with_post_auth_resource_admission_retaining_connected_control_slot<
+    'a,
+    C: Send + 'static,
+>(
+    arguments: Vec<String>,
+    control: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+    parent_stream: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>,
+    collection: &Arc<RoventPcCollectionLaunchOwnerV3>,
+    post_auth: impl FnOnce(&RoventPcCollectionStartGateV3) -> Result<(), RoventLaunchError> + 'a,
+    admit_resource: impl FnOnce(
+        &Arc<RoventInputLockV3>,
+        &Dir,
+        &std::fs::File,
+        std::time::Instant,
+        std::time::Instant,
+        Option<&Dir>,
+        Option<&std::path::Path>,
+        &Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+    ) -> Result<(), RoventLaunchError>
+    + 'a,
+) -> ControlledV3Result<C> {
+    run_with_v3_control_slot_inner(
+        arguments,
+        control,
+        Some(parent_stream),
+        Some(v3::OriginalCollectionOwnerV3::Pc(Arc::clone(collection))),
+        Some(Box::new(post_auth)),
         admit_resource,
     )
 }
@@ -1405,6 +1446,7 @@ pub fn run_own_collection_v3_with_resource_admission_retaining_connected_control
         control,
         Some(parent_stream),
         Some(v3::OriginalCollectionOwnerV3::Own(Arc::clone(collection))),
+        None,
         admit_resource,
     )
 }
@@ -1415,6 +1457,9 @@ fn run_with_v3_control_slot_inner<'a, C: Send + 'static>(
     control: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
     parent_stream: Option<Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>>,
     collection: Option<v3::OriginalCollectionOwnerV3>,
+    post_auth: Option<
+        Box<dyn FnOnce(&RoventPcCollectionStartGateV3) -> Result<(), RoventLaunchError> + 'a>,
+    >,
     admit_resource: impl FnOnce(
         &Arc<RoventInputLockV3>,
         &Dir,
@@ -1464,6 +1509,7 @@ fn run_with_v3_control_slot_inner<'a, C: Send + 'static>(
             scope_pin: Some(Box::new(control)),
             is_installed: Some(Box::new(move || gate_control.get().is_some())),
             parent_stream,
+            post_auth,
             scope_reserved: Some(Box::new(move |key| {
                 marker_for_scope
                     .set(key.clone())
@@ -1618,6 +1664,10 @@ struct ResourceAdmissionV3<'a> {
         Option<Box<dyn FnOnce(&RoventV3ScopeKey) -> Result<(), RoventLaunchError> + 'a>>,
     #[cfg(target_os = "linux")]
     parent_stream: Option<Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>>,
+    #[cfg(target_os = "linux")]
+    post_auth: Option<
+        Box<dyn FnOnce(&RoventPcCollectionStartGateV3) -> Result<(), RoventLaunchError> + 'a>,
+    >,
     callback: Box<
         dyn FnOnce(
                 &Arc<RoventInputLockV3>,

@@ -141,6 +141,12 @@ fn registry() -> &'static Mutex<Vec<Arc<Slot>>> {
 pub struct RoventV3ScopeKey(Arc<Slot>);
 
 impl RoventV3ScopeKey {
+    /// Same process-local scope identity only, not a physical completion or
+    /// permission to release any native or external worker.
+    pub fn same_original(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// None includes missing, busy and poisoned slots; it never grants release.
     pub fn product_finish_observation(&self) -> Option<V3ProductFinishObservation> {
         self.0.state.try_lock().ok()?.product_finish.clone()

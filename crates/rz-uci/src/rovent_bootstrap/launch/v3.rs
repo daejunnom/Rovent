@@ -1688,6 +1688,11 @@ pub(super) struct OriginalV3Inputs<'a> {
     receipt_writer: Option<Arc<SystemReceiptWriter>>,
     control_scope_pin: Option<Box<dyn std::any::Any + Send>>,
     connected_parent: Option<Arc<super::ConnectedParent>>,
+    post_auth: Option<
+        Box<
+            dyn FnOnce(&super::RoventPcCollectionStartGateV3) -> Result<(), RoventLaunchError> + 'a,
+        >,
+    >,
     go_observer: Option<crate::engine::GoAdmissionObserver>,
     scope_reserved:
         Option<Box<dyn FnOnce(&v3_scope::RoventV3ScopeKey) -> Result<(), RoventLaunchError> + 'a>>,
@@ -1855,6 +1860,7 @@ fn admit_original_inner<'a>(
     let mut control_scope_pin = None;
     let mut scope_reserved = None;
     let mut connected_parent = None;
+    let mut post_auth = None;
     if let Some(admit_resource) = resource {
         let ResourceAdmissionV3 {
             require_control_dir,
@@ -1862,6 +1868,7 @@ fn admit_original_inner<'a>(
             is_installed,
             scope_reserved: reserved_callback,
             parent_stream,
+            post_auth: post_auth_callback,
             callback,
         } = admit_resource;
         control
@@ -1931,6 +1938,7 @@ fn admit_original_inner<'a>(
         }
         control_scope_pin = scope_pin;
         scope_reserved = reserved_callback;
+        post_auth = post_auth_callback;
         control
             .check()
             .map_err(|failure| error("ResourceAdmission", failure))?;
@@ -2168,6 +2176,7 @@ fn admit_original_inner<'a>(
         receipt_writer: receipt_writer.map(Arc::new),
         control_scope_pin,
         connected_parent,
+        post_auth,
         go_observer,
         scope_reserved,
     })
@@ -2282,6 +2291,7 @@ pub(super) fn run_native_admitted(
         receipt_writer,
         control_scope_pin,
         connected_parent,
+        post_auth,
         go_observer,
         scope_reserved,
     } = original;
@@ -2570,6 +2580,45 @@ pub(super) fn run_native_admitted(
         match owner {
             OriginalCollectionOwnerV3::Pc(owner) => scope.attach_pin(Box::new(Arc::clone(owner))),
             OriginalCollectionOwnerV3::Own(owner) => scope.attach_pin(Box::new(Arc::clone(owner))),
+        }
+    }
+    if let Some(callback) = post_auth {
+        let (Some(OriginalCollectionOwnerV3::Pc(owner)), Some(parent)) =
+            (collection.as_ref(), connected_parent.as_ref())
+        else {
+            scope.mark_before_native();
+            return Err(error(
+                "CollectionStartGate",
+                "original PC owner or authenticated parent unavailable",
+            )
+            .into());
+        };
+        let gate = super::RoventPcCollectionStartGateV3 {
+            lock: Arc::clone(&lock),
+            owner: Arc::clone(owner),
+            control: control.clone(),
+            scope_key: scope.key().clone(),
+            _parent: Arc::clone(parent),
+        };
+        if let Err(failure) = control.check() {
+            scope.mark_before_native();
+            return Err(error("CollectionStartGate", failure).into());
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(&gate)));
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(failure)) => {
+                scope.mark_before_native();
+                return Err(failure.into());
+            }
+            Err(payload) => {
+                scope.mark_before_native();
+                std::panic::resume_unwind(payload);
+            }
+        }
+        if let Err(failure) = control.check() {
+            scope.mark_before_native();
+            return Err(error("CollectionStartGate", failure).into());
         }
     }
     // Before native entry, reserve both ends in the original scope. The only
