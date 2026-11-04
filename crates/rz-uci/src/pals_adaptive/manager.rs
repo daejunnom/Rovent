@@ -2457,6 +2457,10 @@ where
     /// until this same root's physical fence and settlement.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_v2_abandon_custody: Vec<RoleTicketEnvelope>,
+    /// Original ticket whose nonblocking abandonment callback has not yet
+    /// been applied. A Busy response is not an observer failure.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_pending_abandoned: VecDeque<RoleTicketEnvelope>,
     /// A failed bypass must stop admission; retrying or treating it as a
     /// completed capture could drop the original input owner.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -3776,6 +3780,7 @@ where
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         {
             self.collection_pending_event.is_some()
+                || !self.collection_pending_abandoned.is_empty()
                 || !self.collection_retired_pending.is_empty()
                 || self.roles.iter().any(|role| {
                     role.collection_accept_pending
@@ -3794,6 +3799,11 @@ where
     }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn collection_callback_pending(&self) -> bool {
+        !self.collection_pending_abandoned.is_empty()
+            || self.collection_non_abandon_callback_pending()
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn collection_non_abandon_callback_pending(&self) -> bool {
         !self.collection_retired_pending.is_empty()
             || self.roles.iter().any(|role| {
                 role.collection_accept_pending
@@ -3864,6 +3874,120 @@ where
                     changed = true;
                 }
             }
+        }
+        Ok(changed)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn retain_failed_collection_abandon(
+        &mut self,
+        ticket: RoleTicketEnvelope,
+        error: AdaptiveCollectionError,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.collection_v2_first_failure
+            .get_or_insert_with(|| error.clone());
+        if !self.collection_v2_abandon_custody.contains(&ticket) {
+            if self.collection_v2_abandon_custody.len() >= self.limits.role_tickets_max {
+                self.record_failure(error.into());
+                return Err(AdaptiveManagerError::PhysicalUnknown);
+            }
+            if self.collection_v2_abandon_custody.try_reserve(1).is_err() {
+                self.record_failure(error.into());
+                return Err(AdaptiveManagerError::PhysicalUnknown);
+            }
+            self.collection_v2_abandon_custody.push(ticket);
+        }
+        self.record_failure(error.into());
+        Ok(())
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn queue_collection_abandon(
+        &mut self,
+        ticket: RoleTicketEnvelope,
+    ) -> Result<(), AdaptiveManagerError> {
+        if self.collection_pending_abandoned.contains(&ticket) {
+            return Ok(());
+        }
+        if self.collection_pending_abandoned.len() >= self.limits.role_tickets_max {
+            return Err(AdaptiveManagerError::PhysicalUnknown);
+        }
+        self.collection_pending_abandoned
+            .try_reserve(1)
+            .map_err(|_| AdaptiveManagerError::PhysicalUnknown)?;
+        self.collection_pending_abandoned.push_back(ticket);
+        Ok(())
+    }
+    /// Reserve both possible outcomes before a one-shot Search discard.
+    /// Busy and a later observer error then retain the same original ticket
+    /// without replaying the already-completed discard.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn reserve_collection_abandon(
+        &mut self,
+        ticket: RoleTicketEnvelope,
+    ) -> Result<(), AdaptiveManagerError> {
+        if self.collection_observer_v2.is_none() {
+            return Ok(());
+        }
+        if !self.collection_pending_abandoned.contains(&ticket) {
+            if self.collection_pending_abandoned.len() >= self.limits.role_tickets_max {
+                return Err(AdaptiveManagerError::PhysicalUnknown);
+            }
+            self.collection_pending_abandoned
+                .try_reserve(1)
+                .map_err(|_| AdaptiveManagerError::PhysicalUnknown)?;
+        }
+        if !self.collection_v2_abandon_custody.contains(&ticket) {
+            if self.collection_v2_abandon_custody.len() >= self.limits.role_tickets_max {
+                return Err(AdaptiveManagerError::PhysicalUnknown);
+            }
+            self.collection_v2_abandon_custody
+                .try_reserve(1)
+                .map_err(|_| AdaptiveManagerError::PhysicalUnknown)?;
+        }
+        Ok(())
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn notify_collection_abandon(
+        &mut self,
+        ticket: RoleTicketEnvelope,
+    ) -> Result<(), AdaptiveManagerError> {
+        if !self.collection_pending_abandoned.is_empty()
+            || self.collection_pending_event.is_some()
+            || self.collection_non_abandon_callback_pending()
+        {
+            return self.queue_collection_abandon(ticket);
+        }
+        let Some(observer) = self.collection_observer_v2.as_mut() else {
+            return Ok(());
+        };
+        match observer.try_abandoned(&ticket) {
+            Ok(collection::AdaptiveCollectionBoundaryV2::Ready) => Ok(()),
+            Ok(collection::AdaptiveCollectionBoundaryV2::Busy) => {
+                self.queue_collection_abandon(ticket)
+            }
+            Err(error) => self.retain_failed_collection_abandon(ticket, error),
+        }
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn poll_collection_pending_abandoned(&mut self) -> Result<bool, AdaptiveManagerError> {
+        let mut changed = false;
+        while let Some(ticket) = self.collection_pending_abandoned.front().copied() {
+            let observer =
+                self.collection_observer_v2
+                    .as_mut()
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "pending abandoned observer absent",
+                    ))?;
+            match observer.try_abandoned(&ticket) {
+                Ok(collection::AdaptiveCollectionBoundaryV2::Busy) => return Ok(changed),
+                Ok(collection::AdaptiveCollectionBoundaryV2::Ready) => {
+                    self.collection_pending_abandoned.pop_front();
+                }
+                Err(error) => {
+                    self.retain_failed_collection_abandon(ticket, error)?;
+                    self.collection_pending_abandoned.pop_front();
+                }
+            }
+            changed = true;
         }
         Ok(changed)
     }
@@ -4819,23 +4943,37 @@ where
         }
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         {
-            match self.poll_collection_pending_acceptances() {
-                Ok(progress) => changed |= progress,
-                Err(error) => {
-                    self.record_failure(error.at_semantic_stage("collection_accept_pending"))
+            if self.collection_pending_event.is_none() {
+                match self.poll_collection_pending_acceptances() {
+                    Ok(progress) => changed |= progress,
+                    Err(error) => {
+                        self.record_failure(error.at_semantic_stage("collection_accept_pending"))
+                    }
                 }
             }
-            if !self.roles.iter().any(|role| role.collection_accept_pending) {
+            if self.collection_pending_event.is_none()
+                && !self.roles.iter().any(|role| role.collection_accept_pending)
+            {
                 match self.poll_collection_pending_consumption() {
                     Ok(progress) => changed |= progress,
                     Err(error) => self
                         .record_failure(error.at_semantic_stage("collection_consumption_pending")),
                 }
             }
+            if self.collection_pending_event.is_none()
+                && !self.collection_non_abandon_callback_pending()
+            {
+                match self.poll_collection_pending_abandoned() {
+                    Ok(progress) => changed |= progress,
+                    Err(error) => {
+                        self.record_failure(error.at_semantic_stage("collection_abandoned_pending"))
+                    }
+                }
+            }
         }
         for _ in 0..MAX_EVENT_DRAIN {
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-            if self.collection_callback_pending() {
+            if self.collection_callback_pending() && self.collection_pending_event.is_none() {
                 break;
             }
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -6436,40 +6574,28 @@ where
             // A prior successful acceptance may have retired the registry
             // before a later Store/transition error. Its original binding is
             // still retained here; closure never invents another consumption.
+            let consumed = self.roles[index].consumption_recorded;
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if !consumed && self.roles[index].v2_capture_possible {
+                self.reserve_collection_abandon(ticket)?;
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if self.roles[index].collection_observation_failed {
+                if self.collection_failed_evidence.len() >= self.limits.role_tickets_max
+                    || self.collection_failed_evidence.try_reserve(1).is_err()
+                {
+                    return Err(AdaptiveManagerError::PhysicalUnknown);
+                }
+            }
             if self.registry.ticket(ticket.id).is_some() {
                 self.registry.discard_delivered(&ticket)?;
             }
-            let consumed = self.roles[index].consumption_recorded;
             if let Some(original) = &self.roles[index].goal_local {
                 self.driver.discard_rovent_goal_input(original)?;
             }
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             if !consumed && self.roles[index].v2_capture_possible {
-                let result = self
-                    .collection_observer_v2
-                    .as_mut()
-                    .map(|observer| observer.abandoned(&ticket));
-                if let Some(Err(error)) = result {
-                    // Keep the same ticket even when observer cleanup fails;
-                    // settlement can retry only after the actual root fence.
-                    // Captures are bounded by the original in-flight limit and
-                    // the first failure disables new captured dispatches.
-                    if self.collection_v2_abandon_custody.len() >= self.limits.role_tickets_max {
-                        self.record_failure(error.into());
-                        return Err(AdaptiveManagerError::Capacity(
-                            "V2 abandoned ticket custody",
-                        ));
-                    }
-                    self.collection_v2_abandon_custody
-                        .try_reserve(1)
-                        .map_err(|_| {
-                            AdaptiveManagerError::Capacity("V2 abandoned ticket custody")
-                        })?;
-                    self.collection_v2_abandon_custody.push(ticket);
-                    self.collection_v2_first_failure
-                        .get_or_insert_with(|| error.clone());
-                    self.record_failure(error.into());
-                }
+                self.notify_collection_abandon(ticket)?;
             }
             self.retire_role_binding(index)?;
             if !consumed {
@@ -6635,9 +6761,18 @@ where
         let mut changed = self.flush_frontier_native()?;
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         {
-            changed |= self.poll_collection_pending_acceptances()?;
-            if !self.roles.iter().any(|role| role.collection_accept_pending) {
+            if self.collection_pending_event.is_none() {
+                changed |= self.poll_collection_pending_acceptances()?;
+            }
+            if self.collection_pending_event.is_none()
+                && !self.roles.iter().any(|role| role.collection_accept_pending)
+            {
                 changed |= self.poll_collection_pending_consumption()?;
+            }
+            if self.collection_pending_event.is_none()
+                && !self.collection_non_abandon_callback_pending()
+            {
+                changed |= self.poll_collection_pending_abandoned()?;
             }
             if self.collection_event_pending() {
                 return Ok(changed);
@@ -6968,10 +7103,8 @@ where
                         self.record_failure(other.into());
                     }
                     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                    if let Some(observer) = &mut self.collection_observer_v2 {
-                        if let Err(other) = observer.abandoned(&ticket) {
-                            self.record_failure(other.into());
-                        }
+                    if let Err(other) = self.notify_collection_abandon(ticket) {
+                        self.record_failure(other);
                     }
                     if let Err(native) = cancel {
                         self.record_failure(error.into());
@@ -7018,10 +7151,8 @@ where
                         self.record_failure(other.into());
                     }
                     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                    if let Some(observer) = &mut self.collection_observer_v2 {
-                        if let Err(other) = observer.abandoned(&ticket) {
-                            self.record_failure(other.into());
-                        }
+                    if let Err(other) = self.notify_collection_abandon(ticket) {
+                        self.record_failure(other);
                     }
                     return Err(error.into());
                 }
