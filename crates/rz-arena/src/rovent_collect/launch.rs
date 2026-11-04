@@ -63,6 +63,8 @@ pub use partial_collection_v1::{
 mod r_stream;
 mod resources;
 mod utility_stream;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+pub(crate) use super::pc_worker_v3::PcSupervisorJoinedProofV3;
 pub use cohort::{
     RoventUtilityCohortLaunchFailure, RoventUtilityCohortLaunchPlan,
     RoventUtilityCohortLaunchReceipt, run_rovent_utility_cohort,
@@ -84,14 +86,16 @@ pub use pc_lock_v2::{
     run_rovent_pc_collection_lock_v2_with_verified_partial_game,
 };
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
-pub use pc_lock_v3::{
-    PcCollectionCliV3, PreparedPcCollectionInputsV3, RoventCollectionLockV3LaunchPlan,
-    ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN, ROVENT_OWN_COLLECTION_LOCK_V3_LAUNCH_PLAN,
-    parse_pc_collection_cli_v3,
-};
-#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 #[allow(unused_imports)]
 pub(crate) use pc_lock_v3::ManagedOutputOwnerV3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+pub(crate) use pc_lock_v3::PcCollectionOwnersV3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+pub use pc_lock_v3::{
+    PcCollectionCliV3, PreparedPcCollectionInputsV3, ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN,
+    ROVENT_OWN_COLLECTION_LOCK_V3_LAUNCH_PLAN, RoventCollectionLockV3LaunchPlan,
+    parse_pc_collection_cli_v3,
+};
 pub use r_stream::{RoventRCollectionAncestor, RoventRCollectionPlan};
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
 

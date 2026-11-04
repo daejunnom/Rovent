@@ -367,6 +367,8 @@ impl PcCollectionOwnersV3 {
             outcome,
             pending_stop: None,
             stop_authorized: false,
+            pending_joined: None,
+            joined_offered: false,
         })
     }
 }
@@ -380,9 +382,33 @@ pub(crate) struct PcCollectionRunV3 {
     outcome: crate::rovent_resource_scope::launch::RoventPcCollectionResourceOutcomeV3,
     pending_stop: Option<crate::rovent_collect::pc_hooks_lock_v3::PcSupervisorStopAuthorizationV3>,
     stop_authorized: bool,
+    pending_joined: Option<crate::rovent_collect::pc_worker_v3::PcSupervisorJoinedProofV3>,
+    joined_offered: bool,
 }
 
 impl PcCollectionRunV3 {
+    /// Progress exact driver settlement and then the original resource
+    /// outcome. A returned outcome still contains the native result and does
+    /// not claim durable publication or an independent GPU observation.
+    pub(crate) fn try_settle(
+        &mut self,
+    ) -> Result<
+        Option<crate::rovent_resource_scope::launch::RoventPcCollectionSettledOutcomeV3>,
+        &'static str,
+    > {
+        if !self.joined_offered && self.pending_joined.is_none() {
+            self.pending_joined = self.try_join_driver()?;
+        }
+        if let Some(proof) = self.pending_joined.take() {
+            if let Err(proof) = self.outcome.offer_joined_driver(&self.owners, proof) {
+                self.pending_joined = Some(proof);
+                return Err("P-C joined proof differs from resource owner");
+            }
+            self.joined_offered = true;
+        }
+        self.outcome.try_settle()
+    }
+
     /// Advance the same driver's physical shutdown without waiting. A native
     /// fence alone is insufficient: the bridge must first seal every original
     /// root and teacher before it issues the exact supervisor authorization.

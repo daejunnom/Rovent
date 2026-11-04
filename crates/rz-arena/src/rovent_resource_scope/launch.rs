@@ -1840,6 +1840,10 @@ pub struct RoventPcCollectionResourceOutcomeV3 {
     native: Option<Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure>>,
     collection: Option<Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>>,
     settlement: Option<rz_uci::rovent_bootstrap::launch::RoventPcCollectionSettlementPermitV3>,
+    #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+    driver_joined: Option<crate::rovent_collect::launch::PcSupervisorJoinedProofV3>,
+    #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+    driver_released: bool,
     recovery: Arc<PcCollectionRecoverySlotV3>,
 }
 
@@ -1847,6 +1851,10 @@ struct PcCollectionRecoveryOwnersV3 {
     native: Option<Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure>>,
     collection: Option<Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>>,
     settlement: Option<rz_uci::rovent_bootstrap::launch::RoventPcCollectionSettlementPermitV3>,
+    #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+    driver_joined: Option<crate::rovent_collect::launch::PcSupervisorJoinedProofV3>,
+    #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+    driver_released: bool,
 }
 
 struct PcCollectionRecoverySlotV3 {
@@ -1884,6 +1892,10 @@ impl RoventPcCollectionRecoveryKeyV3 {
             native: owners.native,
             collection: owners.collection,
             settlement: owners.settlement,
+            #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+            driver_joined: owners.driver_joined,
+            #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+            driver_released: owners.driver_released,
             recovery: Arc::clone(&self.0),
         }))
     }
@@ -1901,6 +1913,30 @@ pub struct RoventPcCollectionSettledOutcomeV3 {
 }
 
 impl RoventPcCollectionResourceOutcomeV3 {
+    /// Retain physical join evidence from this original supervisor. This
+    /// neither proves GPU completion nor releases any owner by itself.
+    #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+    pub(crate) fn offer_joined_driver(
+        &mut self,
+        owners: &crate::rovent_collect::launch::PcCollectionOwnersV3,
+        proof: crate::rovent_collect::launch::PcSupervisorJoinedProofV3,
+    ) -> Result<(), crate::rovent_collect::launch::PcSupervisorJoinedProofV3> {
+        if self.driver_joined.is_some()
+            || !self
+                .collection
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, owners.native()))
+            || !proof.matches_original(
+                owners.driver_custody(),
+                owners.supervisor(),
+                owners.native(),
+            )
+        {
+            return Err(proof);
+        }
+        self.driver_joined = Some(proof);
+        Ok(())
+    }
     pub fn recovery_key(&self) -> RoventPcCollectionRecoveryKeyV3 {
         RoventPcCollectionRecoveryKeyV3(Arc::clone(&self.recovery))
     }
@@ -1970,6 +2006,8 @@ impl RoventPcCollectionResourceOutcomeV3 {
                 .cpu_supervisor_custody_unresolved(),
             None => return Err("native outcome already moved"),
         };
+        #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+        let cpu_unresolved = cpu_unresolved && self.driver_joined.is_none();
         if cpu_unresolved {
             return Ok(None);
         }
@@ -1986,6 +2024,30 @@ impl RoventPcCollectionResourceOutcomeV3 {
         let Some(permit) = self.settlement.as_mut() else {
             return Ok(None);
         };
+        #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+        if let Some(proof) = self.driver_joined.as_ref() {
+            if !self.driver_released {
+                if !proof.release_after_settlement(permit)? {
+                    return Ok(None);
+                }
+                self.driver_released = true;
+                match self.native.as_mut() {
+                    Some(Ok(receipt)) => receipt.cpu_supervisor_custody_unresolved = false,
+                    Some(Err(
+                        RoventControlledRunFailure::BeforeControl(failure)
+                        | RoventControlledRunFailure::Failed(failure),
+                    )) => {
+                        failure.cpu_supervisor_custody_unresolved = false;
+                    }
+                    Some(Err(RoventControlledRunFailure::Quarantined(quarantine))) => {
+                        quarantine
+                            .original_failure
+                            .cpu_supervisor_custody_unresolved = false;
+                    }
+                    None => return Err("native outcome already moved"),
+                }
+            }
+        }
         let (observer, observer_poison_observed) = match owner.try_reclaim_observer(permit) {
             Ok(observer) => (observer, false),
             Err(
@@ -2011,6 +2073,8 @@ impl RoventPcCollectionResourceOutcomeV3 {
             .take()
             .expect("original collection remains retained");
         self.settlement.take();
+        #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+        self.driver_joined.take();
         Ok(Some(RoventPcCollectionSettledOutcomeV3 {
             native,
             collection,
@@ -2030,6 +2094,10 @@ impl Drop for RoventPcCollectionResourceOutcomeV3 {
             native: self.native.take(),
             collection: self.collection.take(),
             settlement: self.settlement.take(),
+            #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+            driver_joined: self.driver_joined.take(),
+            #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+            driver_released: self.driver_released,
         };
         let mut slot = self
             .recovery
@@ -2127,6 +2195,10 @@ fn run_pc_collection_with_resources_v3_control_inner(
         native: Some(native),
         collection: Some(Arc::clone(collection)),
         settlement: None,
+        #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+        driver_joined: None,
+        #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+        driver_released: false,
         recovery: Arc::new(PcCollectionRecoverySlotV3 {
             owners: Mutex::new(None),
         }),
