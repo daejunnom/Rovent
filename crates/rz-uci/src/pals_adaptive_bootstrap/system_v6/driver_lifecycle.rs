@@ -164,9 +164,10 @@ impl PalsSystemDriverLifecycleV6 {
                     None => serde_json::json!({
                         "domain": "rz-pals-system-v6-startup-resource-observation/1",
                         "observation": "observer_panicked",
-                        "gpu_physical_completion": "unknown",
-                        "numeric_acceptance": false,
-                        "performance_acceptance": false,
+                    "physical_completion": "unknown",
+                    "placement_acceptance": "not_evaluated",
+                    "numerical_acceptance": "not_evaluated",
+                    "performance_acceptance": "not_evaluated",
                     }),
                 };
                 let bytes = serde_json::to_vec(&observation).map_err(|error| error.to_string())?;

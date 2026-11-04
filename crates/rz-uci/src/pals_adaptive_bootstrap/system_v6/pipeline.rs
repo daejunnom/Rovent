@@ -496,7 +496,12 @@ impl V6Pipeline {
                 self.state = V6PipelineObservation::Failed;
                 return self.state;
             }
-            lifecycle.observe_startup_resources(until);
+            // One bounded ready-boundary diagnostic, never the entire
+            // startup window. A blocked kernel read is not preemptible.
+            let probe_until = Instant::now()
+                .checked_add(Duration::from_millis(50))
+                .map_or(until, |bound| bound.min(until));
+            lifecycle.observe_startup_resources(probe_until);
             self.checker_start = Some(result);
         }
         self.state = V6PipelineObservation::ServiceInProgress;
@@ -512,9 +517,6 @@ impl V6Pipeline {
         }));
         match result {
             Ok(result) => {
-                // A delayed diagnostic writer may have arrived while UCI ran.
-                // Missing or failed publication never changes service outcome.
-                lifecycle.publish_startup_resources();
                 // Called once while retaining the lifecycle, including errors.
                 if lifecycle.record_service_outcome(result).is_err() {
                     return self.fail(V6PipelineFailure::LifecycleAdmission);
@@ -523,7 +525,6 @@ impl V6Pipeline {
                 self.state
             }
             Err(payload) => {
-                lifecycle.publish_startup_resources();
                 self.service_panic = Some(payload);
                 self.fail(V6PipelineFailure::ServicePanic)
             }
@@ -545,5 +546,20 @@ impl V6Pipeline {
             self.deliver_release_once(cleanup_cancelled);
         }
         observation
+    }
+
+    /// Optional post-release diagnostic I/O. This may perform a synchronous
+    /// file flush, so the supervisor must schedule it separately from UCI,
+    /// the original native drain and release acknowledgement.
+    pub(super) fn publish_startup_resources_after_release(&mut self) {
+        if self
+            .release_delivery
+            .as_ref()
+            .is_some_and(|result| matches!(result, Ok(Ok(_))))
+        {
+            if let Some(lifecycle) = self.lifecycle.as_mut() {
+                lifecycle.publish_startup_resources();
+            }
+        }
     }
 }

@@ -46,6 +46,7 @@ pub(super) struct StartupResourceObservationV6 {
     pub(super) process_epoch: u64,
     pub(super) original_startup_lock_sha256: String,
     pub(super) started: Instant,
+    pub(super) probe_deadline: Instant,
     pub(super) ended: Instant,
     /// Checks the original declaration marker and process epoch. The caller
     /// must still supply the driver held by this exact lifecycle.
@@ -139,6 +140,7 @@ pub(super) fn observe_startup_v6(
         process_epoch,
         original_startup_lock_sha256,
         started,
+        probe_deadline: until,
         ended: Instant::now(),
         owner_scope_consistent,
         native_ready_thread,
@@ -347,6 +349,12 @@ impl StartupResourceObservationV6 {
             .saturating_duration_since(self.started)
             .as_micros();
         let elapsed_us = u64::try_from(elapsed_us).ok();
+        let requested_probe_budget_us = u64::try_from(
+            self.probe_deadline
+                .saturating_duration_since(self.started)
+                .as_micros(),
+        )
+        .ok();
         serde_json::json!({
             "domain":"rz-pals-system-v6-startup-resource-observation/1",
             "scope":"same_lifecycle_ready_boundary_diagnostic_not_lifetime",
@@ -357,6 +365,8 @@ impl StartupResourceObservationV6 {
             "owner_scope_consistency":self.owner_scope_consistent,
             "owner_scope_note":"declaration marker and process epoch only; caller supplies the same original lifecycle driver",
             "observation_elapsed_us":elapsed_us,
+            "requested_probe_budget_us": requested_probe_budget_us,
+            "probe_budget_scope":"cooperative_deadline_not_kernel_io_preemption",
             "native_ready_thread":native,
             "external_identity":external_identity,
             "host_cpu":host_cpu,
