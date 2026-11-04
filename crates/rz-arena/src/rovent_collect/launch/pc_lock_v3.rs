@@ -212,6 +212,7 @@ impl PcCollectionOwnersV3 {
         )
         .map_err(invalid)?;
         let supervisor = Arc::new(Mutex::new(supervisor));
+        bridge.bind_supervisor(&supervisor).map_err(invalid)?;
         // The recovery registry retains this exact owner before any callback
         // can start a worker. It does not itself start a thread or teacher.
         let driver_custody =
