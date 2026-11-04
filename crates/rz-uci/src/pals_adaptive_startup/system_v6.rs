@@ -946,7 +946,7 @@ fn check_startup_window(original_ms: u64, requested_ms: u64) -> Result<(), Manif
 }
 
 #[cfg(target_os = "linux")]
-fn verify_root_identity(root: &Dir, expected_path: &Path) -> Result<(), ManifestError> {
+pub(crate) fn verify_root_identity(root: &Dir, expected_path: &Path) -> Result<(), ManifestError> {
     use std::os::unix::fs::MetadataExt;
     let current = std::env::current_dir().map_err(|_| invalid("system startup cwd unavailable"))?;
     if current != expected_path {
@@ -976,7 +976,7 @@ fn verify_root_identity(root: &Dir, expected_path: &Path) -> Result<(), Manifest
 }
 
 #[cfg(not(target_os = "linux"))]
-fn verify_root_identity(_: &Dir, _: &Path) -> Result<(), ManifestError> {
+pub(crate) fn verify_root_identity(_: &Dir, _: &Path) -> Result<(), ManifestError> {
     Err(invalid("system CUDA startup requires Linux FD identity"))
 }
 

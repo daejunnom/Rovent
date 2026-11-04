@@ -14,6 +14,8 @@ mod proxy_entry_smoke_channel_v1;
 #[allow(dead_code)]
 mod proxy_entry_no_game_smoke_v1;
 #[allow(dead_code)]
+mod proxy_entry_smoke_lock_v1;
+#[allow(dead_code)]
 mod proxy_entry_smoke_v1;
 pub use proxy_entry_smoke_v1::ProxyEntryFunctionalSmokeV1;
 #[allow(dead_code)]
