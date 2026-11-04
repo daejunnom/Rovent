@@ -7,6 +7,7 @@
 //! connection and cannot authorize termination, replace a GPU fence, or
 //! silently retry native initialization.
 
+use super::projection::{Lc0ObservedRelease, Lc0ObservedService};
 use super::*;
 use serde::Deserialize;
 use std::{
@@ -73,6 +74,14 @@ pub(super) struct Lc0ControlSupervisor {
     followup_count: u64,
     control_until: Instant,
     last_control: Option<(u64, ControlOperation, serde_json::Value)>,
+}
+
+pub(super) struct ControlProjection {
+    pub(super) ort_entry_observed: bool,
+    pub(super) service: Lc0ObservedService,
+    pub(super) original_release: Lc0ObservedRelease,
+    pub(super) latest_release: Lc0ObservedRelease,
+    pub(super) scope_settled: bool,
 }
 
 fn remaining(until: Instant) -> io::Result<Duration> {
@@ -195,6 +204,37 @@ fn service_failure(error: &EngineError) -> &'static str {
 }
 
 impl Lc0ControlSupervisor {
+    pub(super) fn project_original(&self) -> ControlProjection {
+        let release = |value: Option<&Poll<Result<SessionReleased, PhysicalFailure>>>| match value {
+            None => Lc0ObservedRelease::NotObserved,
+            Some(Poll::Pending) => Lc0ObservedRelease::Pending,
+            Some(Poll::Ready(Ok(_))) => Lc0ObservedRelease::Released,
+            Some(Poll::Ready(Err(_))) => Lc0ObservedRelease::Failed,
+        };
+        let original = self
+            .finish
+            .as_ref()
+            .and_then(|v| v.session_release.as_ref())
+            .or(self.unstarted_release.as_ref());
+        let service = if !self.service_started {
+            Lc0ObservedService::NotStarted
+        } else if self.state == ServiceState::Serving {
+            Lc0ObservedService::Serving
+        } else if self.service_panic.is_some() || self.service_failure_projection.is_some() {
+            Lc0ObservedService::Failed
+        } else if self.finish.as_ref().is_some_and(|f| f.run.is_ok()) {
+            Lc0ObservedService::Succeeded
+        } else {
+            Lc0ObservedService::Unknown
+        };
+        ControlProjection {
+            ort_entry_observed: self.owner.custody.ort_entry_observed(),
+            service,
+            original_release: release(original),
+            latest_release: release(self.followup_release.as_ref().or(original)),
+            scope_settled: self.original_scope_settled(),
+        }
+    }
     pub(super) fn new(owner: Lc0SystemSessionOwner, control_until: Instant) -> Self {
         Self {
             owner,

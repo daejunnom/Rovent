@@ -9,6 +9,7 @@ use super::{
     control::Lc0ControlSupervisor,
     endpoint::Lc0ParentEndpoint,
     profile::{Lc0ProfileCreateError, Lc0ProfileDirectory},
+    projection::{Lc0OriginalSessionObservation, PublicationObservations},
     *,
 };
 use std::{
@@ -210,6 +211,7 @@ pub struct Lc0SupervisedSession {
     profile_verification_failure: Option<BackendError>,
     endpoint_retirement_started: bool,
     epoch: u64,
+    publications: PublicationObservations,
 }
 
 impl Lc0PendingSupervisor {
@@ -359,11 +361,47 @@ impl Lc0PendingSupervisor {
             profile_verification_failure: None,
             endpoint_retirement_started: false,
             epoch: self.epoch,
+            publications: PublicationObservations::default(),
         })
     }
 }
 
 impl Lc0SupervisedSession {
+    /// A projection of this exact owner and its own publication attempts.
+    /// It cannot authorize process exit or establish physical completion.
+    pub fn original_session_observation(
+        &self,
+    ) -> Result<Lc0OriginalSessionObservation, NativeBootstrapError> {
+        let ordinal = match &self.lock.runtime {
+            NativeRuntimeSourceV6::SystemCuda(spec) => spec.cuda_device_id,
+            _ => {
+                return Err(NativeBootstrapError::Config(
+                    "LC0 observation requires CUDA",
+                ));
+            }
+        };
+        let source = self.supervisor.project_original();
+        Ok(Lc0OriginalSessionObservation {
+            schema: "rz-lc0-original-session-observation/1",
+            process_id: std::process::id(),
+            process_epoch: self.epoch,
+            lock_sha256: self.lock.canonical_sha256.clone(),
+            cuda_ordinal: ordinal,
+            ort_entry_observed: source.ort_entry_observed,
+            service: source.service,
+            original_release: source.original_release,
+            latest_release: source.latest_release,
+            scope_settled: source.scope_settled,
+            runtime_start_receipt: self.publications.runtime_start,
+            runtime_finish_receipt: self.publications.runtime_finish,
+            original_failure_receipt: self.publications.original_failure,
+            finish_receipt: self.publications.finish,
+            reobservation_receipt: self.publications.reobservation,
+            endpoint_retirement: self.publications.endpoint_retirement,
+            output_preservation: "unknown",
+            physical_completion: "unknown",
+        })
+    }
     fn check_receipts(&self, receipts: &Lc0ReceiptOwner) -> Result<(), String> {
         if !self
             .receipt_token
@@ -426,13 +464,15 @@ impl Lc0SupervisedSession {
                 .writer
                 .write_bytes("lc0-original-failure.v1.json", &bytes)
         }));
-        match result {
+        let outcome = match result {
             Ok(result) => result,
             Err(payload) => {
                 self.supervisor.retain_publication_panic(payload);
                 Err("LC0 original failure observation panicked; owner retained".into())
             }
-        }
+        };
+        self.publications.original_failure.record(outcome.is_ok());
+        outcome
     }
 
     /// Publication failure never changes the retained service or physical
@@ -443,20 +483,34 @@ impl Lc0SupervisedSession {
         finish: bool,
     ) -> Result<(), String> {
         self.check_receipts(receipts)?;
-        self.supervisor
-            .publish_runtime_receipt(&receipts.writer, &self.lock, finish)
+        let outcome = self
+            .supervisor
+            .publish_runtime_receipt(&receipts.writer, &self.lock, finish);
+        let observed = if finish {
+            &mut self.publications.runtime_finish
+        } else {
+            &mut self.publications.runtime_start
+        };
+        observed.record(outcome.is_ok());
+        outcome
     }
 
     pub fn publish_finish_observation(&mut self, receipts: &Lc0ReceiptOwner) -> Result<(), String> {
         self.check_receipts(receipts)?;
-        self.supervisor
-            .publish_finish_observation(&receipts.writer, &self.lock)
+        let outcome = self
+            .supervisor
+            .publish_finish_observation(&receipts.writer, &self.lock);
+        self.publications.finish.record(outcome.is_ok());
+        outcome
     }
 
     pub fn publish_reobservation(&mut self, receipts: &Lc0ReceiptOwner) -> Result<(), String> {
         self.check_receipts(receipts)?;
-        self.supervisor
-            .publish_reobservation(&receipts.writer, &self.lock)
+        let outcome = self
+            .supervisor
+            .publish_reobservation(&receipts.writer, &self.lock);
+        self.publications.reobservation.record(outcome.is_ok());
+        outcome
     }
     /// This only returns the same registry used to construct the factory.
     pub fn owners(&self) -> Arc<OwnerRegistry> {
@@ -648,6 +702,10 @@ impl Lc0SupervisedSession {
         // admission first, including on cleanup failure or unwind, so a
         // retired endpoint cannot be followed by a new CUDA startup.
         self.endpoint_retirement_started = true;
-        listener.endpoint.cleanup(until)
+        let outcome = listener.endpoint.cleanup(until);
+        self.publications
+            .endpoint_retirement
+            .record(outcome.is_ok());
+        outcome
     }
 }

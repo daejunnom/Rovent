@@ -55,6 +55,7 @@ use std::{
 mod system_cuda;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
 pub use system_cuda::{
+    Lc0ObservedPublication, Lc0ObservedRelease, Lc0ObservedService, Lc0OriginalSessionObservation,
     Lc0ParentListener, Lc0PendingSupervisor, Lc0ReceiptOwner, Lc0SupervisedSession,
     parent_preflight as lc0_parent_preflight,
 };
