@@ -598,3 +598,7 @@ mod tests {
         assert!(!pending_frame_needs_rebuild(shorter, old, 1).unwrap());
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "deadline_socket_tests.rs"]
+mod socket_tests;
