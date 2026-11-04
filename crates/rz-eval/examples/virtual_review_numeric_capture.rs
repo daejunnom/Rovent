@@ -2317,6 +2317,21 @@ fn execute(
     };
     if system_cuda {
         selected.validate_system_execution_selection()?;
+        #[cfg(target_os = "linux")]
+        {
+            // The original supervisor reserves the output only after this
+            // request. A pre-native rejection therefore creates no output
+            // lease; no ORT call or output directory precedes its grant.
+            let supervisor_control = supervisor.as_mut().ok_or("system supervisor is required")?;
+            let original_cleanup_limit =
+                system_cleanup_limit.ok_or("system cleanup limit absent")?;
+            system_cleanup_limit = Some(check_supervisor_deadline(
+                until,
+                Duration::from_secs(config.cleanup_seconds),
+                original_cleanup_limit,
+            )?);
+            supervisor_control.admit_native(until)?;
+        }
     }
     let output_owner =
         capture_output_root(&config.output_root, config.output_root_admission.as_ref())?;
@@ -2386,13 +2401,6 @@ fn execute(
             // Admission must establish the supervisor channel before any
             // reservation, worker creation, or ORT entry.
             let supervisor_control = supervisor.as_mut().ok_or("system supervisor is required")?;
-            let original_cleanup_limit =
-                system_cleanup_limit.ok_or("system cleanup limit absent")?;
-            system_cleanup_limit = Some(check_supervisor_deadline(
-                until,
-                Duration::from_secs(config.cleanup_seconds),
-                original_cleanup_limit,
-            )?);
             let custody = system_startup_custody(
                 &config.export_manifest,
                 &summary,
@@ -2400,7 +2408,6 @@ fn execute(
                 system_control,
             )?;
             let expected_runtime_sha256 = pin(&b.runtime_library_sha256)?;
-            supervisor_control.admit_native(until)?;
             let supervisor = supervisor_control.socket.try_clone()?;
             supervisor_control.no_native_and_no_reservation = false;
             let (mut reservation, key) = match PhysicalRecoveryReservation::reserve() {

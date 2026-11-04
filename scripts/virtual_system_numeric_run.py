@@ -274,8 +274,6 @@ def main(argv=None):
         receipt.update(source_pins=pins, model_registry=registry,
                        sealed_image_bytes=args.binary_bytes,
                        input_identity_scope="sealed_binary_and_config_bytes; plan_rechecked_by_native")
-        lease = OutputLease(target, source, reserve=args.output_bytes_max, deferred=True).acquire()
-        receipt["output_lease"]["acquired"] = True
         receipt["capture_window_dispatch"] = require_capture_window(config, deadline_ns)
         remaining = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
         cleanup_ns, group_drain_reserve_ns, child_cleanup_deadline_ns = capture_cleanup_partition(
@@ -291,8 +289,27 @@ def main(argv=None):
         receipt["dispatch_attempted"] = True
         receipt["producer_tree_gone"] = "unknown"
         receipt["producer_group_gone"] = "unknown"
+        admission_error = None
+        def acquire_output_and_allow_native():
+            nonlocal lease, admission_error
+            if time.monotonic_ns() + cleanup_ns >= deadline_ns:
+                return False
+            try:
+                if lease is not None:
+                    raise RuntimeError("capture output lease was already acquired")
+                lease = OutputLease(target, source, reserve=args.output_bytes_max, deferred=True).acquire()
+                receipt["output_lease"]["acquired"] = True
+            except Exception as error:
+                admission_error = error
+                receipt["output_lease"]["admission_error"] = {
+                    "type": type(error).__name__, "message": str(error)}
+                raise
+            # Acquiring the original lease may itself consume the remaining
+            # window. Never grant output creation or native entry after it.
+            return time.monotonic_ns() + cleanup_ns < deadline_ns
+
         transport = CustodyTransport(
-            allow_native=lambda: (time.monotonic_ns() + config["cleanup_seconds"] * 1_000_000_000 < deadline_ns),
+            allow_native=acquire_output_and_allow_native,
             reobserve_interval_ns=(cleanup_ns - group_drain_reserve_ns) // 32,
         )
         receipt["custody_transport"] = transport.state
@@ -312,7 +329,10 @@ def main(argv=None):
                 transport.stop_sending(f"poll:{type(error).__name__}")
         def producer_check():
             try:
-                lease.check_budget()
+                if admission_error is not None:
+                    raise admission_error
+                if lease is not None:
+                    lease.check_budget()
             except BaseException:
                 transport.close_native_admission()
                 raise

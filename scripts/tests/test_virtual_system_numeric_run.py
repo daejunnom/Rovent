@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 if sys.platform == "linux":
     import fcntl
+    import virtual_system_numeric_run as numeric_runner
     from managed_process import ProcessNotSpawned, run_group
     from virtual_system_numeric_run import (capture_cleanup_partition, capture_process_status, observe_unresolved_owned,
                                             output_lease_tree_observation,
@@ -183,6 +185,83 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
         channel.child.send(b"NO_NATIVE_ENTRY")
         channel.poll()
         self.assertEqual(channel.state["status"], "no_native_entry")
+
+    def test_pre_native_rejection_does_not_request_output_admission(self):
+        acquire_output = mock.Mock(return_value=True)
+        channel = CustodyTransport(allow_native=acquire_output)
+        self.addCleanup(channel.close)
+        channel.child.send(b"PENDING")
+        channel.child.send(b"NO_NATIVE_ENTRY")
+        channel.poll()
+        acquire_output.assert_not_called()
+        self.assertEqual(channel.state["status"], "no_native_entry")
+        self.assertEqual(channel.state["native_authorization"], "not_requested")
+
+    def test_supervised_pre_native_rejection_creates_no_output_lease(self):
+        binary = self.root / "capture"
+        binary_bytes = b"test executable bytes"
+        binary.write_bytes(binary_bytes)
+        plan = self.root / "plan.json"
+        plan_bytes = json.dumps({"bindings": {
+            "source_components": {"native": "fixture"},
+            "model_semantic_sha256": "model", "encoding_sha256": "encoding",
+        }}).encode()
+        plan.write_bytes(plan_bytes)
+        config = self.root / "config.json"
+        config_bytes = json.dumps({
+            "provider": "cuda-system", "output_root": str(self.root / "output"),
+            "case_plan": str(plan), "case_plan_sha256": hashlib.sha256(plan_bytes).hexdigest(),
+            "deadline_seconds": 1, "cleanup_seconds": 1,
+        }).encode()
+        config.write_bytes(config_bytes)
+        receipt = self.root / "receipt.json"
+
+        def rejected_child(*args, **kwargs):
+            peer = socket.socket(fileno=os.dup(kwargs["pass_fds"][-1]))
+            try:
+                kwargs["on_spawn"]()
+                peer.send(b"PENDING")
+                peer.send(b"NO_NATIVE_ENTRY")
+                kwargs["on_tick"]()
+                kwargs["admission_check"]() if "admission_check" in kwargs else args[4]()
+                kwargs["deadline_observation"]["exit_observation_timing"] = "before_deadline"
+                return 17, True, None
+            finally:
+                peer.close()
+
+        def getter(_fd, label, *_args):
+            if label == "--source-pins":
+                return {"native": "fixture"}
+            return {"model_semantic_sha256": "model", "encoding_sha256": "encoding"}
+
+        argv = ["--binary", str(binary), "--binary-sha256", hashlib.sha256(binary_bytes).hexdigest(),
+                "--binary-bytes", str(len(binary_bytes)), "--config", str(config),
+                "--config-sha256", hashlib.sha256(config_bytes).hexdigest(),
+                "--receipt", str(receipt), "--timeout", "30"]
+        with mock.patch.object(numeric_runner, "metadata_getter", side_effect=getter), \
+                mock.patch.object(numeric_runner, "run_group", side_effect=rejected_child), \
+                mock.patch.object(numeric_runner, "OutputLease") as output_lease:
+            self.assertEqual(numeric_runner.main(argv), 1)
+        output_lease.assert_not_called()
+        record = json.loads(receipt.read_text())
+        self.assertEqual(record["producer_exit_code"], 17)
+        self.assertEqual(record["custody_transport"]["status"], "no_native_entry")
+        self.assertFalse(record["output_lease"]["acquired"])
+        self.assertFalse((self.root / "output").exists())
+
+    def test_failed_output_admission_never_grants_native_entry(self):
+        acquire_output = mock.Mock(side_effect=OSError("original admission failure"))
+        channel = CustodyTransport(allow_native=acquire_output)
+        self.addCleanup(channel.close)
+        channel.child.send(b"PENDING")
+        channel.child.send(b"NATIVE_READY")
+        channel.poll()
+        acquire_output.assert_called_once_with()
+        self.assertEqual(channel.state["error"], "OSError")
+        self.assertEqual(channel.state["native_authorization"], "not_sent_deadline_or_policy")
+        channel.child.setblocking(False)
+        with self.assertRaises(BlockingIOError):
+            channel.child.recv(64)
 
     def test_stop_closes_native_admission_but_keeps_recovery_channel(self):
         channel = CustodyTransport(allow_native=lambda: True)
