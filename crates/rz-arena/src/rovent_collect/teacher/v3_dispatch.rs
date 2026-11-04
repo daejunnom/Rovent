@@ -44,6 +44,8 @@ pub(crate) enum TeacherSubmitV3 {
     Submitted(TeacherJobId),
     /// No physical job was issued; retain and retry the same capsule later.
     StartupPending(Arc<SubmittedTeacherQueryV3>),
+    /// The exact root authority was busy; no physical request was issued.
+    AuthorityBusy(Arc<SubmittedTeacherQueryV3>),
     /// Original capsule and possibly admitted physical owner remain retained.
     SubmissionUnknown(TeacherJobId),
 }
@@ -55,6 +57,7 @@ pub(crate) struct TeacherRejectedV3 {
 
 /// Completion is raw evidence only. Validation failure and cancellation are
 /// retained alongside the exact original capsule, dispatch and terminal.
+#[derive(Clone)]
 pub(crate) struct TeacherCompletedV3 {
     pub capsule: Arc<SubmittedTeacherQueryV3>,
     pub soft_quantum: Duration,
@@ -147,8 +150,11 @@ impl TeacherDispatchOwnerV3 {
         {
             reject!(invalid("V3 teacher query root, actor or admission differs"));
         }
-        if let Err(error) = admission.validate_ticket(&input.ticket) {
-            reject!(invalid(error.to_string()));
+        if let Err(error) = admission.try_validate_ticket(&input.ticket) {
+            if error.kind == rz_uci::pals_adaptive::RoventTicketValidationKindV3::Busy {
+                return Ok(TeacherSubmitV3::AuthorityBusy(capsule));
+            }
+            reject!(invalid(error.error.to_string()));
         }
         let manifest_sha = match session
             .manifest_lock()

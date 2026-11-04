@@ -24,6 +24,7 @@ pub(crate) enum TeacherPumpStepV3 {
     Idle,
     InputHeld,
     StartupPending,
+    AuthorityBusy,
     Submitted,
     SubmissionUnknown,
     ObservationUnknown,
@@ -361,6 +362,10 @@ impl TeacherPumpV3 {
             Ok(TeacherSubmitV3::StartupPending(capsule)) => {
                 self.held = Some(capsule);
                 Ok(TeacherPumpStepV3::StartupPending)
+            }
+            Ok(TeacherSubmitV3::AuthorityBusy(capsule)) => {
+                self.held = Some(capsule);
+                Ok(TeacherPumpStepV3::AuthorityBusy)
             }
             Ok(TeacherSubmitV3::SubmissionUnknown(_)) => {
                 self.held.take();

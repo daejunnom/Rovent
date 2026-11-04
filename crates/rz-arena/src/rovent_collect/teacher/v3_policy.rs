@@ -9,7 +9,7 @@ use rz_contracts::{Digest, pals::Role};
 use rz_experiments::pals_data_v3::GenerationRoleV3;
 use rz_uci::rovent_external_launch::{
     RoventTeacherPolicyCustodyV3, RoventTeacherPolicyEvidenceV3, RoventTeacherPolicySealErrorV3,
-    VerifiedRoventExternalStartup,
+    RoventTeacherPolicySealFailureKindV3, VerifiedRoventExternalStartup,
 };
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -44,6 +44,7 @@ impl RoventSealedTeacherPolicyV3 {
 
 pub(crate) enum TeacherPolicySealCauseV3 {
     Validation(ArenaError),
+    Busy,
     Panic(Box<dyn Any + Send>),
     Native(RoventTeacherPolicySealErrorV3),
 }
@@ -66,10 +67,123 @@ pub(crate) enum TeacherPolicySealRejectionV3 {
     CancelledAfterSeal(RoventSealedTeacherPolicyV3),
 }
 
+/// The original completed terminal stays in the caller's shared custody even
+/// if sealing unwinds after the one-shot claim. The caller must persist all
+/// slots and this state before invoking the function.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TeacherPolicySealStepV3 {
+    Ready,
+    Busy,
+    Sealed,
+    Rejected,
+    Unknown,
+}
+
+pub(crate) fn seal_teacher_policy_in_slots_v3(
+    session: &mut RoventCollectionTeacherSessionV3,
+    completed: &mut Option<TeacherCompletedV3>,
+    sealed: &mut Option<RoventSealedTeacherPolicyV3>,
+    rejection: &mut Option<Box<TeacherPolicySealRejectionV3>>,
+    panic: &mut Option<Box<dyn Any + Send>>,
+    state: &mut TeacherPolicySealStepV3,
+) -> TeacherPolicySealStepV3 {
+    if !matches!(
+        *state,
+        TeacherPolicySealStepV3::Ready | TeacherPolicySealStepV3::Busy
+    ) || sealed.is_some()
+        || panic.is_some()
+        || completed.is_none()
+    {
+        return *state;
+    }
+    // Only a definite pre-claim Busy may be retried. Its previous duplicate
+    // custody can be released because the original completed owner remains
+    // in the caller's slot and the worker's claim atomic is shared.
+    if *state == TeacherPolicySealStepV3::Busy {
+        let retryable = rejection
+            .as_ref()
+            .is_some_and(|failure| match failure.as_ref() {
+                TeacherPolicySealRejectionV3::BeforeClaim {
+                    cause: TeacherPolicySealCauseV3::Busy,
+                    ..
+                } => true,
+                TeacherPolicySealRejectionV3::Custody {
+                    cause: TeacherPolicySealCauseV3::Native(error),
+                    custody,
+                    ..
+                } => {
+                    error.kind == RoventTeacherPolicySealFailureKindV3::Busy
+                        && !custody.is_uncertain()
+                }
+                _ => false,
+            });
+        if !retryable {
+            *state = TeacherPolicySealStepV3::Unknown;
+            return *state;
+        }
+        drop(rejection.take());
+    } else if rejection.is_some() {
+        *state = TeacherPolicySealStepV3::Unknown;
+        return *state;
+    }
+    *state = TeacherPolicySealStepV3::Unknown;
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        seal_teacher_policy_v3(
+            session,
+            completed.as_ref().expect("checked completed").clone(),
+        )
+    }));
+    match outcome {
+        Ok(Ok(original)) => {
+            *sealed = Some(original);
+            *state = TeacherPolicySealStepV3::Sealed;
+        }
+        Ok(Err(original)) => {
+            let busy = match original.as_ref() {
+                TeacherPolicySealRejectionV3::BeforeClaim {
+                    cause: TeacherPolicySealCauseV3::Busy,
+                    ..
+                } => true,
+                TeacherPolicySealRejectionV3::Custody {
+                    cause: TeacherPolicySealCauseV3::Native(error),
+                    custody,
+                    ..
+                } => {
+                    error.kind == RoventTeacherPolicySealFailureKindV3::Busy
+                        && !custody.is_uncertain()
+                }
+                _ => false,
+            };
+            *rejection = Some(original);
+            *state = if busy {
+                TeacherPolicySealStepV3::Busy
+            } else {
+                TeacherPolicySealStepV3::Rejected
+            };
+        }
+        Err(payload) => {
+            *panic = Some(payload);
+        }
+    }
+    *state
+}
+
 pub(crate) fn seal_teacher_policy_v3(
     session: &mut RoventCollectionTeacherSessionV3,
     completed: TeacherCompletedV3,
 ) -> Result<RoventSealedTeacherPolicyV3, Box<TeacherPolicySealRejectionV3>> {
+    let ticket = completed.capsule.ticket();
+    if let Err(error) = session.original_admission().try_validate_ticket(&ticket) {
+        let cause = if error.kind == rz_uci::pals_adaptive::RoventTicketValidationKindV3::Busy {
+            TeacherPolicySealCauseV3::Busy
+        } else {
+            TeacherPolicySealCauseV3::Validation(invalid(error.error.to_string()))
+        };
+        return Err(Box::new(TeacherPolicySealRejectionV3::BeforeClaim {
+            cause,
+            completed,
+        }));
+    }
     let checked = catch_unwind(AssertUnwindSafe(|| -> Result<_, ArenaError> {
         let capsule = &completed.capsule;
         if completed.cancel_requested
@@ -94,9 +208,6 @@ pub(crate) fn seal_teacher_policy_v3(
         {
             return Err(invalid("V3 teacher completion actor or manifest differs"));
         }
-        admission
-            .validate_ticket(&input.ticket)
-            .map_err(|e| invalid(e.to_string()))?;
         let role = match input.role {
             GenerationRoleV3::Proposer => Role::Proposer,
             GenerationRoleV3::Critic => Role::Critic,
