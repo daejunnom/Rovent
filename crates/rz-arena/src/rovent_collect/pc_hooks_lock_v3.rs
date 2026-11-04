@@ -525,7 +525,7 @@ pub(crate) struct RoventPcCollectionBridgeV3 {
     game_admission_seal: OnceLock<PcGameAdmissionSealV3>,
     supervisor: OnceLock<Weak<Mutex<PcWorkerSupervisorV3>>>,
     state: Mutex<PcBridgeStateV3>,
-    requests: mpsc::SyncSender<RoventCollectionRootAdmissionV3>,
+    requests: super::game_authority_v3::GameDispatchChannelV3<RoventCollectionRootAdmissionV3>,
     request_receiver: Mutex<mpsc::Receiver<RoventCollectionRootAdmissionV3>>,
 }
 
@@ -568,6 +568,11 @@ impl RoventPcCollectionBridgeV3 {
         deferred.try_reserve_exact(max).map_err(|_| "P-C V3 cleanup allocation")?;
         let (requests, receiver) = mpsc::sync_channel(max);
         let game = super::game_authority_v3::GameAuthorityV3::new_candidate(Arc::clone(&inputs));
+        let requests = super::game_authority_v3::GameDispatchChannelV3::new(requests);
+        match game.try_bind_dispatch_channel(&requests) {
+            super::game_authority_v3::GameStepV3::Ready => {},
+            _ => return Err("P-C V3 original game channel binding failed"),
+        }
         Ok(Arc::new_cyclic(|self_weak| Self {
             self_weak: self_weak.clone(),
             ledger: Arc::new(Mutex::new(PcRootQuotaLedgerV3::new(Arc::clone(&inputs)))),
