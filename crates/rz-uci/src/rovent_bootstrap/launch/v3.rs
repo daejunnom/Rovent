@@ -116,6 +116,10 @@ impl v3_scope::RoventV3ScopeKey {
                 .and_then(|service| service.recovery_key())
         );
         find_custody!(
+            super::super::product::RoventOwnBoardAssemblyV3,
+            |owner: &mut super::super::product::RoventOwnBoardAssemblyV3| owner.recovery_key()
+        );
+        find_custody!(
             super::super::product::RoventPcAssemblyV3,
             |owner: &mut super::super::product::RoventPcAssemblyV3| owner
                 .prepared_service()
@@ -2239,6 +2243,20 @@ pub(super) fn run_native_admitted(
         go_observer,
         scope_reserved,
     } = original;
+    let own_board = matches!(
+        sources.configuration().fields().execution,
+        ExecutionConfiguration::OwnResearcher {
+            value: ResearchValueConfiguration::BaselineBoard,
+            ..
+        }
+    );
+    if own_board && (storage.is_some() || collection.is_some()) {
+        return Err(error(
+            "InputLockUnsupportedV3",
+            "own-board V3 archive and Collection owners are not connected",
+        )
+        .into());
+    }
     if storage.is_some()
         && matches!(
             sources.topology(),
@@ -2277,6 +2295,14 @@ pub(super) fn run_native_admitted(
         (
             super::super::RoventStartupTopology::OwnResearcher,
             ExecutionConfiguration::OwnResearcher {
+                value: ResearchValueConfiguration::BaselineBoard,
+                ..
+            },
+            NativeNnuecSelection::Absent,
+        ) => NativeNnuecSelection::Absent,
+        (
+            super::super::RoventStartupTopology::OwnResearcher,
+            ExecutionConfiguration::OwnResearcher {
                 value: ResearchValueConfiguration::NnuecV2 { .. },
                 ..
             },
@@ -2303,6 +2329,7 @@ pub(super) fn run_native_admitted(
     enum ProductChoice {
         Pc,
         PcShared(LoadedRoventNnuecSource<RoventInputLockV3>),
+        OwnBoard,
         OwnPcr(LoadedRoventNnuecSource<RoventInputLockV3>),
         External(
             RoventPinnedExternalRSource<RoventInputLockV3>,
@@ -2382,6 +2409,7 @@ pub(super) fn run_native_admitted(
         (NativeNnuecSelection::Absent, Some(external), Some(evidence)) => {
             ProductChoice::External(external, evidence)
         }
+        (NativeNnuecSelection::Absent, None, None) if own_board => ProductChoice::OwnBoard,
         (NativeNnuecSelection::Absent, None, None) => ProductChoice::Pc,
         (NativeNnuecSelection::SharedPc, None, None) => ProductChoice::PcShared(
             LoadedRoventNnuecSource::load(Arc::clone(&sources), &control)
@@ -2602,18 +2630,19 @@ pub(super) fn run_native_admitted(
     } else {
         None
     };
-    let (driver, completion, observation, observe_release): (
-        Arc<dyn SearchSessionDriver>,
-        _,
-        _,
-        Option<SessionReleaseProbe>,
-    ) = match product {
-        ProductChoice::OwnPcr(loaded) => {
+    // The same launch/custody and rejection path serves both own CPU
+    // implementations; archive remains available only to a supporting owner.
+    macro_rules! attach_own_storage {
+        (enabled, $driver:ident, $custody:ident) => {
+            attach_storage!($driver, $custody)
+        };
+        (disabled, $driver:ident, $custody:ident) => {};
+    }
+    macro_rules! launch_own {
+        ($assembly:expr, $storage:ident) => {{
             // The same assembly slot owns loaded inputs before the worker can
             // enter native code. It stays in this scope through errors/panics.
-            let custody = Arc::new(std::sync::Mutex::new(
-                super::super::product::RoventOwnNnuecAssemblyV3::new(loaded, Arc::clone(&boundary)),
-            ));
+            let custody = Arc::new(std::sync::Mutex::new($assembly));
             scope.attach_pin(Box::new(Arc::clone(&custody)));
             let prepared = match super::super::prepare_native_v3_retaining_with_parent::<
                 AdaptivePortQuestion,
@@ -2835,13 +2864,28 @@ pub(super) fn run_native_admitted(
                     });
                 }
             };
-            attach_storage!(driver, custody);
+            attach_own_storage!($storage, driver, custody);
             let completion = driver.physical_close_observation();
             let original_driver = Arc::clone(&driver);
             let observe_release: SessionReleaseProbe =
                 Box::new(move || original_driver.session_release_observation());
             (driver, completion, observation, Some(observe_release))
-        }
+        }};
+    }
+    let (driver, completion, observation, observe_release): (
+        Arc<dyn SearchSessionDriver>,
+        _,
+        _,
+        Option<SessionReleaseProbe>,
+    ) = match product {
+        ProductChoice::OwnPcr(loaded) => launch_own!(
+            super::super::product::RoventOwnNnuecAssemblyV3::new(loaded, Arc::clone(&boundary)),
+            enabled
+        ),
+        ProductChoice::OwnBoard => launch_own!(
+            super::super::product::RoventOwnBoardAssemblyV3::new(Arc::clone(&boundary)),
+            disabled
+        ),
         ProductChoice::External(external, evidence) => {
             // Preserve the original external source, retirement authority and
             // process before any native startup; all live in the same slot.
@@ -3091,7 +3135,9 @@ pub(super) fn run_native_admitted(
             let shared_loaded = match pc_product {
                 ProductChoice::Pc => None,
                 ProductChoice::PcShared(loaded) => Some(loaded),
-                ProductChoice::OwnPcr(_) | ProductChoice::External(_, _) => {
+                ProductChoice::OwnBoard
+                | ProductChoice::OwnPcr(_)
+                | ProductChoice::External(_, _) => {
                     unreachable!("matched P/C product")
                 }
             };
