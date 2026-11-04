@@ -138,6 +138,12 @@ impl ObservedManagedOutputLeaseV3 {
             ));
         }
         self.check_original_parent_and_directory()?;
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "managed output response verification exceeded deadline",
+            ));
+        }
         self.next_sequence = next_sequence;
         Ok(())
     }

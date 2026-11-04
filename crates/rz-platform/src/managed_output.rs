@@ -3,7 +3,8 @@
 
 use nix::libc;
 use nix::sys::socket::{
-    getsockname, getsockopt, send, setsockopt, sockopt, MsgFlags, SockType, UnixAddr,
+    getsockname, getsockopt, send, setsockopt, shutdown, sockopt, MsgFlags, Shutdown, SockType,
+    UnixAddr,
 };
 use std::collections::HashMap;
 use std::fs::File;
@@ -11,7 +12,10 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock, Weak,
+};
 
 /// Same-process inherited descriptors, retained together. The caller must
 /// establish exclusive inheritance before any other thread can close/reuse
@@ -21,12 +25,14 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 pub struct ManagedOutputInheritedFds {
     directory: File,
     channel: UnixDatagram,
+    shutdown_unknown: Arc<AtomicBool>,
     _exclusive_channel: Arc<()>,
 }
 
 struct ChannelRegistration {
     owner: Weak<()>,
     original_fd: RawFd,
+    shutdown_unknown: Arc<AtomicBool>,
 }
 fn exclusive_channels() -> &'static Mutex<HashMap<u64, ChannelRegistration>> {
     static CHANNELS: OnceLock<Mutex<HashMap<u64, ChannelRegistration>>> = OnceLock::new();
@@ -182,6 +188,7 @@ impl ManagedOutputInheritedFds {
         mark_original_cloexec(directory_fd, directory.as_raw_fd())?;
         mark_original_cloexec(channel_fd, channel.as_raw_fd())?;
         let exclusive = Arc::new(());
+        let shutdown_unknown = Arc::new(AtomicBool::new(false));
         {
             let mut channels = match exclusive_channels().try_lock() {
                 Ok(channels) => channels,
@@ -199,7 +206,8 @@ impl ManagedOutputInheritedFds {
             // this exact socket. A dropped wrapper must not permit stale ACKs
             // on the still-open original fd to seed a new sequence.
             channels.retain(|cookie, entry| {
-                entry.owner.strong_count() != 0
+                entry.shutdown_unknown.load(Ordering::Acquire)
+                    || entry.owner.strong_count() != 0
                     || socket_cookie(entry.original_fd).ok() == Some(*cookie)
             });
             if channels.contains_key(&channel_identity) {
@@ -213,12 +221,14 @@ impl ManagedOutputInheritedFds {
                 ChannelRegistration {
                     owner: Arc::downgrade(&exclusive),
                     original_fd: channel_fd,
+                    shutdown_unknown: Arc::clone(&shutdown_unknown),
                 },
             );
         }
         Ok(Self {
             directory,
             channel,
+            shutdown_unknown,
             _exclusive_channel: exclusive,
         })
     }
@@ -343,6 +353,21 @@ impl ManagedOutputInheritedFds {
             bytes: data,
             credentials,
         }))
+    }
+}
+
+impl Drop for ManagedOutputInheritedFds {
+    fn drop(&mut self) {
+        // Shutdown affects the socket itself, including inherited dup FDs.
+        // A later wrapper cannot send a request and consume an old ACK.
+        match shutdown(self.channel.as_raw_fd(), Shutdown::Both) {
+            Ok(()) => {}
+            Err(_) => {
+                // An unproven shutdown must not allow this cookie to be
+                // reissued after a different dup closes or reuses its number.
+                self.shutdown_unknown.store(true, Ordering::Release);
+            }
+        }
     }
 }
 
