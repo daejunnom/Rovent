@@ -227,7 +227,10 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineRun<O, D> 
                 self.cleanup_failure = Some(error);
                 return EngineTimerJoinStatus::Failed;
             }
-            if !owner.workers.is_empty() || owner.active.is_some() {
+            // The legacy owner retains the last ActiveBinding as historical
+            // cancellation authority even after workers join; it is not a
+            // live-worker counter and must not block timer join forever.
+            if !owner.workers.is_empty() {
                 return EngineTimerJoinStatus::WaitingWorkers;
             }
             if owner.fence_failure.is_some() || !owner.pending_failures.is_empty() {
