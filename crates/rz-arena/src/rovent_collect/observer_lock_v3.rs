@@ -9,6 +9,7 @@ use super::native_capture::{
     LockV3CancelAttempt, LockV3RegistrationAttempt, RoventFailedCapturedInput,
     RoventUnstartedRouteRollbackV3,
 };
+use super::policy_row_pipeline_v3::PolicyRowPipelineOwnerV3;
 use super::producer_v3::{
     RoventCorpusProducerLockV3, RoventInputCaptureReservationV3, RoventRetiredLockV3Record,
 };
@@ -38,6 +39,20 @@ pub(crate) enum UnstartedRouteDetachV3 {
     Detached,
     Busy(RoventUnstartedRouteRollbackV3),
     Rejected(ArenaError, RoventUnstartedRouteRollbackV3),
+}
+
+pub(super) enum RetiredTransferV3 {
+    Transferred,
+    Busy,
+    NotFound,
+    SlotOccupied,
+}
+
+pub(super) enum PipelinePreparationV3 {
+    Ready,
+    Busy,
+    NotReady,
+    Failed,
 }
 
 struct Staged {
@@ -81,6 +96,75 @@ pub(crate) struct RoventCollectionOwnerLockV3 {
     registration: RoventNativeCaptureRegistration,
 }
 impl RoventCollectionOwnerLockV3 {
+    /// Identity only: this grants no execution, publication or completion.
+    pub(crate) fn same_original_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Move an exact retired row directly into the caller-retained shared
+    /// pipeline slot. Both locks are nonblocking and no fallible operation
+    /// occurs between removing the row and transferring or restoring it.
+    /// This is custody only, not publication or completion authority.
+    pub(super) fn try_transfer_retired_to_pipeline(
+        &self,
+        ticket: &RoleTicketEnvelope,
+        pipeline: &PolicyRowPipelineOwnerV3,
+    ) -> Result<RetiredTransferV3, ArenaError> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(RetiredTransferV3::Busy),
+            Err(_) => return Err(invalid("lock-v3 owner poisoned")),
+        };
+        let mut slot = match pipeline.try_lock().map_err(invalid)? {
+            Some(slot) => slot,
+            None => return Ok(RetiredTransferV3::Busy),
+        };
+        let Some(index) = state
+            .retired
+            .iter()
+            .position(|row| row.ticket().id == ticket.id)
+        else {
+            return Ok(RetiredTransferV3::NotFound);
+        };
+        check(
+            state.retired[index].ticket() == *ticket,
+            "lock-v3 retired ticket differs",
+        )?;
+        let mut row = state.retired.remove(index);
+        if slot.install_row(&mut row) {
+            return Ok(RetiredTransferV3::Transferred);
+        }
+        state.retired.insert(
+            index,
+            row.expect("rejected transfer preserves original row"),
+        );
+        Ok(RetiredTransferV3::SlotOccupied)
+    }
+
+    /// The same nonblocking lock order as row transfer: original observer,
+    /// then pipeline. Run on a worker: preparation can encode and seal data.
+    /// Target publication gate and writer append are separate.
+    pub(super) fn try_prepare_pipeline(
+        &self,
+        pipeline: &PolicyRowPipelineOwnerV3,
+    ) -> Result<PipelinePreparationV3, ArenaError> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(PipelinePreparationV3::Busy),
+            Err(_) => return Err(invalid("lock-v3 owner poisoned")),
+        };
+        let mut slot = match pipeline.try_lock().map_err(invalid)? {
+            Some(slot) => slot,
+            None => return Ok(PipelinePreparationV3::Busy),
+        };
+        if slot.prepare(state.producer()?) {
+            Ok(PipelinePreparationV3::Ready)
+        } else if slot.failure().is_some() {
+            Ok(PipelinePreparationV3::Failed)
+        } else {
+            Ok(PipelinePreparationV3::NotReady)
+        }
+    }
     pub(crate) fn new_shared(
         manifest: Arc<RoventCorpusManifestLockV3>,
         metadata: RoventCollectionMetadata,

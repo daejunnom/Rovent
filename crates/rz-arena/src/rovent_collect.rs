@@ -1111,6 +1111,8 @@ mod own_hooks_lock_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod own_hooks_lock_v3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod own_worker_v3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod own_root_router_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod own_worker_supervisor_v2;
@@ -1118,6 +1120,10 @@ mod own_worker_supervisor_v2;
 mod pc_hooks_lock_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod pc_hooks_lock_v3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod pc_worker_v3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod policy_row_pipeline_v3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod pc_root_router_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
