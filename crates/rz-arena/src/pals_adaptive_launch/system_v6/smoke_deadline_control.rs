@@ -42,6 +42,9 @@ use std::{
 #[path = "smoke_cancel_sender.rs"]
 mod smoke_cancel_sender;
 pub(crate) use smoke_cancel_sender::SmokeCancelProgress;
+#[path = "smoke_reobserve_sender.rs"]
+mod smoke_reobserve_sender;
+pub(crate) use smoke_reobserve_sender::{SmokeReobserveObservation, SmokeReobserveProgress};
 
 struct SmokePeer {
     stream: UnixStream,
@@ -100,6 +103,8 @@ pub(crate) struct SmokeDeadlineControl {
     first_failure: Option<String>,
     cancel_peer: Option<smoke_cancel_sender::SmokeCancelPeer>,
     cancel_failure: Option<Arc<ArenaError>>,
+    reobserve_sequence: u64,
+    reobserve: Option<smoke_reobserve_sender::ReobserveAttempt>,
     // Drop after listener and every retained/partial stream.
     _retained_permit: Option<Arc<NoGameBindingPermit>>,
 }
@@ -230,6 +235,8 @@ impl SmokeDeadlineControl {
             first_failure: None,
             cancel_peer: None,
             cancel_failure: None,
+            reobserve_sequence: 0,
+            reobserve: None,
             _retained_permit: Some(Arc::clone(permit)),
         })
     }
@@ -322,6 +329,8 @@ impl SmokeDeadlineControl {
             first_failure: None,
             cancel_peer: None,
             cancel_failure: None,
+            reobserve_sequence: 0,
+            reobserve: None,
             _retained_permit: None,
         })
     }

@@ -32,7 +32,7 @@ use std::{
 mod smoke_deadline_control;
 pub(crate) use smoke_deadline_control::{
     SmokeCancelProgress, SmokeControlProgress, SmokeDeadlineControl, SmokeGrantObservation,
-    validate_smoke_request_ids,
+    SmokeReobserveObservation, SmokeReobserveProgress, validate_smoke_request_ids,
 };
 
 const MAX_ADMISSIONS: usize = 256;

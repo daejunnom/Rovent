@@ -65,7 +65,7 @@ pub(crate) use system_v6::{ProxyEntryFunctionalSmokeOwnerV1, SMOKE_RECEIPT_FILE}
 #[cfg(target_os = "linux")]
 pub(crate) use system_v6::{
     SmokeCancelProgress, SmokeControlProgress, SmokeDeadlineControl, SmokeGrantObservation,
-    validate_smoke_request_ids,
+    SmokeReobserveObservation, SmokeReobserveProgress, validate_smoke_request_ids,
 };
 
 pub const PALS_ARENA_V5_DOMAIN: &str = "rz-pals-arena-launch-v5/1";

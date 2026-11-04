@@ -831,6 +831,7 @@ impl IndependentNoGameSupervisorEnvelope {
 pub(crate) struct PreparedIndependentNoGameOwner {
     owners: Option<IndependentNoGameOwners>,
     process: Option<ProcessOutput>,
+    retained_receipt: Option<ProcessReceipt>,
     spawn_custody: crate::process::SpawnCustody,
     // Vacuously true only while no child has been started. Any future spawn
     // adapter must clear this before dispatch and restore it only on the
@@ -931,6 +932,7 @@ pub(crate) struct IndependentNoGameRawEvidence {
     pub(crate) owner_id: [u8; 16],
     pub(crate) owner_epoch: u64,
     pub(crate) process: Option<ProcessOutput>,
+    pub(crate) retained_receipt: Option<ProcessReceipt>,
     pub(crate) original_error: Option<ArenaError>,
     pub(crate) failures: Vec<String>,
     pub(crate) observation: Option<crate::process::OriginalSmokeUciObservation>,
@@ -948,6 +950,7 @@ pub(crate) struct IndependentNoGameEvidenceView<'a> {
     pub(crate) owner_id: [u8; 16],
     pub(crate) owner_epoch: u64,
     pub(crate) process: Option<&'a ProcessOutput>,
+    pub(crate) retained_receipt: Option<&'a ProcessReceipt>,
     pub(crate) original_error: Option<&'a ArenaError>,
     pub(crate) failures: &'a [String],
     pub(crate) observation: Option<&'a crate::process::OriginalSmokeUciObservation>,
@@ -1126,6 +1129,8 @@ pub(crate) enum IndependentNoGameSupervisorOutcome {
     /// The ProcessOutput is retained, but its stop and all higher-level
     /// acceptance conditions remain unassessed.
     ReturnedUnassessed,
+    /// The original proxy, pipes and receipt remain with the same owner.
+    RetainedUnassessed,
     /// The original failure is retained by the same owner.
     FailedRetained,
 }
@@ -1149,6 +1154,22 @@ pub(crate) enum IndependentNoGameOwnedDispatch {
 pub(crate) enum IndependentNoGameOwnedPersistence {
     Returned(Result<IndependentNoGamePersistence, ArenaError>),
     Panicked(Box<dyn std::any::Any + Send>),
+}
+
+/// Lock contention is not a transport or neural-network failure.
+#[cfg(target_os = "linux")]
+pub(crate) enum IndependentNoGameReobservePoll {
+    Busy,
+    Progress(crate::pals_adaptive_launch::SmokeReobserveProgress),
+    Unavailable(ArenaError),
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) enum IndependentNoGameReobserveTake {
+    Busy,
+    NoCompletedObservation,
+    Observed(crate::pals_adaptive_launch::SmokeReobserveObservation),
+    Unavailable(ArenaError),
 }
 
 /// This outcome owns the exact original supervisor even when the child or
@@ -1322,6 +1343,7 @@ impl PreparedIndependentNoGameOwner {
                 raw_persistence_started: AtomicBool::new(false),
             }),
             process: None,
+            retained_receipt: None,
             spawn_custody: crate::process::SpawnCustody::default(),
             physical_fence_confirmed: true,
             evidence_transferred: false,
@@ -1344,6 +1366,99 @@ impl PreparedIndependentNoGameOwner {
     /// False does not attest model correctness or a device-wide fence.
     pub(crate) fn physical_or_process_completion_unknown(&self) -> bool {
         self.unresolved()
+    }
+
+    /// Observe only this retained process and its original pipes. This does
+    /// not send a command, reap the child, or establish GPU completion.
+    pub(crate) fn observe_retained_process(
+        &mut self,
+        until: std::time::Instant,
+    ) -> Result<
+        crate::process::smoke_reobserve::SmokeReobserve,
+        crate::process::smoke_reobserve::SmokeReobserveError,
+    > {
+        let observation = self
+            .owners
+            .as_mut()
+            .and_then(|owners| owners.observation.as_mut())
+            .ok_or(crate::process::smoke_reobserve::SmokeReobserveError::NotRetained)?;
+        crate::process::smoke_reobserve::observe_once(&mut self.spawn_custody, observation, until)
+    }
+
+    /// Begin an observation on the same retained proxy and original Run
+    /// stream. This neither extends the execution window nor releases custody.
+    pub(crate) fn begin_reobserve(&self, until: std::time::Instant) -> Result<bool, ArenaError> {
+        let owners = self
+            .owners
+            .as_ref()
+            .ok_or_else(|| ArenaError::Invalid("NoGame original owner unavailable".into()))?;
+        let mut control = match owners._binding.control().try_lock() {
+            Ok(control) => control,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(ArenaError::Io("NoGame reobserve control poisoned".into()));
+            }
+        };
+        control.begin_no_game_reobserve(&self.spawn_custody, until)?;
+        Ok(true)
+    }
+
+    /// Resume only waiting on the same timed-out request; no Run is renewed.
+    pub(crate) fn resume_reobserve(&self, until: std::time::Instant) -> Result<bool, ArenaError> {
+        let owners = self
+            .owners
+            .as_ref()
+            .ok_or_else(|| ArenaError::Invalid("NoGame original owner unavailable".into()))?;
+        let mut control = match owners._binding.control().try_lock() {
+            Ok(control) => control,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(ArenaError::Io("NoGame reobserve control poisoned".into()));
+            }
+        };
+        control.resume_no_game_reobserve(until)?;
+        Ok(true)
+    }
+
+    pub(crate) fn poll_reobserve(&self) -> IndependentNoGameReobservePoll {
+        let Some(owners) = self.owners.as_ref() else {
+            return IndependentNoGameReobservePoll::Unavailable(ArenaError::Invalid(
+                "NoGame original owner unavailable".into(),
+            ));
+        };
+        let mut control = match owners._binding.control().try_lock() {
+            Ok(control) => control,
+            Err(TryLockError::WouldBlock) => return IndependentNoGameReobservePoll::Busy,
+            Err(TryLockError::Poisoned(_)) => {
+                return IndependentNoGameReobservePoll::Unavailable(ArenaError::Io(
+                    "NoGame reobserve control poisoned".into(),
+                ));
+            }
+        };
+        IndependentNoGameReobservePoll::Progress(
+            control.poll_no_game_reobserve(&self.spawn_custody),
+        )
+    }
+
+    pub(crate) fn take_reobservation(&self) -> IndependentNoGameReobserveTake {
+        let Some(owners) = self.owners.as_ref() else {
+            return IndependentNoGameReobserveTake::Unavailable(ArenaError::Invalid(
+                "NoGame original owner unavailable".into(),
+            ));
+        };
+        let mut control = match owners._binding.control().try_lock() {
+            Ok(control) => control,
+            Err(TryLockError::WouldBlock) => return IndependentNoGameReobserveTake::Busy,
+            Err(TryLockError::Poisoned(_)) => {
+                return IndependentNoGameReobserveTake::Unavailable(ArenaError::Io(
+                    "NoGame reobserve control poisoned".into(),
+                ));
+            }
+        };
+        match control.take_no_game_reobservation() {
+            Some(observation) => IndependentNoGameReobserveTake::Observed(observation),
+            None => IndependentNoGameReobserveTake::NoCompletedObservation,
+        }
     }
 
     /// A borrow transfers neither custody nor a completion assertion.
@@ -1373,6 +1488,7 @@ impl PreparedIndependentNoGameOwner {
             owner_id: execution.owner_id(),
             owner_epoch: execution.owner_epoch(),
             process: self.process.as_ref(),
+            retained_receipt: self.retained_receipt.as_ref(),
             original_error: self.original_error.as_ref(),
             failures: &self.failures,
             observation: owners.observation.as_ref(),
@@ -1484,6 +1600,8 @@ impl PreparedIndependentNoGameOwner {
                 serde_json::json!({"state": "unsupported_declared_environment"}),
             IndependentNoGameOwnedDispatch::Returned(IndependentNoGameDispatchOutcome::Supervisor(IndependentNoGameSupervisorOutcome::ReturnedUnassessed)) =>
                 serde_json::json!({"state": "returned_unassessed"}),
+            IndependentNoGameOwnedDispatch::Returned(IndependentNoGameDispatchOutcome::Supervisor(IndependentNoGameSupervisorOutcome::RetainedUnassessed)) =>
+                serde_json::json!({"state": "retained_unassessed"}),
             IndependentNoGameOwnedDispatch::Returned(IndependentNoGameDispatchOutcome::Supervisor(IndependentNoGameSupervisorOutcome::FailedRetained)) =>
                 serde_json::json!({"state": "failed_retained"}),
             IndependentNoGameOwnedDispatch::Returned(IndependentNoGameDispatchOutcome::Rejected(error)) =>
@@ -1501,6 +1619,7 @@ impl PreparedIndependentNoGameOwner {
             "plan_sha256": snapshot.plan.sha256(),
             "physical_or_process_completion_unknown": self.unresolved(),
             "process_receipt": process.map(|p| &p.receipt),
+            "retained_process_receipt": self.retained_receipt.as_ref(),
             "original_error": self.original_error.as_ref().map(ToString::to_string),
             "dispatch_observation": dispatch_observation,
             "failures": self.failures,
@@ -1756,7 +1875,7 @@ impl PreparedIndependentNoGameOwner {
             )
         };
         self.physical_fence_confirmed = false;
-        let result = crate::process::supervise_smoke_uci_in_original_window(
+        let result = crate::process::supervise_smoke_uci_retaining_in_original_window(
             binding.proxy().as_ref(),
             binding.arguments(),
             &binding.snapshot().cwd,
@@ -1771,9 +1890,13 @@ impl PreparedIndependentNoGameOwner {
             owners.observation.as_mut().expect("installed observation"),
         );
         match result {
-            Ok(output) => {
+            Ok(crate::process::RetainingSmokeOutcome::Finished(output)) => {
                 self.process = Some(output);
                 IndependentNoGameSupervisorOutcome::ReturnedUnassessed
+            }
+            Ok(crate::process::RetainingSmokeOutcome::Retained(receipt)) => {
+                self.retained_receipt = Some(receipt);
+                IndependentNoGameSupervisorOutcome::RetainedUnassessed
             }
             Err(error) => {
                 // If no child was ever installed, no physical scope existed.
@@ -1815,6 +1938,7 @@ impl PreparedIndependentNoGameOwner {
             owner_id: execution.owner_id(),
             owner_epoch: execution.owner_epoch(),
             process: self.process.take(),
+            retained_receipt: self.retained_receipt.take(),
             original_error: self.original_error.take(),
             failures: std::mem::take(&mut self.failures),
             observation: owners.observation.take(),
@@ -1860,6 +1984,10 @@ impl Drop for PreparedIndependentNoGameOwner {
             owners.quarantined_error = self.original_error.take();
         }
         crate::native_launch::close_native_admission();
+        let last_spawn_pid = self.spawn_custody.last_spawn_pid;
+        // The NoGame retained supervisor keeps the original pipes in this
+        // custody too. Moving only Child would silently close those pipes.
+        let retained_custody = std::mem::take(&mut self.spawn_custody);
         let retained = Box::new(RetainedNativeScope {
             _owner: Box::new(
                 self.owners
@@ -1867,10 +1995,14 @@ impl Drop for PreparedIndependentNoGameOwner {
                     .expect("NoGame owns its original snapshot"),
             ),
             process: self.process.take(),
-            spawned_child: self.spawn_custody.take_child(),
-            last_spawn_pid: self.spawn_custody.last_spawn_pid,
+            spawned_child: None,
+            retained_custody: Some(retained_custody),
+            last_spawn_pid,
             physical_lifetime_unknown,
-            receipt: None,
+            receipt: self
+                .retained_receipt
+                .take()
+                .map(|receipt| Box::new(receipt) as Box<dyn Send>),
             original_error: error_description,
             guarded_preflight_failures: std::mem::take(&mut self.failures),
             interrupted_by_unwind: std::thread::panicking(),
@@ -2862,6 +2994,8 @@ impl<S: NativeProviderDeclaration> Drop for NativeRunBundle<S> {
             _owner: Box::new(self.owner.take().expect("native bundle owns its lease")),
             process: self.process.take(),
             spawned_child: self.spawn_custody.take_child(),
+            #[cfg(target_os = "linux")]
+            retained_custody: None,
             last_spawn_pid: self.spawn_custody.last_spawn_pid,
             physical_lifetime_unknown,
             receipt: self.receipt.take().map(|r| Box::new(r) as Box<dyn Send>),
@@ -2887,6 +3021,8 @@ struct RetainedNativeScope {
     _owner: Box<dyn Send>,
     process: Option<ProcessOutput>,
     spawned_child: Option<std::process::Child>,
+    #[cfg(target_os = "linux")]
+    retained_custody: Option<crate::process::SpawnCustody>,
     last_spawn_pid: Option<u32>,
     physical_lifetime_unknown: bool,
     receipt: Option<Box<dyn Send>>,
@@ -2896,6 +3032,20 @@ struct RetainedNativeScope {
     guarded_probe_scope: Option<GuardedProbeScope>,
     #[cfg(target_os = "linux")]
     _v6_supervisor: Option<NativeV6Supervisor>,
+}
+
+impl RetainedNativeScope {
+    fn original_child_pid(&self) -> Option<u32> {
+        let direct = self.spawned_child.as_ref().map(std::process::Child::id);
+        #[cfg(target_os = "linux")]
+        let direct = direct.or_else(|| {
+            self.retained_custody
+                .as_ref()?
+                .child()
+                .map(std::process::Child::id)
+        });
+        direct
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2996,14 +3146,11 @@ fn observe_quarantine_scope(
 ) {
     status.slot_observed = true;
     if let Some(scope) = slot {
-        let current_pid = scope
-            .spawned_child
-            .as_ref()
-            .map(std::process::Child::id)
-            .or(scope.last_spawn_pid);
+        let retained_child = scope.original_child_pid();
+        let current_pid = retained_child.or(scope.last_spawn_pid);
         let previous_process = guarded_process_is_previous(
             scope.physical_lifetime_unknown,
-            scope.spawned_child.is_some(),
+            retained_child.is_some(),
             current_pid,
             scope.process.as_ref().map(|process| process.receipt.pid),
         );
@@ -3028,10 +3175,10 @@ fn observe_quarantine_scope(
         if scope.physical_lifetime_unknown {
             status.guarded_physical_lifetime_unknown = Some(true);
             status.guarded_spawn_raw_evidence_incomplete =
-                Some(scope.spawned_child.is_some() || previous_process || scope.process.is_none());
+                Some(retained_child.is_some() || previous_process || scope.process.is_none());
             status.guarded_last_spawn_pid = current_pid;
             status.guarded_original_spawn_handle_retained = Some(
-                scope.spawned_child.is_some()
+                retained_child.is_some()
                     || scope.process.as_ref().is_some_and(|process| {
                         Some(process.receipt.pid) == current_pid && process.pending_child.is_some()
                     }),
@@ -3109,6 +3256,8 @@ mod quarantine_observation_tests {
                 _owner: Box::new(()),
                 process: None,
                 spawned_child: None,
+                #[cfg(target_os = "linux")]
+                retained_custody: None,
                 last_spawn_pid: Some(pid),
                 physical_lifetime_unknown: true,
                 receipt: None,

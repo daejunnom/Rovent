@@ -215,7 +215,7 @@ impl SmokeDeadlineControl {
     }
 }
 
-fn verify_child_and_peer(
+pub(super) fn verify_child_and_peer(
     custody: &SpawnCustody,
     stream: &UnixStream,
     pid: u32,

@@ -30,7 +30,7 @@ mod deadline_control;
 #[cfg(target_os = "linux")]
 pub(crate) use deadline_control::{
     SmokeCancelProgress, SmokeControlProgress, SmokeDeadlineControl, SmokeGrantObservation,
-    validate_smoke_request_ids,
+    SmokeReobserveObservation, SmokeReobserveProgress, validate_smoke_request_ids,
 };
 mod deadline_grant;
 mod deadline_sources;
