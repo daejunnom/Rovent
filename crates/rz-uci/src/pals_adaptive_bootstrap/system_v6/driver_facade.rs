@@ -122,6 +122,15 @@ impl V6DriverFacade {
             }
         }
     }
+
+    /// The lifecycle may use this only before it has started the UCI
+    /// protocol or created any UCI worker. The same one-shot state is used.
+    pub(super) fn finish_before_service(
+        &self,
+        until: Instant,
+    ) -> Result<AdaptiveSessionProcessReceipt, SearchSessionFailure> {
+        self.finish_once(until)
+    }
 }
 
 impl SearchSessionDriver for V6DriverFacade {

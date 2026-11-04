@@ -87,6 +87,36 @@ impl PalsSystemDriverLifecycleV6 {
         self.served.as_ref().map(Result::is_ok)
     }
 
+    pub(super) fn start_checker(
+        &self,
+        until: Instant,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<bool>, SearchSessionFailure> {
+        self.driver.start_checker(until, cancelled)
+    }
+
+    /// Only the pipeline's pre-service state may call this. An arbitrary
+    /// service error is not proof that no UCI worker was created.
+    pub(super) fn finish_before_service(&mut self, until: Instant) -> FinishObservationV6 {
+        if self.served.is_some() {
+            return FinishObservationV6::Incomplete;
+        }
+        match self.driver.finish_before_service(until) {
+            Ok(receipt) if receipt.permits_process_close() => {
+                self.closed_receipt = Some(receipt);
+                FinishObservationV6::OwnerScopesClosed
+            }
+            Ok(receipt) => {
+                self.incomplete_receipt = Some(receipt);
+                FinishObservationV6::Incomplete
+            }
+            Err(error) => {
+                self.first_finish_failure = Some(error);
+                FinishObservationV6::Incomplete
+            }
+        }
+    }
+
     /// Give the existing UCI protocol the exact assembled driver. The caller
     /// remains responsible for ensuring that no clone independently initiates
     /// process finish while this facade is doing so.

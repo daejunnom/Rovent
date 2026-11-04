@@ -43,6 +43,8 @@ pub(super) enum V6PipelineFailure {
     SnapshotDisconnected,
     Preparation(V6PreparationObservation),
     Admission(V6AdmissionObservation),
+    CheckerStartup(SearchSessionFailure),
+    CheckerStartupPanic,
     LifecycleAdmission,
     ServicePanic,
 }
@@ -76,6 +78,8 @@ pub(super) struct V6Pipeline {
             std::io::Error,
         >,
     >,
+    checker_start: Option<Result<Option<bool>, SearchSessionFailure>>,
+    pre_service_finish: Option<FinishObservationV6>,
     failure: Option<V6PipelineFailure>,
     failed_native_drain: Option<V6FailedStartupDrain>,
     first_failed_native_drain: Option<FailedNativeDrainObservation>,
@@ -119,6 +123,8 @@ impl V6Pipeline {
             lifecycle: None,
             service_panic: None,
             release_delivery: None,
+            checker_start: None,
+            pre_service_finish: None,
             failure: None,
             failed_native_drain: None,
             first_failed_native_drain: None,
@@ -150,6 +156,12 @@ impl V6Pipeline {
     }
     pub(super) fn service_panic(&self) -> Option<&(dyn Any + Send)> {
         self.service_panic.as_deref()
+    }
+    pub(super) fn checker_start(&self) -> Option<&Result<Option<bool>, SearchSessionFailure>> {
+        self.checker_start.as_ref()
+    }
+    pub(super) fn pre_service_finish(&self) -> Option<FinishObservationV6> {
+        self.pre_service_finish
     }
     pub(super) fn release_delivery(
         &self,
@@ -343,6 +355,9 @@ impl V6Pipeline {
             Ok(cpu) => cpu,
             Err(error) => return self.fail(V6PipelineFailure::Bootstrap(error)),
         };
+        // Match the registered PALS CPU credit instead of inheriting the
+        // generic engine's unrelated default simulation count.
+        self.settings.search.max_simulations = cpu.search.settings.limits.max_cpu_nodes;
         self.cpu = Some(cpu);
         // Existing factory startup takes the CPU owner by value. If it
         // unwinds inside that function this stage remains explicitly unknown;
@@ -441,6 +456,32 @@ impl V6Pipeline {
     pub(super) fn serve(&mut self) -> V6PipelineObservation {
         if self.state != V6PipelineObservation::ReadyForService {
             return V6PipelineObservation::AlreadyAttempted;
+        }
+        if self.checker_start.is_none() {
+            let (until, cancelled) = self.source.original_startup_control();
+            let lifecycle = self.lifecycle.as_mut().expect("original lifecycle");
+            let result = match catch_unwind(AssertUnwindSafe(|| {
+                lifecycle.start_checker(until, cancelled)
+            })) {
+                Ok(result) => result,
+                Err(payload) => {
+                    self.service_panic = Some(payload);
+                    self.failure = Some(V6PipelineFailure::CheckerStartupPanic);
+                    self.pre_service_finish =
+                        Some(lifecycle.finish_before_service(self.original_cleanup_until));
+                    self.state = V6PipelineObservation::Failed;
+                    return self.state;
+                }
+            };
+            if let Err(error) = &result {
+                self.failure = Some(V6PipelineFailure::CheckerStartup(error.clone()));
+                self.pre_service_finish =
+                    Some(lifecycle.finish_before_service(self.original_cleanup_until));
+                self.checker_start = Some(result);
+                self.state = V6PipelineObservation::Failed;
+                return self.state;
+            }
+            self.checker_start = Some(result);
         }
         self.state = V6PipelineObservation::ServiceInProgress;
         let lifecycle = self.lifecycle.as_mut().expect("original lifecycle");
