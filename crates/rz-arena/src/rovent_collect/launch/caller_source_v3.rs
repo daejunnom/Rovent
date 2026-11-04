@@ -50,6 +50,7 @@ const ARENA_CALLER_FILES: &[(&str, &[u8])] = &[
     arena_source!("src/rovent_collect/speculative_route_v3/target_gate.rs"),
     arena_source!("src/rovent_collect/observer_lock_v3.rs"),
     arena_source!("src/rovent_collect/observer.rs"),
+    arena_source!("src/rovent_collect/game_authority_v3.rs"),
     arena_source!("src/rovent_collect/policy_row_pipeline_v3.rs"),
     arena_source!("src/rovent_collect/pc_hooks_lock_v3.rs"),
     arena_source!("src/rovent_collect/pc_worker_v3.rs"),
