@@ -10,7 +10,9 @@
 //! None of these operations establishes a fence, validates an output handoff,
 //! or authorizes settlement or resource release.
 use super::pc_lock_v3::{ManagedOutputOwnerV3, PcCollectionOwnersV3};
-use crate::rovent_collect::pc_hooks_lock_v3::PcSupervisorStopAuthorizationV3;
+use crate::rovent_collect::pc_hooks_lock_v3::{
+    PcSupervisorStopAuthorizationV3, RoventPcCollectionBridgeV3,
+};
 use crate::rovent_collect::pc_worker_v3::{
     PcSupervisorBeforeAdmissionJoinProofV3, PcSupervisorJoinedProofV3, PcSupervisorNoWorkerProofV3,
     PcWorkerSupervisorV3,
@@ -29,6 +31,13 @@ pub(crate) enum PcEvidenceCustodyErrorV3 {
     Missing,
     AlreadyOccupied,
     DifferentOwner,
+}
+
+/// A busy original owner is pending, never a completed stop or join.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PcStopStepV3 {
+    Pending,
+    Ready,
 }
 
 trait SamePcRunV3 {
@@ -123,6 +132,7 @@ struct OriginalPcRunV3 {
     outcome_key: Option<RoventPcCollectionRecoveryKeyV3>,
     panic: Option<Box<dyn Any + Send>>,
     stop_authorization: Option<PcSupervisorStopAuthorizationV3>,
+    stop_handed_off: bool,
     joined_proof: Option<PcSupervisorJoinedProofV3>,
     no_worker_proof: Option<PcSupervisorNoWorkerProofV3>,
     before_admission_join_proof: Option<PcSupervisorBeforeAdmissionJoinProofV3>,
@@ -186,6 +196,7 @@ impl PcRunRecoveryKeyV3 {
                 outcome_key: Some(outcome_key),
                 panic: None,
                 stop_authorization: None,
+                stop_handed_off: false,
                 joined_proof: None,
                 no_worker_proof: None,
                 before_admission_join_proof: None,
@@ -354,12 +365,6 @@ impl PcRunRecoveryKeyV3 {
     }
 
     evidence_custody!(
-        put_stop_authorization,
-        take_stop_authorization,
-        stop_authorization,
-        PcSupervisorStopAuthorizationV3
-    );
-    evidence_custody!(
         put_joined_proof,
         take_joined_proof,
         joined_proof,
@@ -377,6 +382,88 @@ impl PcRunRecoveryKeyV3 {
         before_admission_join_proof,
         PcSupervisorBeforeAdmissionJoinProofV3
     );
+
+    /// Produce the exact bridge authorization directly into this slot. The
+    /// bridge's native fence and original supervisor checks remain mandatory.
+    /// Its current issuance path has no irreversible token-consumption step;
+    /// a panic before return must not be treated as an issued authorization.
+    pub(crate) fn try_prepare_stop(
+        &self,
+        bridge: &Arc<RoventPcCollectionBridgeV3>,
+        fence: &rz_uci::rovent_bootstrap::launch::RoventPcCollectionNativeFenceV3,
+    ) -> Result<PcStopStepV3, &'static str> {
+        let mut guard = match self.0.original.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(PcStopStepV3::Pending),
+            Err(TryLockError::Poisoned(_)) => return Err("P-C recovery slot poisoned"),
+        };
+        let original = guard.as_mut().ok_or("P-C original custody missing")?;
+        if !fence.matches_original_owner(original.owners.native()) {
+            return Err("P-C stop fence belongs to another owner");
+        }
+        if original.stop_handed_off {
+            return Ok(PcStopStepV3::Ready);
+        }
+        if original.stop_authorization.is_some() {
+            return Ok(PcStopStepV3::Ready);
+        }
+        let issued = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bridge.try_authorize_supervisor_stop(fence, original.owners.supervisor())
+        }));
+        match issued {
+            Ok(Ok(Some(token))) => {
+                // Bridge checks the original fence, hook and same supervisor
+                // before issuing this non-cloneable token.
+                original.stop_authorization = Some(token);
+                Ok(PcStopStepV3::Ready)
+            }
+            Ok(Ok(None)) => Ok(PcStopStepV3::Pending),
+            Ok(Err(error)) => Err(error),
+            Err(payload) => {
+                drop(guard);
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    /// Move the slot's original authorization directly into the same driver
+    /// custody. The worker primitive checks identity and performs the final
+    /// in-memory move without further fallible or user-provided callbacks.
+    /// This is not a joined, native/GPU, teacher, or output completion proof.
+    pub(crate) fn try_handoff_stop(&self) -> Result<PcStopStepV3, &'static str> {
+        let mut guard = match self.0.original.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(PcStopStepV3::Pending),
+            Err(TryLockError::Poisoned(_)) => return Err("P-C recovery slot poisoned"),
+        };
+        let original = guard.as_mut().ok_or("P-C original custody missing")?;
+        if original.stop_handed_off {
+            return Ok(PcStopStepV3::Ready);
+        }
+        if original.stop_authorization.is_none() {
+            return Ok(PcStopStepV3::Pending);
+        }
+        let mut driver = match original.owners.driver_custody().try_lock() {
+            Ok(driver) => driver,
+            Err(TryLockError::WouldBlock) => return Ok(PcStopStepV3::Pending),
+            Err(TryLockError::Poisoned(_)) => return Err("P-C supervisor custody poisoned"),
+        };
+        let moved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            driver.authorize_from_slot(&mut original.stop_authorization)
+        }));
+        drop(driver);
+        match moved {
+            Ok(Ok(())) => {
+                original.stop_handed_off = true;
+                Ok(PcStopStepV3::Ready)
+            }
+            Ok(Err(error)) => Err(error),
+            Err(payload) => {
+                drop(guard);
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
 
     /// The caller catches the launch panic and transfers the original payload.
     /// A panic does not imply that no worker, native work, or GPU work started.
