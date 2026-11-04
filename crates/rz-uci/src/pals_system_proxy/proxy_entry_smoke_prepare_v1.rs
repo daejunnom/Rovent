@@ -173,6 +173,10 @@ impl NoGameProxyPrepareOwnerV1 {
         let Some(lock) = self.lock.as_ref() else {
             return Err((invalid("NoGame original lock owner missing"), None));
         };
+        let until = self
+            .run
+            .as_ref()
+            .map_or(until, |run| until.min(run.deadline()));
         lock.open_direct_arena_stream(socket_path, until)
     }
     fn fail(&mut self, error: io::Error) -> io::Error {
@@ -204,6 +208,10 @@ impl NoGameProxyPrepareOwnerV1 {
             return Err((self.fail(error), stream));
         }
         let until = until.min(lock.local_until());
+        let until = self
+            .run
+            .as_ref()
+            .map_or(until, |run| until.min(run.deadline()));
         let challenge = match PendingDirectSmokeChallenge::begin(stream, until) {
             Ok(challenge) => challenge,
             Err((error, stream)) => return Err((self.fail(error), stream)),
