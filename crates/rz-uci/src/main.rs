@@ -3553,8 +3553,13 @@ fn run_lc0_supervised(
                 let cleanup = session
                     .retire_parent_listener(&mut listener, cleanup_until)
                     .err();
+                let cause = match evidence {
+                    Ok(Err(error)) => Lc0PreparationCause::Error(error),
+                    Err(payload) => Lc0PreparationCause::Panic(payload),
+                    Ok(Ok(())) => unreachable!("successful preparation was handled above"),
+                };
                 return Err(Box::new(Lc0PreNativePreparationFailure {
-                    _original_evidence: evidence,
+                    cause,
                     cleanup,
                     _owners: (session, listener, receipts),
                 }));
@@ -3693,25 +3698,38 @@ impl<E: std::error::Error + 'static, O> std::error::Error for Lc0PreNativeCleanu
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
-struct Lc0PreNativePreparationFailure<E, O> {
-    _original_evidence: E,
+enum Lc0PreparationCause {
+    Error(&'static str),
+    Panic(Box<dyn std::any::Any + Send>),
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+struct Lc0PreNativePreparationFailure<O> {
+    cause: Lc0PreparationCause,
     cleanup: Option<io::Error>,
     _owners: O,
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
-impl<E, O> std::fmt::Debug for Lc0PreNativePreparationFailure<E, O> {
+impl<O> std::fmt::Debug for Lc0PreNativePreparationFailure<O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("Lc0PreNativePreparationFailure")
     }
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
-impl<E, O> std::fmt::Display for Lc0PreNativePreparationFailure<E, O> {
+impl<O> std::fmt::Display for Lc0PreNativePreparationFailure<O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cause = match &self.cause {
+            Lc0PreparationCause::Error(error) => *error,
+            Lc0PreparationCause::Panic(payload) => {
+                let _ = payload;
+                "panic; original payload retained without rendering"
+            }
+        };
         write!(
             formatter,
-            "LC0 preparation failed before native entry; listener cleanup: {}",
+            "LC0 preparation failed before native entry: {cause}; listener cleanup: {}",
             self.cleanup
                 .as_ref()
                 .map_or("completed", |_| "failed or unknown")
@@ -3720,7 +3738,11 @@ impl<E, O> std::fmt::Display for Lc0PreNativePreparationFailure<E, O> {
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
-impl<E, O> std::error::Error for Lc0PreNativePreparationFailure<E, O> {}
+impl<O> std::error::Error for Lc0PreNativePreparationFailure<O> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cleanup.as_ref().map(|error| error as _)
+    }
+}
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
 struct Lc0SettledAuxiliaryFailure<O> {
@@ -3731,6 +3753,7 @@ struct Lc0SettledAuxiliaryFailure<O> {
     control: Option<io::Error>,
     parent: Option<io::Error>,
     renewal: Option<io::Error>,
+    session: rz_uci::native_bootstrap::Lc0SupervisedSession,
     _owners: O,
 }
 
@@ -3759,7 +3782,17 @@ impl<O> std::fmt::Display for Lc0SettledAuxiliaryFailure<O> {
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
-impl<O> std::error::Error for Lc0SettledAuxiliaryFailure<O> {}
+impl<O> std::error::Error for Lc0SettledAuxiliaryFailure<O> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.session
+            .original_run_error()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+            .or_else(|| self.cleanup.as_ref().map(|error| error as _))
+            .or_else(|| self.control.as_ref().map(|error| error as _))
+            .or_else(|| self.parent.as_ref().map(|error| error as _))
+            .or_else(|| self.renewal.as_ref().map(|error| error as _))
+    }
+}
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
 fn hold_lc0_session<T: 'static>(
@@ -3784,6 +3817,7 @@ fn hold_lc0_session<T: 'static>(
     let mut receipt_error: Option<String> = None;
     let mut next_release_poll = std::time::Instant::now();
     let mut reobservation_published = false;
+    let mut failure_published = false;
     let mut normal_ready = false;
     let mut service_failed = false;
     loop {
@@ -3894,6 +3928,14 @@ fn hold_lc0_session<T: 'static>(
                     });
                 if released {
                     service_failed = !session.original_service_succeeded();
+                    if service_failed && !failure_published {
+                        failure_published = true;
+                        if let Err(error) = session.publish_original_failure_observation(&receipts)
+                            && receipt_error.is_none()
+                        {
+                            receipt_error = Some(error);
+                        }
+                    }
                     if !reobservation_published
                         && session
                             .original_session_observation()
@@ -3953,7 +3995,8 @@ fn hold_lc0_session<T: 'static>(
                     control: first_control_error,
                     parent: parent_error,
                     renewal: renewal_error,
-                    _owners: (session, listener, receipts, _original_evidence),
+                    session,
+                    _owners: (listener, receipts, _original_evidence),
                 }));
             }
             return Ok(());

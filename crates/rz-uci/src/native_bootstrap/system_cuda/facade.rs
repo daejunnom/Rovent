@@ -693,6 +693,11 @@ impl Lc0SupervisedSession {
         self.supervisor.original_service_succeeded()
     }
 
+    /// Borrow the original run failure without changing its ownership.
+    pub fn original_run_error(&self) -> Option<&NativeRunError> {
+        self.supervisor.original_run_error()
+    }
+
     /// Renew a finite control/observation window on this original session.
     /// The original parent must still be live, the runtime lock and process
     /// identity must match, and an already retired endpoint stays retired.

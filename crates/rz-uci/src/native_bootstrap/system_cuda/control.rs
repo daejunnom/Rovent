@@ -435,6 +435,11 @@ impl Lc0ControlSupervisor {
                 .is_some_and(|finish| finish.run.is_ok())
     }
 
+    /// The original collection error remains owned by this supervisor.
+    pub(super) fn original_run_error(&self) -> Option<&NativeRunError> {
+        self.finish.as_ref()?.run.as_ref().err()
+    }
+
     /// Read-only, bounded classification of the first failures. This is not a
     /// completion witness and must never replace the retained original errors.
     pub(super) fn original_failure_observation(&self) -> serde_json::Value {
