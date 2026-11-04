@@ -33,6 +33,46 @@ class ManagedProcessSpawnTests(unittest.TestCase):
         popen.assert_not_called()
         self.assertEqual(callbacks, [])
 
+    def test_opt_in_work_deadline_uses_original_cleanup_deadline_for_drain(self):
+        import managed_process
+        start = time.monotonic()
+        work, cleanup = start + 0.2, start + 2.0
+        group = OwnedProcessGroup()
+        with mock.patch("managed_process._finish_owned_group", wraps=managed_process._finish_owned_group) as drain:
+            result = run_group(
+                [self.python, "-c", "import time; time.sleep(30)"], self.root,
+                os.environ.copy(), 30, lambda: None, owned_group=group,
+                absolute_deadline=work, cleanup_absolute_deadline=cleanup,
+                graceful_drain_deadline=start + 0.3,
+            )
+        self.assertEqual(result, (124, True, None))
+        self.assertEqual(drain.call_args.args[3], cleanup)
+
+    def test_owner_release_does_not_extend_explicit_cleanup_deadline(self):
+        import managed_process
+        start = time.monotonic()
+        work, cleanup = start + 0.2, start + 2.0
+        group = OwnedProcessGroup()
+        with mock.patch("managed_process._finish_owned_group", wraps=managed_process._finish_owned_group) as drain:
+            result = run_group(
+                [self.python, "-c", "import time; time.sleep(30)"], self.root,
+                os.environ.copy(), 30, lambda: None, owned_group=group,
+                absolute_deadline=work, cleanup_absolute_deadline=cleanup,
+                on_stop=lambda: True,
+            )
+        self.assertEqual(result, (124, True, None))
+        self.assertEqual(drain.call_args.args[3], cleanup)
+        self.assertLessEqual(drain.call_args.args[2], cleanup)
+
+    def test_cleanup_before_work_deadline_never_spawns(self):
+        start = time.monotonic()
+        with mock.patch("managed_process.subprocess.Popen") as popen:
+            with self.assertRaisesRegex(ValueError, "cleanup deadline"):
+                run_group([self.python], self.root, os.environ.copy(), 10, lambda: None,
+                          owned_group=OwnedProcessGroup(), absolute_deadline=start + 2,
+                          cleanup_absolute_deadline=start + 1)
+        popen.assert_not_called()
+
     def test_success_reports_spawn_once_and_preserves_fd_and_stdout(self):
         callbacks = []
         with tempfile.TemporaryFile(mode="w+b", dir=self.root) as data, \

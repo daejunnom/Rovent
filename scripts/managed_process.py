@@ -212,12 +212,13 @@ def _check_before_spawn(argv, cwd, pass_fds, stdout):
 def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=None, on_spawn=None,
               verify_before_spawn=False, absolute_deadline=None, deadline_observation=None,
               on_tick=None, owned_group=None, graceful_drain_deadline=None, on_stop=None,
-              output_handoff=None):
+              output_handoff=None, cleanup_absolute_deadline=None):
     if os.name == "nt":
         if (pass_fds or stdout is not None or on_spawn is not None or verify_before_spawn
                 or absolute_deadline is not None or deadline_observation is not None
                 or on_tick is not None or owned_group is not None or graceful_drain_deadline is not None
-                or on_stop is not None or output_handoff is not None):
+                or on_stop is not None or output_handoff is not None
+                or cleanup_absolute_deadline is not None):
             raise RuntimeError("explicit descriptor handoff requires Linux")
         return _run_windows(argv, cwd, env, timeout, admission_check)
     if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
@@ -259,12 +260,25 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
             output_handoff.service()
             if previous_on_tick is not None:
                 previous_on_tick()
+    if cleanup_absolute_deadline is not None:
+        try:
+            valid_cleanup = (owned_group is not None and absolute_deadline is not None
+                             and type(cleanup_absolute_deadline) in (int, float)
+                             and math.isfinite(cleanup_absolute_deadline)
+                             and math.isfinite(absolute_deadline)
+                             and 0 < absolute_deadline <= cleanup_absolute_deadline)
+        except (TypeError, OverflowError):
+            valid_cleanup = False
+        if not valid_cleanup:
+            raise ValueError("cleanup deadline requires an original work deadline and owner")
     if graceful_drain_deadline is not None:
         try:
             valid_grace = (owned_group is not None and absolute_deadline is not None
                            and type(graceful_drain_deadline) in (int, float)
                            and math.isfinite(graceful_drain_deadline)
-                           and 0 < graceful_drain_deadline <= absolute_deadline)
+                           and 0 < graceful_drain_deadline <= (
+                               cleanup_absolute_deadline if cleanup_absolute_deadline is not None
+                               else absolute_deadline))
         except (TypeError, OverflowError):
             valid_grace = False
         if not valid_grace:
@@ -438,10 +452,14 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
         if stop_result is True:
             # A retained original owner was released after the work deadline.
             # Give that same child a separate, bounded process-drain window.
-            absolute_deadline = time.monotonic() + 3.0
-            graceful_drain_deadline = time.monotonic() + 1.0
+            if cleanup_absolute_deadline is None:
+                absolute_deadline = time.monotonic() + 3.0
+                graceful_drain_deadline = time.monotonic() + 1.0
+            else:
+                graceful_drain_deadline = min(time.monotonic() + 1.0, cleanup_absolute_deadline)
         gone, result, cleanup_error = _finish_owned_group(
-            child, on_tick, graceful_drain_deadline, absolute_deadline)
+            child, on_tick, graceful_drain_deadline,
+            cleanup_absolute_deadline if cleanup_absolute_deadline is not None else absolute_deadline)
         owned_group.cleanup_error = cleanup_error
         if cleanup_error is not None and failure is None:
             failure = f"{cleanup_error['error_type']}: {cleanup_error['message']}"
