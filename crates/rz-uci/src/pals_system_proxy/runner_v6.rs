@@ -8,6 +8,7 @@ use super::{
     PalsImageGrantObservationV6, PalsProxyBinaryPinV6, PalsProxyLaunchV6,
     cancel_control_v1::{CancelFailureObservation, CancelReceiverV1},
     finish::{self, PalsRuntimeFinishClaimV6, PalsSessionReleaseClaimV6},
+    proxy_entry_smoke_cancel_v1::{NoGameCancelFailure, NoGameCancelReceiverV1},
     relay::{
         PalsUciRelayV6, RelayInputCleanupReportV6, RelayInputCleanupStartV6,
         RelayInputCleanupStopV6, RelayPipeObservationV6,
@@ -63,6 +64,7 @@ pub(super) struct ProxySupervisorObservationV6 {
     pub physical_completion: &'static str,
     /// Transport failure only; not a cancellation or physical completion.
     pub cancel_control_failure: Option<CancelFailureObservation>,
+    pub no_game_cancel_failure: Option<NoGameCancelFailure>,
 }
 
 #[must_use = "retain the original child, relay and process while physical completion is unknown"]
@@ -85,6 +87,7 @@ pub(super) struct PalsProxySupervisorV6 {
     finish_cancelled: Arc<AtomicBool>,
     // The exact channel remains with this original supervisor even on error.
     cancel_receiver: Option<CancelReceiverV1>,
+    no_game_cancel_receiver: Option<NoGameCancelReceiverV1>,
     max_line: usize,
     pub stage: ProxyStageV6,
     pub failed_stage: Option<ProxyStageV6>,
@@ -139,6 +142,7 @@ impl PalsProxySupervisorV6 {
             cancelled,
             finish_cancelled,
             cancel_receiver: None,
+            no_game_cancel_receiver: None,
             max_line,
             stage: ProxyStageV6::Configured,
             failed_stage: None,
@@ -170,6 +174,7 @@ impl PalsProxySupervisorV6 {
     ) -> Result<(), CancelReceiverV1> {
         if self.stage != ProxyStageV6::Configured
             || self.cancel_receiver.is_some()
+            || self.no_game_cancel_receiver.is_some()
             || !receiver.matches_window(&self.cancelled, self.finish_until)
         {
             return Err(receiver);
@@ -178,10 +183,31 @@ impl PalsProxySupervisorV6 {
         Ok(())
     }
 
+    /// A NoGame receiver must have been constructed from this same bundle's
+    /// original Run grant. A separate caller owns listener provenance.
+    pub(super) fn attach_no_game_cancel(
+        &mut self,
+        receiver: NoGameCancelReceiverV1,
+    ) -> Result<(), NoGameCancelReceiverV1> {
+        if self.stage != ProxyStageV6::Configured
+            || self.cancel_receiver.is_some()
+            || self.no_game_cancel_receiver.is_some()
+            || !receiver.matches_window(&self.cancelled, self.finish_until)
+        {
+            return Err(receiver);
+        }
+        self.no_game_cancel_receiver = Some(receiver);
+        Ok(())
+    }
+
     fn poll_cancel_control(&mut self) {
         if let Some(receiver) = self.cancel_receiver.as_mut() {
             // A transport failure is retained on this receiver and reported
             // separately; output drain and child supervision must continue.
+            let _ = receiver.poll();
+        }
+        if let Some(receiver) = self.no_game_cancel_receiver.as_mut() {
+            // Preserve failure independently while continuing the same drain.
             let _ = receiver.poll();
         }
     }
@@ -330,6 +356,11 @@ impl PalsProxySupervisorV6 {
             .as_ref()
             .and_then(CancelReceiverV1::first_failure)
             .cloned();
+        let no_game_cancel_failure = self
+            .no_game_cancel_receiver
+            .as_ref()
+            .and_then(NoGameCancelReceiverV1::first_failure)
+            .cloned();
         let mut cleanup_stop = None;
         let relay = self.relay.as_mut().map(|relay| {
             let observation = relay.poll();
@@ -364,6 +395,7 @@ impl PalsProxySupervisorV6 {
             input_cleanup_stop: cleanup_stop,
             physical_completion: "unknown",
             cancel_control_failure,
+            no_game_cancel_failure,
         })
     }
 

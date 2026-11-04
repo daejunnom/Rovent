@@ -12,11 +12,15 @@ mod arena_launch_inputs;
 #[allow(dead_code)]
 mod proxy_entry_no_game_smoke_v1;
 #[allow(dead_code)]
+mod proxy_entry_smoke_cancel_v1;
+#[allow(dead_code)]
 mod proxy_entry_smoke_channel_v1;
 #[allow(dead_code)]
 mod proxy_entry_smoke_lock_v1;
 #[allow(dead_code)]
 mod proxy_entry_smoke_prepare_v1;
+#[allow(dead_code)]
+mod proxy_entry_smoke_supervisor_v1;
 #[allow(dead_code)]
 mod proxy_entry_smoke_v1;
 #[allow(dead_code)]

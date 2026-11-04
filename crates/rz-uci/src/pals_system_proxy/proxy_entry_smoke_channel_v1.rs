@@ -325,6 +325,19 @@ pub(super) struct OriginalDirectSmokeGrant {
     deadline: Instant,
 }
 
+/// Process identities observed from the original grant and cancel streams.
+/// This does not establish original listener provenance or physical completion.
+pub(super) struct DirectSmokeCancelPeer(OriginalDirectPeer);
+
+impl DirectSmokeCancelPeer {
+    pub(super) fn verify(&self, stream: &UnixStream) -> io::Result<()> {
+        if observe_direct_parent(stream)? != self.0 {
+            return Err(invalid("NoGame original cancel peer changed"));
+        }
+        Ok(())
+    }
+}
+
 impl PendingDirectSmokeGrant {
     /// The caller owns role-channel provenance and a finite exchange bound.
     /// Setup refusal returns the exact supplied socket to that same caller.
@@ -522,6 +535,15 @@ impl PendingDirectSmokeGrant {
 }
 
 impl OriginalDirectSmokeGrant {
+    /// Compare both actual sockets and their direct-parent identities. The
+    /// caller separately owns proof of which role listener was selected.
+    pub(super) fn cancel_peer(&self, stream: &UnixStream) -> io::Result<DirectSmokeCancelPeer> {
+        self.verify_original_peer()?;
+        if observe_direct_parent(stream)? != self.peer {
+            return Err(invalid("NoGame cancel peer differs from original grant"));
+        }
+        Ok(DirectSmokeCancelPeer(self.peer))
+    }
     pub(super) fn scope(&self) -> &ProxyEntrySmokeScope {
         &self.scope
     }

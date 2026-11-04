@@ -87,6 +87,17 @@ pub(super) struct SmokeLockAdmissionFailure {
 }
 
 impl OriginalSmokeLockAdmission {
+    /// The named root and lock are only declarations beside this same
+    /// retained root capability and lock FD; callers must still verify_held.
+    pub(super) fn local_paths_and_root_identity(&self) -> io::Result<(PathBuf, PathBuf, u64, u64)> {
+        let held = self.pin.root.try_clone()?.into_std_file().metadata()?;
+        Ok((
+            self.pin.private_cwd.clone(),
+            self.pin.private_cwd.join(&self.pin.relative),
+            StdMetadataExt::dev(&held),
+            StdMetadataExt::ino(&held),
+        ))
+    }
     #[cfg(test)]
     pub(super) fn retained_file_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
