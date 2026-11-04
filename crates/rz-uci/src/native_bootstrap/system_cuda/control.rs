@@ -536,14 +536,9 @@ impl Lc0ControlSupervisor {
         }
     }
 
-    /// Setup and protocol service must be inside `serve`; this prevents a
-    /// setup error or unwind after factory creation from skipping the original
-    /// owner's bounded finish path. The original panic is retained here.
-    pub(super) fn serve_until(
-        &mut self,
-        until: Instant,
-        serve: impl FnOnce(Arc<NativeCudaFactory>) -> Result<(), EngineError>,
-    ) -> Result<(), NativeBootstrapError> {
+    // Keep admission and collection on the same supervisor. These operations
+    // do not hand a completion token to an external caller.
+    fn begin_service(&mut self) -> Result<Arc<NativeCudaFactory>, NativeBootstrapError> {
         if self.state != ServiceState::Prepared {
             return Err(NativeBootstrapError::Config(
                 "LC0 service already started or closed",
@@ -558,6 +553,18 @@ impl Lc0ControlSupervisor {
             ))?;
         self.state = ServiceState::Serving;
         self.service_started = true;
+        Ok(factory)
+    }
+
+    /// Setup and protocol service must be inside `serve`; this prevents a
+    /// setup error or unwind after factory creation from skipping the original
+    /// owner's bounded finish path. The original panic is retained here.
+    pub(super) fn serve_until(
+        &mut self,
+        until: Instant,
+        serve: impl FnOnce(Arc<NativeCudaFactory>) -> Result<(), EngineError>,
+    ) -> Result<(), NativeBootstrapError> {
+        let factory = self.begin_service()?;
         let result = catch_unwind(AssertUnwindSafe(|| serve(factory)));
         let served = match result {
             Ok(result) => result,
@@ -566,6 +573,14 @@ impl Lc0ControlSupervisor {
                 Err(EngineError::WorkerPanic)
             }
         };
+        self.finish_service(until, served)
+    }
+
+    fn finish_service(
+        &mut self,
+        until: Instant,
+        served: Result<(), EngineError>,
+    ) -> Result<(), NativeBootstrapError> {
         // Keep the original error in the supervisor until the finish report
         // takes it. A panic during collection must not drop the service error.
         self.service_failure_projection = served.as_ref().err().map(service_failure);
