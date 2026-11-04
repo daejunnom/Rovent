@@ -39,6 +39,23 @@ pub(crate) enum SmokePreparationUnobserved {
     Unknown,
 }
 
+/// Stages apply only to this selected NoGame preparation attempt. They do not
+/// describe the result of an independent CPU or another engine execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NoGamePreparationStage {
+    Admission,
+    SelectedInputs,
+    SourceAssets,
+    OutputDirectory,
+    SnapshotCopy,
+    RuntimeDirectory,
+}
+
+pub(crate) struct NoGamePreparationFailure {
+    pub(crate) stage: NoGamePreparationStage,
+    pub(crate) original: NativePreparationFailure,
+}
+
 /// Retains the exact lease and pinned files. These fields provide no process
 /// start, system provider, source mapping or physical-completion capability.
 pub(crate) struct ProxyEntrySmokeSnapshotOwnerV1 {
@@ -228,7 +245,7 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
     source_root: &Path,
     output_root: &Path,
     output_directory: &str,
-) -> Result<ProxyEntrySmokeSnapshotOwnerV1, Box<NativePreparationFailure>> {
+) -> Result<ProxyEntrySmokeSnapshotOwnerV1, Box<NoGamePreparationFailure>> {
     let mut trace = NativePreparationReceipt {
         receipt_version: 1,
         policy_envelope: None,
@@ -251,6 +268,7 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
         automatic_retry: false,
     };
     let mut retained_directory = None;
+    let mut stage = NoGamePreparationStage::Admission;
     let result = (|| -> Result<_, ArenaError> {
         let lease = NativeAdmissionLease::acquire()?;
         if !native_launch::safe_output_basename(output_directory) {
@@ -261,10 +279,12 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
             return Err(invalid("smoke original execution identity differs"));
         }
         let role = plan.input().declared_role;
+        stage = NoGamePreparationStage::SelectedInputs;
         let (inputs, source_observation) = selected_inputs(plan)?;
         let names: Vec<_> = inputs.iter().map(|item| item.name.clone()).collect();
         let parents =
             linux::snapshot_parents(&names, usize::from(plan.input().budget.max_runtime_depth))?;
+        stage = NoGamePreparationStage::SourceAssets;
         let sources = inputs
             .iter()
             .map(|item| {
@@ -277,6 +297,7 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
             })
             .collect::<Result<Vec<_>, ArenaError>>()?;
         execution.require_running()?;
+        stage = NoGamePreparationStage::OutputDirectory;
         let root_path = linux::outside_git(output_root)?;
         let root = Dir::open_ambient_dir(&root_path, cap_std::ambient_authority())
             .map_err(|_| io("cannot pin smoke output root"))?;
@@ -332,6 +353,7 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
         }
         let mut pins = Vec::new();
         let mut receipts = Vec::new();
+        stage = NoGamePreparationStage::SnapshotCopy;
         for (item, source) in inputs.iter().zip(sources) {
             execution.require_running()?;
             let relative = PathBuf::from("inputs").join(&item.name);
@@ -366,6 +388,7 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
         linux::readable_directory_pin(&input_directory)?
             .set_permissions(Permissions::from_mode(0o500))
             .map_err(|_| io("cannot close smoke input directory"))?;
+        stage = NoGamePreparationStage::RuntimeDirectory;
         let runtime_name = &plan.input().endpoint.startup_lock.config.runtime_directory;
         directory
             .create_dir(runtime_name)
@@ -404,7 +427,10 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
     match result {
         Ok(owner) => Ok(owner),
         Err(cause) => {
-            trace.original_error = cause.to_string().chars().take(4096).collect();
+            trace.original_error = format!("NoGame {stage:?}: {cause}")
+                .chars()
+                .take(4096)
+                .collect();
             let persisted = if trace.attempt_created {
                 linux::save_preparation_failure(
                     retained_directory.as_ref(),
@@ -418,11 +444,14 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
                 Ok(artifact) => (artifact, None),
                 Err(error) => (None, Some(error)),
             };
-            Err(Box::new(NativePreparationFailure {
-                cause,
-                receipt: trace,
-                receipt_artifact,
-                persistence_error,
+            Err(Box::new(NoGamePreparationFailure {
+                stage,
+                original: NativePreparationFailure {
+                    cause,
+                    receipt: trace,
+                    receipt_artifact,
+                    persistence_error,
+                },
             }))
         }
     }

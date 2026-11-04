@@ -49,9 +49,12 @@ pub(crate) use system_v6::{
     NoGameSmokeBudgetV1, NoGameSmokeEndpointV1, NoGameSmokePlanV1,
 };
 #[cfg(target_os = "linux")]
-pub(crate) use system_v6::{ProxyEntryFunctionalSmokeOwnerV1, SMOKE_RECEIPT_FILE};
+pub(crate) use system_v6::{
+    NoGamePreparationFailure, NoGamePreparationStage, ProxyEntrySmokeSnapshotOwnerV1,
+    prepare_proxy_entry_smoke_snapshot_v1,
+};
 #[cfg(target_os = "linux")]
-pub(crate) use system_v6::{ProxyEntrySmokeSnapshotOwnerV1, prepare_proxy_entry_smoke_snapshot_v1};
+pub(crate) use system_v6::{ProxyEntryFunctionalSmokeOwnerV1, SMOKE_RECEIPT_FILE};
 #[cfg(target_os = "linux")]
 pub(crate) use system_v6::{SmokeControlProgress, SmokeDeadlineControl, SmokeGrantObservation};
 
