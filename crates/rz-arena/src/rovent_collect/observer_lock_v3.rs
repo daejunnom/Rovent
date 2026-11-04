@@ -945,7 +945,7 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
 
     fn try_adaptive_consumed(
         &mut self,
-        witness: RovventCollectionConsumedWitnessV3<'_>,
+        witness: RoventCollectionConsumedWitnessV3<'_>,
         _: bool,
     ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
         self.try_apply(AdaptiveCollectionStage::Accepted, |state| {
