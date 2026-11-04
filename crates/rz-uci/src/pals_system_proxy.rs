@@ -160,9 +160,11 @@ impl PalsProxyLaunchV6 {
         ) || binary.artifact.sha256 != lock.config.endpoint.binary.sha256
             || binary.artifact.bytes != lock.config.endpoint.binary.bytes
             || !controlled_path(&startup_lock_path)
-            || !controlled_path(&parent_socket_path)
             || !startup_lock_path.starts_with(&binary.private_cwd)
-            || parent_socket_path.parent() != Some(binary.private_cwd.as_path())
+            || (crate::pals_adaptive_startup::v6_abstract_socket_name(&parent_socket_path)
+                .is_none()
+                && (!controlled_path(&parent_socket_path)
+                    || parent_socket_path.parent() != Some(binary.private_cwd.as_path())))
         {
             return Err(invalid("invalid PALS direct-parent launch declaration"));
         }
@@ -302,8 +304,9 @@ pub struct DirectPalsChildV6 {
     binary: Arc<PalsProxyBinaryPinV6>,
     mapped_image: Option<File>,
     image_after_auth_verified: bool,
-    listener: UnixListener,
+    listener: Option<UnixListener>,
     channel: Option<parent::AuthenticatedChildChannel>,
+    socket_abstract: bool,
     socket_path: PathBuf,
     socket_device: u64,
     socket_inode: u64,
@@ -355,6 +358,21 @@ pub struct PalsDirectChildObservationV6 {
     pub child_pid: u32,
     pub child_exit: Option<ExitStatus>,
     pub physical_completion: &'static str,
+}
+
+/// Last recorded identity of this owner's original listener, not liveness or
+/// peer authentication. Abstract names are never filesystem paths.
+pub enum PalsParentSocketIdentityV6<'a> {
+    Pathname {
+        path: &'a Path,
+        device: u64,
+        inode: u64,
+    },
+    Abstract {
+        name: &'a str,
+        listener_device: u64,
+        listener_inode: u64,
+    },
 }
 
 /// The originals are transferred once, so the relay can use exactly one stdin
@@ -423,25 +441,47 @@ impl DirectPalsChildV6 {
         };
         let lock_path = as_text(&launch.startup_lock_path)?;
         let socket_path = as_text(&launch.parent_socket_path)?;
-        let transport_path = socket_transport_path(&launch.parent_socket_path, &launch.binary.cwd)?;
-        let listener = UnixListener::bind(&transport_path)?;
-        let bound = fs::symlink_metadata(&transport_path)?;
-        let socket = fs::symlink_metadata(&launch.parent_socket_path).map_err(|error| {
-            io::Error::other(format!(
-                "PALS parent socket identity unavailable; preserved: {error}"
-            ))
-        })?;
-        if !socket.file_type().is_socket()
-            || socket.uid() != nix::unistd::geteuid().as_raw()
-            || (socket.dev(), socket.ino()) != (bound.dev(), bound.ino())
-        {
-            return Err(invalid("PALS parent socket owner differs; path preserved"));
-        }
+        let abstract_name =
+            crate::pals_adaptive_startup::v6_abstract_socket_name(&launch.parent_socket_path);
+        let (listener, socket, socket_abstract) = if let Some(name) = abstract_name {
+            use std::os::linux::net::SocketAddrExt;
+            let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+            let listener = UnixListener::bind_addr(&address)?;
+            // This identifies the held kernel listener FD; no filesystem socket
+            // is created or unlinked. It is not peer-authentication evidence.
+            let metadata = fs::metadata(format!("/proc/self/fd/{}", listener.as_raw_fd()))?;
+            if !metadata.file_type().is_socket()
+                || metadata.uid() != nix::unistd::geteuid().as_raw()
+            {
+                return Err(invalid("PALS abstract listener owner differs"));
+            }
+            (listener, metadata, true)
+        } else {
+            let transport_path =
+                socket_transport_path(&launch.parent_socket_path, &launch.binary.cwd)?;
+            let listener = UnixListener::bind(&transport_path)?;
+            let bound = fs::symlink_metadata(&transport_path)?;
+            let socket = fs::symlink_metadata(&launch.parent_socket_path).map_err(|error| {
+                io::Error::other(format!(
+                    "PALS parent socket identity unavailable; preserved: {error}"
+                ))
+            })?;
+            if !socket.file_type().is_socket()
+                || socket.uid() != nix::unistd::geteuid().as_raw()
+                || (socket.dev(), socket.ino()) != (bound.dev(), bound.ino())
+            {
+                return Err(invalid("PALS parent socket owner differs; path preserved"));
+            }
+            (listener, socket, false)
+        };
         // The 0700 directory and authenticated peer protect this socket;
         // do not chmod a pathname that another process might replace.
         if let Err(error) = listener.set_nonblocking(true) {
-            let cleanup =
-                retire_socket_if_unchanged(&launch.parent_socket_path, socket.dev(), socket.ino());
+            let cleanup = if socket_abstract {
+                Ok(())
+            } else {
+                retire_socket_if_unchanged(&launch.parent_socket_path, socket.dev(), socket.ino())
+            };
             return match cleanup {
                 Ok(()) => Err(error),
                 Err(cleanup) => Err(io::Error::other(format!(
@@ -453,6 +493,11 @@ impl DirectPalsChildV6 {
             "/proc/self/fd/{}",
             launch.binary.executable.as_raw_fd()
         ));
+        let parent_socket_option = if let Some(name) = abstract_name {
+            format!("--pals-system-parent-abstract={name}")
+        } else {
+            format!("--pals-system-parent-socket={socket_path}")
+        };
         command
             .current_dir(format!("/proc/self/fd/{}", launch.binary.cwd.as_raw_fd()))
             .arg(format!("--pals-system-startup-lock={lock_path}"))
@@ -464,13 +509,16 @@ impl DirectPalsChildV6 {
                 "--pals-system-startup-ms={}",
                 launch.lock.config.native_options.startup_ms
             ))
-            .arg(format!("--pals-system-parent-socket={socket_path}"))
+            .arg(parent_socket_option)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Err(error) = launch.check_startup_control() {
-            let cleanup =
-                retire_socket_if_unchanged(&launch.parent_socket_path, socket.dev(), socket.ino());
+            let cleanup = if socket_abstract {
+                Ok(())
+            } else {
+                retire_socket_if_unchanged(&launch.parent_socket_path, socket.dev(), socket.ino())
+            };
             return match cleanup {
                 Ok(()) => Err(error),
                 Err(cleanup) => Err(io::Error::other(format!(
@@ -481,11 +529,15 @@ impl DirectPalsChildV6 {
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                let cleanup = retire_socket_if_unchanged(
-                    &launch.parent_socket_path,
-                    socket.dev(),
-                    socket.ino(),
-                );
+                let cleanup = if socket_abstract {
+                    Ok(())
+                } else {
+                    retire_socket_if_unchanged(
+                        &launch.parent_socket_path,
+                        socket.dev(),
+                        socket.ino(),
+                    )
+                };
                 return match cleanup {
                     Ok(()) => Err(error),
                     Err(cleanup) => Err(io::Error::other(format!(
@@ -499,8 +551,9 @@ impl DirectPalsChildV6 {
             binary: Arc::clone(&launch.binary),
             mapped_image: None,
             image_after_auth_verified: false,
-            listener,
+            listener: Some(listener),
             channel: None,
+            socket_abstract,
             socket_path: launch.parent_socket_path,
             socket_device: socket.dev(),
             socket_inode: socket.ino(),
@@ -532,7 +585,9 @@ impl DirectPalsChildV6 {
             return Err(invalid("PALS direct child has no CUDA registration"));
         };
         self.channel = Some(parent::accept_and_authenticate_child(
-            &self.listener,
+            self.listener
+                .as_ref()
+                .ok_or_else(|| invalid("PALS listener retired"))?,
             &mut self.child,
             self.lock.config.process_generation,
             &self.lock.canonical_sha256,
@@ -618,7 +673,11 @@ impl DirectPalsChildV6 {
         }
         // Both descriptors stay with this same owner; this temporary clone is
         // not exposed to another process or independent accept loop.
-        let listener = self.listener.try_clone()?;
+        let listener = self
+            .listener
+            .as_ref()
+            .ok_or_else(|| invalid("PALS listener retired"))?
+            .try_clone()?;
         let until = self.startup_until;
         let cancelled = Arc::clone(&self.startup_cancelled);
         match parent::grant_after_original_image(&listener, self, until, cancelled.as_ref()) {
@@ -659,7 +718,9 @@ impl DirectPalsChildV6 {
         };
         self.finish_channel_attempted = true;
         let channel = parent::accept_and_authenticate_finish_child(
-            &self.listener,
+            self.listener
+                .as_ref()
+                .ok_or_else(|| invalid("PALS listener retired"))?,
             &mut self.child,
             self.lock.config.process_generation,
             &self.lock.canonical_sha256,
@@ -752,9 +813,31 @@ impl DirectPalsChildV6 {
 
     /// A caller may retire this socket only after it has separately settled
     /// the original child and physical owner. This method checks path identity
-    /// but does not itself establish either condition.
+    /// but does not itself establish either condition. For an abstract
+    /// listener the first value is the `abstract:` address representation,
+    /// not a filesystem path; device/inode identify the held listener FD.
     pub fn socket_identity(&self) -> (&Path, u64, u64) {
         (&self.socket_path, self.socket_device, self.socket_inode)
+    }
+
+    /// Typed observation of the original listener's transport and recorded
+    /// inode. It is not a physical-release or peer-authentication proof.
+    pub fn socket_observation(&self) -> io::Result<PalsParentSocketIdentityV6<'_>> {
+        if self.socket_abstract {
+            let name = crate::pals_adaptive_startup::v6_abstract_socket_name(&self.socket_path)
+                .ok_or_else(|| invalid("PALS abstract address unavailable"))?;
+            Ok(PalsParentSocketIdentityV6::Abstract {
+                name,
+                listener_device: self.socket_device,
+                listener_inode: self.socket_inode,
+            })
+        } else {
+            Ok(PalsParentSocketIdentityV6::Pathname {
+                path: &self.socket_path,
+                device: self.socket_device,
+                inode: self.socket_inode,
+            })
+        }
     }
 
     /// The proof must originate from the original supervisor's validated
@@ -788,7 +871,24 @@ impl DirectPalsChildV6 {
         {
             return Err(invalid("PALS private directory changed; socket preserved"));
         }
-        retire_socket_if_unchanged(&self.socket_path, self.socket_device, self.socket_inode)?;
+        if self.socket_abstract {
+            let listener = self
+                .listener
+                .as_ref()
+                .ok_or_else(|| invalid("PALS listener retired"))?;
+            let held = fs::metadata(format!("/proc/self/fd/{}", listener.as_raw_fd()))?;
+            if !held.file_type().is_socket()
+                || held.dev() != self.socket_device
+                || held.ino() != self.socket_inode
+            {
+                return Err(invalid("PALS abstract listener changed; retained"));
+            }
+            // Only the exact listener owned here is dropped, after the same
+            // physical proof as the pathname retirement path.
+            self.listener.take();
+        } else {
+            retire_socket_if_unchanged(&self.socket_path, self.socket_device, self.socket_inode)?;
+        }
         self.socket_retired = true;
         Ok(())
     }
@@ -810,6 +910,30 @@ mod tests {
             let _ = fs::remove_file(self.0.join("original"));
             let _ = fs::remove_dir(&self.0);
         }
+    }
+
+    #[test]
+    fn abstract_listener_collision_and_same_process_peer_credentials() {
+        use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixStream};
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("rz-child-{}-{nonce}", std::process::id());
+        let address = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let listener = UnixListener::bind_addr(&address).unwrap();
+        assert!(UnixListener::bind_addr(&address).is_err());
+        let client = UnixStream::connect_addr(&address).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let peer = getsockopt(&accepted, PeerCredentials).unwrap();
+        assert_eq!(peer.pid(), std::process::id() as i32);
+        assert_eq!(peer.uid(), nix::unistd::geteuid().as_raw());
+        drop(accepted);
+        drop(client);
+        drop(listener);
+        assert!(UnixListener::bind_addr(&address).is_ok());
     }
 
     #[test]

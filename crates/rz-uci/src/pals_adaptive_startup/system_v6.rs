@@ -24,6 +24,18 @@ use std::{
     time::Instant,
 };
 
+/// The abstract prefix is an in-process representation, never a filesystem
+/// path or evidence of peer identity. AF_UNIX reserves one of 108 bytes for
+/// the leading NUL. Empty and control-character names are invalid.
+pub fn v6_abstract_socket_name(path: &Path) -> Option<&str> {
+    let name = path.to_str()?.strip_prefix("abstract:")?;
+    if name.is_empty() || name.len() > 107 || !name.is_ascii() || name.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(name)
+}
+
 /// V6 has a separate CLI domain; V5 arguments are never silently translated.
 pub struct PalsSystemStartupOptionsV6 {
     pub lock_path: PathBuf,
@@ -61,6 +73,15 @@ impl PalsSystemStartupOptionsV6 {
                     .is_some()
                 {
                     return Err(invalid("duplicate system parent socket"));
+                }
+            } else if let Some(value) = argument.strip_prefix("--pals-system-parent-abstract=") {
+                let address = PathBuf::from(format!("abstract:{value}"));
+                if v6_abstract_socket_name(&address).is_none()
+                    || parent_socket.replace(address).is_some()
+                {
+                    return Err(invalid(
+                        "invalid or duplicate abstract system parent socket",
+                    ));
                 }
             } else if argument == "--preflight=true" && !preflight {
                 preflight = true;
@@ -408,7 +429,10 @@ impl PinnedPalsSystemStartupV6 {
         socket_path: &Path,
         original_parent_pid: i32,
     ) -> std::io::Result<std::os::unix::net::UnixStream> {
-        if original_parent_pid <= 0 || socket_path.parent() != Some(self.private_cwd()) {
+        if original_parent_pid <= 0
+            || (v6_abstract_socket_name(socket_path).is_none()
+                && socket_path.parent() != Some(self.private_cwd()))
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "PALS direct parent socket differs from private root",
@@ -449,28 +473,44 @@ impl PinnedPalsSystemStartupV6 {
         };
 
         let invalid = |detail| std::io::Error::new(std::io::ErrorKind::InvalidInput, detail);
-        if original_parent_pid <= 0 || socket_path.parent() != Some(self.private_cwd()) {
+        if original_parent_pid <= 0
+            || (v6_abstract_socket_name(socket_path).is_none()
+                && socket_path.parent() != Some(self.private_cwd()))
+        {
             return Err(invalid(
                 "PALS direct parent socket differs from private root",
             ));
         }
-        let metadata = std::fs::symlink_metadata(socket_path)?;
-        if !metadata.file_type().is_socket() || metadata.uid() != nix::unistd::geteuid().as_raw() {
-            return Err(invalid("PALS direct parent socket owner differs"));
-        }
-        // The child opens its own original root capability; the parent's FD
-        // number is neither inherited nor assumed to be the same here.
-        let root = self
-            .root
-            .try_clone()
-            .map_err(std::io::Error::other)?
-            .into_std_file();
-        let transport = crate::pals_system_proxy::socket_transport_path(socket_path, &root)?;
-        let transport_meta = std::fs::symlink_metadata(&transport)?;
-        if (metadata.dev(), metadata.ino()) != (transport_meta.dev(), transport_meta.ino()) {
-            return Err(invalid("PALS direct parent socket identity changed"));
-        }
-        let address = UnixAddr::new(&transport).map_err(std::io::Error::other)?;
+        let (address, path_identity) = if let Some(name) = v6_abstract_socket_name(socket_path) {
+            // Abstract names contain no filesystem inode. Peer credentials and
+            // the original direct-parent handshake remain independently required.
+            (
+                UnixAddr::new_abstract(name.as_bytes()).map_err(std::io::Error::other)?,
+                None,
+            )
+        } else {
+            let metadata = std::fs::symlink_metadata(socket_path)?;
+            if !metadata.file_type().is_socket()
+                || metadata.uid() != nix::unistd::geteuid().as_raw()
+            {
+                return Err(invalid("PALS direct parent socket owner differs"));
+            }
+            // Each process holds its own directory FD for a long pathname.
+            let root = self
+                .root
+                .try_clone()
+                .map_err(std::io::Error::other)?
+                .into_std_file();
+            let transport = crate::pals_system_proxy::socket_transport_path(socket_path, &root)?;
+            let transport_meta = std::fs::symlink_metadata(&transport)?;
+            if (metadata.dev(), metadata.ino()) != (transport_meta.dev(), transport_meta.ino()) {
+                return Err(invalid("PALS direct parent socket identity changed"));
+            }
+            (
+                UnixAddr::new(&transport).map_err(std::io::Error::other)?,
+                Some((metadata, transport)),
+            )
+        };
         let descriptor = socket(
             AddressFamily::Unix,
             SockType::Stream,
@@ -518,12 +558,14 @@ impl PinnedPalsSystemStartupV6 {
             }
         }
         check()?;
-        let after = std::fs::symlink_metadata(socket_path)?;
-        let held_after = std::fs::symlink_metadata(&transport)?;
-        if (metadata.dev(), metadata.ino()) != (after.dev(), after.ino())
-            || (metadata.dev(), metadata.ino()) != (held_after.dev(), held_after.ino())
-        {
-            return Err(invalid("PALS direct parent socket changed during connect"));
+        if let Some((metadata, transport)) = path_identity {
+            let after = std::fs::symlink_metadata(socket_path)?;
+            let held_after = std::fs::symlink_metadata(&transport)?;
+            if (metadata.dev(), metadata.ino()) != (after.dev(), after.ino())
+                || (metadata.dev(), metadata.ino()) != (held_after.dev(), held_after.ino())
+            {
+                return Err(invalid("PALS direct parent socket changed during connect"));
+            }
         }
         Ok(UnixStream::from(descriptor))
     }
@@ -1124,6 +1166,41 @@ mod tests {
         );
         actual.push(parent);
         assert!(PalsSystemStartupOptionsV6::parse(&actual).is_err());
+    }
+
+    #[test]
+    fn v6_abstract_parent_option_is_distinct_from_existing_pathname() {
+        let root = std::env::temp_dir();
+        let mut args = vec![
+            format!(
+                "--pals-system-startup-lock={}",
+                root.join("inputs/system-lock.json").display()
+            ),
+            format!(
+                "--pals-system-startup-lock-sha256={:x}",
+                Sha256::digest(b"original-lock")
+            ),
+            "--pals-system-startup-ms=1000".to_owned(),
+            "--pals-system-parent-abstract=rz-parent-fixture".to_owned(),
+        ];
+        let parsed = PalsSystemStartupOptionsV6::parse(&args).unwrap();
+        assert_eq!(
+            parsed
+                .parent_socket
+                .as_deref()
+                .and_then(v6_abstract_socket_name),
+            Some("rz-parent-fixture")
+        );
+        args.push(format!(
+            "--pals-system-parent-socket={}",
+            root.join("owner.sock").display()
+        ));
+        assert!(PalsSystemStartupOptionsV6::parse(&args).is_err());
+        assert!(v6_abstract_socket_name(Path::new("abstract:")).is_none());
+        assert!(
+            v6_abstract_socket_name(Path::new(&format!("abstract:{}", "a".repeat(108)))).is_none()
+        );
+        assert!(v6_abstract_socket_name(Path::new("abstract:bad\nname")).is_none());
     }
 
     #[test]
