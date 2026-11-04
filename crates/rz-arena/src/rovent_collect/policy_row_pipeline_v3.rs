@@ -35,6 +35,13 @@ pub(super) enum PolicyPipelineProgressV3 {
     Failed,
 }
 
+pub(super) enum PolicyFlushOutcomeV3 {
+    Packet,
+    Empty,
+    NotReady,
+    Failed,
+}
+
 pub(super) struct PolicyRowPipelineV3 {
     row: Option<RoventRetiredLockV3Record>,
     prepared: Option<PreparedTeacherPolicyLockV3>,
@@ -225,26 +232,32 @@ impl PolicyRowPipelineV3 {
     }
 
     /// A successful packet moves only to another caller-owned retained slot.
-    pub(super) fn flush_into(&mut self, output: &mut Option<RoventChunkPacket>) -> bool {
-        if self.failure.is_some() || output.is_some() {
-            return false;
+    pub(super) fn flush_into(
+        &mut self,
+        output: &mut Option<RoventChunkPacket>,
+    ) -> PolicyFlushOutcomeV3 {
+        if self.failure.is_some() {
+            return PolicyFlushOutcomeV3::Failed;
+        }
+        if output.is_some() {
+            return PolicyFlushOutcomeV3::NotReady;
         }
         let Some(writer) = self.writer.as_mut() else {
-            return false;
+            return PolicyFlushOutcomeV3::NotReady;
         };
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer.flush())) {
             Ok(Ok(Some(packet))) => {
                 *output = Some(packet);
-                true
+                PolicyFlushOutcomeV3::Packet
             }
-            Ok(Ok(None)) => true,
+            Ok(Ok(None)) => PolicyFlushOutcomeV3::Empty,
             Ok(Err(error)) => {
                 self.failure = Some(PolicyPipelineFailureV3::Flush(error));
-                false
+                PolicyFlushOutcomeV3::Failed
             }
             Err(payload) => {
                 self.failure = Some(PolicyPipelineFailureV3::FlushPanic(payload));
-                false
+                PolicyFlushOutcomeV3::Failed
             }
         }
     }
