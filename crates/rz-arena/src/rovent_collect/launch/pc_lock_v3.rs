@@ -537,6 +537,50 @@ pub(crate) struct PcCollectionRunV3 {
 }
 
 impl PcCollectionRunV3 {
+    /// Reclaim only the outcome held by this supervisor's original recovery
+    /// key. None does not prove that no worker or resource exists.
+    pub(crate) fn recover_original(
+        owners: &Arc<PcCollectionOwnersV3>,
+        output: &Arc<ManagedOutputOwnerV3>,
+    ) -> Result<Option<Self>, &'static str> {
+        use super::pc_recovery_v3::PcRunRecoveryStateV3;
+        let Some(recovery) = super::pc_recovery_v3::PcRunRecoveryKeyV3::recover_for_supervisor(
+            owners.supervisor(),
+        )? else {
+            return Ok(None);
+        };
+        let (original_owners, original_output) = recovery.original_owners()?;
+        if !Arc::ptr_eq(&original_owners, owners) || !Arc::ptr_eq(&original_output, output) {
+            return Err("Collection original recovery owners differ");
+        }
+        let Some(key) = recovery.original_outcome_key()? else {
+            return Ok(None);
+        };
+        let Some(outcome) = key.try_recover()? else {
+            return Ok(None);
+        };
+        if !outcome.matches_original_collection(owners.native()) {
+            return Err("Collection recovered outcome owner differs");
+        }
+        let (state, _, _) = recovery.observation()?;
+        let recovery_recorded = match state {
+            PcRunRecoveryStateV3::Returned | PcRunRecoveryStateV3::Panicked => true,
+            PcRunRecoveryStateV3::Executing => false,
+            PcRunRecoveryStateV3::Prepared => {
+                return Err("Collection recovered outcome was not executing");
+            }
+        };
+        Ok(Some(Self {
+            owners: Arc::clone(owners),
+            output: Arc::clone(output),
+            outcome,
+            recovery,
+            recovery_recorded,
+            recovery_error: None,
+            settled: false,
+        }))
+    }
+
     /// This key names the retained original owner; it is not completion.
     pub(crate) fn recovery_key(&self) -> super::pc_recovery_v3::PcRunRecoveryKeyV3 {
         self.recovery.clone()
