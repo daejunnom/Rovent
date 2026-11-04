@@ -130,6 +130,94 @@ pub(crate) enum ManagedPcPrepareErrorV3 {
     },
 }
 
+/// A read-only profile observation retaining the same authenticated /2
+/// owner and the original profile file. It grants no execution authority.
+pub(crate) struct PreparedLongGamePreflightV3 {
+    _observation: ObservedManagedPlanLeaseV2,
+    pub(crate) profile: super::long_game_profile_v3::PreparedLongGameProfileV3,
+}
+
+pub(crate) enum LongGamePreflightErrorV3 {
+    Selection(ArenaError),
+    Setup(ManagedPcPrepareErrorV3),
+    Read {
+        error: ArenaError,
+        observation: ObservedManagedPlanLeaseV2,
+        profile: Option<super::long_game_profile_v3::PreparedLongGameProfileV3>,
+    },
+}
+
+/// Uses the same inherited /2 input owner; no native/teacher or output write
+/// is started. The selected profile pin is not inserted into the launch plan.
+pub(crate) fn prepare_long_game_preflight_v3(
+    selection: ManagedCollectionCliV3,
+    bootstrap_until: Instant,
+) -> Result<PreparedLongGamePreflightV3, LongGamePreflightErrorV3> {
+    let profile_pin = selection.long_game_preflight.as_ref().ok_or_else(|| {
+        LongGamePreflightErrorV3::Selection(super::invalid("long-game preflight not selected"))
+    })?;
+    let fds = ManagedCollectionInheritedFds::seal_exclusive(
+        selection.channel,
+        selection.output,
+        selection.input,
+        selection.plan,
+    )
+    .map_err(|error| {
+        LongGamePreflightErrorV3::Setup(ManagedPcPrepareErrorV3::DescriptorUncertain(error))
+    })?;
+    let pin = &selection.selection.plan_pin;
+    let mut observation = ObservedManagedPlanLeaseV2::bind(
+        fds,
+        pin.path.clone(),
+        pin.bytes,
+        pin.sha256.clone(),
+        pin.bytes,
+        bootstrap_until,
+    )
+    .map_err(|error| {
+        LongGamePreflightErrorV3::Setup(ManagedPcPrepareErrorV3::Observation(error))
+    })?;
+    if let Err(error) = selection.remaining_deadlines(&mut observation, bootstrap_until) {
+        return Err(LongGamePreflightErrorV3::Setup(
+            ManagedPcPrepareErrorV3::Deadline { error, observation },
+        ));
+    }
+    let first_read = (|| -> Result<_, ArenaError> {
+        observation
+            .verify_live(bootstrap_until)
+            .map_err(super::io)?;
+        let (directory, _plan) = observation.clone_original_input().map_err(super::io)?;
+        let directory = cap_std::fs::Dir::from_std_file(directory);
+        super::long_game_profile_v3::PreparedLongGameProfileV3::open(&directory, profile_pin)
+    })();
+    let profile = match first_read {
+        Ok(profile) => profile,
+        Err(error) => {
+            return Err(LongGamePreflightErrorV3::Read {
+                error,
+                observation,
+                profile: None,
+            });
+        }
+    };
+    let after = if Instant::now() >= bootstrap_until {
+        Err(super::invalid("long-game preflight deadline expired"))
+    } else {
+        observation.verify_live(bootstrap_until).map_err(super::io)
+    };
+    if let Err(error) = after {
+        return Err(LongGamePreflightErrorV3::Read {
+            error,
+            observation,
+            profile: Some(profile),
+        });
+    }
+    Ok(PreparedLongGamePreflightV3 {
+        _observation: observation,
+        profile,
+    })
+}
+
 /// `bootstrap_until` is a finite local setup ceiling supplied independently
 /// of the unverified parent timestamps. Seal at single-threaded child entry;
 /// a successful namespace observation is only point-in-time evidence.

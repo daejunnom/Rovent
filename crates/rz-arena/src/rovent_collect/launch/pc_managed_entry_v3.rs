@@ -7,7 +7,8 @@ use super::managed_output_fd_v2::ManagedPlanLeaseRejectionV2;
 use super::pc_cli_managed_v3::parse_managed_collection_cli_v3;
 use super::pc_lock_v3::{ManagedOutputCloseEvidenceV3, PcCollectionRunV3};
 use super::pc_managed_prepare_v3::{
-    ManagedPcPrepareErrorV3, ManagedPcStartErrorV3, prepare_managed_pc_v3,
+    LongGamePreflightErrorV3, ManagedPcPrepareErrorV3, ManagedPcStartErrorV3,
+    PreparedLongGamePreflightV3, prepare_long_game_preflight_v3, prepare_managed_pc_v3,
 };
 use crate::rovent_collect::pc_worker_v3::{
     PcDriverEvidenceErrorV3, PcDriverPollV3, PcSupervisorNoWorkerProofV3, SupervisorStartCustodyV3,
@@ -69,6 +70,8 @@ fn start_error(error: &ManagedPcStartErrorV3) -> (&'static str, Option<String>) 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedPcEntryProgressV3 {
     Pending,
+    /// Only the selected read-only profile check completed.
+    PreflightComplete,
     Settled,
     Failed,
     DeadlineReached,
@@ -78,6 +81,7 @@ enum EntryState {
     Selection(ArenaError),
     Bootstrap(ArenaError),
     Prepare(ManagedPcPrepareErrorV3),
+    LongGamePreflight(Result<PreparedLongGamePreflightV3, LongGamePreflightErrorV3>),
     Start {
         original: ManagedPcStartErrorV3,
         recovered: Option<Box<PcCollectionRunV3>>,
@@ -130,6 +134,14 @@ pub fn try_run_managed_pc_entry_v3(
             });
         }
     };
+    if selection.long_game_preflight.is_some() {
+        return Some(ManagedPcEntryResultV3 {
+            original: EntryState::LongGamePreflight(prepare_long_game_preflight_v3(
+                selection,
+                bootstrap_until,
+            )),
+        });
+    }
     let prepared = match prepare_managed_pc_v3(selection, bootstrap_until) {
         Ok(prepared) => prepared,
         Err(original) => {
@@ -168,6 +180,13 @@ impl ManagedPcEntryResultV3 {
     /// A single bounded poll. The caller owns pacing and may not extend the
     /// original cleanup ceiling; `poll_until` is clamped to that ceiling.
     pub fn try_progress(&mut self, poll_until: Instant) -> ManagedPcEntryProgressV3 {
+        if let EntryState::LongGamePreflight(outcome) = &self.original {
+            return if outcome.is_ok() {
+                ManagedPcEntryProgressV3::PreflightComplete
+            } else {
+                ManagedPcEntryProgressV3::Failed
+            };
+        }
         if let EntryState::Start {
             original,
             recovered,
@@ -403,6 +422,47 @@ impl ManagedPcEntryResultV3 {
     /// Diagnostic only. Errors and panic payloads remain in the original
     /// owner; no raw credentials or source file contents are exposed.
     pub fn observation(&self) -> serde_json::Value {
+        if let EntryState::LongGamePreflight(outcome) = &self.original {
+            return match outcome {
+                Ok(prepared) => {
+                    let digest: String = prepared
+                        .profile
+                        .canonical_sha256()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
+                    serde_json::json!({
+                        "schema":"rz-rovent-long-game-preflight-observation/1",
+                        "status":"validated",
+                        "raw_profile_pin":prepared.profile.original_pin(),
+                        "canonical_profile_sha256":digest,
+                        "profile_file_owner":"retained_during_process",
+                        "native_started":false,
+                        "long_game_execution":"not_started",
+                        "capacity_applied":false,
+                        "gpu_physical_completion":"not_observed",
+                    })
+                }
+                Err(error) => {
+                    let detail = match error {
+                        LongGamePreflightErrorV3::Selection(error) => bounded_detail(error),
+                        LongGamePreflightErrorV3::Setup(error) => {
+                            let (stage, detail) = prepare_error(error);
+                            format!("{stage}: {}", detail.unwrap_or_default())
+                        }
+                        LongGamePreflightErrorV3::Read { error, .. } => bounded_detail(error),
+                    };
+                    serde_json::json!({
+                        "schema":"rz-rovent-long-game-preflight-observation/1",
+                        "status":"failed",
+                        "error":detail,
+                        "native_started":false,
+                        "long_game_execution":"not_started",
+                        "capacity_applied":false,
+                    })
+                }
+            };
+        }
         let before_native_recovered = match &self.original {
             EntryState::Run { original, .. } => original.before_native_recovered(),
             EntryState::Start {
@@ -440,6 +500,13 @@ impl ManagedPcEntryResultV3 {
                     "not_started",
                     "not_started",
                     Some(("bootstrap", Some(bounded_detail(error)))),
+                    false,
+                ),
+                EntryState::LongGamePreflight(_) => (
+                    "long_game_preflight",
+                    "not_started",
+                    "not_started",
+                    None,
                     false,
                 ),
                 EntryState::Prepare(error) => (
@@ -527,6 +594,10 @@ impl ManagedPcEntryResultV3 {
     /// Publication and independent physical evidence are not yet available
     /// through this entry, so even settled custody is not a success result.
     pub fn exit_code(&self) -> u8 {
-        1
+        if matches!(&self.original, EntryState::LongGamePreflight(Ok(_))) {
+            0
+        } else {
+            1
+        }
     }
 }

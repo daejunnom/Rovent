@@ -40,6 +40,8 @@ const ARENA_CALLER_FILES: &[(&str, &[u8])] = &[
     arena_source!("src/rovent_collect/launch/pc_cli_managed_v3.rs"),
     arena_source!("src/rovent_collect/launch/pc_managed_prepare_v3.rs"),
     arena_source!("src/rovent_collect/launch/pc_managed_entry_v3.rs"),
+    arena_source!("src/rovent_collect/launch/long_game_profile_v3.rs"),
+    arena_source!("src/rovent_collect/long_game_profile_v3.rs"),
     arena_source!("src/rovent_collect/launch/managed_output_fd_v2.rs"),
     arena_source!("src/rovent_collect/launch/caller_source_v3.rs"),
     arena_source!("src/rovent_collect/native_capture.rs"),
