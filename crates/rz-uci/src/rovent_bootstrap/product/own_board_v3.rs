@@ -16,6 +16,22 @@ pub(crate) struct RoventOwnBoardAssemblyV3 {
     process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
     product: Option<Arc<RoventOwnBoardProductDriverV3>>,
     recovery_key: Option<crate::pals_native::ticketed::TicketNativeRecoveryKey>,
+    collection_hooks: Option<
+        Arc<
+            dyn crate::pals_adaptive::RoventBoardCollectionHooksV3<
+                    RoventNativeBackend<AdaptivePortQuestion>,
+                >,
+        >,
+    >,
+    collection_origin: Option<crate::pals_adaptive::RoventNativeCollectionOriginV3>,
+    collection_rejection: Option<
+        Box<
+            crate::pals_adaptive::RoventBoardCollectionRegistrationRejectionV3<
+                RoventNativeBackend<AdaptivePortQuestion>,
+            >,
+        >,
+    >,
+    collection_panic: Option<Box<dyn std::any::Any + Send>>,
 }
 
 impl RoventOwnBoardAssemblyV3 {
@@ -27,7 +43,26 @@ impl RoventOwnBoardAssemblyV3 {
             process,
             product: None,
             recovery_key: None,
+            collection_hooks: None,
+            collection_origin: None,
+            collection_rejection: None,
+            collection_panic: None,
         }
+    }
+
+    /// Retains the actual typed hook owner before native startup. This is not
+    /// permission to execute a collection root or evidence of teacher exit.
+    pub(crate) fn new_collection(
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+        hooks: Arc<
+            dyn crate::pals_adaptive::RoventBoardCollectionHooksV3<
+                    RoventNativeBackend<AdaptivePortQuestion>,
+                >,
+        >,
+    ) -> Self {
+        let mut assembly = Self::new(process);
+        assembly.collection_hooks = Some(hooks);
+        assembly
     }
 
     #[allow(clippy::result_large_err)]
@@ -107,14 +142,16 @@ impl RoventOwnBoardAssemblyV3 {
                 "original /3 source, process and control differ",
             ));
         }
+        let is_collection = pins.lock().manifest.purpose == RoventPurpose::Collection;
         if !matches!(
             pins.lock().manifest.purpose,
-            RoventPurpose::Validation | RoventPurpose::Deployment
-        ) || pins.collection_preload_sources().is_some()
+            RoventPurpose::Validation | RoventPurpose::Deployment | RoventPurpose::Collection
+        ) || is_collection != self.collection_hooks.is_some()
+            || is_collection != pins.collection_preload_sources().is_some()
         {
             return Err(failure(
-                "RoventOwnBoardV3CollectionUnsupported",
-                "V3 Collection requires its own original hook owner",
+                "RoventOwnBoardV3CollectionOwner",
+                "V3 collection purpose, original preload and hook owner differ",
             ));
         }
         pins.configuration()
@@ -152,6 +189,18 @@ impl RoventOwnBoardAssemblyV3 {
             cpu.iter().map(|owner| &owner.engine),
         )?;
 
+        let collection_control = if is_collection {
+            let origin =
+                crate::pals_adaptive::RoventNativeCollectionOriginV3::from_loaded_ready(prepared)
+                    .map_err(|error| {
+                    SearchSessionFailure::debug("RoventOwnBoardV3CollectionOrigin", &error)
+                })?;
+            self.collection_origin = Some(origin);
+            Some(prepared.startup_control().clone())
+        } else {
+            None
+        };
+
         // No fallible operation occurs between taking the original service and
         // placing it into the caller's still-live custody slot.
         let (native, _, _) = self
@@ -179,6 +228,35 @@ impl RoventOwnBoardAssemblyV3 {
             Arc::clone(pins.lock_owner()),
             root_policy,
         )?;
+        if let Some(control) = collection_control {
+            let origin = self
+                .collection_origin
+                .as_ref()
+                .expect("original collection origin retained")
+                .clone();
+            let hooks = Arc::clone(
+                self.collection_hooks
+                    .as_ref()
+                    .expect("original collection hooks retained"),
+            );
+            let session = self.session.as_mut().expect("original session installed");
+            let installed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                session.register_rovent_collection_v3(origin, hooks, &control)
+            }));
+            match installed {
+                Ok(Ok(())) => {}
+                Ok(Err(rejected)) => {
+                    let mut failure = rejected.error.clone();
+                    failure.physical_completion = DriverPhysicalCompletion::Unknown;
+                    self.collection_rejection = Some(rejected);
+                    return Err(failure);
+                }
+                Err(payload) => {
+                    self.collection_panic = Some(payload);
+                    return Err(SearchSessionFailure::physical_completion_unknown());
+                }
+            }
+        }
         let session = self
             .session
             .take()
