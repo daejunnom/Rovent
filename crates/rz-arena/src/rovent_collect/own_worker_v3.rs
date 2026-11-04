@@ -51,6 +51,12 @@ pub(crate) struct OwnRootRecoveryV3 {
     pub(super) consumer_phase: u8,
     pub(super) processed: Option<TeacherProcessedOwnerV3>,
     pub(super) consumer_failure: Option<ArenaError>,
+    // Only a row-scoped rejection may request retention for this exact
+    // original completion ticket. Seal failures and Unknown have no ticket.
+    pub(super) rejection_scope: Option<(
+        RoventCollectionRootAdmissionV3,
+        rz_contracts::pals_adaptive::RoleTicketEnvelope,
+    )>,
     pub(super) rejection_retained: bool,
     pub(super) rejection_retention_failure: Option<ArenaError>,
     // The pipeline owns the original packet and detailed failure. This flag
@@ -107,6 +113,7 @@ impl OwnRootRecoveryV3 {
             consumer_phase: 0,
             processed: None,
             consumer_failure: None,
+            rejection_scope: None,
             rejection_retained: false,
             rejection_retention_failure: None,
             persistence_failure: None,
@@ -1119,12 +1126,24 @@ impl OwnRootRecoveryV3 {
                 // Re-observe append on the next worker pass after the
                 // original pipeline has retained the persistence result.
             }
-            Ok(
-                TeacherPolicyConsumerProgressV3::Rejected
-                | TeacherPolicyConsumerProgressV3::Unknown,
-            ) => {
+            Ok(TeacherPolicyConsumerProgressV3::Rejected) => {
+                if (3..=6).contains(&self.consumer_phase) {
+                    self.rejection_scope =
+                        consumer
+                            .original_completion_scope()
+                            .and_then(|(admission, ticket)| {
+                                admission
+                                    .same_original_admission(&self.request.admission)
+                                    .then(|| (admission.clone(), ticket))
+                            });
+                }
                 self.consumer_failure = Some(invalid(
-                    "Own /3 policy consumer rejected or uncertain; original owner retained",
+                    "Own /3 policy consumer rejected; original owner retained",
+                ));
+            }
+            Ok(TeacherPolicyConsumerProgressV3::Unknown) => {
+                self.consumer_failure = Some(invalid(
+                    "Own /3 policy consumer outcome unknown; original owner retained",
                 ));
             }
             Ok(
@@ -1168,6 +1187,9 @@ impl OwnRootRecoveryV3 {
         let Some(retained) = &self.retained_policy else {
             return;
         };
+        let Some((admission, ticket)) = &self.rejection_scope else {
+            return;
+        };
         let mut pipeline = match self.pipeline.try_lock() {
             Ok(Some(pipeline)) => pipeline,
             Ok(None) => return,
@@ -1176,7 +1198,7 @@ impl OwnRootRecoveryV3 {
                 return;
             }
         };
-        match pipeline.try_retain_known_rejection(retained) {
+        match pipeline.try_retain_known_rejection(retained, admission, ticket) {
             Ok(PolicyRetentionOutcomeV3::Transferred) => self.rejection_retained = true,
             Ok(
                 PolicyRetentionOutcomeV3::Busy
