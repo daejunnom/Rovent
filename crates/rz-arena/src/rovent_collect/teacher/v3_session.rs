@@ -15,11 +15,11 @@ use rz_uci::pals_adaptive::{
 };
 use rz_uci::rovent_bootstrap::RoventStartupControl;
 use rz_uci::rovent_external_launch::{
-    bind_collection_teacher_actor_v3, spawn_bound_collection_teacher_v3,
     BoundCollectionTeacherActorV3, BoundTeacherSpawnCauseV3, BoundTeacherSpawnFailureV3,
     RoventCollectionTeacherLifecycleV3, RoventTeacherScopeAggregateAckV3,
     RoventTeacherScopeAggregateFailureV3, RoventTeacherWorkerTerminalTokenV3,
     TeacherActorBindingErrorV3, TeacherRecoveryCustodianV3, TeacherRecoveryKeyV3,
+    bind_collection_teacher_actor_v3, spawn_bound_collection_teacher_v3,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -125,6 +125,7 @@ pub(crate) struct TeacherSessionStagingV3 {
     scope_effect_identity: Arc<()>,
     scope_effect_source_issued: bool,
     scope_effect_attempted: bool,
+    scope_preclaim_sealed: bool,
 }
 
 /// One original staged teacher scope; this does not attest dispatch receipt,
@@ -132,6 +133,41 @@ pub(crate) struct TeacherSessionStagingV3 {
 pub(crate) struct TeacherScopeEffectSourceV3 {
     identity: Arc<()>,
     admission: RoventCollectionRootAdmissionV3,
+}
+
+/// The exact staged issuer never entered its original claim and was sealed
+/// against future claim. This is not a game abort, process/GPU completion,
+/// or the separate one-shot no-scope acknowledgement.
+pub(crate) struct TeacherScopeUnclaimedProofV3 {
+    identity: Arc<()>,
+    admission: RoventCollectionRootAdmissionV3,
+}
+
+impl TeacherScopeUnclaimedProofV3 {
+    pub(crate) fn matches_original(
+        &self,
+        stage: &TeacherSessionStagingV3,
+        source: &TeacherScopeEffectSourceV3,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> bool {
+        Arc::ptr_eq(&self.identity, &stage.scope_effect_identity)
+            && Arc::ptr_eq(&self.identity, &source.identity)
+            && self.admission.same_original_admission(admission)
+            && source.admission.same_original_admission(admission)
+            && stage
+                .scope_original_admission
+                .same_original_admission(admission)
+            && stage.scope_preclaim_sealed
+            && stage.scope_effect_source_issued
+            && !stage.scope_effect_attempted
+            && stage.state == TeacherSessionStageStateV3::Prepared
+            && stage.ready.is_none()
+            && stage.panic.is_none()
+            && stage
+                .preflight
+                .as_ref()
+                .is_some_and(|preflight| !preflight.scope.is_claimed())
+    }
 }
 
 /// Known return from the same staged scope claim. The stage and any acquired
@@ -230,6 +266,7 @@ impl TeacherSessionStagingV3 {
         destination: &mut Option<TeacherScopeEffectSourceV3>,
     ) -> Result<(), TeacherSessionClaimErrorV3> {
         if self.scope_effect_source_issued
+            || self.scope_preclaim_sealed
             || destination.is_some()
             || self.state != TeacherSessionStageStateV3::Prepared
             || !self
@@ -245,6 +282,40 @@ impl TeacherSessionStagingV3 {
         self.scope_effect_source_issued = true;
         *destination = Some(source);
         Ok(())
+    }
+
+    /// Retain the same stage/source proof directly in the caller's recovery
+    /// slot. The real issuer remains in this stage; no no-scope claim occurs.
+    pub(crate) fn seal_unclaimed_scope_after_source(
+        &mut self,
+        source: &TeacherScopeEffectSourceV3,
+        destination: &mut Option<TeacherScopeUnclaimedProofV3>,
+    ) -> bool {
+        if destination.is_some()
+            || self.scope_preclaim_sealed
+            || !self.scope_effect_source_issued
+            || self.scope_effect_attempted
+            || self.state != TeacherSessionStageStateV3::Prepared
+            || self.ready.is_some()
+            || self.panic.is_some()
+            || !Arc::ptr_eq(&self.scope_effect_identity, &source.identity)
+            || !self
+                .scope_original_admission
+                .same_original_admission(&source.admission)
+            || !self
+                .preflight
+                .as_ref()
+                .is_some_and(|preflight| !preflight.scope.is_claimed())
+        {
+            return false;
+        }
+        let proof = TeacherScopeUnclaimedProofV3 {
+            identity: Arc::clone(&self.scope_effect_identity),
+            admission: self.scope_original_admission.clone(),
+        };
+        self.scope_preclaim_sealed = true;
+        *destination = Some(proof);
+        true
     }
 
     /// The caller must have published this stage before invoking the claim.
@@ -269,6 +340,7 @@ impl TeacherSessionStagingV3 {
             return false;
         }
         if !self.scope_effect_source_issued
+            || self.scope_preclaim_sealed
             || !Arc::ptr_eq(&self.scope_effect_identity, &source.identity)
             || !self
                 .scope_original_admission
@@ -319,7 +391,7 @@ impl TeacherSessionStagingV3 {
     }
 
     fn claim_original(&mut self) -> Result<(), TeacherSessionClaimErrorV3> {
-        if self.state != TeacherSessionStageStateV3::Prepared {
+        if self.state != TeacherSessionStageStateV3::Prepared || self.scope_preclaim_sealed {
             return Err(TeacherSessionClaimErrorV3::InvalidState);
         }
         let Some(preflight) = self.preflight.as_mut() else {
@@ -596,6 +668,7 @@ impl RoventCollectionTeacherSessionV3 {
             scope_effect_identity: Arc::new(()),
             scope_effect_source_issued: false,
             scope_effect_attempted: false,
+            scope_preclaim_sealed: false,
         })
     }
 
