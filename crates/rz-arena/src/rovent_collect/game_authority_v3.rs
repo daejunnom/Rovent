@@ -19,6 +19,8 @@ const ADMISSION_SEALED: u64 = 8;
 const PUBLICATION_NOT_STARTED: u64 = 16;
 const DISPATCH_CLAIM: u64 = 32;
 const CONTROL_FLAGS: u64 = DISPATCH_CLAIM - 1;
+const EFFECT_CLAIM: u64 = 1u64 << 32;
+const DISPATCH_MASK: u64 = (EFFECT_CLAIM - 1) & !CONTROL_FLAGS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PhaseV3 {
@@ -32,6 +34,41 @@ enum PhaseV3 {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GameEffectKindV3 {
+    TeacherScope,
+    TeacherActor,
+    NativeWorker,
+    RouteInstall,
+}
+
+struct GameEffectRecordV3 {
+    root: RoventCollectionRootAdmissionV3,
+    kind: GameEffectKindV3,
+    stage: Arc<()>,
+    active: bool,
+}
+
+/// Placeholder for a future original stage/session witness. This has no
+/// constructor until each real acquisition owner supplies its typed proof.
+pub(super) struct GameEffectSourceV3<S> {
+    owner: Arc<GameAuthorityV3<S>>,
+    root: RoventCollectionRootAdmissionV3,
+    kind: GameEffectKindV3,
+    stage: Arc<()>,
+    _requires_original_stage: Infallible,
+}
+
+/// Not constructible until the actual start primitive preserves its original
+/// result/owner. It never represents worker join or physical completion.
+pub(super) struct GameEffectOutcomeV3<S> {
+    owner: Arc<GameAuthorityV3<S>>,
+    root: RoventCollectionRootAdmissionV3,
+    kind: GameEffectKindV3,
+    stage: Arc<()>,
+    _requires_original_result: Infallible,
+}
+
 struct StateV3<S> {
     phase: PhaseV3,
     supervisor: Option<Weak<Mutex<S>>>,
@@ -43,6 +80,7 @@ struct StateV3<S> {
     admitted: Vec<RoventCollectionRootAdmissionV3>,
     dispatching: Vec<RoventCollectionRootAdmissionV3>,
     dispatched: Vec<RoventCollectionRootAdmissionV3>,
+    effects: Vec<GameEffectRecordV3>,
 }
 
 pub(super) struct GameAuthorityV3<S> {
@@ -107,6 +145,7 @@ impl<S> GameAuthorityV3<S> {
                 admitted: Vec::new(),
                 dispatching: Vec::new(),
                 dispatched: Vec::new(),
+                effects: Vec::new(),
             }),
         })
     }
@@ -324,9 +363,114 @@ impl<S> GameAuthorityV3<S> {
         if control & ABORT_REQUESTED == 0 {
             return GameStepV3::Unknown;
         }
-        if !state.dispatching.is_empty() || control & !CONTROL_FLAGS != 0 {
+        if !state.dispatching.is_empty() || control & DISPATCH_MASK != 0 {
             return GameStepV3::Busy;
         }
+        GameStepV3::Ready
+    }
+
+    /// This observes only in-flight acquisition claims. Started actors and
+    /// workers still need independent cancellation, joins and physical proof.
+    pub(super) fn try_observe_abort_effects_quiescent(&self) -> GameStepV3 {
+        if !self.abort_requested() {
+            return GameStepV3::Busy;
+        }
+        let state = match self.lock() {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        if state.effects.iter().any(|effect| effect.active)
+            || self.control.load(Ordering::SeqCst) & !(EFFECT_CLAIM - 1) != 0
+        {
+            return GameStepV3::Busy;
+        }
+        GameStepV3::Ready
+    }
+
+    /// Candidate-only until each stage owner can issue an original source and
+    /// actual outcome witness. No generic bool can resolve this claim.
+    pub(super) fn try_claim_effect(
+        self: &Arc<Self>,
+        source: &GameEffectSourceV3<S>,
+        destination: &mut Option<GameEffectClaimV3<S>>,
+    ) -> GameStepV3 {
+        if destination.is_some() {
+            return GameStepV3::Busy;
+        }
+        if !Arc::ptr_eq(self, &source.owner) {
+            return GameStepV3::Foreign;
+        }
+        let mut state = match self.lock() {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        if state.phase != PhaseV3::Open {
+            return GameStepV3::Closed;
+        }
+        if !state
+            .admitted
+            .iter()
+            .any(|root| root.same_original_admission(&source.root))
+        {
+            return GameStepV3::Foreign;
+        }
+        if state.effects.iter().any(|effect| {
+            effect.root.same_original_admission(&source.root)
+                && effect.kind == source.kind
+                && Arc::ptr_eq(&effect.stage, &source.stage)
+        }) {
+            return GameStepV3::Existing;
+        }
+        let limit = usize::from(self.inputs.plan().maximum_roots)
+            .checked_mul(self.inputs.plan().teacher_slots.len().saturating_add(3));
+        if limit.is_none_or(|limit| state.effects.len() >= limit)
+            || state.effects.try_reserve(1).is_err()
+        {
+            return GameStepV3::Capacity;
+        }
+        let retained_root = source.root.clone();
+        let state_root = source.root.clone();
+        let stage = Arc::clone(&source.stage);
+        let retained_stage = Arc::clone(&source.stage);
+        let owner = Arc::clone(self);
+        let mut current = self.control.load(Ordering::SeqCst);
+        loop {
+            if current & ABORT_REQUESTED != 0 {
+                return GameStepV3::Aborted;
+            }
+            if current
+                & (ADMISSION_SEALED
+                    | PUBLICATION_GRANTED
+                    | NO_DATA_FINISHED
+                    | PUBLICATION_NOT_STARTED)
+                != 0
+            {
+                return GameStepV3::Closed;
+            }
+            let Some(next) = current.checked_add(EFFECT_CLAIM) else {
+                return GameStepV3::Capacity;
+            };
+            match self
+                .control
+                .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+        state.effects.push(GameEffectRecordV3 {
+            root: state_root,
+            kind: source.kind,
+            stage,
+            active: true,
+        });
+        *destination = Some(GameEffectClaimV3 {
+            owner,
+            root: retained_root,
+            kind: source.kind,
+            stage: retained_stage,
+            resolved: false,
+        });
         GameStepV3::Ready
     }
 
@@ -400,6 +544,9 @@ impl<S> GameAuthorityV3<S> {
                 != 0
             {
                 return GameStepV3::Closed;
+            }
+            if current & DISPATCH_MASK == DISPATCH_MASK {
+                return GameStepV3::Capacity;
             }
             let Some(next) = current.checked_add(DISPATCH_CLAIM) else {
                 return GameStepV3::Capacity;
@@ -863,7 +1010,7 @@ impl<S> GameDispatchClaimV3<S> {
                 .owner
                 .control
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
-                    if (word & !CONTROL_FLAGS) < DISPATCH_CLAIM {
+                    if (word & DISPATCH_MASK) < DISPATCH_CLAIM {
                         None
                     } else {
                         Some(word - DISPATCH_CLAIM)
@@ -901,6 +1048,69 @@ impl<S> GameDispatchClaimV3<S> {
 impl<S> Drop for GameDispatchClaimV3<S> {
     fn drop(&mut self) {
         if !self.settled || self.receipt.is_some() {
+            self.owner.unknown.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The caller must install this original guard in the recovery slot before
+/// entering the external start primitive. Dropping it unresolved keeps the
+/// game Unknown and does not refund the outstanding acquisition.
+pub(super) struct GameEffectClaimV3<S> {
+    owner: Arc<GameAuthorityV3<S>>,
+    root: RoventCollectionRootAdmissionV3,
+    kind: GameEffectKindV3,
+    stage: Arc<()>,
+    resolved: bool,
+}
+impl<S> GameEffectClaimV3<S> {
+    /// Consumes no result: the real stage/result witness remains with the
+    /// caller. It is only an acquisition result, never a physical join.
+    pub(super) fn try_complete(&mut self, result: &GameEffectOutcomeV3<S>) -> GameStepV3 {
+        if !Arc::ptr_eq(&self.owner, &result.owner)
+            || !self.root.same_original_admission(&result.root)
+            || self.kind != result.kind
+            || !Arc::ptr_eq(&self.stage, &result.stage)
+        {
+            return GameStepV3::Foreign;
+        }
+        if self.resolved {
+            return GameStepV3::Existing;
+        }
+        let mut state = match self.owner.lock() {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let Some(index) = state.effects.iter().position(|effect| {
+            effect.active
+                && effect.root.same_original_admission(&self.root)
+                && effect.kind == self.kind
+                && Arc::ptr_eq(&effect.stage, &self.stage)
+        }) else {
+            return GameStepV3::Unknown;
+        };
+        if self
+            .owner
+            .control
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
+                if word & !(EFFECT_CLAIM - 1) == 0 {
+                    None
+                } else {
+                    Some(word - EFFECT_CLAIM)
+                }
+            })
+            .is_err()
+        {
+            return GameStepV3::Unknown;
+        }
+        state.effects[index].active = false;
+        self.resolved = true;
+        GameStepV3::Ready
+    }
+}
+impl<S> Drop for GameEffectClaimV3<S> {
+    fn drop(&mut self) {
+        if !self.resolved {
             self.owner.unknown.store(true, Ordering::SeqCst);
         }
     }
