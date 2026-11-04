@@ -273,6 +273,10 @@ impl<S> GameAuthorityV3<S> {
         if !Arc::ptr_eq(&self.identity, &proof.owner) {
             return GameStepV3::Foreign;
         }
+        self.try_seal_validated_admission()
+    }
+
+    fn try_seal_validated_admission(&self) -> GameStepV3 {
         let mut state = match self.lock() {
             Ok(s) => s,
             Err(e) => return e,
@@ -347,6 +351,20 @@ impl<S> GameAuthorityV3<S> {
             owner: Arc::clone(self),
             resolved: false,
         })
+    }
+}
+
+impl GameAuthorityV3<super::pc_worker_v3::PcWorkerSupervisorV3> {
+    /// Only the original P-C bridge can create this nonclone native fence
+    /// witness. It is admission evidence only, not worker or output proof.
+    pub(super) fn try_seal_pc(
+        self: &Arc<Self>,
+        proof: &super::pc_hooks_lock_v3::PcGameAdmissionSealV3,
+    ) -> GameStepV3 {
+        if !proof.matches_game(self) {
+            return GameStepV3::Foreign;
+        }
+        self.try_seal_validated_admission()
     }
 }
 
