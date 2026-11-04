@@ -5,8 +5,9 @@
 //! The caller retains all original owners, including the child custody slot.
 
 use super::{
-    LockedPalsSystemArenaPairV6, PalsV6ExecutionStart, endpoint_snapshot::PalsV6EndpointSnapshot,
-    invocation::PalsV6RoleSockets, proxy_entry_smoke::ProxyEntryFunctionalSmokeOwnerV1,
+    LockedPalsSystemArenaPairV6, PalsV6ExecutionStart, SmokeDeadlineControl,
+    endpoint_snapshot::PalsV6EndpointSnapshot, invocation::PalsV6RoleSockets,
+    proxy_entry_smoke::ProxyEntryFunctionalSmokeOwnerV1,
 };
 use crate::{ArenaError, NativeLaunchOwner, process::SpawnCustody};
 use rz_experiments::NativeEngineRole;
@@ -27,6 +28,7 @@ pub(super) struct DirectSmokeBinding<'a> {
     sockets: &'a Arc<PalsV6RoleSockets>,
     custody: &'a mut SpawnCustody,
     proxy: Arc<File>,
+    control: Arc<Mutex<SmokeDeadlineControl>>,
     role: NativeEngineRole,
     owner_id: [u8; 16],
     owner_epoch: u64,
@@ -46,6 +48,7 @@ impl<'a> DirectSmokeBinding<'a> {
         role: NativeEngineRole,
         owner_id: [u8; 16],
         owner_epoch: u64,
+        request_ids: [u64; 2],
     ) -> Result<Self, ArenaError> {
         if custody.child().is_some() || custody.pending.load(Ordering::Acquire) {
             return Err(ArenaError::Invalid(
@@ -58,11 +61,22 @@ impl<'a> DirectSmokeBinding<'a> {
             })?;
             selected.verify_original_binding(owner, execution, role, owner_id, owner_epoch)?;
         }
-        sockets.verify_original(owner, execution)?;
+        sockets.verify_role_socket_owner(owner, execution, role)?;
         let endpoint = PalsV6EndpointSnapshot::from_original(owner, role)?;
         let proxy = Arc::new(endpoint.proxy_file().try_clone().map_err(|_| {
             ArenaError::Io("direct smoke original proxy FD duplicate failed".into())
         })?);
+        let control = Arc::new(Mutex::new(SmokeDeadlineControl::new(
+            owner,
+            smoke,
+            execution,
+            sockets,
+            &proxy,
+            role,
+            owner_id,
+            owner_epoch,
+            request_ids,
+        )?));
         let pair = owner.spec();
         let sidecar = pair.proxy_inputs().ok_or_else(|| {
             ArenaError::Invalid("direct smoke original proxy sidecar missing".into())
@@ -136,6 +150,7 @@ impl<'a> DirectSmokeBinding<'a> {
             sockets,
             custody,
             proxy,
+            control,
             role,
             owner_id,
             owner_epoch,
@@ -159,7 +174,8 @@ impl<'a> DirectSmokeBinding<'a> {
                 self.owner_id,
                 self.owner_epoch,
             )?;
-        self.sockets.verify_original(self.owner, self.execution)?;
+        self.sockets
+            .verify_role_socket_owner(self.owner, self.execution, self.role)?;
         let endpoint = PalsV6EndpointSnapshot::from_original(self.owner, self.role)?;
         let held = endpoint.proxy_file().metadata().map_err(|_| {
             ArenaError::Io("direct smoke original proxy metadata unavailable".into())
@@ -177,6 +193,9 @@ impl<'a> DirectSmokeBinding<'a> {
 
     pub(super) fn proxy(&self) -> &Arc<File> {
         &self.proxy
+    }
+    pub(super) fn control(&self) -> &Arc<Mutex<SmokeDeadlineControl>> {
+        &self.control
     }
     pub(super) fn common_arguments(&self) -> &[OsString] {
         &self.common_arguments
