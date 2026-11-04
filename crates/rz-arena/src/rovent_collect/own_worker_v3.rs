@@ -24,9 +24,10 @@ use super::teacher::v3_session::{
 use super::writer_lock_v3::RoventCorpusWriterLockV3;
 use super::{invalid, ArenaError};
 use rz_uci::pals_adaptive::{
-    AdaptiveCollectionError, RoventBoardCollectionWorkerKeyV3,
-    RoventBoardCollectionWorkerSpawnFailureV3, RoventBoardCollectionWorkerV3,
-    RoventBoardRootHandoffReceiverV3, RoventBoardRootHandoffV3, RoventCollectionRootAdmissionV3,
+    AdaptiveCollectionError, RoventBoardCollectionWorkerKeyV3, RoventBoardCollectionWorkerStageV3,
+    RoventBoardCollectionWorkerV3, RoventBoardRootHandoffReceiverV3, RoventBoardRootHandoffV3,
+    RoventBoardWorkerStagePrepareFailureV3, RoventBoardWorkerStageStartRejectionV3,
+    RoventBoardWorkerStageStartV3, RoventCollectionRootAdmissionV3,
 };
 use rz_uci::rovent_external_launch::{
     RoventTeacherScopeAggregateAckV3, TeacherRecoveryCustodianV3,
@@ -57,7 +58,9 @@ pub(crate) struct OwnRootRecoveryV3 {
     pub(super) pump_error: Option<TeacherPumpSetupErrorV3>,
     pub(super) pump_unknown: bool,
     pub(super) worker_key: Option<RoventBoardCollectionWorkerKeyV3>,
-    pub(super) worker_failure: Option<RoventBoardCollectionWorkerSpawnFailureV3>,
+    pub(super) worker_stage: Option<RoventBoardCollectionWorkerStageV3>,
+    pub(super) worker_prepare_failure: Option<RoventBoardWorkerStagePrepareFailureV3>,
+    pub(super) worker_start_rejection: Option<RoventBoardWorkerStageStartRejectionV3>,
     pub(super) custodian: TeacherRecoveryCustodianV3,
     pub(super) panic: Option<Box<dyn std::any::Any + Send>>,
     pub(super) additional_panics: Vec<Box<dyn std::any::Any + Send>>,
@@ -103,7 +106,9 @@ impl OwnRootRecoveryV3 {
             pump_error: None,
             pump_unknown: false,
             worker_key: None,
-            worker_failure: None,
+            worker_stage: None,
+            worker_prepare_failure: None,
+            worker_start_rejection: None,
             custodian: TeacherRecoveryCustodianV3::new(),
             panic: None,
             additional_panics: Vec::new(),
@@ -591,6 +596,21 @@ pub(crate) fn prepare_own_root_step_v3(
         }
     }
     if state.worker.is_none() && state.prepared.is_none() {
+        if state.worker_stage.is_none() {
+            match RoventBoardCollectionWorkerStageV3::prepare(admission.clone()) {
+                Ok(stage) => {
+                    state.worker_key = Some(stage.recovery_key());
+                    state.worker_stage = Some(stage);
+                    // The original stage and key are retained before spawn.
+                    return Ok(OwnPrepareStepV3::Pending);
+                }
+                Err(error) => {
+                    state.worker_prepare_failure = Some(error);
+                    state.failure = Some("Own /3 root worker preparation failed".into());
+                    return Ok(OwnPrepareStepV3::Failed);
+                }
+            }
+        }
         // A failed spawn retains its closure in this same recovery. Use a
         // Weak back-reference so that retained task cannot form an Arc cycle.
         let root = Arc::downgrade(recovery);
@@ -659,14 +679,26 @@ pub(crate) fn prepare_own_root_step_v3(
             }
             Box::new(root) as Box<dyn std::any::Any + Send>
         });
-        match RoventBoardCollectionWorkerV3::spawn(admission.clone(), task) {
-            Ok(worker) => {
-                state.worker_key = Some(worker.recovery_key());
+        let stage = state
+            .worker_stage
+            .as_mut()
+            .expect("original worker stage retained");
+        match stage.start(task) {
+            Ok(RoventBoardWorkerStageStartV3::Started) => {
+                let Some(worker) = stage.take_worker() else {
+                    state.failure = Some("Own /3 started worker custody unknown".into());
+                    return Ok(OwnPrepareStepV3::Failed);
+                };
                 state.worker = Some(worker);
             }
-            Err(error) => {
-                state.worker_failure = Some(error);
+            Ok(RoventBoardWorkerStageStartV3::Failed) => {
+                // The stage retains the original spawn error and task.
                 state.failure = Some("Own /3 root worker spawn failed".into());
+                return Ok(OwnPrepareStepV3::Failed);
+            }
+            Err(rejection) => {
+                state.worker_start_rejection = Some(rejection);
+                state.failure = Some("Own /3 root worker start rejected".into());
                 return Ok(OwnPrepareStepV3::Failed);
             }
         }
