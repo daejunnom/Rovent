@@ -80,6 +80,22 @@ impl RoventNoCaptureRootCapabilityV3 {
             && self.verifier.same_owner(&other.verifier)
     }
 
+    pub(in crate::pals_adaptive::manager) fn same_native_owner(
+        &self,
+        verifier: &NativeAcceptanceVerifier,
+    ) -> bool {
+        self.verifier.same_owner(verifier)
+    }
+
+    /// This is stronger than comparing a caller-provided receipt: the fence
+    /// holds this exact original root/worker capability from its manager.
+    pub fn matches_role_only_fence(
+        &self,
+        fence: &super::super::role_only::RoventRoleOnlyNoCaptureFenceV3,
+    ) -> bool {
+        fence.matches_original_capability(self)
+    }
+
     /// Late discard checks immutable owner and ticket identity even after
     /// root revocation. It grants no new admission or completion authority.
     pub fn validate_native_discard_owner<V, Q, P>(

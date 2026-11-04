@@ -353,6 +353,33 @@ impl RoleOnlyShutdownReceipt {
     }
 }
 
+/// A role-only root closure bound to the exact original V3 no-capture
+/// capability. Only this manager module can construct the proof; a caller
+/// cannot promote a cloned or modified public shutdown receipt into one.
+#[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Clone)]
+pub struct RoventRoleOnlyNoCaptureFenceV3 {
+    capability: super::collection::RoventNoCaptureRootCapabilityV3,
+    receipt: RoleOnlyShutdownReceipt,
+}
+
+#[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl RoventRoleOnlyNoCaptureFenceV3 {
+    /// This is the original immutable observation, not fence construction
+    /// authority or a claim about any other worker or root.
+    pub fn receipt(&self) -> &RoleOnlyShutdownReceipt {
+        &self.receipt
+    }
+
+    pub(in crate::pals_adaptive::manager) fn matches_original_capability(
+        &self,
+        capability: &super::collection::RoventNoCaptureRootCapabilityV3,
+    ) -> bool {
+        capability.same_original_capability(&self.capability)
+            && capability.matches_role_only_shutdown_receipt(&self.receipt)
+    }
+}
+
 struct PendingSharedReadout<Q> {
     input: FrameInput<ReviewView, Q>,
     request: Option<SharedNnuecRequest>,
@@ -427,6 +454,10 @@ where
     collection_v2_busy_ticket: Option<RoleTicketEnvelope>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_admission_v2: Option<VersionedCollectionAdmission>,
+    #[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+    no_capture_original_v3: std::sync::OnceLock<super::collection::RoventNoCaptureRootCapabilityV3>,
+    #[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+    no_capture_cleanup_confirmed_v3: bool,
     collection_settled: bool,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_v2_settlement: Option<Result<(), AdaptiveCollectionError>>,
@@ -545,6 +576,10 @@ where
             collection_v2_busy_ticket: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_admission_v2: None,
+            #[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+            no_capture_original_v3: std::sync::OnceLock::new(),
+            #[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+            no_capture_cleanup_confirmed_v3: false,
             collection_settled: false,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_v2_settlement: None,
@@ -939,6 +974,7 @@ where
         if self.collection.is_some()
             || self.collection_admission.is_some()
             || self.has_collection_v2()
+            || self.has_original_no_capture_v3()
             || self.phase != ManagerPhase::Running
             || self.registry.cumulative_observation().admitted != 0
             || !self.bindings.is_empty()
@@ -975,6 +1011,7 @@ where
         if self.collection.is_some()
             || self.collection_admission.is_some()
             || self.has_collection_v2()
+            || self.has_original_no_capture_v3()
             || self.phase != ManagerPhase::Running
             || !self.bindings.is_empty()
             || self.pending_input.is_some()
@@ -993,6 +1030,17 @@ where
             self.collection_v2.is_some() || self.collection_admission_v2.is_some()
         }
         #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        {
+            false
+        }
+    }
+
+    fn has_original_no_capture_v3(&self) -> bool {
+        #[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+        {
+            self.no_capture_original_v3.get().is_some()
+        }
+        #[cfg(not(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu")))]
         {
             false
         }
@@ -1020,6 +1068,7 @@ where
         if self.collection.is_some()
             || self.collection_admission.is_some()
             || self.has_collection_v2()
+            || self.has_original_no_capture_v3()
             || self.phase != ManagerPhase::Running
             || self.registry.cumulative_observation().admitted != 0
             || !self.bindings.is_empty()
@@ -1091,13 +1140,102 @@ where
                 .ok_or(AdaptiveManagerError::Invalid(
                     "P/C no-capture native verifier unavailable",
                 ))?;
-        super::collection::RoventNoCaptureRootCapabilityV3::new(admission.clone(), verifier)
-            .map_err(|error| match error {
-                super::collection::RoventNoCaptureIssueErrorV3::Busy(_) => {
-                    AdaptiveManagerError::AuxiliaryPending
-                }
-                super::collection::RoventNoCaptureIssueErrorV3::Rejected(error) => error.into(),
-            })
+        let capability =
+            super::collection::RoventNoCaptureRootCapabilityV3::new(admission.clone(), verifier)
+                .map_err(|error| match error {
+                    super::collection::RoventNoCaptureIssueErrorV3::Busy(_) => {
+                        AdaptiveManagerError::AuxiliaryPending
+                    }
+                    super::collection::RoventNoCaptureIssueErrorV3::Rejected(error) => error.into(),
+                })?;
+        let _ = self.no_capture_original_v3.set(capability.clone());
+        if !self
+            .no_capture_original_v3
+            .get()
+            .is_some_and(|original| original.same_original_capability(&capability))
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C V3 no-capture capability differs from original owner",
+            ));
+        }
+        Ok(capability)
+    }
+
+    /// Observe the exact capability retained by this manager after a pending
+    /// marker installation; observing it does not prove marker installation.
+    #[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn original_no_capture_v3(
+        &self,
+    ) -> Option<&super::collection::RoventNoCaptureRootCapabilityV3> {
+        self.no_capture_original_v3.get()
+    }
+
+    /// Seal the manager's actual closure to its exact original capability.
+    /// A caller-modified public receipt is not authority to release a marker.
+    #[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn role_only_no_capture_fence_v3(
+        &self,
+        capability: &super::collection::RoventNoCaptureRootCapabilityV3,
+    ) -> Result<RoventRoleOnlyNoCaptureFenceV3, AdaptiveManagerError> {
+        let original = self
+            .no_capture_original_v3
+            .get()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "P/C V3 original no-capture capability absent",
+            ))?;
+        if !original.same_original_capability(capability) {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C V3 no-capture capability differs from original root",
+            ));
+        }
+        let verifier =
+            self.native
+                .native_acceptance_verifier()
+                .ok_or(AdaptiveManagerError::Invalid(
+                    "P/C V3 original native verifier absent",
+                ))?;
+        if !original.same_native_owner(&verifier) {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C V3 native verifier differs from original worker",
+            ));
+        }
+        let receipt = self.shutdown_receipt()?;
+        if self.phase != ManagerPhase::Finished
+            || !self.collection_settled
+            || !original.matches_role_only_shutdown_receipt(&receipt)
+        {
+            return Err(AdaptiveManagerError::PhysicalUnknown);
+        }
+        Ok(RoventRoleOnlyNoCaptureFenceV3 {
+            capability: original.clone(),
+            receipt,
+        })
+    }
+
+    /// Called only after the original native marker owner reports that this
+    /// exact capability has been removed (or proven never installed).
+    #[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn confirm_no_capture_v3_cleanup(
+        &mut self,
+        capability: &super::collection::RoventNoCaptureRootCapabilityV3,
+        fence: &RoventRoleOnlyNoCaptureFenceV3,
+    ) -> Result<(), AdaptiveManagerError> {
+        let original = self
+            .no_capture_original_v3
+            .get()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "P/C V3 original no-capture capability absent",
+            ))?;
+        if self.phase != ManagerPhase::Finished
+            || !original.same_original_capability(capability)
+            || !original.matches_role_only_fence(fence)
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C V3 no-capture cleanup owner or root fence differs",
+            ));
+        }
+        self.no_capture_cleanup_confirmed_v3 = true;
+        Ok(())
     }
 
     /// Internal V2 admission preserves its original objects on every failure.
@@ -1115,6 +1253,7 @@ where
                 if self.collection.is_some()
                     || self.collection_admission.is_some()
                     || self.has_collection_v2()
+                    || self.has_original_no_capture_v3()
                     || self.phase != ManagerPhase::Running
                     || self.registry.cumulative_observation().admitted != 0
                     || !self.bindings.is_empty()
@@ -1214,6 +1353,7 @@ where
                 if self.collection.is_some()
                     || self.collection_admission.is_some()
                     || self.has_collection_v2()
+                    || self.no_capture_original_v3.get().is_some()
                     || self.phase != ManagerPhase::Running
                     || self.registry.cumulative_observation().admitted != 0
                     || !self.bindings.is_empty()
@@ -2931,6 +3071,13 @@ where
         };
         if self.phase != ManagerPhase::Finished || !receipt.permits_semantic_closure() {
             return Err((self, AdaptiveManagerError::PhysicalUnknown));
+        }
+        #[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self.no_capture_original_v3.get().is_some() && !self.no_capture_cleanup_confirmed_v3 {
+            return Err((
+                self,
+                AdaptiveManagerError::Invalid("P/C V3 no-capture cleanup not confirmed"),
+            ));
         }
         if self.has_collection_v2() {
             return Err((
