@@ -1,4 +1,5 @@
 import os
+import errno
 from pathlib import Path
 import sys
 import tempfile
@@ -74,11 +75,12 @@ class AsyncOutputSpoolTests(unittest.TestCase):
         original = os.pwrite
         calls = []
         failing = True
+        disk_error = OSError(errno.EIO, "fixture disk error")
 
         def partial(fd, data, offset):
             calls.append(offset)
             if failing and offset:
-                raise OSError("fixture disk error")
+                raise disk_error
             return original(fd, data[:2] if failing else data, offset)
 
         with tempfile.TemporaryFile() as output, mock.patch.object(lc0_output_spool.os, "pwrite", partial):
@@ -89,6 +91,7 @@ class AsyncOutputSpoolTests(unittest.TestCase):
                 blocked = wait_state(spool, "write_blocked")
                 self.assertEqual(blocked["inflight_bytes"], 5)
                 self.assertEqual(blocked["last_completed_spool_observation"]["bytes_pending"], 3)
+                self.assertIs(spool.original_errors()[2], disk_error)
                 self.assertEqual(spool.offer(b"later"), "unavailable")
                 self.assertEqual(calls, [0, 2])
                 failing = False
@@ -110,6 +113,7 @@ class AsyncOutputSpoolTests(unittest.TestCase):
                 spool._thread.join(3)
             final = wait_state(spool, "stopped")
             self.assertEqual(final["last_completed_spool_observation"]["first_write_error"], "OSError")
+            self.assertIs(spool.original_errors()[2], disk_error)
             self.assertEqual(os.pread(output.fileno(), 64, 0), b"abcde")
 
     def test_unexpected_writer_exception_quarantines_fd_and_inflight(self):
@@ -138,12 +142,14 @@ class AsyncOutputSpoolTests(unittest.TestCase):
             spool = async_spool.AsyncOutputSpool(output.fileno(), max_bytes=64,
                                                   max_queue_bytes=16, max_queue_items=2)
             self.assertEqual(spool.offer(b"data"), "accepted")
-            spool.observe_read_error(OSError("fixture read error"))
+            read_error = OSError(errno.EIO, "fixture read error")
+            spool.observe_read_error(read_error)
             self.assertTrue(spool.request_finish())
             final = wait_state(spool, "stopped")
             observed = final["last_completed_spool_observation"]
             self.assertEqual(observed["read_error"], "OSError")
             self.assertFalse(observed["eof_observed"])
+            self.assertIs(spool.original_errors()[1], read_error)
             self.assertEqual(os.pread(output.fileno(), 64, 0), b"data")
 
 

@@ -52,6 +52,7 @@ class AsyncOutputSpool:
         self._state = "initializing"
         self._spool = None
         self._last_spool = None
+        self._last_errors = (None, None)
         self._failure = None
         self._original_failure = None
         self._terminal = None
@@ -156,6 +157,16 @@ class AsyncOutputSpool:
                 "physical_gpu_completion": "not_observed",
             }
 
+    def original_errors(self):
+        """Return retained worker, read and write errors for this same owner.
+
+        Read/write errors are the last completed spool observation; a write
+        currently in flight can still fail later. No disk operation or wait is
+        performed while acquiring these references.
+        """
+        with self._condition:
+            return (self._original_failure, *self._last_errors)
+
     def _run(self):
         try:
             spool = OutputSpool(self._fd, self._max_bytes)
@@ -169,6 +180,7 @@ class AsyncOutputSpool:
         with self._condition:
             self._spool = spool
             self._last_spool = spool.observation()
+            self._last_errors = spool.original_errors()
             self._state = "idle"
 
         while True:
@@ -215,12 +227,14 @@ class AsyncOutputSpool:
                     self._failure = self._failure or type(error).__name__
                     if self._original_failure is None:
                         self._original_failure = error
+                    self._last_errors = spool.original_errors()
                     self._state = "close_unknown" if operation == "close" else "writer_fault"
                     _QUARANTINED_WRITERS.append(self)
                 return
 
             with self._condition:
                 self._last_spool = spool.observation()
+                self._last_errors = spool.original_errors()
                 if operation == "close":
                     self._state = "stopped"
                     return
