@@ -40,6 +40,12 @@ mod pair_native;
 mod preflight;
 #[cfg(target_os = "linux")]
 mod proxy_entry_smoke;
+#[cfg(target_os = "linux")]
+mod smoke_preparation;
+#[cfg(target_os = "linux")]
+pub(crate) use smoke_preparation::{
+    ProxyEntrySmokeSnapshotOwnerV1, prepare_proxy_entry_smoke_snapshot_v1,
+};
 mod proxy_inputs;
 pub use deadline_sources::*;
 pub use execution_start::*;

@@ -46,6 +46,8 @@ pub(crate) use system_v6::{CancelSourceObservation, compiled_cancel_source_obser
 #[cfg(target_os = "linux")]
 pub(crate) use system_v6::{ProxyEntryFunctionalSmokeOwnerV1, SMOKE_RECEIPT_FILE};
 #[cfg(target_os = "linux")]
+pub(crate) use system_v6::{ProxyEntrySmokeSnapshotOwnerV1, prepare_proxy_entry_smoke_snapshot_v1};
+#[cfg(target_os = "linux")]
 pub(crate) use system_v6::{SmokeControlProgress, SmokeDeadlineControl, SmokeGrantObservation};
 
 pub const PALS_ARENA_V5_DOMAIN: &str = "rz-pals-arena-launch-v5/1";

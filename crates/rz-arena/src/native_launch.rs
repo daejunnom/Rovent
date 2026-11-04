@@ -324,7 +324,7 @@ impl Drop for NativeAdmissionLease {
 }
 impl NativeAdmissionLease {
     #[cfg(target_os = "linux")]
-    fn acquire() -> Result<Self, ArenaError> {
+    pub(crate) fn acquire() -> Result<Self, ArenaError> {
         if NATIVE_ADMISSION_CLOSED.load(Ordering::Acquire) {
             return Err(ArenaError::Invalid(
                 "native integration admission is closed".into(),
@@ -572,7 +572,7 @@ pub(crate) fn prepare_native_launch_for<S: NativeLaunchDeclaration>(
         }))
     }
 }
-fn safe_output_basename(name: &str) -> bool {
+pub(crate) fn safe_output_basename(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && !name.starts_with('.')
@@ -792,7 +792,7 @@ pub(crate) mod linux {
     // cap_std's directory capability may use O_PATH. That descriptor can pin
     // cwd/path authority, but Linux fchmod rejects it with EBADF. Open a real
     // readable directory descriptor relative to the same capability instead.
-    fn readable_directory_pin(directory: &Dir) -> Result<File, ArenaError> {
+    pub(crate) fn readable_directory_pin(directory: &Dir) -> Result<File, ArenaError> {
         let mut options = OpenOptions::new();
         options
             .read(true)
@@ -832,7 +832,7 @@ pub(crate) mod linux {
         }
         Ok(PathBuf::from(relative))
     }
-    fn snapshot_parents(
+    pub(crate) fn snapshot_parents(
         names: &[String],
         max_depth: usize,
     ) -> Result<std::collections::BTreeSet<PathBuf>, ArenaError> {
@@ -929,7 +929,7 @@ pub(crate) mod linux {
             .ok_or_else(|| ArenaError::Integrity("native input has no direct copy name".into()))?;
         Ok((directory, name))
     }
-    fn outside_git(path: &Path) -> Result<PathBuf, ArenaError> {
+    pub(crate) fn outside_git(path: &Path) -> Result<PathBuf, ArenaError> {
         let metadata =
             std::fs::symlink_metadata(path).map_err(|_| io("native output root unavailable"))?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -953,7 +953,7 @@ pub(crate) mod linux {
         }
         Ok(path)
     }
-    pub(super) fn save_preparation_failure(
+    pub(crate) fn save_preparation_failure(
         directory: Option<&Dir>,
         receipt: &NativePreparationReceipt,
         provider: &str,
