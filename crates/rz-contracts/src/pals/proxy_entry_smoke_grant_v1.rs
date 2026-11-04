@@ -10,6 +10,8 @@ pub const PROXY_ENTRY_SMOKE_POLICY_DOMAIN: &str = "rz-pals-proxy-entry-functiona
 const MAGIC: [u8; 8] = *b"RZPES1\0\0";
 pub const PROXY_ENTRY_SMOKE_REQUEST_BYTES: usize = 84;
 pub const PROXY_ENTRY_SMOKE_GRANT_BYTES: usize = PROXY_ENTRY_SMOKE_REQUEST_BYTES + 8;
+const CHALLENGE_MAGIC: [u8; 8] = *b"RZPCH1\0\0";
+pub const PROXY_ENTRY_SMOKE_CHALLENGE_BYTES: usize = 9 + 2 * PROXY_ENTRY_SMOKE_REQUEST_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProxyEntrySmokePolicy {
@@ -52,6 +54,68 @@ impl ProxyEntrySmokeScope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyEntrySmokeRequest {
     pub scope: ProxyEntrySmokeScope,
+}
+
+/// Two original NoGame scopes selected by the owner; the frame itself is not
+/// proof of listener origin, peer identity or execution authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProxyEntrySmokeChallenge {
+    pub run: ProxyEntrySmokeScope,
+    pub cleanup: ProxyEntrySmokeScope,
+}
+
+impl ProxyEntrySmokeChallenge {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.run.validate()?;
+        self.cleanup.validate()?;
+        let left = &self.run;
+        let right = &self.cleanup;
+        if left.phase != ProxyEntrySmokePhase::Run
+            || right.phase != ProxyEntrySmokePhase::Cleanup
+            || left.policy != right.policy
+            || left.owner_id != right.owner_id
+            || left.owner_epoch != right.owner_epoch
+            || left.role != right.role
+            || left.generation != right.generation
+            || left.lock_sha256 != right.lock_sha256
+            || left.request_id == right.request_id
+        {
+            return Err("proxy_smoke_challenge_scope_mismatch");
+        }
+        Ok(())
+    }
+    pub fn encode(&self) -> Result<[u8; PROXY_ENTRY_SMOKE_CHALLENGE_BYTES], &'static str> {
+        self.validate()?;
+        let run = ProxyEntrySmokeRequest {
+            scope: self.run.clone(),
+        }
+        .encode()?;
+        let cleanup = ProxyEntrySmokeRequest {
+            scope: self.cleanup.clone(),
+        }
+        .encode()?;
+        let mut bytes = [0; PROXY_ENTRY_SMOKE_CHALLENGE_BYTES];
+        bytes[..8].copy_from_slice(&CHALLENGE_MAGIC);
+        bytes[8] = 1;
+        bytes[9..9 + PROXY_ENTRY_SMOKE_REQUEST_BYTES].copy_from_slice(&run);
+        bytes[9 + PROXY_ENTRY_SMOKE_REQUEST_BYTES..].copy_from_slice(&cleanup);
+        Ok(bytes)
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
+        if bytes.len() != PROXY_ENTRY_SMOKE_CHALLENGE_BYTES
+            || bytes[..8] != CHALLENGE_MAGIC
+            || bytes[8] != 1
+        {
+            return Err("proxy_smoke_challenge_header_invalid");
+        }
+        let run =
+            ProxyEntrySmokeRequest::decode(&bytes[9..9 + PROXY_ENTRY_SMOKE_REQUEST_BYTES])?.scope;
+        let cleanup =
+            ProxyEntrySmokeRequest::decode(&bytes[9 + PROXY_ENTRY_SMOKE_REQUEST_BYTES..])?.scope;
+        let challenge = Self { run, cleanup };
+        challenge.validate()?;
+        Ok(challenge)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -246,6 +310,25 @@ mod tests {
             remaining_ns: 0,
         };
         assert!(grant.encode().is_err());
+    }
+    #[test]
+    fn challenge_requires_same_original_nogame_scope_and_distinct_requests() {
+        let run = scope(DeadlineRole::Baseline, ProxyEntrySmokePhase::Run);
+        let mut cleanup = scope(DeadlineRole::Baseline, ProxyEntrySmokePhase::Cleanup);
+        cleanup.request_id += 1;
+        let challenge = ProxyEntrySmokeChallenge { run, cleanup };
+        let encoded = challenge.encode().unwrap();
+        assert_eq!(
+            ProxyEntrySmokeChallenge::decode(&encoded).unwrap(),
+            challenge
+        );
+        assert!(ProxyEntrySmokeChallenge::decode(&encoded[..encoded.len() - 1]).is_err());
+        let mut different = challenge.clone();
+        different.cleanup.role = DeadlineRole::Candidate;
+        assert!(different.encode().is_err());
+        different.cleanup.role = different.run.role;
+        different.cleanup.request_id = different.run.request_id;
+        assert!(different.encode().is_err());
     }
     #[test]
     fn game_deadline_wire_is_not_a_smoke_wire() {
