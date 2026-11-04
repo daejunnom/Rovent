@@ -26,7 +26,9 @@ from lc0_parent_preflight import (
 
 # A caller accidentally dropping an uncertain admission must not close the
 # original parent stream while the process remains alive. This is quarantine,
-# not a completion witness or an automated recovery policy.
+# not a completion witness, an automatic retry, or an operating-owner recovery
+# capability. The owning process must retain its original child and use its own
+# authorized observation/recovery path; this list provides no release API.
 _DROPPED_UNCERTAIN_SOCKETS = []
 
 
