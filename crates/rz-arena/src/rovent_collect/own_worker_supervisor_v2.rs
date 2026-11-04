@@ -18,8 +18,8 @@ use rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2;
 use rz_uci::rovent_bootstrap::nnuec_session::RoventNnuecCollectionHooksV2;
 use std::{
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -73,6 +73,76 @@ struct SupervisorState {
     error: Option<ArenaError>,
 }
 
+fn lock_for_preparation_tick<'a>(
+    state: &'a Mutex<SupervisorState>,
+    stop: &AtomicBool,
+) -> Option<MutexGuard<'a, SupervisorState>> {
+    let guard = state.lock().ok()?;
+    (!stop.load(Ordering::Acquire)).then_some(guard)
+}
+
+const SUPERVISOR_STARTING: u8 = 0;
+const SUPERVISOR_STARTED: u8 = 1;
+const SUPERVISOR_NOT_STARTED: u8 = 2;
+
+/// An observation of the original supervisor, never a replacement owner.
+/// The state mutex serializes this check with creation of unpublished workers.
+pub(crate) struct OwnSupervisorPhysicalV2 {
+    state: Arc<Mutex<SupervisorState>>,
+    stop: Arc<AtomicBool>,
+    start: AtomicU8,
+}
+
+impl OwnSupervisorPhysicalV2 {
+    pub(crate) fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn try_observe_stopped_workers(&self) -> Result<bool, ArenaError> {
+        self.request_stop();
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("Own supervisor state poisoned"));
+            }
+        };
+        if self.start.load(Ordering::Acquire) == SUPERVISOR_STARTING {
+            return Ok(false);
+        }
+        for slot in state.slots.iter().chain(state.pending.iter()) {
+            match slot.worker_start {
+                OwnSecondaryWorkerStartV2::StartingUnknown => return Ok(false),
+                OwnSecondaryWorkerStartV2::FailedBeforeStart => continue,
+                OwnSecondaryWorkerStartV2::Started => {}
+            }
+            let exit = slot
+                .bridge
+                .poll_worker()
+                .map_err(|error| invalid(format!("Own secondary worker join: {error:?}")))?;
+            match exit {
+                Some(OwnWorkerExitKindV2::NoAdmission)
+                    if slot.bridge.installed_admission_for_recovery().is_none() => {}
+                Some(OwnWorkerExitKindV2::Aggregate | OwnWorkerExitKindV2::Retirement) => {
+                    if !slot
+                        .bridge
+                        .try_observe_physical_installed()
+                        .map_err(|error| {
+                            invalid(format!("Own secondary physical observation: {error:?}"))
+                        })?
+                    {
+                        return Ok(false);
+                    }
+                }
+                // A join, logical cancellation or late result is not by
+                // itself physical completion of the original worker.
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+}
+
 /// Owns the original supervisor thread and its exact slot state.  Callers
 /// must retain this object across native execution and inspect/join it before
 /// transferring slot custody to the game publisher.
@@ -121,15 +191,24 @@ impl OwnWorkerSupervisorV2 {
             error: None,
         }));
         let stop = Arc::new(AtomicBool::new(false));
+        let physical = Arc::new(OwnSupervisorPhysicalV2 {
+            state: Arc::clone(&state),
+            stop: Arc::clone(&stop),
+            start: AtomicU8::new(SUPERVISOR_STARTING),
+        });
+        router.register_supervisor_physical(Arc::clone(&physical))?;
         let thread_state = Arc::clone(&state);
         let thread_stop = Arc::clone(&stop);
         let thread = thread::Builder::new()
             .name("rovent-own-root-supervisor-v2".into())
             .spawn(move || {
                 run_preparation_loop_v2(&thread_stop, worker_deadline, || {
-                    let mut guard = match thread_state.lock() {
-                        Ok(guard) => guard,
-                        Err(_) => return false,
+                    // A tick may have passed the outer stop check before the
+                    // owner requested shutdown. Recheck under the same lock
+                    // used by the physical observer before creating workers.
+                    let Some(mut guard) = lock_for_preparation_tick(&thread_state, &thread_stop)
+                    else {
+                        return false;
                     };
                     // The same supervisor drains each bounded receiver.  It does
                     // not hold a manager or producer lock while doing so.
@@ -242,7 +321,13 @@ impl OwnWorkerSupervisorV2 {
                     thread::sleep(Duration::from_millis(2));
                 }
             })
-            .map_err(|error| ArenaError::Io(error.to_string()))?;
+            .map_err(|error| {
+                physical
+                    .start
+                    .store(SUPERVISOR_NOT_STARTED, Ordering::Release);
+                ArenaError::Io(error.to_string())
+            })?;
+        physical.start.store(SUPERVISOR_STARTED, Ordering::Release);
         Ok(Self {
             state,
             stop,
@@ -501,6 +586,63 @@ fn supervisor_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_physical(start: u8) -> OwnSupervisorPhysicalV2 {
+        OwnSupervisorPhysicalV2 {
+            state: Arc::new(Mutex::new(SupervisorState {
+                slots: Vec::new(),
+                pending: None,
+                error: None,
+            })),
+            stop: Arc::new(AtomicBool::new(false)),
+            start: AtomicU8::new(start),
+        }
+    }
+
+    #[test]
+    fn supervisor_physical_distinguishes_starting_from_no_workers() {
+        let physical = empty_physical(SUPERVISOR_STARTING);
+        assert!(!physical.try_observe_stopped_workers().unwrap());
+        assert!(physical.stop.load(Ordering::Acquire));
+        physical.start.store(SUPERVISOR_STARTED, Ordering::Release);
+        assert!(physical.try_observe_stopped_workers().unwrap());
+        physical
+            .start
+            .store(SUPERVISOR_NOT_STARTED, Ordering::Release);
+        assert!(physical.try_observe_stopped_workers().unwrap());
+    }
+
+    #[test]
+    fn shutdown_blocks_late_preparation_after_shared_state_unlocks() {
+        let physical = empty_physical(SUPERVISOR_STARTED);
+        let held = physical.state.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let state = Arc::clone(&physical.state);
+            let stop = Arc::clone(&physical.stop);
+            let tick = scope.spawn(move || {
+                ready_tx.send(()).unwrap();
+                lock_for_preparation_tick(&state, &stop).is_some()
+            });
+            ready_rx.recv().unwrap();
+            assert!(!physical.try_observe_stopped_workers().unwrap());
+            drop(held);
+            assert!(!tick.join().unwrap());
+        });
+        assert!(physical.try_observe_stopped_workers().unwrap());
+    }
+
+    #[test]
+    fn supervisor_panic_with_uncertain_state_is_not_physical_completion() {
+        let physical = empty_physical(SUPERVISOR_STARTED);
+        let state = Arc::clone(&physical.state);
+        let _ = std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("simulated supervisor failure while creating a worker");
+        })
+        .join();
+        assert!(physical.try_observe_stopped_workers().is_err());
+    }
 
     #[test]
     fn fatal_preparation_error_exits_without_waiting_for_deadline_or_stopping_another_owner() {

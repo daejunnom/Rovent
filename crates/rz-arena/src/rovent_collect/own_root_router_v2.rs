@@ -7,6 +7,7 @@
 use super::{
     ArenaError, invalid,
     own_hooks_lock_v2::{OwnRootSeparationV2, RoventNnuecCollectionBridgeV2},
+    own_worker_supervisor_v2::OwnSupervisorPhysicalV2,
 };
 use rz_uci::pals_adaptive::{
     AdaptiveCollectionBoundaryV2, AdaptiveCollectionError, AdaptiveCollectionStage,
@@ -90,6 +91,7 @@ pub(crate) struct RoventOwnRootRouterV2 {
     stopped: Vec<OnceLock<Arc<RoventNnuecPendingCollectionV2>>>,
     last_deferred: Mutex<Option<RoventCollectionRootAdmissionV2>>,
     startup: OnceLock<RoventStartupControl>,
+    supervisor_physical: OnceLock<Arc<OwnSupervisorPhysicalV2>>,
 }
 
 impl RoventOwnRootRouterV2 {
@@ -132,7 +134,16 @@ impl RoventOwnRootRouterV2 {
             stopped,
             last_deferred: Mutex::new(None),
             startup: OnceLock::new(),
+            supervisor_physical: OnceLock::new(),
         })
+    }
+    pub(crate) fn register_supervisor_physical(
+        &self,
+        physical: Arc<OwnSupervisorPhysicalV2>,
+    ) -> Result<(), ArenaError> {
+        self.supervisor_physical
+            .set(physical)
+            .map_err(|_| invalid("Own supervisor physical owner already registered"))
     }
     fn primary(&self) -> &Arc<RoventNnuecCollectionBridgeV2> {
         self.slots[0].get().expect("primary root owner")
@@ -934,22 +945,32 @@ impl RoventNnuecCollectionHooksV2 for RoventOwnRootRouterV2 {
         self.primary().pump()
     }
     fn revoke(&self) {
+        if let Some(supervisor) = self.supervisor_physical.get() {
+            supervisor.request_stop();
+        }
         for bridge in self.slots.iter().filter_map(OnceLock::get) {
             bridge.revoke();
         }
     }
     fn finish_physical(&self) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
-        // Only the single original worker can be resolved here. Prepared or
-        // unpublished secondary owners require separate physical evidence.
-        if self.slots.len() != 1
-            || self.states.iter().any(|state| {
-                matches!(
-                    state.load(Ordering::Acquire),
-                    RESERVING | FAILED | PREPARING | PREINSTALL_FAILED | UNCERTAIN
-                )
-            })
-            || self.slots.iter().skip(1).any(|slot| slot.get().is_some())
-        {
+        // Capacity is not a count of started workers. The original
+        // supervisor observes even unpublished pending secondary workers.
+        if self.slots.len() > 1 {
+            let Some(supervisor) = self.supervisor_physical.get() else {
+                return Ok(AdaptiveCollectionBoundaryV2::Busy);
+            };
+            if !supervisor.try_observe_stopped_workers().map_err(|_| {
+                AdaptiveManagerError::Invalid("Own supervisor physical state unknown")
+            })? {
+                return Ok(AdaptiveCollectionBoundaryV2::Busy);
+            }
+        }
+        if self.states.iter().any(|state| {
+            matches!(
+                state.load(Ordering::Acquire),
+                RESERVING | FAILED | PREPARING | PREINSTALL_FAILED | UNCERTAIN
+            )
+        }) {
             return Ok(AdaptiveCollectionBoundaryV2::Busy);
         }
         let finished = if self.states[0].load(Ordering::Acquire) == INSTALLED {
