@@ -6,7 +6,8 @@
 
 use super::game_authority_v3::{GamePublicationOriginV3, GamePublishGuardV3, GameStepV3};
 use super::launch::{
-    ManagedOutputOwnerV3, ManagedOutputWriteErrorV3, PreparedPcCollectionInputsV3,
+    ManagedOutputOwnerV3, ManagedOutputWriteErrorV3, ManagedPublicationUnstartedEvidenceV3,
+    PreparedPcCollectionInputsV3,
 };
 use super::producer_v3::{
     PendingPolicyPublicationV3, RoventCorpusProducerLockV3, RoventRetiredLockV3Record,
@@ -118,6 +119,9 @@ pub(super) struct PolicyRowPipelineV3 {
     output_origin: Option<GamePublicationOriginV3>,
     output_no_data: bool,
     output_aborted: bool,
+    output_not_written: bool,
+    output_unstarted: Option<ManagedPublicationUnstartedEvidenceV3>,
+    output_settlement_unknown: Option<GameStepV3>,
     output_directory: Option<Arc<ManagedOutputOwnerV3>>,
     chunk_attempted: bool,
     chunk_receipts: Vec<rz_experiments::rovent_corpus::RoventCorpusChunk>,
@@ -191,6 +195,9 @@ impl PolicyRowPipelineOwnerV3 {
             output_origin: None,
             output_no_data: false,
             output_aborted: false,
+            output_not_written: false,
+            output_unstarted: None,
+            output_settlement_unknown: None,
             output_directory: None,
             chunk_attempted: false,
             chunk_receipts: Vec::new(),
@@ -281,6 +288,15 @@ impl PolicyRowPipelineOwnerV3 {
         if state.output_aborted {
             return PolicyFinalizationV3::Aborted;
         }
+        if state.output_not_written {
+            return PolicyFinalizationV3::Failed;
+        }
+        if state.output_unstarted.is_some() {
+            let Some(output) = state.output_directory.as_ref().cloned() else {
+                return PolicyFinalizationV3::Unknown;
+            };
+            return state.try_settle_unstarted(guard, &output);
+        }
         if state.failure.is_some() {
             return PolicyFinalizationV3::Failed;
         }
@@ -321,6 +337,11 @@ impl PolicyRowPipelineOwnerV3 {
                 Ok(Err(ManagedOutputWriteErrorV3::BeforeWrite(error))) => {
                     state.failure = Some(PolicyPipelineFailureV3::PublicationBeforeWrite(error));
                     PolicyFinalizationV3::Failed
+                }
+                Ok(Err(ManagedOutputWriteErrorV3::PublicationBeforeWrite { reason, evidence })) => {
+                    state.failure = Some(PolicyPipelineFailureV3::PublicationBeforeWrite(reason));
+                    state.output_unstarted = Some(evidence);
+                    state.try_settle_unstarted(guard, &output)
                 }
                 Ok(Err(ManagedOutputWriteErrorV3::AuthorityUnknown(error))) => {
                     state.failure = Some(PolicyPipelineFailureV3::PublicationUnknown(error));
@@ -459,6 +480,31 @@ impl PolicyOutputOwnerV3 {
 }
 
 impl PolicyRowPipelineV3 {
+    fn try_settle_unstarted<S>(
+        &mut self,
+        guard: &mut GamePublishGuardV3<S>,
+        output: &Arc<ManagedOutputOwnerV3>,
+    ) -> PolicyFinalizationV3 {
+        let Some(evidence) = self.output_unstarted.as_ref() else {
+            return PolicyFinalizationV3::Unknown;
+        };
+        match guard.try_finish_publication_unstarted(output, evidence) {
+            GameStepV3::Ready => {
+                self.output_not_written = true;
+                PolicyFinalizationV3::Failed
+            }
+            GameStepV3::Busy => PolicyFinalizationV3::Pending,
+            GameStepV3::Aborted => {
+                self.output_aborted = true;
+                PolicyFinalizationV3::Aborted
+            }
+            step => {
+                self.output_settlement_unknown = Some(step);
+                PolicyFinalizationV3::Unknown
+            }
+        }
+    }
+
     fn idle(&self) -> bool {
         self.writer.is_some()
             && self.row.is_none()
@@ -606,22 +652,23 @@ impl PolicyRowPipelineV3 {
 
     /// Unknown never authorizes retry, dropping the writer, or publication.
     pub(super) fn is_uncertain(&self) -> bool {
-        matches!(
-            self.failure.as_ref(),
-            Some(
-                PolicyPipelineFailureV3::AppendUncertain
-                    | PolicyPipelineFailureV3::FlushPanic(_)
-                    | PolicyPipelineFailureV3::ChunkIo(_)
-                    | PolicyPipelineFailureV3::ChunkPanic(_)
-                    | PolicyPipelineFailureV3::PublicationUnknown(_)
-                    | PolicyPipelineFailureV3::PublicationPanic(_)
-                    | PolicyPipelineFailureV3::ReceiptReadPanic(_)
-            ) | Some(PolicyPipelineFailureV3::GateRejected(
-                TargetBeginRejectionV3::Uncertain
-                    | TargetBeginRejectionV3::Poisoned
-                    | TargetBeginRejectionV3::AlreadyCommitted
-            ))
-        )
+        self.output_settlement_unknown.is_some()
+            || matches!(
+                self.failure.as_ref(),
+                Some(
+                    PolicyPipelineFailureV3::AppendUncertain
+                        | PolicyPipelineFailureV3::FlushPanic(_)
+                        | PolicyPipelineFailureV3::ChunkIo(_)
+                        | PolicyPipelineFailureV3::ChunkPanic(_)
+                        | PolicyPipelineFailureV3::PublicationUnknown(_)
+                        | PolicyPipelineFailureV3::PublicationPanic(_)
+                        | PolicyPipelineFailureV3::ReceiptReadPanic(_)
+                ) | Some(PolicyPipelineFailureV3::GateRejected(
+                    TargetBeginRejectionV3::Uncertain
+                        | TargetBeginRejectionV3::Poisoned
+                        | TargetBeginRejectionV3::AlreadyCommitted
+                ))
+            )
     }
 
     /// Bind the same original plan and managed directory owner before any
@@ -730,6 +777,15 @@ impl PolicyRowPipelineV3 {
                 self.chunk_attempted = false;
                 self.failure = Some(PolicyPipelineFailureV3::ChunkPrepare(super::invalid(error)));
                 PolicyChunkPersistenceV3::Failed
+            }
+            Ok(Err(super::launch::ManagedOutputWriteErrorV3::PublicationBeforeWrite {
+                reason,
+                evidence,
+            })) => {
+                self.chunk_attempted = false;
+                self.output_unstarted = Some(evidence);
+                self.failure = Some(PolicyPipelineFailureV3::PublicationUnknown(reason));
+                PolicyChunkPersistenceV3::Unknown
             }
             Ok(Err(super::launch::ManagedOutputWriteErrorV3::AuthorityUnknown(error))) => {
                 self.chunk_attempted = false;
