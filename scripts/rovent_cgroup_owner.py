@@ -237,9 +237,14 @@ class CgroupOwner:
 
     def workload_empty(self) -> bool:
         """Observe this same cgroup tree, not a device fence or host-wide state."""
+        self._reconcile_removals()
         self._check_owner()
         if self._workload_removed:
-            raise CgroupOwnerError("workload was already removed")
+            # The kernel only permits removal of an unpopulated cgroup. This
+            # owner attempted rmdir after observing empty; a later cleanup
+            # step can fail, so retain that original tree's empty outcome for
+            # retry without making any claim about a newly created pathname.
+            return True
         fd = os.open("cgroup.events", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
                      dir_fd=self._fds["workload"])
         with os.fdopen(fd, "r", encoding="ascii") as handle:

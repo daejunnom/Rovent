@@ -75,6 +75,50 @@ class CgroupOwnerTests(unittest.TestCase):
             self.assertTrue(owner._closed)
             self.assertEqual(attempts, 2)
 
+    def test_empty_remains_observable_after_workload_removal_then_cleanup_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            owner = self.make_owner(root)
+            original_rmdir = Path.rmdir
+
+            def rmdir(path):
+                if path == owner.workload:
+                    (owner.workload / "cgroup.events").unlink()
+                return original_rmdir(path)
+
+            with mock.patch.object(Path, "rmdir", rmdir):
+                # Missing pseudo-file simulates a later controller-read error.
+                with self.assertRaises(FileNotFoundError):
+                    owner.close()
+                self.assertTrue(owner._workload_removed)
+                self.assertTrue(owner.workload_empty())
+                owner._controls_disabled = True
+                owner._manager_moved = True
+                owner.close()
+            self.assertTrue(owner._closed)
+
+    def test_empty_reconciles_interruption_after_kernel_removed_workload(self):
+        with tempfile.TemporaryDirectory() as root:
+            owner = self.make_owner(root)
+            original_rmdir = Path.rmdir
+
+            def rmdir(path):
+                if path == owner.workload:
+                    (owner.workload / "cgroup.events").unlink()
+                    original_rmdir(path)
+                    raise InterruptedError("interrupted after removal")
+                return original_rmdir(path)
+
+            with mock.patch.object(Path, "rmdir", rmdir):
+                with self.assertRaises(InterruptedError):
+                    owner.close()
+                self.assertFalse(owner._workload_removed)
+                self.assertTrue(owner.workload_empty())
+                self.assertTrue(owner._workload_removed)
+                owner._controls_disabled = True
+                owner._manager_moved = True
+                owner.close()
+            self.assertTrue(owner._closed)
+
 
 if __name__ == "__main__":
     unittest.main()
