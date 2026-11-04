@@ -1197,6 +1197,44 @@ impl SupervisorStartCustodyV3 {
         self.stop.store(true, Ordering::Release);
         Ok(())
     }
+
+    /// Associate the same quiescence proof with a driver which actually
+    /// joined after an error or panic before a stop request could be sent.
+    /// This retains its original result and does not assert collection, GPU,
+    /// or output success. A rejected authorization is returned unchanged.
+    pub(crate) fn authorize_already_joined(
+        &mut self,
+        authorization: super::pc_hooks_lock_v3::PcSupervisorStopAuthorizationV3,
+    ) -> Result<
+        (),
+        (
+            super::pc_hooks_lock_v3::PcSupervisorStopAuthorizationV3,
+            &'static str,
+        ),
+    > {
+        let Some(native) = self.native.as_ref() else {
+            return Err((authorization, "P-C supervisor native owner absent"));
+        };
+        let abnormal_join = match self.state {
+            SupervisorThreadStateV3::Joined => self.result.as_ref().is_some_and(Result::is_err),
+            SupervisorThreadStateV3::JoinPanicked => self.panic.is_some(),
+            _ => false,
+        };
+        if !abnormal_join || self.thread.is_some() || !self.admitted.load(Ordering::Acquire) {
+            return Err((
+                authorization,
+                "P-C supervisor abnormal join not established",
+            ));
+        }
+        if self.stop_authorization.is_some() {
+            return Err((authorization, "P-C supervisor stop already authorized"));
+        }
+        if !authorization.matches_original(&self.supervisor, native) {
+            return Err((authorization, "P-C supervisor stop authorization differs"));
+        }
+        self.stop_authorization = Some(authorization);
+        Ok(())
+    }
     pub(crate) fn result(&self) -> Option<&Result<(), String>> {
         self.result.as_ref()
     }
