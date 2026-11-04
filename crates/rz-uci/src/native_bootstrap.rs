@@ -1555,7 +1555,8 @@ impl NativeSessionFactory {
         served: Result<(), EngineError>,
         until: Instant,
     ) -> Result<NativeRunReport, NativeRunError> {
-        self.finish_until_with_mapping(served, until, false).0
+        let mut service = served.err();
+        self.finish_until_with_mapping(&mut service, until, false).0
     }
 
     // System runtime mappings are a separate observation, not a reason to
@@ -1563,7 +1564,7 @@ impl NativeSessionFactory {
     // The legacy bundled route keeps its strict mapping audit unchanged.
     fn finish_until_with_mapping(
         &self,
-        served: Result<(), EngineError>,
+        service: &mut Option<EngineError>,
         until: Instant,
         system_observation: bool,
     ) -> (
@@ -1656,7 +1657,6 @@ impl NativeSessionFactory {
         } else {
             None
         };
-        let service = served.err().map(Box::new);
         if service.is_none()
             && collection_error.is_none()
             && worker_shutdown_error.is_none()
@@ -1670,13 +1670,16 @@ impl NativeSessionFactory {
         }
         (
             Err(NativeRunError {
-                service,
                 report: report.map(Box::new),
                 collection_error,
                 worker_shutdown_error,
                 runtime_mapping_error,
                 retained_evidence: self.evidence.clone(),
                 retained_owner: self.owner.clone(),
+                // Move the original service failure only after the other
+                // report fields have been prepared. The caller retains it if
+                // those preparations unwind.
+                service: service.take().map(Box::new),
             }),
             mapping_observation,
         )

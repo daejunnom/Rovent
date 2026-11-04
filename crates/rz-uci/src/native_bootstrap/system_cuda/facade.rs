@@ -207,6 +207,7 @@ pub struct Lc0SupervisedSession {
     receipt_token: Option<Arc<()>>,
     profile: Option<Lc0ProfileDirectory>,
     profile_failure: Option<Lc0ProfileCreateError>,
+    profile_verification_failure: Option<BackendError>,
     epoch: u64,
 }
 
@@ -354,6 +355,7 @@ impl Lc0PendingSupervisor {
             receipt_token,
             profile: None,
             profile_failure: None,
+            profile_verification_failure: None,
             epoch: self.epoch,
         })
     }
@@ -381,6 +383,54 @@ impl Lc0SupervisedSession {
     /// Service outcome remains independent of same-session cleanup.
     pub fn original_service_succeeded(&self) -> bool {
         self.supervisor.original_service_succeeded()
+    }
+
+    /// Publish a bounded, non-authoritative classification even when startup
+    /// failed before any finish receipt existed. Original errors, descriptors,
+    /// and the same native owner remain in this process on every outcome.
+    pub fn publish_original_failure_observation(
+        &mut self,
+        receipts: &Lc0ReceiptOwner,
+    ) -> Result<(), String> {
+        self.check_receipts(receipts)?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let profile = match self.profile_failure.as_ref() {
+                Some(Lc0ProfileCreateError::BeforeCreate(error)) => Some(serde_json::json!({
+                    "stage": "before_create", "error": control::backend_failure(error),
+                })),
+                Some(Lc0ProfileCreateError::AfterCreate { cause, .. }) => Some(serde_json::json!({
+                    "stage": "after_create", "error": control::backend_failure(cause),
+                    "original_directory_owner_retained": true,
+                })),
+                None => self.profile_verification_failure.as_ref().map(|error| {
+                    serde_json::json!({
+                        "stage": "verify_original", "error": control::backend_failure(error),
+                        "original_directory_owner_retained": true,
+                    })
+                }),
+            };
+            let value = serde_json::json!({
+                "domain": "rz-lc0-original-failure-observation/1",
+                "process_id": std::process::id(),
+                "process_epoch": self.epoch,
+                "lock_sha256": self.lock.canonical_sha256,
+                "profile": profile,
+                "supervisor": self.supervisor.original_failure_observation(),
+                "scope": "bounded classifications only; original owner and errors remain authoritative",
+                "physical_completion": "unknown",
+            });
+            let bytes = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
+            receipts
+                .writer
+                .write_bytes("lc0-original-failure.v1.json", &bytes)
+        }));
+        match result {
+            Ok(result) => result,
+            Err(payload) => {
+                self.supervisor.retain_publication_panic(payload);
+                Err("LC0 original failure observation panicked; owner retained".into())
+            }
+        }
     }
 
     /// Publication failure never changes the retained service or physical
@@ -433,8 +483,10 @@ impl Lc0SupervisedSession {
             }
         };
         if let Err(error) = profile.verify_original() {
+            let kind = error.kind;
             self.profile = Some(profile);
-            return Err(if error.kind == FailureKind::IdentityMismatch {
+            self.profile_verification_failure = Some(error);
+            return Err(if kind == FailureKind::IdentityMismatch {
                 "LC0 private profile identity differs; original owner retained"
             } else {
                 "LC0 private profile observation failed; original owner retained"
@@ -494,9 +546,10 @@ impl Lc0SupervisedSession {
             .profile
             .as_ref()
             .ok_or("LC0 original private profile owner is absent")?;
-        profile
-            .verify_original()
-            .map_err(|_| "LC0 original profile identity is unknown")?;
+        if let Err(error) = profile.verify_original() {
+            self.profile_verification_failure.get_or_insert(error);
+            return Err("LC0 original profile identity is unknown");
+        }
         if backend.profiling_prefix.as_deref() != Some(profile.prefix()) {
             return Err("LC0 profiling prefix differs from the original private owner");
         }

@@ -55,6 +55,9 @@ pub(super) struct Lc0ControlSupervisor {
     owner: Lc0SystemSessionOwner,
     state: ServiceState,
     service_started: bool,
+    service_failure_projection: Option<&'static str>,
+    // Held independently until the final report has accepted ownership.
+    service_failure: Option<EngineError>,
     finish: Option<Lc0SystemFinish>,
     // Preserve the original panic payload without rendering possibly sensitive
     // details or treating it as a normally completed protocol service.
@@ -63,6 +66,7 @@ pub(super) struct Lc0ControlSupervisor {
     setup_attempted: bool,
     setup_failure: Option<NativeBootstrapError>,
     setup_panic: Option<Box<dyn Any + Send>>,
+    finish_failure: Option<NativeBootstrapError>,
     publication_panic: Option<Box<dyn Any + Send>>,
     unstarted_release: Option<Poll<Result<SessionReleased, PhysicalFailure>>>,
     followup_release: Option<Poll<Result<SessionReleased, PhysicalFailure>>>,
@@ -137,18 +141,74 @@ fn write_frame(
     Ok(())
 }
 
+// These projections deliberately omit external error text and panic payloads.
+// The original errors and physical owner remain in the supervisor.
+fn contract_failure(error: &ContractError) -> serde_json::Value {
+    serde_json::json!({
+        "code": format!("{:?}", error.code),
+        "stage": format!("{:?}", error.stage),
+    })
+}
+
+pub(super) fn backend_failure(error: &BackendError) -> serde_json::Value {
+    serde_json::json!({
+        "kind": format!("{:?}", error.kind),
+        "stage": format!("{:?}", error.stage),
+        "native_detail_retained_by_owner": error.native.is_some(),
+    })
+}
+
+fn physical_failure(error: &PhysicalFailure) -> serde_json::Value {
+    serde_json::json!({
+        "contract": contract_failure(&error.contract),
+        "backend": error.backend.as_ref().map(backend_failure),
+    })
+}
+
+fn bootstrap_failure(error: &NativeBootstrapError) -> serde_json::Value {
+    match error {
+        NativeBootstrapError::Config(_) => serde_json::json!({"type": "config"}),
+        NativeBootstrapError::Backend(error) => {
+            serde_json::json!({"type": "backend", "error": backend_failure(error)})
+        }
+        NativeBootstrapError::Physical(error) => {
+            serde_json::json!({"type": "physical", "error": physical_failure(error)})
+        }
+        NativeBootstrapError::Contract(error) => {
+            serde_json::json!({"type": "contract", "error": contract_failure(error)})
+        }
+    }
+}
+
+fn service_failure(error: &EngineError) -> &'static str {
+    match error {
+        EngineError::Contract(_) => "contract",
+        EngineError::SearchDriverClose(_) => "search_driver_close",
+        EngineError::Session(_) => "session",
+        EngineError::Transport(_) => "transport",
+        EngineError::WorkerPanic => "worker_panic",
+        EngineError::DrainTimeout => "drain_timeout",
+        EngineError::UndeliveredDiagnostics(_) => "undelivered_diagnostics",
+        EngineError::UndeliveredWorkerFailure(_) => "undelivered_worker_failure",
+        EngineError::Cleanup { .. } => "cleanup",
+    }
+}
+
 impl Lc0ControlSupervisor {
     pub(super) fn new(owner: Lc0SystemSessionOwner, control_until: Instant) -> Self {
         Self {
             owner,
             state: ServiceState::Prepared,
             service_started: false,
+            service_failure_projection: None,
+            service_failure: None,
             finish: None,
             service_panic: None,
             finish_panic: None,
             setup_attempted: false,
             setup_failure: None,
             setup_panic: None,
+            finish_failure: None,
             publication_panic: None,
             unstarted_release: None,
             followup_release: None,
@@ -174,6 +234,7 @@ impl Lc0ControlSupervisor {
         if self.state != ServiceState::SessionReleased
             || self.setup_panic.is_some()
             || self.finish_panic.is_some()
+            || self.finish_failure.is_some()
         {
             return false;
         }
@@ -198,10 +259,56 @@ impl Lc0ControlSupervisor {
             && self.setup_panic.is_none()
             && self.service_panic.is_none()
             && self.finish_panic.is_none()
+            && self.finish_failure.is_none()
             && self
                 .finish
                 .as_ref()
                 .is_some_and(|finish| finish.run.is_ok())
+    }
+
+    /// Read-only, bounded classification of the first failures. This is not a
+    /// completion witness and must never replace the retained original errors.
+    pub(super) fn original_failure_observation(&self) -> serde_json::Value {
+        let failure = self
+            .finish
+            .as_ref()
+            .and_then(|finish| finish.run.as_ref().err());
+        let original_session = self
+            .finish
+            .as_ref()
+            .and_then(|finish| finish.session_release.as_ref())
+            .or(self.unstarted_release.as_ref());
+        let release_error =
+            |release: Option<&Poll<Result<SessionReleased, PhysicalFailure>>>| match release {
+                Some(Poll::Ready(Err(error))) => Some(physical_failure(error)),
+                _ => None,
+            };
+        let service_original_retained = self.service_failure_projection.is_none()
+            || self.service_failure.is_some()
+            || failure.is_some_and(|error| error.service.is_some());
+        serde_json::json!({
+            "startup_attempted": self.setup_attempted,
+            "startup": self.setup_failure.as_ref().map(bootstrap_failure),
+            "startup_panic": self.setup_panic.is_some(),
+            "service_started": self.service_started,
+            "service": self.service_failure_projection,
+            "service_original_retained": service_original_retained,
+            "service_panic": self.service_panic.is_some(),
+            "finish_observed": self.finish.is_some(),
+            "finish": self.finish_failure.as_ref().map(bootstrap_failure),
+            "finish_panic": self.finish_panic.is_some(),
+            "collection": failure.and_then(|error| error.collection_error.as_ref()).map(contract_failure),
+            "worker_shutdown": failure.and_then(|error| error.worker_shutdown_error.as_deref()).map(physical_failure),
+            "original_session_release_error": release_error(original_session),
+            "followup_session_release_error": release_error(self.followup_release.as_ref()),
+            "runtime_mapping": failure.and_then(|error| error.runtime_mapping_error.as_deref()).map(backend_failure),
+            "publication_panic": self.publication_panic.is_some(),
+            "physical_completion": "unknown",
+        })
+    }
+
+    pub(super) fn retain_publication_panic(&mut self, payload: Box<dyn Any + Send>) {
+        self.publication_panic.get_or_insert(payload);
     }
 
     /// A missing or failed report is separate from the service and session
@@ -303,10 +410,22 @@ impl Lc0ControlSupervisor {
                 Err(EngineError::WorkerPanic)
             }
         };
+        // Keep the original error in the supervisor until the finish report
+        // takes it. A panic during collection must not drop the service error.
+        self.service_failure_projection = served.as_ref().err().map(service_failure);
+        self.service_failure = served.err();
         self.state = ServiceState::DrainRequested;
-        let result = catch_unwind(AssertUnwindSafe(|| self.owner.finish_until(served, until)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            self.owner.finish_until(&mut self.service_failure, until)
+        }));
         let finish = match result {
-            Ok(result) => result?,
+            Ok(Ok(finish)) => finish,
+            Ok(Err(error)) => {
+                self.finish_failure = Some(error);
+                return Err(NativeBootstrapError::Config(
+                    "LC0 final collection failed; original owner retained",
+                ));
+            }
             Err(payload) => {
                 self.finish_panic.get_or_insert(payload);
                 return Err(NativeBootstrapError::Config(
@@ -314,10 +433,25 @@ impl Lc0ControlSupervisor {
                 ));
             }
         };
-        if matches!(&finish.session_release, Poll::Ready(Ok(_))) {
+        // Keep the original run report (including any service failure) in
+        // the supervisor before the potentially unwinding release call.
+        self.finish = Some(finish);
+        let release = match catch_unwind(AssertUnwindSafe(|| self.owner.try_release())) {
+            Ok(release) => release,
+            Err(payload) => {
+                self.finish_panic.get_or_insert(payload);
+                return Err(NativeBootstrapError::Config(
+                    "LC0 session release panicked; original report and owner retained",
+                ));
+            }
+        };
+        if matches!(&release, Poll::Ready(Ok(_))) {
             self.state = ServiceState::SessionReleased;
         }
-        self.finish = Some(finish);
+        self.finish
+            .as_mut()
+            .expect("report retained above")
+            .session_release = Some(release);
         Ok(())
     }
 
@@ -344,13 +478,13 @@ impl Lc0ControlSupervisor {
     }
 
     fn reobserve(&mut self) {
-        if self.state != ServiceState::DrainRequested {
+        if self.state != ServiceState::DrainRequested || self.finish_panic.is_some() {
             return;
         }
         let previous = self.followup_release.as_ref().or_else(|| {
             self.finish
                 .as_ref()
-                .map(|value| &value.session_release)
+                .and_then(|value| value.session_release.as_ref())
                 .or(self.unstarted_release.as_ref())
         });
         if previous.is_some_and(|value| matches!(value, Poll::Pending)) {
@@ -488,7 +622,7 @@ impl Lc0ControlSupervisor {
             self.reobserve();
         }
         let original_session = if let Some(finish) = &self.finish {
-            Some(&finish.session_release)
+            finish.session_release.as_ref()
         } else {
             self.unstarted_release.as_ref()
         };
@@ -510,6 +644,7 @@ impl Lc0ControlSupervisor {
             "service_state": format!("{:?}", self.state),
             "service_panic": self.service_panic.is_some(),
             "finish_panic": self.finish_panic.is_some(),
+            "finish_failure": self.finish_failure.is_some(),
             "startup_failure": self.setup_failure.is_some(),
             "startup_panic": self.setup_panic.is_some(),
             "publication_panic": self.publication_panic.is_some(),
@@ -559,6 +694,23 @@ impl Lc0ControlSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_projection_preserves_types_without_native_text() {
+        let backend = BackendError::new(
+            FailureKind::BackendUnavailable,
+            FailureStage::Backend,
+            "do not expose this detail",
+        )
+        .with_diagnostic("code", "do not expose this native message");
+        let projected = bootstrap_failure(&NativeBootstrapError::Backend(Box::new(backend)));
+        assert_eq!(projected["type"], "backend");
+        assert_eq!(projected["error"]["kind"], "BackendUnavailable");
+        assert_eq!(projected["error"]["stage"], "Backend");
+        assert_eq!(projected["error"]["native_detail_retained_by_owner"], true);
+        assert!(!projected.to_string().contains("do not expose"));
+        assert_eq!(service_failure(&EngineError::DrainTimeout), "drain_timeout");
+    }
 
     #[test]
     fn control_frame_is_bounded_and_closed_schema_rejects_extra_fields() {

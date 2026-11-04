@@ -188,7 +188,9 @@ pub(super) struct Lc0SystemFinish {
     owner_token: Arc<()>,
     pub(super) run: Result<NativeRunReport, NativeRunError>,
     pub(super) mapping: Option<CudaRuntimeMappingEvidence>,
-    pub(super) session_release: Poll<Result<SessionReleased, PhysicalFailure>>,
+    // None differs from a same-worker release poll returning Pending; neither
+    // establishes GPU-wide physical completion.
+    pub(super) session_release: Option<Poll<Result<SessionReleased, PhysicalFailure>>>,
 }
 
 impl Lc0SystemSessionOwner {
@@ -266,19 +268,26 @@ impl Lc0SystemSessionOwner {
     /// session release is pending or unknown. This is not a supervisor.
     pub(super) fn finish_until(
         &mut self,
-        served: Result<(), EngineError>,
+        service: &mut Option<EngineError>,
         until: Instant,
     ) -> Result<Lc0SystemFinish, NativeBootstrapError> {
         let factory = self.factory.as_ref().ok_or(NativeBootstrapError::Config(
             "LC0 system session is not connected",
         ))?;
-        let (run, mapping) = factory.inner.finish_until_with_mapping(served, until, true);
-        let session_release = self.custody.try_finish();
+        // Retain the capability before the report takes the original service
+        // error; no fallible owner operation follows that ownership transfer.
+        let owner_token = Arc::clone(&self.owner_token);
+        let (run, mapping) = factory
+            .inner
+            .finish_until_with_mapping(service, until, true);
+        // The caller must retain this report before invoking any further
+        // worker operation that can unwind; it may contain the original UCI
+        // service error and evidence owner.
         Ok(Lc0SystemFinish {
-            owner_token: Arc::clone(&self.owner_token),
+            owner_token,
             run,
             mapping,
-            session_release,
+            session_release: None,
         })
     }
 
@@ -369,9 +378,12 @@ impl Lc0SystemSessionOwner {
             return Err("LC0 finish lock differs from the original owner".into());
         }
         let (session_status, completed_runs) = match &finish.session_release {
-            Poll::Pending => ("pending", None),
-            Poll::Ready(Err(_)) => ("failed", None),
-            Poll::Ready(Ok(release)) => ("released", Some(release.completed_synchronous_runs)),
+            None => ("unknown", None),
+            Some(Poll::Pending) => ("pending", None),
+            Some(Poll::Ready(Err(_))) => ("failed", None),
+            Some(Poll::Ready(Ok(release))) => {
+                ("released", Some(release.completed_synchronous_runs))
+            }
         };
         let mapping = match finish.mapping {
             Some(CudaRuntimeMappingEvidence::Observed) => "observed",
