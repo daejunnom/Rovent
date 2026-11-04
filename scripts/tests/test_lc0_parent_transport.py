@@ -89,6 +89,7 @@ class ParentTransportTests(unittest.TestCase):
     def test_partial_request_and_ack_transfer_original_socket_once(self):
         fake = FakeSocket(self.pid, chunk=7)
         handshake = self.handshake(fake)
+        self.assertEqual(handshake.binding, (self.pid, self.epoch, self.digest, self.ordinal))
         self.write_request(handshake)
         self.assertEqual(handshake.state, "reading")
         self.assertEqual(handshake.bytes_sent, len(fake.sent))

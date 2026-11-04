@@ -102,6 +102,11 @@ class NonblockingParentHandshake:
         return self._state
 
     @property
+    def binding(self):
+        """Return the identity carried by this original admission attempt."""
+        return (self._pid, self._epoch, self._lock, self._ordinal)
+
+    @property
     def error(self):
         return self._error
 
