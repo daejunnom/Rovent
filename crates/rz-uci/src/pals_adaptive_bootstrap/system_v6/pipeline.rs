@@ -68,6 +68,7 @@ pub(super) struct V6Pipeline {
     service_panic: Option<Box<dyn Any + Send>>,
     failure: Option<V6PipelineFailure>,
     failed_native_drain: Option<V6FailedStartupDrain>,
+    first_failed_native_drain: Option<FailedNativeDrainObservation>,
     state: V6PipelineObservation,
 }
 
@@ -82,6 +83,13 @@ impl V6Pipeline {
         settings: EngineSettings,
         original_cleanup_until: Instant,
     ) -> Self {
+        let window = &source.lock().config.window;
+        let registered_cleanup_until = source
+            .original_started()
+            .checked_add(Duration::from_millis(window.wall_time_max_ms))
+            .and_then(|end| end.checked_add(Duration::from_millis(window.cleanup_max_ms)))
+            // An unrepresentable bound cannot authorize a later deadline.
+            .unwrap_or_else(|| source.original_started());
         Self {
             source,
             clock,
@@ -90,7 +98,7 @@ impl V6Pipeline {
             identity,
             rules_owners,
             settings,
-            original_cleanup_until,
+            original_cleanup_until: original_cleanup_until.min(registered_cleanup_until),
             parent: None,
             admission: None,
             cpu: None,
@@ -101,6 +109,7 @@ impl V6Pipeline {
             service_panic: None,
             failure: None,
             failed_native_drain: None,
+            first_failed_native_drain: None,
             state: V6PipelineObservation::Initial,
         }
     }
@@ -129,6 +138,12 @@ impl V6Pipeline {
     pub(super) fn service_panic(&self) -> Option<&(dyn Any + Send)> {
         self.service_panic.as_deref()
     }
+    pub(super) fn first_failed_native_drain(&self) -> Option<FailedNativeDrainObservation> {
+        self.first_failed_native_drain
+    }
+    pub(super) fn failed_native_drain(&self) -> Option<&V6FailedStartupDrain> {
+        self.failed_native_drain.as_ref()
+    }
     /// Request shutdown of the same retained native worker after a failed
     /// startup. The caller supplies the original registered cleanup deadline.
     /// This neither clears the failure nor closes external/archive owners.
@@ -150,7 +165,7 @@ impl V6Pipeline {
             return FailedNativeDrainObservation::OwnerUnavailable;
         };
         if self.failed_native_drain.is_none() {
-            match V6FailedStartupDrain::new(service, until) {
+            match V6FailedStartupDrain::new(service, until.min(self.original_cleanup_until)) {
                 Ok(drain) => self.failed_native_drain = Some(drain),
                 Err(observation) => return observation,
             }
@@ -181,7 +196,8 @@ impl V6Pipeline {
         // This only starts the same native worker's bounded drain when one
         // was actually retained. A caller must continue polling; no failure
         // or missing physical completion is converted to success here.
-        let _ = self.begin_failed_native_drain(self.original_cleanup_until);
+        self.first_failed_native_drain =
+            Some(self.begin_failed_native_drain(self.original_cleanup_until));
         self.state
     }
 

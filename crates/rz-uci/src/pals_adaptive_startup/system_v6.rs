@@ -206,6 +206,7 @@ pub struct PinnedPalsSystemStartupV6 {
     system_v6_source: PalsSystemSourceObservationV6,
     system_v6_execution_source: PalsSystemSourceObservationV6,
     mapped_executable: crate::process_receipts::ExecutableIdentityV1,
+    original_started: Instant,
     original_until: Instant,
     original_cancelled: Arc<AtomicBool>,
     root_path: PathBuf,
@@ -337,6 +338,7 @@ impl PinnedPalsSystemStartupV6 {
             system_v6_source,
             system_v6_execution_source,
             mapped_executable,
+            original_started: started,
             original_until: until,
             original_cancelled: cancelled,
             root_path: private_cwd.to_owned(),
@@ -378,6 +380,12 @@ impl PinnedPalsSystemStartupV6 {
     /// This never creates a new cancellation authority or extends its window.
     pub(crate) fn original_startup_control(&self) -> (Instant, Arc<AtomicBool>) {
         (self.original_until, Arc::clone(&self.original_cancelled))
+    }
+
+    /// The same initial execution time accepted by `open`, not a renewed
+    /// cleanup deadline or a replacement time observed after startup.
+    pub(crate) fn original_started(&self) -> Instant {
+        self.original_started
     }
 
     /// Open a bounded direct-parent transport. This checks pathname ownership
