@@ -749,6 +749,7 @@ struct IndependentNoGameOwners {
     plan_sha256: String,
     observation: Option<crate::process::OriginalSmokeUciObservation>,
     quarantined_error: Option<ArenaError>,
+    grants: Arc<Mutex<[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -777,6 +778,7 @@ pub(crate) struct IndependentNoGameRawEvidence {
     pub(crate) original_error: Option<ArenaError>,
     pub(crate) failures: Vec<String>,
     pub(crate) observation: Option<crate::process::OriginalSmokeUciObservation>,
+    pub(crate) grants: Arc<Mutex<[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -867,6 +869,62 @@ fn no_game_raw_bytes(evidence: &IndependentNoGameRawEvidence) -> u64 {
     u64::try_from(process.saturating_add(observation)).unwrap_or(u64::MAX)
 }
 
+/// No producer exists until the original resource/CLI owners are connected.
+/// This keeps the source-level supervisor adapter unreachable in production.
+#[cfg(target_os = "linux")]
+enum IndependentNoGameDispatchAdmission {}
+
+#[cfg(target_os = "linux")]
+enum IndependentNoGameSupervisorOutcome {
+    /// The ProcessOutput is retained, but its stop and all higher-level
+    /// acceptance conditions remain unassessed.
+    ReturnedUnassessed,
+    /// The original failure is retained by the same owner.
+    FailedRetained,
+}
+
+#[cfg(target_os = "linux")]
+fn poll_independent_no_game_control(
+    control: &Mutex<crate::pals_adaptive_launch::SmokeDeadlineControl>,
+    grants: &Mutex<[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]>,
+    custody: &crate::process::SpawnCustody,
+    until: std::time::Instant,
+    cleanup: bool,
+) -> Result<(), ArenaError> {
+    let mut observations = match grants.try_lock() {
+        Ok(value) => value,
+        Err(TryLockError::WouldBlock) => return Ok(()),
+        Err(TryLockError::Poisoned(_)) => {
+            return Err(ArenaError::Io("NoGame grant observation poisoned".into()));
+        }
+    };
+    let mut original = match control.try_lock() {
+        Ok(value) => value,
+        Err(TryLockError::WouldBlock) => return Ok(()),
+        Err(TryLockError::Poisoned(_)) => {
+            return Err(ArenaError::Io("NoGame control poisoned".into()));
+        }
+    };
+    let event = if cleanup {
+        original.poll_cleanup(custody, until)?
+    } else {
+        original.poll_run(custody, until)?
+    };
+    if let Some(event) = event {
+        let index = match event.scope.phase {
+            rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Run => 0,
+            rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Cleanup => 1,
+        };
+        if observations[index].is_some() {
+            return Err(ArenaError::Integrity(
+                "duplicate NoGame grant observation".into(),
+            ));
+        }
+        observations[index] = Some(event);
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 impl PreparedIndependentNoGameOwner {
     /// A rejected binding is returned intact. Moving the binding prevents it
@@ -893,6 +951,7 @@ impl PreparedIndependentNoGameOwner {
                 plan_sha256,
                 observation: None,
                 quarantined_error: None,
+                grants: Arc::new(Mutex::new([None, None])),
             }),
             process: None,
             spawn_custody: crate::process::SpawnCustody::default(),
@@ -923,6 +982,97 @@ impl PreparedIndependentNoGameOwner {
         self.owners.as_ref()?.observation.as_ref()
     }
 
+    /// Source-level link only: admission has no producer until original
+    /// resource, environment and proxy-CLI owners are actually connected.
+    /// Returned results and any unwound observation stay with this owner. An
+    /// Ok return means only that ProcessOutput was retained, not that the
+    /// process, model, resource policy or physical lifetime succeeded.
+    fn supervise_admitted(
+        &mut self,
+        _admission: &IndependentNoGameDispatchAdmission,
+        limits: crate::process::ProcessLimits,
+        watch: &crate::process::OwnedArtifactTreeWatch,
+        cancel: Option<&AtomicBool>,
+    ) -> IndependentNoGameSupervisorOutcome {
+        if self.evidence_transferred || self.unresolved() {
+            self.original_error
+                .get_or_insert_with(|| ArenaError::Invalid("NoGame owner is not fresh".into()));
+            return IndependentNoGameSupervisorOutcome::FailedRetained;
+        }
+        let Some(owners) = self.owners.as_mut() else {
+            return IndependentNoGameSupervisorOutcome::FailedRetained;
+        };
+        let binding = &owners._binding;
+        let execution = binding.execution();
+        let window = match crate::process::OriginalProcessWindow::new(
+            execution.started(),
+            execution.run_until(),
+            execution.cleanup_until(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.original_error.get_or_insert(error);
+                return IndependentNoGameSupervisorOutcome::FailedRetained;
+            }
+        };
+        if owners.observation.is_some() {
+            self.original_error.get_or_insert_with(|| {
+                ArenaError::Invalid("NoGame observation already installed".into())
+            });
+            return IndependentNoGameSupervisorOutcome::FailedRetained;
+        }
+        owners.observation = Some(crate::process::OriginalSmokeUciObservation::new(window));
+        let run_control = Arc::clone(binding.control());
+        let cleanup_control = Arc::clone(binding.control());
+        let run_grants = Arc::clone(&owners.grants);
+        let cleanup_grants = Arc::clone(&owners.grants);
+        let mut run = |custody: &crate::process::SpawnCustody, until| {
+            poll_independent_no_game_control(&run_control, &run_grants, custody, until, false)
+        };
+        let mut cleanup = |custody: &crate::process::SpawnCustody, until| {
+            poll_independent_no_game_control(
+                &cleanup_control,
+                &cleanup_grants,
+                custody,
+                until,
+                true,
+            )
+        };
+        self.physical_fence_confirmed = false;
+        let result = crate::process::supervise_smoke_uci_in_original_window(
+            binding.proxy().as_ref(),
+            binding.arguments(),
+            &binding.snapshot().cwd,
+            limits,
+            cancel,
+            watch,
+            window,
+            &mut self.spawn_custody,
+            &mut run,
+            Some(&mut cleanup),
+            None,
+            owners.observation.as_mut().expect("installed observation"),
+        );
+        match result {
+            Ok(output) => {
+                self.process = Some(output);
+                IndependentNoGameSupervisorOutcome::ReturnedUnassessed
+            }
+            Err(error) => {
+                // If no child was ever installed, no physical scope existed.
+                // Any spawned or uncertain child remains protected instead.
+                if !self.spawn_custody.pending.load(Ordering::Acquire)
+                    && self.spawn_custody.child().is_none()
+                    && self.spawn_custody.last_spawn_pid.is_none()
+                {
+                    self.physical_fence_confirmed = true;
+                }
+                self.original_error.get_or_insert(error);
+                IndependentNoGameSupervisorOutcome::FailedRetained
+            }
+        }
+    }
+
     /// Physical completion must be resolved before moving evidence away from
     /// the original owner. The caller is responsible for durable storage.
     pub(crate) fn take_raw_evidence(&mut self) -> Option<IndependentNoGameRawEvidence> {
@@ -949,6 +1099,7 @@ impl PreparedIndependentNoGameOwner {
             original_error: self.original_error.take(),
             failures: std::mem::take(&mut self.failures),
             observation: owners.observation.take(),
+            grants: Arc::clone(&owners.grants),
         })
     }
 }
