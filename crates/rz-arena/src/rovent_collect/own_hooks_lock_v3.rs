@@ -1218,7 +1218,8 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
                     slot.reservation.take();
                 }
                 GameStepV3::Aborted => {
-                    if !reservation.transfer_abort_receipt(&mut slot.abort_receipt)
+                    if (slot.abort_receipt.is_none()
+                        && !reservation.transfer_abort_receipt(&mut slot.abort_receipt))
                         || !slot.abort_receipt.as_ref().is_some_and(|receipt| {
                             receipt.matches_game(&self.game)
                                 && receipt.matches_original(&slot.admission)
