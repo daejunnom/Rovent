@@ -32,6 +32,16 @@ pub enum AsyncEngineStartFailure<O: Write + Send + 'static, D: Write + Send + 's
     },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnstartedWriterCloseStatus {
+    Requested,
+    AlreadyRequested,
+    NotUnstarted,
+    NotIdle,
+    OriginalOwnerMissing,
+    AlreadyRecovered,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnstartedWriterRecoveryStatus {
     NotUnstarted,
     CloseNotRequested,
@@ -43,19 +53,33 @@ pub enum UnstartedWriterRecoveryStatus {
 impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartFailure<O, D> {
     /// Explicitly request a drain only for the unstarted path. This is not a
     /// writer join or a statement about GPU/native completion.
-    pub fn request_unstarted_writer_close(&mut self) -> bool {
-        match self {
-            Self::Unstarted {
-                output: Some(output),
-                output_close_requested,
-                ..
-            } => {
-                output.request_close();
-                *output_close_requested = true;
-                true
-            }
-            _ => false,
+    pub fn request_unstarted_writer_close(&mut self) -> UnstartedWriterCloseStatus {
+        let Self::Unstarted {
+            output,
+            output_close_requested,
+            output_recovery,
+            ..
+        } = self
+        else {
+            return UnstartedWriterCloseStatus::NotUnstarted;
+        };
+        if output_recovery.is_some() {
+            return UnstartedWriterCloseStatus::AlreadyRecovered;
         }
+        if *output_close_requested {
+            return UnstartedWriterCloseStatus::AlreadyRequested;
+        }
+        let Some(original) = output.as_ref() else {
+            return UnstartedWriterCloseStatus::OriginalOwnerMissing;
+        };
+        // Output was supplied by the caller and may already contain accepted
+        // batches. Only a writer with no accepted work is idle for this path.
+        if original.observation().accepted_batches != 0 {
+            return UnstartedWriterCloseStatus::NotIdle;
+        }
+        original.request_close();
+        *output_close_requested = true;
+        UnstartedWriterCloseStatus::Requested
     }
     /// Preserve the same output owner on Pending and the exact recovery or
     /// original worker panic after a nonblocking join. Prepared is excluded.
@@ -546,7 +570,10 @@ mod tests {
             rejected.try_recover_unstarted_writer(),
             UnstartedWriterRecoveryStatus::CloseNotRequested
         );
-        assert!(rejected.request_unstarted_writer_close());
+        assert_eq!(
+            rejected.request_unstarted_writer_close(),
+            UnstartedWriterCloseStatus::Requested
+        );
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match rejected.try_recover_unstarted_writer() {
