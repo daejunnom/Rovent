@@ -328,14 +328,30 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncOutputOwner<O, D
     }
 
     /// Never waits. If still active, return the original owner unchanged.
-    pub fn try_recover(
+    pub fn try_recover(self) -> Result<Result<OutputRecovery<O, D>, Box<dyn Any + Send>>, Self> {
+        self.try_recover_with_final_snapshot()
+            .map(|(_, result)| result)
+    }
+
+    /// Join only an already-finished original writer and then observe its same
+    /// shared state. An outer thread panic may leave `worker_finished=false`;
+    /// the returned snapshot never substitutes for the join result or a GPU fence.
+    pub fn try_recover_with_final_snapshot(
         mut self,
-    ) -> Result<Result<OutputRecovery<O, D>, Box<dyn Any + Send>>, Self> {
+    ) -> Result<
+        (
+            OutputSnapshot,
+            Result<OutputRecovery<O, D>, Box<dyn Any + Send>>,
+        ),
+        Self,
+    > {
         if !self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
             return Err(self);
         }
         let handle = self.worker.take().expect("finished worker handle retained");
-        Ok(handle.join())
+        let result = handle.join();
+        let snapshot = self.observation();
+        Ok((snapshot, result))
     }
 }
 

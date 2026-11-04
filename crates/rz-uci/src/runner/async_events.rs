@@ -8,8 +8,8 @@
 //! and retain the same driver and output owner on every unfinished exit.
 
 use super::async_output::{
-    AsyncOutputOwner, OutputBatch, OutputEncodingError, OutputRecovery, SubmitError,
-    encode_event_output,
+    AsyncOutputOwner, OutputBatch, OutputEncodingError, OutputRecovery, OutputSnapshot,
+    SubmitError, encode_event_output,
 };
 use super::{Event, handle_event};
 use crate::{Effect, PositionPort, Session, SessionResult};
@@ -111,6 +111,7 @@ where
     shutdown_requested: bool,
     input_disconnected: bool,
     sealed: bool,
+    final_output_observation: Option<OutputSnapshot>,
 }
 
 /// Explicit recovery of the same original resources; `sealed` does not grant
@@ -130,6 +131,7 @@ where
     pub shutdown_requested: bool,
     pub input_disconnected: bool,
     pub sealed: bool,
+    pub final_output_observation: Option<OutputSnapshot>,
 }
 
 impl<P, O, D, H, F> AsyncServeDriver<P, O, D, H, F>
@@ -160,6 +162,7 @@ where
             shutdown_requested: false,
             input_disconnected: false,
             sealed: false,
+            final_output_observation: None,
         }
     }
 
@@ -177,6 +180,12 @@ where
         self.output.as_ref()
     }
 
+    /// Original shared snapshot captured after the writer was actually joined.
+    /// It remains distinct from the join result and physical/GPU completion.
+    pub fn final_output_observation(&self) -> Option<OutputSnapshot> {
+        self.final_output_observation
+    }
+
     /// Never waits. A still-running output owner is restored into this same
     /// driver unchanged; session, pending FIFO and close state never move.
     pub fn try_finish_output(&mut self) -> OutputRecoveryPoll<O, D> {
@@ -186,13 +195,19 @@ where
         let Some(owner) = self.output.take() else {
             return OutputRecoveryPoll::AlreadyRecovered;
         };
-        match owner.try_recover() {
+        match owner.try_recover_with_final_snapshot() {
             Err(original) => {
                 self.output = Some(original);
                 OutputRecoveryPoll::Pending
             }
-            Ok(Ok(recovered)) => OutputRecoveryPoll::Recovered(recovered),
-            Ok(Err(payload)) => OutputRecoveryPoll::WorkerPanicked(payload),
+            Ok((snapshot, Ok(recovered))) => {
+                self.final_output_observation = Some(snapshot);
+                OutputRecoveryPoll::Recovered(recovered)
+            }
+            Ok((snapshot, Err(payload))) => {
+                self.final_output_observation = Some(snapshot);
+                OutputRecoveryPoll::WorkerPanicked(payload)
+            }
         }
     }
 
@@ -209,6 +224,7 @@ where
             shutdown_requested: self.shutdown_requested,
             input_disconnected: self.input_disconnected,
             sealed: self.sealed,
+            final_output_observation: self.final_output_observation,
         }
     }
 

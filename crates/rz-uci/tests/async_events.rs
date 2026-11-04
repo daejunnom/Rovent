@@ -460,6 +460,7 @@ fn nonblocking_writer_recovery_keeps_original_driver_when_pending() {
         driver.try_finish_output(),
         OutputRecoveryPoll::Pending
     ));
+    assert!(driver.final_output_observation().is_none());
     assert!(driver.output().is_some());
     assert!(driver.session_closed());
     assert!(driver.shutdown_requested());
@@ -480,6 +481,13 @@ fn nonblocking_writer_recovery_keeps_original_driver_when_pending() {
     assert!(Arc::ptr_eq(&recovered.protocol.gate, &gate));
     assert_eq!(recovered.protocol.bytes, b"first");
     assert!(recovered.failure.is_none());
+    let final_observation = driver.final_output_observation().unwrap();
+    assert!(final_observation.worker_finished);
+    assert!(!final_observation.failed);
+    assert_eq!(
+        final_observation.accepted_batches,
+        final_observation.completed_batches
+    );
     assert!(driver.output().is_none());
     assert!(matches!(
         driver.try_finish_output(),
@@ -554,6 +562,9 @@ fn writer_recovery_keeps_io_and_panic_as_distinct_original_results() {
         } else {
             matches!(recovered.failure, Some(OutputFailure::Io(_)))
         });
+        let final_observation = driver.final_output_observation().unwrap();
+        assert!(final_observation.worker_finished);
+        assert!(final_observation.failed);
         assert_eq!(recovered.partial.unwrap().batch.protocol, b"data");
         assert!(driver.output().is_none());
     }
