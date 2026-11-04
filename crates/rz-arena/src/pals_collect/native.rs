@@ -2462,10 +2462,10 @@ impl OwnPalsOnnxCollectionDriver {
         if !(1..=16).contains(&max_rounds) {
             return Err(invalid("native collection max rounds must be 1..=16"));
         }
-        let actual_binary = file_sha(&std::env::current_exe().map_err(io)?, 256 * 1024 * 1024)?;
+        let actual_binary = VerifiedExecutableIdentity::current()?;
         if !checkpoint.is_absolute()
             || file_sha(checkpoint, 256 * 1024 * 1024)? != registry.checkpoint_sha256
-            || actual_binary != registry.collector_binary_sha256
+            || actual_binary.sha256 != registry.collector_binary_sha256
             || hex(pin.binary_digest()) != registry.runtime_sha256
             || hex(
                 rz_uci::pals_native::pals_fresh_encoding_semantic_digest_for_config(

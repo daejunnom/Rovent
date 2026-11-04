@@ -442,7 +442,15 @@ struct VerifiedExecutableIdentity {
 }
 impl VerifiedExecutableIdentity {
     fn current() -> Result<Self, ArenaError> {
-        Self::open(&std::env::current_exe().map_err(io)?, 256 * 1024 * 1024)
+        let path = std::env::current_exe().map_err(io)?;
+        let observed = std::fs::symlink_metadata(&path).map_err(io)?;
+        // Bound this hash by the actual executable's observed length, rather
+        // than rejecting valid builds based on an unrelated fixed size.
+        let verified = Self::open(&path, observed.len())?;
+        if !Self::same_metadata(&observed, &verified.metadata)? {
+            return Err(invalid("current executable changed before verification"));
+        }
+        Ok(verified)
     }
 
     fn open(path: &Path, max_bytes: u64) -> Result<Self, ArenaError> {
@@ -2909,7 +2917,8 @@ pub fn own_collection_registry(
             "automatic source enrollment is only available for verified weightless CPU; NN assets need an independent verified registry",
         ));
     }
-    let actual = file_sha(&std::env::current_exe().map_err(io)?, 256 * 1024 * 1024)?;
+    let executable = VerifiedExecutableIdentity::current()?;
+    let actual = executable.sha256.clone();
     if actual != description.implementation_sha256 {
         return Err(invalid("loaded source implementation hash mismatch"));
     }
@@ -2976,7 +2985,10 @@ mod tests {
             cpu_depth: 1,
             nodes_per_job: 256,
             max_total_nodes: 1024,
-            max_wall_time_ms: 10_000,
+            // These exercise result/ownership semantics rather than executable
+            // hashing speed. Keep the same finite window already used by the
+            // strict owner fixtures when the test binary grows or CI is busy.
+            max_wall_time_ms: 120_000,
             max_output_bytes: 1024 * 1024,
             exploration_plies: 0,
             collect_conditional_repair: false,
