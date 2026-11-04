@@ -1,5 +1,6 @@
 """CPU-only tests for bounded original output custody, without an engine."""
 import os
+import errno
 from pathlib import Path
 import sys
 import tempfile
@@ -32,11 +33,12 @@ class OutputSpoolTests(unittest.TestCase):
     def test_partial_write_and_error_retain_original_suffix_for_retry(self):
         spool = OutputSpool(self.file.fileno(), 20)
         pwrite = os.pwrite
+        original_error = OSError(errno.ENOSPC, "disk failed")
 
         def short_then_error(fd, data, offset):
             if offset == 0:
                 return pwrite(fd, data[:2], offset)
-            raise OSError("disk failed")
+            raise original_error
 
         with mock.patch("lc0_output_spool.os.pwrite", side_effect=short_then_error):
             spool.accept(b"abcdef")
@@ -48,6 +50,8 @@ class OutputSpoolTests(unittest.TestCase):
         spool.accept(b"g")
         self.assertEqual(os.pread(self.file.fileno(), 20, 0), b"abcdefg")
         self.assertEqual(spool.observation()["first_write_error"], "OSError")
+        self.assertEqual(spool.observation()["first_write_errno"], errno.ENOSPC)
+        self.assertIs(spool.original_errors()[1], original_error)
         self.assertFalse(spool.observation()["write_blocked"])
         spool.close()
 
@@ -65,9 +69,12 @@ class OutputSpoolTests(unittest.TestCase):
 
     def test_read_failure_is_not_eof(self):
         spool = OutputSpool(self.file.fileno(), 20)
-        spool.observe_read_error(OSError("pipe failed"))
+        original_error = OSError(errno.EIO, "pipe failed")
+        spool.observe_read_error(original_error)
         self.assertFalse(spool.observation()["eof_observed"])
         self.assertEqual(spool.observation()["read_error"], "OSError")
+        self.assertEqual(spool.observation()["read_errno"], errno.EIO)
+        self.assertIs(spool.original_errors()[0], original_error)
         with self.assertRaises(ValueError):
             spool.accept(b"late")
         spool.close()

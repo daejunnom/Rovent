@@ -73,7 +73,7 @@ class OutputSpool:
                 del self._pending[:count]
             except OSError as error:
                 if self._first_write_error is None:
-                    self._first_write_error = type(error).__name__
+                    self._first_write_error = error
                 self._write_blocked = True
                 break
         else:
@@ -94,7 +94,7 @@ class OutputSpool:
         if self._fd is None or self._eof:
             raise ValueError("output stream is already closed")
         if self._read_error is None:
-            self._read_error = type(error).__name__
+            self._read_error = error
 
     def observation(self) -> dict[str, object]:
         return {
@@ -102,11 +102,19 @@ class OutputSpool:
             "bytes_written": self.bytes_written,
             "bytes_pending": len(self._pending),
             "bytes_truncated": self.bytes_truncated,
-            "first_write_error": self._first_write_error,
+            "first_write_error": (type(self._first_write_error).__name__
+                                  if self._first_write_error is not None else None),
+            "first_write_errno": (self._first_write_error.errno
+                                  if self._first_write_error is not None else None),
             "write_blocked": self._write_blocked,
-            "read_error": self._read_error,
+            "read_error": (type(self._read_error).__name__ if self._read_error is not None else None),
+            "read_errno": (self._read_error.errno if self._read_error is not None else None),
             "eof_observed": self._eof,
         }
+
+    def original_errors(self) -> tuple[OSError | None, OSError | None]:
+        """Expose the original read/write errors for same-owner recovery."""
+        return self._read_error, self._first_write_error
 
     def close(self) -> None:
         """Release this descriptor only; this is not output acceptance.
