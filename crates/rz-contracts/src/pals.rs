@@ -475,18 +475,14 @@ mod tests {
         assert!(output.validate_for(&validator).is_err());
         let mut deployment = validator;
         deployment.mode = ExecutionMode::Deployment;
-        assert!(
-            deployment
-                .validate(ClockDomain(ProcessEpoch(1)), MonotonicTick(1))
-                .is_err()
-        );
+        assert!(deployment
+            .validate(ClockDomain(ProcessEpoch(1)), MonotonicTick(1))
+            .is_err());
         let mut proposer = role_request(Role::Proposer);
         proposer.divergence_count = 1;
-        assert!(
-            proposer
-                .validate(ClockDomain(ProcessEpoch(1)), MonotonicTick(1))
-                .is_err()
-        );
+        assert!(proposer
+            .validate(ClockDomain(ProcessEpoch(1)), MonotonicTick(1))
+            .is_err());
     }
 
     #[test]
@@ -530,12 +526,10 @@ mod tests {
             conditions: Digest([3; 32]),
             ..coverage
         }));
-        assert!(
-            !CpuCoverage {
-                bound: Bound::LowerAtDepth,
-                ..coverage
-            }
-            .satisfies(coverage)
-        );
+        assert!(!CpuCoverage {
+            bound: Bound::LowerAtDepth,
+            ..coverage
+        }
+        .satisfies(coverage));
     }
 }
