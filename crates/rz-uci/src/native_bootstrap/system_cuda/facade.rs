@@ -23,7 +23,7 @@ use crate::{
         EngineProcess, PriorityCloseHandle, ProcessClock,
         async_engine::{
             self, AsyncEngineRun, AsyncEngineStartFailure, EngineTimerJoinStatus,
-            EngineWriterRecoveryStatus,
+            EngineWriterRecoveryStatus, UnstartedWriterCloseStatus, UnstartedWriterRecoveryStatus,
         },
     },
     native_profile::ProfiledWrite,
@@ -807,6 +807,39 @@ impl Lc0SupervisedSession {
     pub(crate) fn async_start_failure(&self) -> Option<&Lc0StartFailure> {
         match self.async_custody.as_ref()? {
             Lc0AsyncCustody::StartFailed(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// Request writer close only on this session's original unstarted error.
+    /// Prepared startup custody remains untouched and physical state unknown.
+    pub(crate) fn request_unstarted_writer_close(&mut self) -> Option<UnstartedWriterCloseStatus> {
+        match self.async_custody.as_mut()? {
+            Lc0AsyncCustody::StartFailed(error) => Some(error.request_unstarted_writer_close()),
+            _ => None,
+        }
+    }
+
+    /// Poll the original unstarted writer without blocking or replacing the
+    /// start-failure owner. Recovered does not assert successful delivery.
+    pub(crate) fn try_recover_unstarted_writer(&mut self) -> Option<UnstartedWriterRecoveryStatus> {
+        match self.async_custody.as_mut()? {
+            Lc0AsyncCustody::StartFailed(error) => Some(error.try_recover_unstarted_writer()),
+            _ => None,
+        }
+    }
+
+    /// The original writer recovery or panic remains owned by StartFailed.
+    pub(crate) fn unstarted_writer_recovery(
+        &self,
+    ) -> Option<
+        &Result<
+            OutputRecovery<ProfiledWrite<std::io::Stdout>, std::io::Stderr>,
+            Box<dyn std::any::Any + Send>,
+        >,
+    > {
+        match self.async_custody.as_ref()? {
+            Lc0AsyncCustody::StartFailed(error) => error.unstarted_writer_recovery(),
             _ => None,
         }
     }
