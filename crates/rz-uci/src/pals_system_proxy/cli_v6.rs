@@ -34,7 +34,7 @@ fn invalid(detail: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, detail)
 }
 
-fn sensitive(path: &Path) -> bool {
+pub(super) fn sensitive(path: &Path) -> bool {
     path.components().any(|part| {
         let value = part.as_os_str().to_string_lossy().to_ascii_lowercase();
         value.starts_with(".env")
@@ -64,7 +64,7 @@ fn sensitive(path: &Path) -> bool {
     })
 }
 
-fn validate_descriptor(fd: &OwnedFd, needs_read: bool, needs_write: bool) -> io::Result<()> {
+pub(super) fn validate_descriptor(fd: &OwnedFd, needs_read: bool, needs_write: bool) -> io::Result<()> {
     use nix::fcntl::{FcntlArg, FdFlag, fcntl};
     let descriptor_flags = fcntl(fd, FcntlArg::F_GETFD).map_err(io::Error::other)?;
     if !FdFlag::from_bits_truncate(descriptor_flags).contains(FdFlag::FD_CLOEXEC) {
@@ -94,12 +94,12 @@ pub(super) struct OriginalProxyWindowV6 {
     pub cleanup_cancelled: Arc<AtomicBool>,
 }
 
-struct ProxyArgumentsV6 {
-    startup: PalsSystemStartupOptionsV6,
-    child_path: PathBuf,
+pub(super) struct ProxyArgumentsV6 {
+    pub(super) startup: PalsSystemStartupOptionsV6,
+    pub(super) child_path: PathBuf,
 }
 
-fn parse_arguments(arguments: &[String]) -> io::Result<ProxyArgumentsV6> {
+pub(super) fn parse_arguments(arguments: &[String]) -> io::Result<ProxyArgumentsV6> {
     let mut proxy = false;
     let mut child_path = None;
     let mut startup_arguments = Vec::new();
