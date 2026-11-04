@@ -2,6 +2,10 @@
 //! Loading never starts a process or rewrites the profile's raw/canonical
 //! identity. Only effective executable/cwd paths relocate into this attempt.
 
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub(crate) mod system_v6;
+
 use crate::pals_adaptive_startup::PinnedPalsStartupV5;
 use crate::pals_checker_profile::LoadedPalsAdaptiveCheckerProfileV5;
 #[cfg(target_os = "linux")]
