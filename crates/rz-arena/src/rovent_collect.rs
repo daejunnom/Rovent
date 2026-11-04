@@ -1091,6 +1091,8 @@ pub use teacher::{
 };
 #[cfg(feature = "pals-collection-onnx")]
 mod native_capture;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod capture_router_v3;
 #[cfg(feature = "pals-collection-onnx")]
 pub use native_capture::*;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
