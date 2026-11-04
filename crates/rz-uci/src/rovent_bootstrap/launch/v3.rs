@@ -1635,6 +1635,8 @@ pub(super) struct OriginalV3Inputs<'a> {
     sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
     control: RoventStartupControl,
     clock: ProcessClock,
+    // Original open descriptors only; no archive worker is started here.
+    storage: Option<storage::RoventStorageByteCustody<RoventInputLockV3>>,
     // A legacy selection index is retained through physical completion;
     // direct lock-backed selection has no separate index descriptor.
     selection_file: Option<Arc<File>>,
@@ -1984,12 +1986,53 @@ pub(super) fn admit_original<'a>(
             }
         }
     });
+    let storage = if let Some(selection) = arguments.storage.as_ref() {
+        let custody = storage::open_rovent_storage_byte_custody_v3(
+            Arc::clone(&lock),
+            boundary.original_root(),
+            storage::RoventStorageAdmissionRequest {
+                profile_path: &selection.profile,
+                profile_sha256: &selection.profile_sha256,
+                profile_bytes: selection.profile_bytes,
+                archive_root: &selection.archive_root,
+                checkout_root: &selection.checkout_root,
+                private_snapshot_root: boundary.private_cwd(),
+                protected_execution_root: &selection.protected_root,
+            },
+            control.clone(),
+        )
+        .map_err(|failure| error("StorageAdmissionV3", failure.error))?;
+        let compiled = storage::check_rovent_storage_compiled_custody_v3(custody, &view)
+            .map_err(|failure| error("StorageCompiledCustodyV3", failure.error))?;
+        let observation = compiled.source_roles_observation();
+        if let Some(writer) = receipt_writer.as_ref() {
+            let record = serde_json::json!({
+                "schema": "rz-rovent-storage-source-observation/1",
+                "input_lock_sha256": lock.canonical_sha256,
+                "source_roles": format!("{observation:?}"),
+            });
+            if let Err(failure) = writer.write_bytes(
+                "storage-source-observation.v3.json",
+                record.to_string().as_bytes(),
+            ) {
+                eprintln!("storage source observation warning: {failure}");
+            }
+        } else {
+            eprintln!(
+                "storage source observation unavailable: no original receipt writer; status={observation:?}"
+            );
+        }
+        Some(compiled.into_byte_custody())
+    } else {
+        None
+    };
     Ok(OriginalV3Inputs {
         lock,
         boundary,
         sources,
         control,
         clock,
+        storage,
         selection_file: selection_file.map(Arc::new),
         lock_file: Arc::new(lock_file),
         receipt_writer: receipt_writer.map(Arc::new),
@@ -2102,6 +2145,7 @@ pub(super) fn run_native_admitted(
         sources,
         control,
         clock,
+        storage: _storage,
         selection_file,
         lock_file,
         receipt_writer,
