@@ -275,6 +275,20 @@ time.sleep(2)
         self.assertNotEqual(result[0], 0)
         self.assertIn("invalid managed output", str(result[2]))
 
+    def test_empty_datagram_is_not_mistaken_for_eof(self):
+        source = '''
+import json, socket, sys, time
+s = socket.socket(fileno=int(sys.argv[1]))
+s.send(json.dumps({"schema": "rz-managed-output-lease/1", "sequence": 1}).encode())
+s.recv(4096)
+s.send(b"")
+time.sleep(2)
+'''
+        result, _ = self.run_child(source)
+        self.assertTrue(result[1])
+        self.assertNotEqual(result[0], 0)
+        self.assertIn("invalid managed output", str(result[2]))
+
 
 if __name__ == "__main__":
     unittest.main()

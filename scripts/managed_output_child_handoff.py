@@ -244,7 +244,11 @@ class ManagedOutputChildHandoff:
                                 close_failure = error
                 elif (level, kind) != (socket.SOL_SOCKET, socket.SCM_CREDENTIALS):
                     unexpected = True
-            if not packet and not ancillary and not flags:
+            # Linux recvmsg can echo MSG_CMSG_CLOEXEC in msg_flags even for
+            # EOF. A real zero-byte datagram on this SO_PASSCRED socket still
+            # carries sender credentials and must be rejected as a packet.
+            semantic_flags = flags & ~socket.MSG_CMSG_CLOEXEC
+            if not packet and not ancillary and not semantic_flags:
                 # Closure grants no output or physical-completion proof.
                 self._peer_closed = True
                 return False
