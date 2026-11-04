@@ -162,6 +162,7 @@ class OriginalOwnerGoSupervisor:
         self.rejection = None
         self.observation_error = None
         self._shutdown_attempted = False
+        self._quit_requested = False
         self._observer_disabled = False
         self._owner_thread = threading.current_thread()
 
@@ -170,14 +171,15 @@ class OriginalOwnerGoSupervisor:
             raise RuntimeError('stdin control belongs to the original owner thread')
 
     def _disable_observer(self, reason):
-        self.observation_error = reason
+        if reason is not None:
+            self.observation_error = reason
         self._observer_disabled = True
         self.channel.revoke()
 
     def write(self, command):
         self._assert_owner_thread()
-        if self.frozen or self.pending:
-            raise RuntimeError('original stdin is sealed or a go is pending')
+        if self.frozen or self._quit_requested:
+            raise RuntimeError('original stdin is sealed or quit was requested')
         # Match the engine parser's ASCII, single-line and tab/space token
         # rules. In particular an embedded newline must not smuggle a go.
         if (not isinstance(command, str) or not command.isascii()
@@ -185,6 +187,17 @@ class OriginalOwnerGoSupervisor:
             raise ValueError('one ASCII UCI command without control characters required')
         fields = command.split()
         is_go = bool(fields) and fields[0] == 'go'
+        # Normal control commands remain available during a search. Sending stop is
+        # not a completed search: retain the pending go until bestmove.
+        # Once quit is sent, the normal owner still drains and accounts for
+        # the child; this diagnostic never authorizes physical completion.
+        is_stop = fields == ['stop']
+        is_quit = fields == ['quit']
+        allowed_during_go = is_stop or is_quit or fields in (['isready'], ['ponderhit'])
+        if self.pending and not allowed_during_go:
+            raise RuntimeError('original stdin has a pending go')
+        if is_quit:
+            self._disable_observer(None)
         if is_go:
             if not self._observer_disabled:
                 try:
@@ -195,6 +208,8 @@ class OriginalOwnerGoSupervisor:
             self.pending = True
         try:
             self.engine_io.write(command)
+            if is_quit:
+                self._quit_requested = True
         except BaseException:
             # The child may have received a partial command; never treat it
             # as a known rejection or issue an inferred shutdown.

@@ -126,6 +126,55 @@ class GoAdmissionTest(unittest.TestCase):
         supervisor.write('quit')
         self.assertEqual(writes, ['go nodes 16', 'go nodes 32', 'quit'])
 
+    def test_stop_preserves_pending_go_until_bestmove(self):
+        class Channel:
+            last_trusted_rejection = None
+            def begin_go(self):
+                pass
+            def completed_go(self):
+                pass
+            def revoke(self):
+                pass
+        process = SimpleNamespace(pid=123)
+        writes = []
+        supervisor = observer.OriginalOwnerGoSupervisor(
+            process, SimpleNamespace(process=process, write=writes.append), Channel(),
+            epoch=17, lock_sha256='a' * 64)
+        supervisor.write('go nodes 16')
+        supervisor.write('isready')
+        supervisor.write('ponderhit')
+        supervisor.write(' \tstop\t')
+        with self.assertRaises(RuntimeError):
+            supervisor.write('go nodes 32')
+        supervisor.bestmove()
+        supervisor.write('go nodes 32')
+        self.assertEqual(writes, ['go nodes 16', 'isready', 'ponderhit', ' \tstop\t', 'go nodes 32'])
+
+    def test_quit_during_go_revokes_observer_and_preserves_drain(self):
+        class Channel:
+            last_trusted_rejection = None
+            revoked = False
+            def begin_go(self):
+                pass
+            def completed_go(self):
+                raise AssertionError('quit revoked observer tracking')
+            def revoke(self):
+                self.revoked = True
+        process = SimpleNamespace(pid=123)
+        writes = []
+        channel = Channel()
+        supervisor = observer.OriginalOwnerGoSupervisor(
+            process, SimpleNamespace(process=process, write=writes.append), channel,
+            epoch=17, lock_sha256='a' * 64)
+        supervisor.write('go nodes 16')
+        supervisor.write('quit')
+        self.assertTrue(channel.revoked)
+        self.assertIsNone(supervisor.observation_error)
+        supervisor.bestmove()
+        with self.assertRaises(RuntimeError):
+            supervisor.write('go nodes 32')
+        self.assertEqual(writes, ['go nodes 16', 'quit'])
+
     def test_foreign_thread_and_multiline_commands_are_rejected(self):
         class Channel:
             def revoke(self):
