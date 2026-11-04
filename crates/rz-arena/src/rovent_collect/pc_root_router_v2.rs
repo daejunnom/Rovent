@@ -530,6 +530,12 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
                         state.store(SLOT_UNCERTAIN, Ordering::Release);
                         Ok(RoventPcCollectionAdmissionStatusV2::PendingUncertain { admission })
                     }
+                    Ok(RoventPcCollectionAdmissionStatusV2::PendingSealed { admission }) => {
+                        // Keep this slot reserved for the same original root;
+                        // only the native no-capture marker is still pending.
+                        state.store(SLOT_UNCERTAIN, Ordering::Release);
+                        Ok(RoventPcCollectionAdmissionStatusV2::PendingSealed { admission })
+                    }
                     Ok(other @ RoventPcCollectionAdmissionStatusV2::DeferredNoCapture { .. }) => {
                         state.store(SLOT_UNAVAILABLE_BEFORE_INSTALL, Ordering::Release);
                         Ok(other)
@@ -619,6 +625,24 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
                     }
                     state.store(SLOT_UNCERTAIN, Ordering::Release);
                     Ok(RoventPcCollectionAdmissionStatusV2::PendingUncertain { admission })
+                }
+                Ok(RoventPcCollectionAdmissionStatusV2::PendingSealed { admission }) => {
+                    let _ = self.attempts[index].set(admission.clone());
+                    if !self.attempts[index]
+                        .get()
+                        .is_some_and(|original| original.same_original_admission(&admission))
+                    {
+                        state.store(SLOT_FAILED, Ordering::Release);
+                        return Err(RoventPcCollectionAdmissionFailureV2 {
+                            error: AdaptiveManagerError::Invalid(
+                                "P/C sealed root attempt owner mismatch",
+                            ),
+                            admission,
+                            owners: Box::new(Arc::clone(bridge)),
+                        });
+                    }
+                    state.store(SLOT_UNCERTAIN, Ordering::Release);
+                    Ok(RoventPcCollectionAdmissionStatusV2::PendingSealed { admission })
                 }
                 Ok(other @ RoventPcCollectionAdmissionStatusV2::DeferredNoCapture { .. }) => {
                     state.store(SLOT_UNAVAILABLE_BEFORE_INSTALL, Ordering::Release);

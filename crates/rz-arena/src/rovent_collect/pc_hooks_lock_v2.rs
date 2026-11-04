@@ -31,6 +31,7 @@ pub(crate) struct RoventPcCollectionBridgeV2 {
     manifest: Arc<RoventCorpusManifestLockV2>,
     roster_identity: Vec<(String, usize, u32)>,
     worker: Mutex<Option<PcWorkerCustodianV2>>,
+    before_start_failure: Mutex<Option<(CoreAdmissionFailure, &'static str)>>,
     deferred: Mutex<PcDeferredRootsV2>,
     revoke_observations: Mutex<Vec<RoventPcRevokeObservationV2>>,
     revoke_observations_omitted: std::sync::atomic::AtomicUsize,
@@ -171,25 +172,90 @@ impl RoventPcCollectionBridgeV2 {
         failure: CoreAdmissionFailure,
         code: &'static str,
     ) -> Result<RoventPcCollectionAdmissionStatusV2, RoventPcCollectionAdmissionFailureV2> {
-        match self.core.try_seal_unstarted(&failure.admission) {
+        let admission = failure.admission.clone();
+        let mut stored = match self.before_start_failure.try_lock() {
+            Ok(stored) => stored,
+            Err(_) => {
+                return Err(RoventPcCollectionAdmissionFailureV2 {
+                    error: AdaptiveManagerError::Invalid(
+                        "P/C before-start failure custody unavailable",
+                    ),
+                    admission,
+                    owners: Box::new(failure),
+                });
+            }
+        };
+        if stored.is_some() {
+            return Err(RoventPcCollectionAdmissionFailureV2 {
+                error: AdaptiveManagerError::Invalid("P/C before-start failure already retained"),
+                admission,
+                owners: Box::new(failure),
+            });
+        }
+        *stored = Some((failure, code));
+        drop(stored);
+        self.retry_proven_unstarted(port, admission)
+    }
+
+    fn retry_proven_unstarted(
+        &self,
+        port: &mut RoventPcCollectionAdmissionPortV2<'_>,
+        admission: RoventCollectionRootAdmissionV2,
+    ) -> Result<RoventPcCollectionAdmissionStatusV2, RoventPcCollectionAdmissionFailureV2> {
+        let stored = match self.before_start_failure.try_lock() {
+            Ok(stored) => stored,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(RoventPcCollectionAdmissionStatusV2::PendingUncertain { admission });
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(RoventPcCollectionAdmissionFailureV2 {
+                    error: AdaptiveManagerError::Invalid(
+                        "P/C before-start failure custody poisoned",
+                    ),
+                    admission,
+                    owners: Box::new(self.self_weak.upgrade().expect("original P/C bridge owner")),
+                });
+            }
+        };
+        let Some((failure, code)) = stored.as_ref() else {
+            return Err(RoventPcCollectionAdmissionFailureV2 {
+                error: AdaptiveManagerError::Invalid("P/C original before-start failure missing"),
+                admission,
+                owners: Box::new(()),
+            });
+        };
+        if !failure.admission.same_original_admission(&admission) {
+            return Err(RoventPcCollectionAdmissionFailureV2 {
+                error: AdaptiveManagerError::Invalid("P/C before-start root differs"),
+                admission,
+                owners: Box::new(self.self_weak.upgrade().expect("original P/C bridge owner")),
+            });
+        }
+        let original_error = failure.error.clone();
+        let code = *code;
+        drop(stored);
+        match self.core.try_seal_unstarted(&admission) {
             Ok(CoreUnstartedSealV2::Sealed) => {
                 let reason = AdaptiveCollectionError::new(
                     AdaptiveCollectionStage::Dispatch,
                     code,
-                    format!("{:?}", failure.error),
+                    format!("{:?}", original_error),
                 );
-                self.defer_before_start(port, failure.admission, reason)
-                    .map(Into::into)
+                self.defer_before_start(port, admission, reason)
+                    .map(|outcome| match outcome {
+                        RoventPcCollectionAdmissionOutcomeV2::Pending { admission } => {
+                            RoventPcCollectionAdmissionStatusV2::PendingSealed { admission }
+                        }
+                        other => other.into(),
+                    })
             }
             Ok(CoreUnstartedSealV2::Busy) => {
-                Ok(RoventPcCollectionAdmissionStatusV2::PendingUncertain {
-                    admission: failure.admission,
-                })
+                Ok(RoventPcCollectionAdmissionStatusV2::PendingUncertain { admission })
             }
             Ok(CoreUnstartedSealV2::Unknown) => Err(RoventPcCollectionAdmissionFailureV2 {
-                error: failure.error,
-                admission: failure.admission,
-                owners: failure.owners,
+                error: original_error,
+                admission,
+                owners: Box::new(self.self_weak.upgrade().expect("original P/C bridge owner")),
             }),
             Err(error) => Err(RoventPcCollectionAdmissionFailureV2 {
                 error: AdaptiveManagerError::Collection(AdaptiveCollectionError::new(
@@ -197,8 +263,8 @@ impl RoventPcCollectionBridgeV2 {
                     "PcUnstartedSeal",
                     error.to_string(),
                 )),
-                admission: failure.admission.clone(),
-                owners: Box::new(failure),
+                admission,
+                owners: Box::new(self.self_weak.upgrade().expect("original P/C bridge owner")),
             }),
         }
     }
@@ -300,6 +366,7 @@ impl RoventPcCollectionBridgeV2 {
                 manifest,
                 roster_identity,
                 worker: Mutex::new(None),
+                before_start_failure: Mutex::new(None),
                 deferred: Mutex::new(PcDeferredRootsV2 {
                     originals: Vec::with_capacity(256),
                     active: Vec::new(),
@@ -883,6 +950,36 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
                 AdaptiveCollectionStage::Dispatch, "PcCollectionCapacity",
                 "The previous root's bounded collection worker remains owned; this root is not captured",
             )).map(Into::into);
+        }
+        let retry_before_start = match self.before_start_failure.try_lock() {
+            Ok(stored) => match stored.as_ref() {
+                Some((failure, _)) if failure.admission.same_original_admission(&admission) => true,
+                Some(_) => {
+                    return Err(RoventPcCollectionAdmissionFailureV2 {
+                        error: AdaptiveManagerError::Invalid("P/C prior before-start root differs"),
+                        admission,
+                        owners: Box::new(
+                            self.self_weak.upgrade().expect("original P/C bridge owner"),
+                        ),
+                    });
+                }
+                None => false,
+            },
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(RoventPcCollectionAdmissionStatusV2::PendingUncertain { admission });
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(RoventPcCollectionAdmissionFailureV2 {
+                    error: AdaptiveManagerError::Invalid(
+                        "P/C before-start failure custody poisoned",
+                    ),
+                    admission,
+                    owners: Box::new(self.self_weak.upgrade().expect("original P/C bridge owner")),
+                });
+            }
+        };
+        if retry_before_start {
+            return self.retry_proven_unstarted(port, admission);
         }
         match self.core.admit(admission, |admission, owner| {
             port.install(admission, owner.observer())

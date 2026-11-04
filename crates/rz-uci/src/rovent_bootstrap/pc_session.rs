@@ -490,6 +490,11 @@ pub enum RoventPcCollectionAdmissionStatusV2 {
     Pending {
         admission: RoventCollectionRootAdmissionV2,
     },
+    /// The same original attempt was physically prevented from installing;
+    /// only its no-capture marker remains to be registered.
+    PendingSealed {
+        admission: RoventCollectionRootAdmissionV2,
+    },
     PendingUncertain {
         admission: RoventCollectionRootAdmissionV2,
     },
@@ -523,6 +528,9 @@ impl RoventPcCollectionAdmissionStatusV2 {
         match self {
             Self::Installed => Ok(RoventPcCollectionAdmissionOutcomeV2::Installed),
             Self::Pending { admission } => {
+                Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission })
+            }
+            Self::PendingSealed { admission } => {
                 Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission })
             }
             Self::PendingUncertain { admission } => Err(RoventPcCollectionAdmissionFailureV2 {
@@ -3325,7 +3333,21 @@ impl RoventPcSessionDriver {
                                 }
                                 std::thread::sleep(Duration::from_millis(1));
                             }
-                            Ok(RoventPcCollectionAdmissionStatusV2::Pending { admission }) => {
+                            Ok(
+                                status @ (RoventPcCollectionAdmissionStatusV2::Pending { .. }
+                                | RoventPcCollectionAdmissionStatusV2::PendingSealed {
+                                    ..
+                                }),
+                            ) => {
+                                let (admission, same_root_sealed) = match status {
+                                    RoventPcCollectionAdmissionStatusV2::Pending { admission } => {
+                                        (admission, false)
+                                    }
+                                    RoventPcCollectionAdmissionStatusV2::PendingSealed {
+                                        admission,
+                                    } => (admission, true),
+                                    _ => unreachable!("only pending statuses are matched"),
+                                };
                                 if !admission.same_original_admission(&expected)
                                     || manager.collection_root_admission_v2().is_some()
                                 {
@@ -3341,8 +3363,11 @@ impl RoventPcSessionDriver {
                                         "P/C pending admission owner mismatch",
                                     ));
                                 }
-                                // A later unstarted poll does not retroactively
-                                // settle an earlier uncertain install attempt.
+                                // Only the same attempt's actual no-start seal
+                                // can settle an earlier uncertain install.
+                                if same_root_sealed {
+                                    v2_admission_uncertain = false;
+                                }
                                 v2_hook_started = v2_admission_uncertain;
                                 if !v2_admission_uncertain {
                                     self.collection_v2_outstanding

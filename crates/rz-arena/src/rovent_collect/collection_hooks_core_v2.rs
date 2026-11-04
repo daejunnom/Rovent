@@ -890,23 +890,37 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         if self.admissions.try_send(Arc::clone(&slot)).is_err() {
             // The observer install was never invoked and the slot was not
             // delivered: only this no-start branch may attempt rollback.
-            if let Ok(speculative) = slot.speculative.try_lock() {
-                if let Some((route, _)) = speculative.as_ref() {
-                    let rollback = self
+            let unresolved = match slot.speculative.try_lock() {
+                Ok(speculative) => match speculative.as_ref() {
+                    Some((route, _)) => match self
                         .owner
                         .capture_registration()
-                        .try_rollback_unstarted_speculative_root(route);
-                    if !matches!(rollback, Ok(Some(true))) {
-                        if let Ok(mut issue) = slot.speculative_install_issue.try_lock() {
-                            *issue = Some(format!(
-                                "speculative pre-start rollback unresolved: {rollback:?}"
-                            ));
-                        } else {
-                            slot.speculative_issue_unknown
-                                .store(true, Ordering::Release);
-                        }
-                    }
-                }
+                        .try_rollback_unstarted_speculative_root(route)
+                    {
+                        Ok(Some(true)) => None,
+                        other => Some(format!(
+                            "speculative pre-start rollback unresolved: {other:?}"
+                        )),
+                    },
+                    None => None,
+                },
+                Err(_) => Some("speculative pre-start rollback owner unavailable".into()),
+            };
+            if let Some(issue) = unresolved {
+                // Preserve the exact undelivered slot and route. An observer
+                // no-start fact does not prove speculative cleanup completed.
+                self.revoke();
+                return Err(CoreAdmissionFailure {
+                    error: AdaptiveManagerError::Collection(AdaptiveCollectionError::new(
+                        AdaptiveCollectionStage::Dispatch,
+                        "SpeculativeRollbackUnknown",
+                        issue,
+                    )),
+                    admission,
+                    owners: Box::new(slot),
+                    before_start: false,
+                    game_gate_status: CoreGameGateStatus::NotApplicable,
+                });
             }
             self.close_reserved_before_install();
             return Err(reject(
