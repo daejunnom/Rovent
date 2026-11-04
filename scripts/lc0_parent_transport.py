@@ -209,9 +209,6 @@ class NonblockingParentHandshake:
                     self._fail("ack_eof")
                     return self._state
                 self._response.extend(chunk)
-                if len(self._response) >= FRAME_LIMIT:
-                    self._fail("ack_frame_too_large")
-                    return self._state
                 if b"\n" in self._response:
                     frame, _, trailing = self._response.partition(b"\n")
                     if trailing:
@@ -226,6 +223,8 @@ class NonblockingParentHandshake:
                         self._fail("ack_identity_mismatch")
                     else:
                         self._state = "authenticated"
+                elif len(self._response) >= FRAME_LIMIT:
+                    self._fail("ack_frame_too_large")
         except BlockingIOError:
             pass
         except (OSError, PreflightError, KeyError, struct.error):

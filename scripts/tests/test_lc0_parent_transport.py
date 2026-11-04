@@ -14,7 +14,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import lc0_parent_transport as transport
-from lc0_parent_preflight import ACK_SCHEMA, ACK_SCOPE, NOTICE_SCHEMA
+from lc0_parent_preflight import ACK_SCHEMA, ACK_SCOPE, FRAME_LIMIT, NOTICE_SCHEMA
 
 
 class FakeSocket:
@@ -104,6 +104,17 @@ class ParentTransportTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             handshake.take_authenticated_socket()
         fake.close()
+
+    def test_maximum_ack_body_with_newline_is_accepted(self):
+        fake = FakeSocket(self.pid)
+        handshake = self.handshake(fake)
+        self.write_request(handshake)
+        body = json.dumps(self.ack()).encode()
+        body += b" " * (FRAME_LIMIT - 1 - len(body))
+        fake.received = [body + b"\n"]
+        handshake.advance(selectors.EVENT_READ)
+        self.assertEqual(handshake.state, "authenticated")
+        handshake.take_authenticated_socket().close()
 
     def test_peer_mismatch_is_rejected_before_sending(self):
         for fake in (FakeSocket(self.pid + 1), FakeSocket(self.pid, peer_uid=os.geteuid() + 1)):

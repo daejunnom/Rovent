@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import selectors
 import time
 from copy import deepcopy
@@ -19,7 +20,66 @@ from lc0_parent_transport import NonblockingParentHandshake
 REQUEST_SCHEMA = "rz-lc0-system-observation/2"
 RESPONSE_SCHEMA = "rz-lc0-system-observation-response/2"
 SESSION_SCHEMA = "rz-lc0-original-session-observation/1"
-_UNCLAIMED_SOCKETS = []
+_UNCLAIMED_CUSTODIES = []
+
+
+class OriginalAdmission:
+    """Retain the first authenticated parent stream for one original child.
+
+    This capability does not imply native entry or completion. The future
+    process owner must retain it until that original lifetime is resolved.
+    """
+
+    def __init__(self, handshake):
+        if not isinstance(handshake, NonblockingParentHandshake) or handshake.state != "authenticated":
+            raise ValueError("original LC0 admission is not authenticated")
+        self._binding = handshake.binding
+        self._socket = handshake.take_authenticated_socket()
+        try:
+            st = os.fstat(self._socket.fileno())
+            self._identity = (st.st_dev, st.st_ino)
+        except BaseException:
+            _UNCLAIMED_CUSTODIES.append(self)
+            raise
+
+    def check_control(self, handshake):
+        if (not isinstance(handshake, NonblockingParentHandshake)
+                or handshake.state != "authenticated" or handshake.binding != self.binding):
+            raise ValueError("control admission differs from the original")
+        original = os.fstat(self._socket.fileno())
+        control = os.fstat(handshake.fileno())
+        if ((original.st_dev, original.st_ino) != self._identity
+                or (control.st_dev, control.st_ino) == self._identity):
+            raise ValueError("control must be distinct from the original admission socket")
+
+    @property
+    def binding(self):
+        return self._binding
+
+    def __del__(self):
+        if getattr(self, "_socket", None) is not None:
+            _UNCLAIMED_CUSTODIES.append(self)
+
+
+class ControlCustody:
+    """Retain a control socket together with its exact partial wire state."""
+
+    def __init__(self, owner):
+        self.socket = owner._socket
+        self.original_admission = owner._admission
+        self.binding = owner._binding
+        self.sequence = owner._sequence
+        self.state = owner._state
+        self.error = owner._error
+        self.bytes_sent = owner._sent
+        self.send_uncertain = owner._send_uncertain
+        self.unsent_request = bytes(owner._request)
+        self.partial_response = bytes(owner._response)
+        self.observation = deepcopy(owner._value)
+
+    def __del__(self):
+        if getattr(self, "socket", None) is not None:
+            _UNCLAIMED_CUSTODIES.append(self)
 
 
 def _matches(response, binding, sequence):
@@ -57,13 +117,16 @@ class NonblockingSessionObservation:
     monitor the handed-back stream for later bytes or disconnection.
     """
 
-    def __init__(self, handshake, *, sequence, deadline):
-        if (not isinstance(handshake, NonblockingParentHandshake)
+    def __init__(self, original_admission, handshake, *, sequence, deadline):
+        if (not isinstance(original_admission, OriginalAdmission)
+                or not isinstance(handshake, NonblockingParentHandshake)
                 or handshake.state != "authenticated"
                 or type(sequence) is not int or not 1 <= sequence <= 2**64 - 1
                 or not isinstance(deadline, (int, float)) or isinstance(deadline, bool)
                 or not math.isfinite(deadline) or deadline <= time.monotonic()):
             raise ValueError("invalid LC0 observation admission")
+        original_admission.check_control(handshake)
+        self._admission = original_admission
         self._binding = handshake.binding
         self._sequence = sequence
         self._deadline = float(deadline)
@@ -152,36 +215,38 @@ class NonblockingSessionObservation:
                     self._fail("response_eof")
                     return self._state
                 self._response.extend(chunk)
-                if len(self._response) >= FRAME_LIMIT:
-                    self._fail("response_too_large")
-                    return self._state
                 if b"\n" in self._response:
                     frame, _, trailing = self._response.partition(b"\n")
                     if trailing:
                         self._fail("response_trailing_bytes")
                         return self._state
                     response = _decode(bytes(frame))
-                    if not _matches(response, self._binding, self._sequence):
+                    if time.monotonic() >= self._deadline:
+                        self._fail("deadline_expired")
+                    elif not _matches(response, self._binding, self._sequence):
                         self._fail("response_identity_or_scope_mismatch")
                     else:
                         self._value = response
                         self._state = "observed"
+                elif len(self._response) >= FRAME_LIMIT:
+                    self._fail("response_too_large")
         except BlockingIOError:
             pass
         except (OSError, PreflightError):
             self._fail("transport_or_response_invalid")
         return self._state
 
-    def take_control_socket(self):
-        """Move this exact stream once; initial admission remains caller-owned."""
+    def take_control_custody(self):
+        """Move the exact stream and all partial wire evidence together."""
         if self._socket is None or self._state in ("writing", "reading"):
             raise RuntimeError("LC0 observation stream is not ready for handoff")
-        owned, self._socket = self._socket, None
+        owned = ControlCustody(self)
+        self._socket = None
         self._state = "handed_off"
         return owned
 
     def __del__(self):
         sock = getattr(self, "_socket", None)
         if sock is not None:
-            _UNCLAIMED_SOCKETS.append(sock)
-            self._socket = None
+            # Preserve partial frames and the original admission, not only FD.
+            _UNCLAIMED_CUSTODIES.append(self)
