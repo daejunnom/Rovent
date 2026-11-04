@@ -9,6 +9,8 @@ use crate::pals_adaptive::{
 };
 use crate::search_driver::{DriverPhysicalCompletion, DriverWork};
 use rz_contracts::rovent::ExecutionMode;
+#[cfg(feature = "pals-adaptive")]
+use rz_runtime::contracts::ContractClock as _;
 use rz_search::pals::engine::adaptive_port::{AdaptiveFrontierStartup, AdaptiveModelNamespace};
 use rz_search::pals::rovent_engine::RootMoveDomain;
 use rz_search::pals::rovent_frontier::{
@@ -56,10 +58,29 @@ pub struct RoventPcrSessionProfileV3 {
     pub peers: RoventPeerFollowupPolicy,
 }
 
+/// Own-R reciprocal settings without a root budget. The budget is bound only
+/// after the original V3 go has produced its actual root admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoventOwnReciprocalV3 {
+    pub recipient: rz_contracts::rovent::SearchRecipient,
+    pub max_questions_per_job: u16,
+    pub node_interval: u64,
+    pub first_question_sequence: u64,
+}
+
+/// An own-R V3 profile is distinct from the external-R late-bound profile.
+#[derive(Clone)]
+pub struct RoventOwnPcrSessionProfileV3 {
+    pub common: RoventPcrSessionProfileV3,
+    pub reciprocal: RoventOwnReciprocalV3,
+}
+
 #[derive(Clone)]
 pub(super) enum SessionPcrProfile {
     Fixed(RoventPcrSessionProfile),
     LateBound(RoventPcrSessionProfileV3),
+    #[cfg(feature = "pals-adaptive")]
+    LateBoundOwn(RoventOwnPcrSessionProfileV3),
 }
 
 pub(super) struct SessionPcrCommon<'a> {
@@ -87,6 +108,14 @@ impl SessionPcrProfile {
                 model_namespace: &profile.model_namespace,
                 frontier_limits: &profile.frontier_limits,
             },
+            #[cfg(feature = "pals-adaptive")]
+            Self::LateBoundOwn(own) => SessionPcrCommon {
+                mode: own.common.mode,
+                maximum_goal_plies: own.common.maximum_goal_plies,
+                input_lock: own.common.input_lock,
+                model_namespace: &own.common.model_namespace,
+                frontier_limits: &own.common.frontier_limits,
+            },
         }
     }
 
@@ -94,7 +123,114 @@ impl SessionPcrProfile {
         match self {
             Self::Fixed(profile) => Some(profile),
             Self::LateBound(_) => None,
+            #[cfg(feature = "pals-adaptive")]
+            Self::LateBoundOwn(_) => None,
         }
+    }
+}
+
+#[cfg(feature = "pals-adaptive")]
+impl RoventOwnPcrSessionProfileV3 {
+    fn validate<B>(&self, sources: &AdaptiveSessionSources<B>) -> Result<(), SearchSessionFailure>
+    where
+        B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
+    {
+        let profile = &self.common;
+        let reciprocal = self.reciprocal;
+        if !profile.mode.has_native_r()
+            || profile.maximum_goal_plies != profile.frontier_limits.maximum_goal_plies
+            || profile.input_lock == Digest([0; 32])
+            || profile.selective_policy == Digest([0; 32])
+            || !matches!(
+                reciprocal.recipient,
+                rz_contracts::rovent::SearchRecipient::Proposer
+                    | rz_contracts::rovent::SearchRecipient::Critic
+            )
+            || !(1..=64).contains(&reciprocal.max_questions_per_job)
+            || reciprocal.node_interval == 0
+            || reciprocal.first_question_sequence == 0
+            || sources.external.is_some()
+            || !matches!(
+                sources.engine.checker_identity(),
+                rz_search::cpu_checker::CheckerIdentity::Owned(_)
+            )
+        {
+            return Err(failure(
+                "RoventPcrAssembly",
+                "invalid explicit V3 own-R root profile",
+            ));
+        }
+        profile
+            .model_namespace
+            .verify_identity(
+                sources.engine.model_identity(),
+                sources.engine.model_value_identity(),
+            )
+            .map_err(|error| SearchSessionFailure::debug("RoventModelNamespace", &error))
+    }
+
+    /// The only budget here is the original per-go /3 root capability's
+    /// actual digest. A declaration or another root's budget is insufficient.
+    pub(super) fn bind_original_root(
+        &self,
+        context: &SearchSessionContext,
+        clock: &ProcessClock,
+        admission: &RoventPcrRootAdmission,
+    ) -> Result<RoventPcrSessionProfile, AdaptiveManagerError> {
+        let original = admission
+            .original_v3
+            .as_ref()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "own R requires original /3 root admission",
+            ))?;
+        let original_context = original.original_context();
+        let same_start = match (&original_context.original_start, &context.original_start) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        let budget = original
+            .descriptor()
+            .root_budget_digest()
+            .map_err(|error| AdaptiveManagerError::Semantic(error.to_string()))?;
+        if admission.original.is_some()
+            || admission.original_v2.is_some()
+            || !same_start
+            || !Arc::ptr_eq(&original_context.current, &context.current)
+            || original.startup_lock_digest() != self.common.input_lock
+            || original.authority() != context.authority
+            || original.goal() != context.goal
+            || original.requested_nodes() != context.requested_nodes
+            || original.root_moves().map(|moves| moves.as_ref()) != context.root_moves.as_deref()
+            || original.runtime_clock().domain() != clock.runtime_clock().domain()
+            || original.runtime_clock().origin() != clock.runtime_clock().origin()
+            || original.hard_deadline() != clock.deadline(context.control.deadline)?
+            || budget != admission.budget
+            || budget == Digest([0; 32])
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "own R /3 original root/clock/source differs",
+            ));
+        }
+        let common = &self.common;
+        let reciprocal = self.reciprocal;
+        Ok(RoventPcrSessionProfile {
+            mode: common.mode,
+            maximum_goal_plies: common.maximum_goal_plies,
+            input_lock: common.input_lock,
+            root_budget: budget,
+            selective_policy: common.selective_policy,
+            model_namespace: Arc::clone(&common.model_namespace),
+            frontier_limits: common.frontier_limits.clone(),
+            reciprocal: RoventReciprocalPolicy {
+                mode: common.mode,
+                root_budget: budget,
+                recipient: reciprocal.recipient,
+                max_questions_per_job: reciprocal.max_questions_per_job,
+                node_interval: reciprocal.node_interval,
+                first_question_sequence: reciprocal.first_question_sequence,
+            },
+            peers: common.peers,
+        })
     }
 }
 
@@ -387,6 +523,79 @@ where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    /// Install the same V3 own-R owners in caller-owned custody slots. The
+    /// root budget is deliberately absent here and is bound at the actual go.
+    /// The caller must derive `profile`, including reciprocal settings, from
+    /// the startup configuration admitted against this original V3 lock.
+    /// This boundary checks their ranges and the lock/control identities; it
+    /// does not independently reparse the pinned startup configuration.
+    #[cfg(feature = "pals-adaptive")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_rovent_own_v3_in_slots(
+        options: AdaptiveSessionOptions,
+        limits: AdaptiveExecutionLimits,
+        sources: &mut Option<AdaptiveSessionSources<B>>,
+        driver: &mut Option<Self>,
+        clock: ProcessClock,
+        issuer: AdaptiveRulesOwnerIssuer,
+        registration: PalsCheckerRegistration,
+        profile: RoventOwnPcrSessionProfileV3,
+        lock: Arc<rz_experiments::RoventInputLockV3>,
+        root_policy: crate::rovent_root_admission::RoventRootAdmissionPolicy,
+    ) -> Result<(), SearchSessionFailure> {
+        if driver.is_some() {
+            return Err(failure("RoventOwnV3Custody", "driver destination occupied"));
+        }
+        let original = sources
+            .as_ref()
+            .ok_or_else(|| failure("RoventOwnV3Custody", "original native/CPU owner absent"))?;
+        profile.validate(original)?;
+        let lock_hex: String = profile
+            .common
+            .input_lock
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let search_hex: String = profile
+            .common
+            .selective_policy
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if lock.canonical_sha256 != lock_hex
+            || lock.manifest.engine.mode != profile.common.mode
+            || lock.manifest.startup_search_configuration_sha256 != search_hex
+            || !matches!(
+                lock.manifest.engine.researcher.as_ref(),
+                Some(rz_experiments::RoventResearcher::Own { .. })
+            )
+        {
+            return Err(failure("RoventOwnV3Custody", "own /3 lock or mode differs"));
+        }
+        let mut researcher = Some(SessionResearcherSource::Legacy);
+        let admitted = Self::admit_with_researcher_source_in_slots(
+            options,
+            limits,
+            sources,
+            clock,
+            issuer,
+            registration,
+            None,
+            None,
+            AdaptiveSessionCollectionHooks::default(),
+            true,
+            &mut researcher,
+        )?;
+        // Publish the same owner to the caller before the fallible root-policy
+        // registration. A rejection does not imply physical completion.
+        *driver = Some(admitted);
+        let driver = driver.as_mut().expect("original V3 own driver installed");
+        driver.rovent = Some(SessionPcrProfile::LateBoundOwn(profile));
+        driver.register_rovent_root_policy_v3(lock, root_policy)
+    }
+
     pub(super) fn rovent_root_legal(
         &self,
         position: &Position,

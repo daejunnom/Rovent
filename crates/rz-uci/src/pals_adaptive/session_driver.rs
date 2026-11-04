@@ -48,8 +48,8 @@ use root_admission::{RoventPcrRootPolicy, RoventPcrRootPolicyV2, RoventPcrRootPo
 pub use rovent::ROVENT_PROFILED_EXTERNAL_ROOT_DOMAIN;
 use rovent::SessionPcrProfile;
 pub use rovent::{
-    ROVENT_NATIVE_ROOT_DOMAIN, RoventNativeRootReceipt, RoventPcrSessionProfile,
-    RoventPcrSessionProfileV3,
+    ROVENT_NATIVE_ROOT_DOMAIN, RoventNativeRootReceipt, RoventOwnPcrSessionProfileV3,
+    RoventOwnReciprocalV3, RoventPcrSessionProfile, RoventPcrSessionProfileV3,
 };
 #[cfg(feature = "pals-adaptive")]
 pub use rovent::{
@@ -871,16 +871,29 @@ where
         _external_source: SessionExternalRootSource<'_>,
     ) -> Result<(), AdaptiveManagerError> {
         match self.researcher_class {
-            SessionResearcherClass::Legacy => profile
-                .fixed()
-                .ok_or(AdaptiveManagerError::Invalid("own-R fixed profile absent"))?
-                .attach(
-                    manager,
-                    context,
-                    &self.clock,
-                    self.rovent_collection_origin.as_ref(),
-                    admission,
-                ),
+            SessionResearcherClass::Legacy => {
+                #[cfg(feature = "pals-adaptive")]
+                if let SessionPcrProfile::LateBoundOwn(own) = profile {
+                    if self.rovent_collection_origin.is_some() {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "V3 own-R cannot use a legacy Collection origin",
+                        ));
+                    }
+                    return own
+                        .bind_original_root(context, &self.clock, admission)?
+                        .attach(manager, context, &self.clock, None, admission);
+                }
+                profile
+                    .fixed()
+                    .ok_or(AdaptiveManagerError::Invalid("own-R fixed profile absent"))?
+                    .attach(
+                        manager,
+                        context,
+                        &self.clock,
+                        self.rovent_collection_origin.as_ref(),
+                        admission,
+                    )
+            }
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             SessionResearcherClass::ProfiledExternal => profile
                 .fixed()
@@ -4041,6 +4054,22 @@ where
         }
         *state = SessionState::Closed(receipt.clone());
         Ok(receipt)
+    }
+
+    /// Read the original closed session's release observation without waiting
+    /// for shutdown or creating a new physical completion witness.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn closed_native_session_release(
+        &self,
+    ) -> Result<Option<super::NativeSessionReleaseObservation>, SearchSessionFailure> {
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+        Ok(match &*state {
+            SessionState::Closed(receipt) => receipt.native_session_release(),
+            _ => None,
+        })
     }
 }
 

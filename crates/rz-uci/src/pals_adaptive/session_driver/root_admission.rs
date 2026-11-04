@@ -432,7 +432,10 @@ where
             .map(|byte| format!("{byte:02x}"))
             .collect();
         if self.rovent_root_policy.is_some()
-            || !matches!(self.rovent.as_ref(), Some(SessionPcrProfile::LateBound(_)))
+            || !matches!(
+                self.rovent.as_ref(),
+                Some(SessionPcrProfile::LateBound(_) | SessionPcrProfile::LateBoundOwn(_))
+            )
             || self.rovent_root_policy_v2.is_some()
             || self.rovent_root_policy_v3.is_some()
             || self.closed.load(Ordering::Acquire)
