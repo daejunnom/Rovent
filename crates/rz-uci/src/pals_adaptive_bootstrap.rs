@@ -350,6 +350,16 @@ impl Drop for StartupNativeGuard {
 }
 
 pub fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapError> {
+    if arguments
+        .iter()
+        .any(|arg| arg.starts_with("--pals-system-proxy="))
+    {
+        #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+        return crate::pals_system_proxy::run_guarded_cli(&arguments)
+            .map_err(|error| failure("SystemV6Proxy", &error));
+        #[cfg(not(all(target_os = "linux", feature = "onnx-cuda")))]
+        return Err(boundary("SystemV6ProxyRequiresLinuxCuda"));
+    }
     if arguments == ["--pals-system-source-inventory"] {
         return system_v6::source_inventory();
     }

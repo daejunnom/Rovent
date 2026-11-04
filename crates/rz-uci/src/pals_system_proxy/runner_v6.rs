@@ -7,7 +7,9 @@ use super::{
     DirectPalsChildV6, PalsDirectChildInputPipeV6, PalsDirectChildObservationV6,
     PalsImageGrantObservationV6, PalsProxyBinaryPinV6, PalsProxyLaunchV6,
     finish::{self, PalsRuntimeFinishClaimV6, PalsSessionReleaseClaimV6},
-    relay::{PalsUciRelayV6, RelayPipeObservationV6},
+    relay::{
+        PalsUciRelayV6, RelayInputCleanupStartV6, RelayInputCleanupStopV6, RelayPipeObservationV6,
+    },
 };
 use std::{
     any::Any,
@@ -54,6 +56,8 @@ pub(super) struct ProxySupervisorObservationV6 {
     pub stage: ProxyStageV6,
     pub child: Option<PalsDirectChildObservationV6>,
     pub relay: Option<[Option<RelayPipeObservationV6>; 3]>,
+    pub input_cleanup_start: Option<RelayInputCleanupStartV6>,
+    pub input_cleanup_stop: Option<RelayInputCleanupStopV6>,
     pub physical_completion: &'static str,
 }
 
@@ -92,6 +96,8 @@ pub(super) struct PalsProxySupervisorV6 {
     session_release_stream: Option<UnixStream>,
     runtime_finish_attempted: bool,
     session_release_attempted: bool,
+    input_cleanup_start: Option<RelayInputCleanupStartV6>,
+    input_cleanup_stop: Option<RelayInputCleanupStopV6>,
 }
 
 impl PalsProxySupervisorV6 {
@@ -143,6 +149,8 @@ impl PalsProxySupervisorV6 {
             session_release_stream: None,
             runtime_finish_attempted: false,
             session_release_attempted: false,
+            input_cleanup_start: None,
+            input_cleanup_stop: None,
         }
     }
 
@@ -272,7 +280,10 @@ impl PalsProxySupervisorV6 {
                 ));
             }
         }
-        self.relay.as_mut().expect("original relay").start_input()?;
+        self.relay
+            .as_mut()
+            .expect("original relay")
+            .start_input_until(self.run_until)?;
         self.stage = ProxyStageV6::Serving;
         Ok(())
     }
@@ -280,18 +291,38 @@ impl PalsProxySupervisorV6 {
     /// One nonblocking observation. Cancellation stops new UCI input but
     /// leaves output draining to its original finite deadline.
     pub(super) fn poll(&mut self) -> io::Result<ProxySupervisorObservationV6> {
-        if self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.run_until {
-            if let Some(relay) = &self.relay {
-                relay.cancel_input();
+        let mut cleanup_stop = None;
+        let relay = self.relay.as_mut().map(|relay| {
+            let observation = relay.poll();
+            let input_ended = observation[0].as_ref().is_some_and(|value| !value.active);
+            let should_cleanup = self.cancelled.load(Ordering::Acquire)
+                || Instant::now() >= self.run_until
+                || relay.input_quit_forwarded()
+                || input_ended;
+            if should_cleanup
+                && matches!(
+                    self.input_cleanup_start,
+                    None | Some(RelayInputCleanupStartV6::WaitingForInputJoin)
+                )
+            {
+                self.input_cleanup_start =
+                    Some(relay.request_input_cleanup(
+                        self.finish_until,
+                        Arc::clone(&self.finish_cancelled),
+                    ));
             }
-        }
-        let relay = self.relay.as_mut().map(PalsUciRelayV6::poll);
+            cleanup_stop = relay.poll_input_cleanup().map(|value| value.stop.clone());
+            self.input_cleanup_stop = cleanup_stop.clone();
+            observation
+        });
         Ok(ProxySupervisorObservationV6 {
             stage: self.stage,
             // Child::try_wait can reap the process before a pending finish
             // claim passes the existing live-peer check. Reaping is explicit.
             child: None,
             relay,
+            input_cleanup_start: self.input_cleanup_start,
+            input_cleanup_stop: cleanup_stop,
             physical_completion: "unknown",
         })
     }
@@ -373,6 +404,20 @@ impl PalsProxySupervisorV6 {
     pub(super) fn observe_session_release_once(&mut self) -> SessionReleaseObservationV6 {
         if self.session_release_attempted {
             return SessionReleaseObservationV6::AlreadyAttempted;
+        }
+        // A synchronous finish read must not prevent the run deadline from
+        // being supervised. Before that deadline, wait until the single
+        // input writer actually forwarded quit; afterwards continue trying
+        // to preserve any independent release evidence even on input error.
+        let input_retired = matches!(
+            self.input_cleanup_stop.as_ref(),
+            Some(
+                RelayInputCleanupStopV6::QuitAlreadyForwarded
+                    | RelayInputCleanupStopV6::StopAndQuitForwarded
+            )
+        );
+        if !input_retired && Instant::now() < self.run_until {
+            return SessionReleaseObservationV6::NotReady;
         }
         match self
             .child

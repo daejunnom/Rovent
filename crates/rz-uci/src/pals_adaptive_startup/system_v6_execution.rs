@@ -79,6 +79,14 @@ pub fn compiled_pals_system_v6_execution_source_digest() -> String {
             "proxy_runner_source",
             include_bytes!("../pals_system_proxy/runner_v6.rs"),
         ),
+        (
+            "proxy_cli_source",
+            include_bytes!("../pals_system_proxy/cli_v6.rs"),
+        ),
+        (
+            "proxy_relay_source",
+            include_bytes!("../pals_system_proxy/relay.rs"),
+        ),
     ];
     let mut hash = Sha256::new();
     hash.update(b"rz-pals-system-v6-execution-source/1");

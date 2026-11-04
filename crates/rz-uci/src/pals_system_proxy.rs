@@ -5,12 +5,17 @@
 //! evidence until shutdown is resolved. Process exit, pipe EOF, timeout and
 //! a UCI `bestmove` are not GPU completion and do not authorize killing it.
 
+mod cli_v6;
 #[allow(dead_code)]
 pub(crate) mod finish;
 mod parent;
 #[allow(dead_code)]
 mod protocol;
 pub mod relay;
+
+pub(crate) fn run_guarded_cli(arguments: &[String]) -> io::Result<()> {
+    cli_v6::run_guarded_cli(arguments)
+}
 mod runner_v6;
 
 use rz_experiments::{ArtifactRef, NativeRuntimeSourceV6, PalsSystemStartupLockV6};
