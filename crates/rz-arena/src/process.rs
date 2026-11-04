@@ -799,7 +799,7 @@ impl OwnedArtifactTreeWatch {
         }
     }
 
-    fn validate(&self) -> Result<(), ArenaError> {
+    pub(crate) fn validate(&self) -> Result<(), ArenaError> {
         self.validate_with_file_ceiling(Self::MAX_FILES)
     }
     fn validate_with_file_ceiling(&self, file_ceiling: usize) -> Result<(), ArenaError> {
@@ -930,7 +930,7 @@ impl ArtifactWatch {
 }
 
 impl ProcessLimits {
-    fn validate(self) -> Result<(), ArenaError> {
+    pub(crate) fn validate(self) -> Result<(), ArenaError> {
         if self.wall_ms == 0
             || self.shutdown_grace_ms == 0
             || self.max_output_bytes == 0
