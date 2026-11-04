@@ -2,8 +2,10 @@
 //! A returned status is neither physical completion nor a writer join.
 use super::*;
 use crate::runner::{
-    async_events::{AsyncControl, AsyncServeDriver, AsyncServeExit, AsyncServeStatus},
-    async_output::{AsyncOutputOwner, OutputSnapshot},
+    async_events::{
+        AsyncControl, AsyncServeDriver, AsyncServeExit, AsyncServeStatus, OutputRecoveryPoll,
+    },
+    async_output::{AsyncOutputOwner, OutputRecovery, OutputSnapshot},
 };
 
 type Handler =
@@ -34,6 +36,15 @@ pub enum EngineTimerJoinStatus {
     Joined,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EngineWriterRecoveryStatus {
+    DriverNotSealed,
+    Pending,
+    Recovered,
+    WorkerPanicked,
+    OriginalRecoveryMissing,
+}
+
 /// Owns the *same* UCI session, pending output, timer and process owner across
 /// time slices. A terminal/unknown result stays here for inspection. Dropping
 /// this owner is not a shutdown or physical-completion operation.
@@ -46,6 +57,7 @@ pub struct AsyncEngineRun<O: Write + Send + 'static, D: Write + Send + 'static> 
     timer_joined: bool,
     cleanup_failure: Option<EngineError>,
     timer_panic: Option<Box<dyn std::any::Any + Send>>,
+    output_recovery: Option<Result<OutputRecovery<O, D>, Box<dyn std::any::Any + Send>>>,
     _priority_close_owner: priority_close::PriorityCloseOwner,
     close: PriorityCloseHandle,
     last_exit: Option<AsyncServeExit<EngineError>>,
@@ -167,6 +179,7 @@ pub fn start_async<O: Write + Send + 'static, D: Write + Send + 'static>(
         timer_joined: false,
         cleanup_failure: None,
         timer_panic: None,
+        output_recovery: None,
         _priority_close_owner: close_owner,
         close,
         last_exit: None,
@@ -308,8 +321,39 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineRun<O, D> 
     pub fn close_observation(&self) -> PriorityCloseObservation {
         self.close.observe()
     }
-    pub fn output_observation(&self) -> OutputSnapshot {
-        self.driver.output().observation()
+    pub fn output_observation(&self) -> Option<OutputSnapshot> {
+        self.driver.output().map(AsyncOutputOwner::observation)
+    }
+    /// Keep the exact writer recovery or panic with this same engine run.
+    /// A joined writer is not proof of delivery or native physical completion.
+    pub fn try_recover_writer(&mut self) -> EngineWriterRecoveryStatus {
+        if let Some(recovered) = &self.output_recovery {
+            return if recovered.is_ok() {
+                EngineWriterRecoveryStatus::Recovered
+            } else {
+                EngineWriterRecoveryStatus::WorkerPanicked
+            };
+        }
+        match self.driver.try_finish_output() {
+            OutputRecoveryPoll::DriverNotSealed => EngineWriterRecoveryStatus::DriverNotSealed,
+            OutputRecoveryPoll::Pending => EngineWriterRecoveryStatus::Pending,
+            OutputRecoveryPoll::Recovered(original) => {
+                self.output_recovery = Some(Ok(original));
+                EngineWriterRecoveryStatus::Recovered
+            }
+            OutputRecoveryPoll::WorkerPanicked(payload) => {
+                self.output_recovery = Some(Err(payload));
+                EngineWriterRecoveryStatus::WorkerPanicked
+            }
+            OutputRecoveryPoll::AlreadyRecovered => {
+                EngineWriterRecoveryStatus::OriginalRecoveryMissing
+            }
+        }
+    }
+    pub fn output_recovery(
+        &self,
+    ) -> Option<&Result<OutputRecovery<O, D>, Box<dyn std::any::Any + Send>>> {
+        self.output_recovery.as_ref()
     }
     pub fn session_closed(&self) -> bool {
         self.driver.session_closed()
