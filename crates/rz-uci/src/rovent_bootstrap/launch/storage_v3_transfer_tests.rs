@@ -12,7 +12,7 @@ use rz_experiments::{
     ROVENT_STORAGE_PROFILE_DOMAIN, RoventArchiveRuntimeLimits, RoventExecutionManifestV3,
     RoventStorageHelpers, RoventStoragePolicy, RoventStorageSourcePins, SystemRuntimeLockV6,
 };
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
