@@ -332,14 +332,37 @@ fn cancel_child() {
         .unwrap_or_else(|(error, _)| panic!("cancel attach: {error}"));
     assert!(receiver.matches_window(&cancelled, prepared.bundle.window.cleanup_until));
     if scenario == "accepted" {
-        for _ in 0..2 {
-            loop {
-                if receiver.poll().unwrap() {
-                    break;
+        // The bounded operation cannot finish before the same original
+        // receiver has accepted cancellation. This exercises the exact
+        // scoped service used around startup/finish without starting a child.
+        let mut game = None;
+        let mut no_game = Some(receiver);
+        let (operation, worker_panicked) = crate::pals_system_proxy::runner_v6::poll_cancel_during(
+            &mut game,
+            &mut no_game,
+            || {
+                while !cancelled.load(Ordering::Acquire) {
+                    assert!(Instant::now() < until, "blocking operation missed cancel");
+                    thread::sleep(Duration::from_millis(2));
                 }
-                assert!(Instant::now() < until, "cancel ack timed out");
-                thread::sleep(Duration::from_millis(2));
+            },
+        )
+        .unwrap();
+        operation.expect("bounded operation failed");
+        assert!(!worker_panicked);
+        receiver = no_game.take().expect("original receiver returned");
+        while receiver.ack.is_some() {
+            receiver.poll().unwrap();
+            assert!(Instant::now() < until, "first cancel ack timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
+        // The parent sends the same sequence again after the first ACK.
+        loop {
+            if receiver.poll().unwrap() {
+                break;
             }
+            assert!(Instant::now() < until, "duplicate cancel ack timed out");
+            thread::sleep(Duration::from_millis(2));
         }
         assert!(cancelled.load(Ordering::Acquire));
         assert!(receiver.first_failure().is_none());

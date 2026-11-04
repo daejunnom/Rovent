@@ -68,6 +68,35 @@ pub(super) struct ProxySupervisorObservationV6 {
     pub cancel_service_failure: Option<String>,
 }
 
+/// Run the existing cancellation poll on the original borrowed receivers
+/// during one bounded blocking exchange; the caller keeps their ownership.
+pub(super) fn poll_cancel_during<T>(
+    game: &mut Option<CancelReceiverV1>,
+    no_game: &mut Option<NoGameCancelReceiverV1>,
+    operation: impl FnOnce() -> T,
+) -> io::Result<(std::thread::Result<T>, bool)> {
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("pals-cancel-drain".into())
+            .spawn_scoped(scope, || {
+                while !done.load(Ordering::Acquire) {
+                    if let Some(receiver) = game.as_mut() {
+                        let _ = receiver.poll();
+                    }
+                    if let Some(receiver) = no_game.as_mut() {
+                        let _ = receiver.poll();
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })?;
+        let result = catch_unwind(AssertUnwindSafe(operation));
+        done.store(true, Ordering::Release);
+        let worker_panicked = worker.join().is_err();
+        Ok((result, worker_panicked))
+    })
+}
+
 #[must_use = "retain the original child, relay and process while physical completion is unknown"]
 pub(super) struct PalsProxySupervisorV6 {
     launch: Option<PalsProxyLaunchV6>,
@@ -224,27 +253,8 @@ impl PalsProxySupervisorV6 {
         }
         let mut game = self.cancel_receiver.take();
         let mut no_game = self.no_game_cancel_receiver.take();
-        let done = AtomicBool::new(false);
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            std::thread::scope(|scope| {
-                let worker = std::thread::Builder::new()
-                    .name("pals-cancel-drain".into())
-                    .spawn_scoped(scope, || {
-                        while !done.load(Ordering::Acquire) {
-                            if let Some(receiver) = game.as_mut() {
-                                let _ = receiver.poll();
-                            }
-                            if let Some(receiver) = no_game.as_mut() {
-                                let _ = receiver.poll();
-                            }
-                            std::thread::sleep(Duration::from_millis(2));
-                        }
-                    })?;
-                let result = catch_unwind(AssertUnwindSafe(|| operation(self)));
-                done.store(true, Ordering::Release);
-                let worker_panicked = worker.join().is_err();
-                Ok((result, worker_panicked))
-            })
+            poll_cancel_during(&mut game, &mut no_game, || operation(self))
         }));
         self.cancel_receiver = game;
         self.no_game_cancel_receiver = no_game;
