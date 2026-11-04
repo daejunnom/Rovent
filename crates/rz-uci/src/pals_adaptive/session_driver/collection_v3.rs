@@ -765,27 +765,42 @@ impl RoventBoardCollectionWorkerStageV3 {
         self.start_inner(task)
     }
 
-    /// A result witness exists only when the actual platform spawn returned
-    /// on this exact stage. Unwind leaves no witness and no retry authority.
+    /// Install the result into the caller's already-retained recovery slot.
+    /// A witness exists only when the actual platform spawn returned on this
+    /// exact stage. Unwind leaves no witness and no retry authority.
     pub fn start_with_source(
         &mut self,
         source: &RoventBoardWorkerStartSourceV3,
         task: RoventBoardRootWorkerTaskV3,
-    ) -> Result<RoventBoardWorkerStartOutcomeV3, RoventBoardWorkerStageStartRejectionV3> {
+        outcome: &mut Option<RoventBoardWorkerStartOutcomeV3>,
+    ) -> Result<(), RoventBoardWorkerStageStartRejectionV3> {
+        if outcome.is_some() {
+            return Err(RoventBoardWorkerStageStartRejectionV3 {
+                reason: "original start outcome slot already occupied",
+                task,
+            });
+        }
         if !self.matches_start_source(source) {
             return Err(RoventBoardWorkerStageStartRejectionV3 {
                 reason: "different original start source",
                 task,
             });
         }
+        // Prepare all witness ownership before spawn. Following its return,
+        // installation is only a move into the caller's original slot.
+        let seal = Arc::clone(&source.seal);
+        let key = source.key.clone();
+        let admission = source.admission.clone();
+        let received = Arc::clone(&source.received);
         let result = self.start_inner(task)?;
-        Ok(RoventBoardWorkerStartOutcomeV3 {
-            seal: Arc::clone(&source.seal),
-            key: source.key.clone(),
-            admission: source.admission.clone(),
-            received: Arc::clone(&source.received),
+        *outcome = Some(RoventBoardWorkerStartOutcomeV3 {
+            seal,
+            key,
+            admission,
+            received,
             result,
-        })
+        });
+        Ok(())
     }
 
     fn start_inner(
