@@ -99,7 +99,7 @@ pub(crate) struct SmokeDeadlineControl {
     no_game_run_closed: bool,
     first_failure: Option<String>,
     cancel_peer: Option<smoke_cancel_sender::SmokeCancelPeer>,
-    cancel_failure: Option<ArenaError>,
+    cancel_failure: Option<Arc<ArenaError>>,
     // Drop after listener and every retained/partial stream.
     _retained_permit: Option<Arc<NoGameBindingPermit>>,
 }

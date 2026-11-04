@@ -52,7 +52,7 @@ impl SmokeDeadlineControl {
         match self.poll_no_game_cancel_inner(custody, callback_until) {
             Ok(progress) => progress,
             Err(error) => {
-                self.cancel_failure = Some(error);
+                self.cancel_failure = Some(Arc::new(error));
                 SmokeCancelProgress::Failed
             }
         }
@@ -198,7 +198,13 @@ impl SmokeDeadlineControl {
     }
 
     pub(crate) fn no_game_cancel_first_failure(&self) -> Option<&ArenaError> {
-        self.cancel_failure.as_ref()
+        self.cancel_failure.as_deref()
+    }
+
+    /// Share the same typed error with retained evidence without cloning its
+    /// contents or transferring its original stream and control owner.
+    pub(crate) fn no_game_cancel_failure_owner(&self) -> Option<Arc<ArenaError>> {
+        self.cancel_failure.as_ref().map(Arc::clone)
     }
 
     /// Offsets remain observable after a failure without replacing the stream.
