@@ -6,12 +6,16 @@ use super::launch::{ManagedOutputOwnerV3, PreparedPcCollectionInputsV3};
 use super::policy_row_pipeline_v3::PolicyRowPipelineOwnerV3;
 use rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 
-const ABORT_REQUESTED: u8 = 1;
-const PUBLICATION_GRANTED: u8 = 2;
-const NO_DATA_FINISHED: u8 = 4;
+const ABORT_REQUESTED: u64 = 1;
+const PUBLICATION_GRANTED: u64 = 2;
+const NO_DATA_FINISHED: u64 = 4;
+const ADMISSION_SEALED: u64 = 8;
+const DISPATCH_CLAIM: u64 = 16;
+const CONTROL_FLAGS: u64 = DISPATCH_CLAIM - 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PhaseV3 {
@@ -29,15 +33,18 @@ struct StateV3<S> {
     supervisor: Option<Weak<Mutex<S>>>,
     pipeline: Option<PolicyRowPipelineOwnerV3>,
     output: Option<Weak<ManagedOutputOwnerV3>>,
+    dispatch_channel: Option<Arc<()>>,
     first: Option<RoventCollectionRootAdmissionV3>,
     pending: Vec<RoventCollectionRootAdmissionV3>,
     admitted: Vec<RoventCollectionRootAdmissionV3>,
+    dispatching: Vec<RoventCollectionRootAdmissionV3>,
+    dispatched: Vec<RoventCollectionRootAdmissionV3>,
 }
 
 pub(super) struct GameAuthorityV3<S> {
     identity: Arc<()>,
     inputs: Arc<PreparedPcCollectionInputsV3>,
-    control: AtomicU8,
+    control: AtomicU64,
     unknown: AtomicBool,
     state: Mutex<StateV3<S>>,
 }
@@ -83,16 +90,19 @@ impl<S> GameAuthorityV3<S> {
         Arc::new(Self {
             identity: Arc::new(()),
             inputs,
-            control: AtomicU8::new(0),
+            control: AtomicU64::new(0),
             unknown: AtomicBool::new(false),
             state: Mutex::new(StateV3 {
                 phase: PhaseV3::Open,
                 supervisor: None,
                 pipeline: None,
                 output: None,
+                dispatch_channel: None,
                 first: None,
                 pending: Vec::new(),
                 admitted: Vec::new(),
+                dispatching: Vec::new(),
+                dispatched: Vec::new(),
             }),
         })
     }
@@ -156,6 +166,30 @@ impl<S> GameAuthorityV3<S> {
             Some(_) => GameStepV3::Foreign,
             None => {
                 state.output = Some(candidate);
+                GameStepV3::Ready
+            }
+        }
+    }
+
+    /// The bridge moves its original sender into this channel wrapper at
+    /// creation and binds its identity once; a different sender cannot use
+    /// an existing game's dispatch claim.
+    pub(super) fn try_bind_dispatch_channel<T>(
+        &self,
+        channel: &GameDispatchChannelV3<T>,
+    ) -> GameStepV3 {
+        let mut state = match self.lock() {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        if state.phase != PhaseV3::Open {
+            return GameStepV3::Closed;
+        }
+        match &state.dispatch_channel {
+            Some(original) if Arc::ptr_eq(original, &channel.identity) => GameStepV3::Existing,
+            Some(_) => GameStepV3::Foreign,
+            None => {
+                state.dispatch_channel = Some(Arc::clone(&channel.identity));
                 GameStepV3::Ready
             }
         }
@@ -271,6 +305,91 @@ impl<S> GameAuthorityV3<S> {
         self.control.fetch_or(ABORT_REQUESTED, Ordering::SeqCst);
     }
 
+    /// Claims queue dispatch against the same atomic abort word. The caller
+    /// pre-retains `destination` in the root slot; no mutex stays held while
+    /// the actual bounded channel send executes.
+    pub(super) fn try_claim_dispatch(
+        self: &Arc<Self>,
+        root: &RoventCollectionRootAdmissionV3,
+        destination: &mut Option<GameDispatchClaimV3<S>>,
+    ) -> GameStepV3 {
+        if destination.is_some() {
+            return GameStepV3::Busy;
+        }
+        let mut state = match self.lock() {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        if state.phase != PhaseV3::Open {
+            return GameStepV3::Closed;
+        }
+        if state.dispatch_channel.is_none() {
+            return GameStepV3::Foreign;
+        }
+        if !state
+            .admitted
+            .iter()
+            .any(|a| a.same_original_admission(root))
+        {
+            return GameStepV3::Foreign;
+        }
+        if state
+            .dispatched
+            .iter()
+            .any(|a| a.same_original_admission(root))
+        {
+            return GameStepV3::Existing;
+        }
+        if state
+            .dispatching
+            .iter()
+            .any(|a| a.same_original_admission(root))
+        {
+            return GameStepV3::Busy;
+        }
+        let reserve = state.dispatching.len().saturating_add(1);
+        if state.dispatching.try_reserve(1).is_err()
+            || state.dispatched.try_reserve(reserve).is_err()
+        {
+            return GameStepV3::Capacity;
+        }
+        // Clones and allocation precede the successful claim CAS.
+        let retained_root = root.clone();
+        let state_root = root.clone();
+        let owner = Arc::clone(self);
+        let mut current = self.control.load(Ordering::SeqCst);
+        loop {
+            if current & ABORT_REQUESTED != 0 {
+                return GameStepV3::Aborted;
+            }
+            if current & (ADMISSION_SEALED | PUBLICATION_GRANTED | NO_DATA_FINISHED) != 0 {
+                return GameStepV3::Closed;
+            }
+            let Some(next) = current.checked_add(DISPATCH_CLAIM) else {
+                return GameStepV3::Capacity;
+            };
+            match self
+                .control
+                .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+        // Both vectors have reserved capacity and the caller's slot was
+        // checked empty. No callback or fallible operation occurs here.
+        state.dispatching.push(state_root);
+        *destination = Some(GameDispatchClaimV3 {
+            owner,
+            root: retained_root,
+            send_result: None,
+            attempted: false,
+            settled: false,
+            receipt: None,
+        });
+        GameStepV3::Ready
+    }
+
     /// Only admission is sealed here. Existing reservations and original
     /// root work remain held and must be separately settled and observed.
     pub(super) fn try_seal_admission(&self, proof: &GameAdmissionSealProofV3) -> GameStepV3 {
@@ -287,6 +406,7 @@ impl<S> GameAuthorityV3<S> {
         };
         match state.phase {
             PhaseV3::Open => {
+                self.control.fetch_or(ADMISSION_SEALED, Ordering::SeqCst);
                 state.phase = PhaseV3::AdmissionSealed;
                 GameStepV3::Ready
             }
@@ -310,7 +430,10 @@ impl<S> GameAuthorityV3<S> {
         if (self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0) {
             return GameStepV3::Aborted;
         }
-        if !state.pending.is_empty() {
+        if !state.pending.is_empty()
+            || !state.dispatching.is_empty()
+            || self.control.load(Ordering::SeqCst) & !CONTROL_FLAGS != 0
+        {
             return GameStepV3::Busy;
         }
         if state.supervisor.as_ref().and_then(Weak::upgrade).is_none()
@@ -346,7 +469,11 @@ impl<S> GameAuthorityV3<S> {
         if (self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0) {
             return Err(GameStepV3::Aborted);
         }
-        if state.phase != PhaseV3::Closed || !state.pending.is_empty() {
+        if state.phase != PhaseV3::Closed
+            || !state.pending.is_empty()
+            || !state.dispatching.is_empty()
+            || self.control.load(Ordering::SeqCst) & !CONTROL_FLAGS != 0
+        {
             return Err(GameStepV3::Closed);
         }
         state.phase = PhaseV3::Preparing;
@@ -474,6 +601,192 @@ impl<S> Drop for GameRootReservationV3<S> {
     }
 }
 
+/// Only the actual P-C and Own root envelopes can use this dispatch path.
+pub(super) trait GameDispatchEnvelopeV3: Clone {
+    fn matches_root(&self, root: &RoventCollectionRootAdmissionV3) -> bool;
+}
+
+pub(super) struct GameDispatchChannelV3<T> {
+    identity: Arc<()>,
+    sender: SyncSender<T>,
+}
+impl<T> GameDispatchChannelV3<T> {
+    pub(super) fn new(sender: SyncSender<T>) -> Self {
+        Self {
+            identity: Arc::new(()),
+            sender,
+        }
+    }
+}
+impl GameDispatchEnvelopeV3 for RoventCollectionRootAdmissionV3 {
+    fn matches_root(&self, root: &RoventCollectionRootAdmissionV3) -> bool {
+        self.same_original_admission(root)
+    }
+}
+impl GameDispatchEnvelopeV3 for super::own_hooks_lock_v3::OwnRootRequestV3 {
+    fn matches_root(&self, root: &RoventCollectionRootAdmissionV3) -> bool {
+        self.admission.same_original_admission(root)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GameDispatchOutcomeV3 {
+    Sent,
+    Full,
+    Disconnected,
+    Aborted,
+    AdmissionSealed,
+}
+
+/// Original completed send observation. Sent remains separate from the
+/// same root's eventual cancellation, worker join and physical completion.
+pub(super) struct GameDispatchReceiptV3<S> {
+    owner: Arc<GameAuthorityV3<S>>,
+    root: RoventCollectionRootAdmissionV3,
+    outcome: GameDispatchOutcomeV3,
+    abort_observed: bool,
+}
+impl<S> GameDispatchReceiptV3<S> {
+    pub(super) fn matches_game(&self, game: &Arc<GameAuthorityV3<S>>) -> bool {
+        Arc::ptr_eq(&self.owner, game)
+    }
+    pub(super) fn matches_root(&self, root: &RoventCollectionRootAdmissionV3) -> bool {
+        self.root.same_original_admission(root)
+    }
+    pub(super) fn outcome(&self) -> GameDispatchOutcomeV3 {
+        self.outcome
+    }
+    pub(super) fn abort_observed(&self) -> bool {
+        self.abort_observed
+    }
+}
+
+pub(super) struct GameDispatchClaimV3<S> {
+    owner: Arc<GameAuthorityV3<S>>,
+    root: RoventCollectionRootAdmissionV3,
+    send_result: Option<GameDispatchOutcomeV3>,
+    attempted: bool,
+    settled: bool,
+    receipt: Option<GameDispatchReceiptV3<S>>,
+}
+
+impl<S> GameDispatchClaimV3<S> {
+    /// The original envelope remains in the caller's slot on every result.
+    /// This sends one clone sharing its original admission/cancel owners;
+    /// a second invocation never sends again. A panic leaves claim Unknown.
+    pub(super) fn try_send<T: GameDispatchEnvelopeV3>(
+        &mut self,
+        channel: &GameDispatchChannelV3<T>,
+        envelope: &T,
+    ) -> Result<GameDispatchOutcomeV3, GameStepV3> {
+        if let Some(result) = self.send_result {
+            return Ok(result);
+        }
+        if self.settled {
+            return Err(GameStepV3::Unknown);
+        }
+        if self.attempted {
+            self.owner.unknown.store(true, Ordering::SeqCst);
+            return Err(GameStepV3::Unknown);
+        }
+        if !envelope.matches_root(&self.root) {
+            return Err(GameStepV3::Foreign);
+        }
+        {
+            let state = self.owner.lock()?;
+            if !state
+                .dispatch_channel
+                .as_ref()
+                .is_some_and(|original| Arc::ptr_eq(original, &channel.identity))
+            {
+                return Err(GameStepV3::Foreign);
+            }
+        }
+        self.attempted = true;
+        let copy = envelope.clone();
+        let control = self.owner.control.load(Ordering::SeqCst);
+        let result = if control & ABORT_REQUESTED != 0 {
+            GameDispatchOutcomeV3::Aborted
+        } else if control & ADMISSION_SEALED != 0 {
+            GameDispatchOutcomeV3::AdmissionSealed
+        } else {
+            match channel.sender.try_send(copy) {
+                Ok(()) => GameDispatchOutcomeV3::Sent,
+                Err(TrySendError::Full(_)) => GameDispatchOutcomeV3::Full,
+                Err(TrySendError::Disconnected(_)) => GameDispatchOutcomeV3::Disconnected,
+            }
+        };
+        self.send_result = Some(result);
+        Ok(result)
+    }
+
+    /// Records the actual prior send result in this original claim. Busy
+    /// preserves the claim and never repeats an already attempted send.
+    pub(super) fn try_settle(&mut self) -> GameStepV3 {
+        if self.settled {
+            return GameStepV3::Existing;
+        }
+        let Some(outcome) = self.send_result else {
+            return GameStepV3::Busy;
+        };
+        let mut state = match self.owner.lock() {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let Some(index) = state
+            .dispatching
+            .iter()
+            .position(|a| a.same_original_admission(&self.root))
+        else {
+            return GameStepV3::Unknown;
+        };
+        let prior =
+            match self
+                .owner
+                .control
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
+                    if (word & !CONTROL_FLAGS) < DISPATCH_CLAIM {
+                        None
+                    } else {
+                        Some(word - DISPATCH_CLAIM)
+                    }
+                }) {
+                Ok(value) => value,
+                Err(_) => return GameStepV3::Unknown,
+            };
+        let root = state.dispatching.remove(index);
+        if outcome == GameDispatchOutcomeV3::Sent {
+            state.dispatched.push(root);
+        }
+        self.receipt = Some(GameDispatchReceiptV3 {
+            owner: Arc::clone(&self.owner),
+            root: self.root.clone(),
+            outcome,
+            abort_observed: prior & ABORT_REQUESTED != 0 || self.owner.abort_requested(),
+        });
+        self.settled = true;
+        GameStepV3::Ready
+    }
+
+    pub(super) fn transfer_receipt(
+        &mut self,
+        destination: &mut Option<GameDispatchReceiptV3<S>>,
+    ) -> bool {
+        if destination.is_some() || self.receipt.is_none() {
+            return false;
+        }
+        *destination = self.receipt.take();
+        true
+    }
+}
+impl<S> Drop for GameDispatchClaimV3<S> {
+    fn drop(&mut self) {
+        if !self.settled || self.receipt.is_some() {
+            self.owner.unknown.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 pub(crate) struct GamePublishGuardV3<S> {
     owner: Arc<GameAuthorityV3<S>>,
     resolved: bool,
@@ -536,8 +849,8 @@ impl<S> GamePublishGuardV3<S> {
             return GameStepV3::Unknown;
         }
         match self.owner.control.compare_exchange(
-            0,
-            NO_DATA_FINISHED,
+            ADMISSION_SEALED,
+            ADMISSION_SEALED | NO_DATA_FINISHED,
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
@@ -566,8 +879,8 @@ impl<S> GamePublishGuardV3<S> {
             return GameStepV3::Unknown;
         }
         match self.owner.control.compare_exchange(
-            0,
-            PUBLICATION_GRANTED,
+            ADMISSION_SEALED,
+            ADMISSION_SEALED | PUBLICATION_GRANTED,
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
