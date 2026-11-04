@@ -698,8 +698,12 @@ fn publish_original_payloads_inner<P: serde::Serialize, S: PublicationSourceByte
         Ok(())
     };
     let mut hook = |event, phase| {
-        // Always call the liveness observer even when a name check fails.
+        // No operation follows a failed Before check, so do not mark that
+        // operation attempted. After still observes liveness on name failure.
         let before = check_held();
+        if phase == RoventPublicationHookPhaseV3::Before && before.is_err() {
+            return before;
+        }
         let live = outer_hook(event, phase);
         let after = check_held();
         before?;
