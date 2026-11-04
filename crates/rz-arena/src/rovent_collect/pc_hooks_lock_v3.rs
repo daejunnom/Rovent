@@ -8,6 +8,7 @@ use super::teacher::v3_pump::TeacherPumpV3;
 use super::teacher::v3_session::TeacherSessionStagingV3;
 use super::native_capture::RoventNativeCaptureRegistration;
 use super::observer_lock_v3::RoventCollectionOwnerLockV3;
+use super::pc_worker_v3::PcRootRecoveryV3;
 use super::{ArenaError, invalid};
 use rz_uci::pals_adaptive::{AdaptiveCollectionBoundaryV2, AdaptiveCollectionObserverBoxV3,
     AdaptiveManagerError, RoventCollectionRootAdmissionV3, RoventNoCaptureRootCapabilityV3,
@@ -260,14 +261,17 @@ struct PcRootSlotV3 {
     admission: RoventCollectionRootAdmissionV3,
     requested: bool,
     installed: bool,
+    recovery: Option<Arc<Mutex<PcRootRecoveryV3>>>,
     owner: Option<RoventCollectionOwnerLockV3>,
     route: Option<SpeculativeRootV3>,
+    route_retirement: Option<RoventTeacherRouteRetirementV3>,
     stage: Option<Arc<Mutex<TeacherSessionStagingV3>>>,
     pump: Option<Arc<Mutex<TeacherPumpV3>>>,
     observer: Option<PcObserverV3>,
     worker: Option<RoventPcCollectionWorkerV3>,
     handoff: Option<PcHandoffV3>,
     joined: Option<RoventPcCollectionRootCustodyV3>,
+    custody_taken: bool,
     returned: Option<Arc<Mutex<RoventPcCollectionRootCustodyV3>>>,
     join_failure: Option<RoventPcCollectionWorkerJoinFailureV3>,
     join_panic: Option<Box<dyn std::any::Any + Send>>,
@@ -281,6 +285,7 @@ struct PcBridgeStateV3 {
 /// Manager callbacks only exchange bounded state; setup runs on the separate
 /// supervisor. The same bridge, native owner and inputs must remain retained.
 pub(crate) struct RoventPcCollectionBridgeV3 {
+    self_weak: Weak<RoventPcCollectionBridgeV3>,
     inputs: Arc<PreparedPcCollectionInputsV3>,
     registration: RoventNativeCaptureRegistration,
     ledger: Arc<Mutex<PcRootQuotaLedgerV3>>,
@@ -300,12 +305,19 @@ pub(crate) struct PcPreparedRootV3 {
     pub stage: Arc<Mutex<TeacherSessionStagingV3>>,
     pub pump: Arc<Mutex<TeacherPumpV3>>,
     pub worker: RoventPcCollectionWorkerV3,
+    pub recovery: Arc<Mutex<PcRootRecoveryV3>>,
 }
 
 pub(crate) enum PcPreparedOutcomeV3 {
     Accepted,
     Busy(PcPreparedRootV3),
     Rejected(&'static str, PcPreparedRootV3),
+}
+
+pub(crate) enum PcRootAccountingV3 {
+    Pending,
+    TeacherPending,
+    PhysicallyRetired,
 }
 
 impl RoventPcCollectionBridgeV3 {
@@ -322,7 +334,8 @@ impl RoventPcCollectionBridgeV3 {
         roots.try_reserve_exact(max).map_err(|_| "P-C V3 root allocation")?;
         deferred.try_reserve_exact(max).map_err(|_| "P-C V3 cleanup allocation")?;
         let (requests, receiver) = mpsc::sync_channel(max);
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|self_weak| Self {
+            self_weak: self_weak.clone(),
             ledger: Arc::new(Mutex::new(PcRootQuotaLedgerV3::new(Arc::clone(&inputs)))),
             inputs, registration, startup: OnceLock::new(), native_owner: OnceLock::new(),
             state: Mutex::new(PcBridgeStateV3 { roots, deferred }), requests,
@@ -332,6 +345,7 @@ impl RoventPcCollectionBridgeV3 {
 
     pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> { &self.inputs }
     pub(crate) fn startup(&self) -> Option<&RoventStartupControl> { self.startup.get() }
+    pub(crate) fn capture_registration(&self) -> &RoventNativeCaptureRegistration { &self.registration }
 
     /// The bundle supplies this once, before any native root admission.
     pub(crate) fn bind_native_owner(
@@ -365,6 +379,35 @@ impl RoventPcCollectionBridgeV3 {
             Err(TryLockError::Poisoned(_)) => return Err(PcQuotaEvidenceErrorV3::Poisoned),
         };
         ledger.reserve_teacher(admission)
+    }
+
+    /// Publish the exact root recovery owner before route creation, scope
+    /// claim, worker startup, or teacher actor spawn. The caller retains its
+    /// Arc on Busy or error; this does not itself reserve teacher quota.
+    pub(crate) fn try_publish_recovery(
+        &self, admission: &RoventCollectionRootAdmissionV3,
+        recovery: &Arc<Mutex<PcRootRecoveryV3>>,
+    ) -> Result<bool, &'static str> {
+        {
+            let owner = match recovery.try_lock() {
+                Ok(owner) => owner,
+                Err(TryLockError::WouldBlock) => return Ok(false),
+                Err(TryLockError::Poisoned(_)) => return Err("P-C V3 recovery owner poisoned"),
+            };
+            if !owner.matches_admission(admission) { return Err("P-C V3 recovery root differs"); }
+        }
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => return Err("P-C V3 roots poisoned"),
+        };
+        let slot = state.roots.iter_mut().find(|slot| slot.admission.same_original_admission(admission))
+            .ok_or("P-C V3 original request absent")?;
+        if let Some(old) = &slot.recovery {
+            return if Arc::ptr_eq(old, recovery) { Ok(true) } else { Err("P-C V3 recovery owner changed") };
+        }
+        slot.recovery = Some(Arc::clone(recovery));
+        Ok(true)
     }
 
     /// Called by the supervisor after route installation, native owner
@@ -447,6 +490,9 @@ impl RoventPcCollectionBridgeV3 {
         };
         let Some(slot) = state.roots.iter_mut().find(|slot| slot.admission.same_original_admission(&original.admission))
         else { return PcPreparedOutcomeV3::Rejected("P-C V3 original request absent", original); };
+        if !slot.recovery.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, &original.recovery)) {
+            return PcPreparedOutcomeV3::Rejected("P-C V3 original recovery owner missing", original);
+        }
         if slot.owner.is_some() || slot.worker.is_some() || slot.installed {
             return PcPreparedOutcomeV3::Rejected("P-C V3 root already prepared", original);
         }
@@ -462,7 +508,8 @@ impl RoventPcCollectionBridgeV3 {
         let mut state = self.state.try_lock().map_err(|_| "P-C V3 roots unavailable")?;
         let slot = state.roots.iter_mut().find(|slot| slot.admission.same_original_admission(admission))
             .ok_or("P-C V3 root absent")?;
-        if slot.joined.is_some() { return Ok(true); }
+        if slot.returned.is_some() || slot.joined.is_some() { return Ok(true); }
+        if slot.custody_taken { return Ok(false); }
         if slot.join_failure.is_some() || slot.join_panic.is_some() { return Err("P-C V3 worker join unresolved"); }
         let Some(handoff) = &slot.handoff else { return Ok(false); };
         let worker = slot.worker.as_mut().ok_or("P-C V3 worker absent")?;
@@ -473,6 +520,77 @@ impl RoventPcCollectionBridgeV3 {
             Err(payload) => { slot.join_panic = Some(payload); Err("P-C V3 original join panicked") }
         }
     }
+
+    /// Separately account manager-returned joined custody and the original
+    /// same-handoff teacher aggregate. Never releases the route or labels.
+    pub(crate) fn try_account_root(&self, admission: &RoventCollectionRootAdmissionV3)
+        -> Result<PcRootAccountingV3, &'static str> {
+        let state = self.state.try_lock().map_err(|_| "P-C V3 roots unavailable")?;
+        let slot = state.roots.iter().find(|slot| slot.admission.same_original_admission(admission))
+            .ok_or("P-C V3 root absent")?;
+        let Some(custody) = &slot.returned else { return Ok(PcRootAccountingV3::Pending); };
+        let handoff = match custody.try_lock() {
+            Ok(custody) => Arc::clone(custody.handoff()),
+            Err(TryLockError::WouldBlock) => return Ok(PcRootAccountingV3::Pending),
+            Err(_) => return Err("P-C V3 original custody poisoned"),
+        };
+        let mut ledger = match self.ledger.try_lock() {
+            Ok(ledger) => ledger,
+            Err(TryLockError::WouldBlock) => return Ok(PcRootAccountingV3::Pending),
+            Err(_) => return Err("P-C V3 ledger poisoned"),
+        };
+        let Some(index) = ledger.roots.iter().position(|root| root.admission.same_original_admission(admission))
+            else { return Err("P-C V3 quota root absent"); };
+        if ledger.roots[index].joined.is_none() {
+            match ledger.retain_joined_worker(admission, Arc::clone(custody)) {
+                Ok(()) => {},
+                Err(PcQuotaEvidenceErrorV3::Busy) => return Ok(PcRootAccountingV3::Pending),
+                Err(_) => return Err("P-C V3 original joined custody differs"),
+            }
+        }
+        if ledger.roots[index].teacher_reserved {
+            match ledger.retain_teacher_aggregate(admission, handoff) {
+                Ok(()) => {},
+                Err(PcQuotaEvidenceErrorV3::Busy | PcQuotaEvidenceErrorV3::MissingTeacherAggregate) =>
+                    return Ok(PcRootAccountingV3::TeacherPending),
+                Err(_) => return Err("P-C V3 teacher aggregate differs"),
+            }
+        }
+        if ledger.roots[index].retired_teacher_handoff.is_none() {
+            return Ok(PcRootAccountingV3::TeacherPending);
+        }
+        Ok(PcRootAccountingV3::PhysicallyRetired)
+    }
+
+    /// Unlink only after independent joined/native/teacher/receiver evidence.
+    /// Failed semantic settlement remains in the original handoff custody.
+    pub(crate) fn try_retire_route(&self, admission: &RoventCollectionRootAdmissionV3)
+        -> Result<bool, ArenaError> {
+        let mut state = match self.state.try_lock() {
+            Ok(value) => value,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(_) => return Err(invalid("P-C V3 root custody poisoned")),
+        };
+        let slot = state.roots.iter_mut().find(|slot| slot.admission.same_original_admission(admission))
+            .ok_or_else(|| invalid("P-C V3 route root absent"))?;
+        if slot.route_retirement.is_some() { return Ok(true); }
+        let Some(route) = slot.route.as_ref() else { return Ok(false); };
+        let Some(pump) = slot.pump.as_ref() else { return Ok(false); };
+        let Some(proof) = RoventTeacherRouteRetirementV3::try_prepare(
+            Arc::clone(&self.ledger), route.clone(), Arc::clone(pump),
+        )? else { return Ok(false); };
+        match self.registration.try_unlink_finished_speculative_root_v3(route, &proof)? {
+            Some(true) => { slot.route_retirement = Some(proof); Ok(true) }
+            Some(false) | None => Ok(false),
+        }
+    }
+}
+
+/// Retains all original root proof owners after the native owner seals the
+/// same installed hook. This is not a model/teacher/collection success claim.
+struct PcV3LaunchClosure {
+    _bridge: Arc<RoventPcCollectionBridgeV3>,
+    _native_owner: Arc<RoventPcCollectionLaunchOwnerV3>,
 }
 
 fn pc_state<'a>(state: &'a Mutex<PcBridgeStateV3>)
@@ -522,9 +640,9 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
                     PcQuotaOutcomeV3::Busy | PcQuotaOutcomeV3::Exhausted => return Ok(RoventPcCollectionAdmissionOutcomeV3::Pending { admission }),
                     _ => return Err(failure(AdaptiveManagerError::Invalid("P-C V3 duplicate root reservation"), admission)),
                 }
-                state.roots.push(PcRootSlotV3 { admission: admission.clone(), requested: false, installed: false,
-                    owner: None, route: None, stage: None, pump: None, observer: None, worker: None,
-                    handoff: None, joined: None, returned: None, join_failure: None, join_panic: None });
+                state.roots.push(PcRootSlotV3 { admission: admission.clone(), requested: false, installed: false, recovery: None,
+                    owner: None, route: None, route_retirement: None, stage: None, pump: None, observer: None, worker: None,
+                    handoff: None, joined: None, custody_taken: false, returned: None, join_failure: None, join_panic: None });
                 state.roots.len() - 1
             }
         };
@@ -602,7 +720,9 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
         }
         if slot.handoff.is_none() { slot.handoff = Some(Arc::clone(handoff)); }
         if slot.join_failure.is_some() || slot.join_panic.is_some() { return Err(AdaptiveManagerError::Invalid("P-C V3 worker join unresolved")); }
-        Ok(slot.joined.take())
+        let custody = slot.joined.take();
+        if custody.is_some() { slot.custody_taken = true; }
+        Ok(custody)
     }
 
     fn return_root_custody(&self, custody: Arc<Mutex<RoventPcCollectionRootCustodyV3>>) -> Result<RoventPcCustodyReturnV3, AdaptiveManagerError> {
@@ -618,5 +738,36 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
             Some(_) => Err(AdaptiveManagerError::Invalid("P-C V3 returned custody changed")),
             None => { slot.returned = Some(custody); Ok(RoventPcCustodyReturnV3::Accepted) }
         }
+    }
+
+    fn try_finish_launch(&self, fence: &rz_uci::rovent_bootstrap::RoventPcCollectionNativeFenceV3)
+        -> Result<Option<Box<dyn std::any::Any + Send>>, AdaptiveManagerError> {
+        let Some(bridge) = self.self_weak.upgrade() else {
+            return Err(AdaptiveManagerError::Invalid("P-C V3 original bridge absent"));
+        };
+        let hooks: Arc<dyn RoventPcCollectionHooksV3> = bridge.clone();
+        let Some(owner) = self.native_owner.get().and_then(Weak::upgrade) else {
+            return Err(AdaptiveManagerError::Invalid("P-C V3 native owner absent"));
+        };
+        if !fence.matches_original_owner(&owner) || !fence.matches_original_hooks(&hooks) {
+            return Err(AdaptiveManagerError::Invalid("P-C V3 native fence belongs to another launch"));
+        }
+        let state = match pc_state(&self.state) {
+            Ok(state) => state,
+            Err(AdaptiveManagerError::AuxiliaryPending) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !state.deferred.is_empty() { return Ok(None); }
+        for slot in &state.roots {
+            let (Some(route), Some(proof), Some(_returned)) =
+                (&slot.route, &slot.route_retirement, &slot.returned) else { return Ok(None); };
+            match proof.matches_original_route(route) {
+                Ok(Some(true)) => {},
+                Ok(Some(false) | None) => return Ok(None),
+                Err(error) => return Err(AdaptiveManagerError::Semantic(error.to_string())),
+            }
+        }
+        drop(state);
+        Ok(Some(Box::new(PcV3LaunchClosure { _bridge: bridge, _native_owner: owner })))
     }
 }
