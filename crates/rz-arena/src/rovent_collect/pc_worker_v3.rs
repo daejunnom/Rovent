@@ -583,6 +583,43 @@ impl PcSupervisorJoinedProofV3 {
         self.panicked
     }
 
+    /// Nonblocking retirement of only this joined driver's registry owner.
+    /// Both proofs remain borrowed on contention and errors.
+    pub(crate) fn try_release_after_settlement(
+        &self,
+        permit: &rz_uci::rovent_bootstrap::launch::RoventPcCollectionSettlementPermitV3,
+    ) -> Result<PcDriverPollV3<bool>, PcDriverEvidenceErrorV3> {
+        if !permit.matches_original_owner(&self.native) {
+            return Err(PcDriverEvidenceErrorV3::Invalid(
+                "P-C supervisor settlement belongs to another native owner",
+            ));
+        }
+        let mut registry = driver_evidence_lock!(supervisor_registry_v3(), "registry");
+        let Some(index) = registry
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.custody, &self.custody))
+        else {
+            return Ok(PcDriverPollV3::Ready(false));
+        };
+        let custody = driver_evidence_lock!(self.custody, "custody");
+        if !Arc::ptr_eq(&custody.supervisor, &self.supervisor)
+            || custody.state != SupervisorThreadStateV3::Joined
+            || custody.thread.is_some()
+            || !custody
+                .native
+                .as_ref()
+                .is_some_and(|native| permit.matches_original_owner(native))
+        {
+            return Ok(PcDriverPollV3::Ready(false));
+        }
+        let mut supervisor = driver_evidence_lock!(custody.supervisor, "supervisor");
+        supervisor.driver_sealed = true;
+        drop(supervisor);
+        drop(custody);
+        registry.swap_remove(index);
+        Ok(PcDriverPollV3::Ready(true))
+    }
+
     /// Keep both original proofs with the caller on pending or failure.
     /// This retires only the supervisor registry owner, not the observer,
     /// output, GPU work, or the collection's semantic result.
