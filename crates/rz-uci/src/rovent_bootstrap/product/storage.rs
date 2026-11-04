@@ -860,6 +860,8 @@ macro_rules! implement_staged_v3_storage_attachment {
 }
 implement_staged_v3_storage_attachment!(RoventNativeProductDriverV3);
 implement_staged_v3_storage_attachment!(RoventOwnNnuecProductDriverV3);
+#[cfg(target_os = "linux")]
+implement_staged_v3_storage_attachment!(super::RoventOwnBoardProductDriverV3);
 
 #[cfg(test)]
 mod tests {

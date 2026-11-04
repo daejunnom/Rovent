@@ -189,6 +189,7 @@ impl RoventOwnBoardAssemblyV3 {
             process: Arc::clone(&self.process),
             physically_closed: Arc::new(AtomicBool::new(false)),
             process_clock: clock,
+            storage_registration: std::sync::Mutex::new(None),
         });
         self.product = Some(Arc::clone(&product));
         Ok(product)
@@ -198,11 +199,12 @@ impl RoventOwnBoardAssemblyV3 {
 /// Actual own CPU and native owners stay together until the same session
 /// reports physical completion.  This is not a device-wide GPU fence.
 pub(crate) struct RoventOwnBoardProductDriverV3 {
-    inner: Arc<PcrDriver>,
-    sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
-    process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
-    physically_closed: Arc<AtomicBool>,
-    process_clock: ProcessClock,
+    pub(super) inner: Arc<PcrDriver>,
+    pub(super) sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
+    pub(super) process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+    pub(super) physically_closed: Arc<AtomicBool>,
+    pub(super) process_clock: ProcessClock,
+    pub(super) storage_registration: std::sync::Mutex<Option<storage::RetainedStorageRegistration>>,
 }
 
 impl RoventOwnBoardProductDriverV3 {

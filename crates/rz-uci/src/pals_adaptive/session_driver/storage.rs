@@ -5,6 +5,7 @@
 use super::*;
 use crate::rovent_bootstrap::launch::storage::{
     RoventStorageOwnedRuntimeRegistration, RoventStorageOwnedRuntimeRegistrationV2,
+    RoventStoragePreparedTransferV3,
 };
 use crate::rovent_bootstrap::product::SharedRoventStorageRegistration;
 use crate::rovent_bootstrap::storage_lifecycle::{SessionStorageLifecycle, StorageSemanticOwner};
@@ -33,11 +34,15 @@ pub(super) fn original_storage_admission(
 enum OriginalStorageAdmission {
     V1(Arc<crate::rovent_root_admission::RoventRootAdmission>),
     V2(Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV2>),
+    V3(Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV3>),
 }
 
 fn original_storage_admission_versioned(
     admission: Option<&RoventPcrRootAdmission>,
 ) -> Result<OriginalStorageAdmission, SearchSessionFailure> {
+    if let Some(original) = admission.and_then(|value| value.original_v3.as_ref()) {
+        return Ok(OriginalStorageAdmission::V3(Arc::clone(original)));
+    }
     if let Some(original) = admission.and_then(|value| value.original_v2.as_ref()) {
         return Ok(OriginalStorageAdmission::V2(Arc::clone(original)));
     }
@@ -365,6 +370,126 @@ where
         Ok(shared)
     }
 
+    /// Install into the exact idle V3 session while the original transfer slot
+    /// remains pinned by its launcher scope. All allocation and validation
+    /// precede the move-only transfer commit.
+    pub(crate) fn install_prepared_storage_registration_v3(
+        &self,
+        shared: Arc<SharedRoventStorageRegistration>,
+        prepared: RoventStoragePreparedTransferV3,
+    ) -> Result<(), SearchSessionFailure> {
+        let unknown = |detail: &'static str| {
+            failure("RoventEngineStorageInstallV3", detail).unknown_if_unclosed()
+        };
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|_| unknown("session busy or poisoned"))?;
+        let mut slot = self
+            .storage
+            .try_lock()
+            .map_err(|_| unknown("storage busy or poisoned"))?;
+        let policy = self
+            .rovent_root_policy_v3
+            .as_ref()
+            .ok_or_else(|| unknown("V3 root policy absent"))?;
+        let lock = policy
+            .owner
+            .v3()
+            .ok_or_else(|| unknown("original V3 lock absent"))?;
+        let valid_idle = matches!(&*state, SessionState::Idle(owners)
+            if unused_engine_storage_owner(owners)
+                && owners.native.ready_clock().is_some_and(|clock|
+                    clock.domain() == self.clock.domain()
+                        && clock.origin() == self.clock.runtime_clock().origin()));
+        let clock = self.clock.runtime_clock();
+        let expected = prepared.clock().runtime_clock();
+        let own_board = self.rovent.as_ref().is_some_and(|profile| {
+            profile.common().mode.has_native_r()
+                && matches!(
+                    lock.manifest.engine.researcher,
+                    Some(rz_experiments::RoventResearcher::Own { .. })
+                )
+                && lock.manifest.engine.nnuec.is_none()
+        });
+        let no_prior_go = self
+            .latest_root
+            .try_lock()
+            .map_err(|_| unknown("root busy"))?
+            .is_none()
+            && self
+                .latest_rovent_root
+                .try_lock()
+                .map_err(|_| unknown("root busy"))?
+                .is_none()
+            && self
+                .latest_rovent_root_v2
+                .try_lock()
+                .map_err(|_| unknown("V2 root busy"))?
+                .is_none()
+            && self
+                .latest_rovent_root_v3
+                .try_lock()
+                .map_err(|_| unknown("V3 root busy"))?
+                .is_none()
+            && self
+                .latest_rovent_initial
+                .try_lock()
+                .map_err(|_| unknown("initial busy"))?
+                .is_none()
+            && self
+                .latest_rovent_initial_v2
+                .try_lock()
+                .map_err(|_| unknown("V2 initial busy"))?
+                .is_none()
+            && self
+                .latest_rovent_initial_v3
+                .try_lock()
+                .map_err(|_| unknown("V3 initial busy"))?
+                .is_none()
+            && self
+                .pending_output
+                .try_lock()
+                .map_err(|_| unknown("output busy"))?
+                .is_none();
+        if !own_board
+            || !matches!(self.researcher_class, SessionResearcherClass::Legacy)
+            || !matches!(self.registration.identity, CheckerIdentity::Owned(_))
+            || slot.is_some()
+            || self.closed.load(Ordering::Acquire)
+            || self.reset_requests.load(Ordering::Acquire) != 0
+            || !valid_idle
+            || !no_prior_go
+            || !Arc::ptr_eq(lock, prepared.input_lock())
+            || self.clock.epoch() != prepared.clock().epoch()
+            || clock.domain() != expected.domain()
+            || clock.origin() != expected.origin()
+            || self.options.implementation != prepared.implementation()
+        {
+            return Err(unknown(
+                "V3 storage requires the same unused original Own session",
+            ));
+        }
+        prepared
+            .profile()
+            .validate_for_manifest_v3(&lock.manifest)
+            .map_err(|error| {
+                SearchSessionFailure::debug("RoventEngineStorageResourcesV3", &error)
+                    .unknown_if_unclosed()
+            })?;
+        let lifecycle = SessionStorageLifecycle::new(shared);
+        prepared.commit().map_err(|error| {
+            SearchSessionFailure::debug("RoventEngineStorageTransferV3", &error)
+                .unknown_if_unclosed()
+        })?;
+        *slot = Some(EngineStorageSlot {
+            lifecycle,
+            last_authority: None,
+            caller_panic: None,
+        });
+        Ok(())
+    }
+
     /// The source has passed into_initial before this method is reached. A
     /// stopped-initial source never resets a CPU or takes the Engine Box.
     pub(super) fn prepare_engine_storage(
@@ -422,6 +547,9 @@ where
             OriginalStorageAdmission::V2(original) => storage
                 .lifecycle
                 .prepare_v2(owner, original, reset, position, &signal),
+            OriginalStorageAdmission::V3(original) => storage
+                .lifecycle
+                .prepare_v3(owner, original, reset, position, &signal),
         };
         match prepared {
             Ok(StorageSemanticOwner::EnginePcr(engine)) => {
