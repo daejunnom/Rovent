@@ -225,6 +225,23 @@ pub(super) enum LockV3RegistrationAttempt {
     Busy(RoventInputCaptureReservationV3),
     Failed(ArenaError, RoventInputCaptureReservationV3),
 }
+/// Issued only after the original registration owner has atomically removed
+/// this exact unstarted route. It grants no physical completion authority.
+#[cfg(target_os = "linux")]
+pub(crate) struct RoventUnstartedRouteRollbackV3 {
+    original: SpeculativeRootV3,
+}
+#[cfg(target_os = "linux")]
+impl RoventUnstartedRouteRollbackV3 {
+    pub(crate) fn matches_original_route(&self, route: &SpeculativeRootV3) -> bool {
+        self.original.same_original_route(route) && !route.route.installed.load(Ordering::Acquire)
+    }
+}
+#[cfg(target_os = "linux")]
+pub(crate) enum RoventRouteRollbackV3 {
+    RolledBack(RoventUnstartedRouteRollbackV3),
+    NotUnstarted,
+}
 /// The /3 native callback transfers this exact capture with its original
 /// admission. It is input evidence only, not physical completion or a row.
 #[cfg(target_os = "linux")]
@@ -425,7 +442,7 @@ impl RoventNativeCaptureRegistration {
     ) -> Result<
         Option<(
             SpeculativeRootV3,
-            mpsc::Receiver<super::producer_v3::SubmittedTeacherQueryV3>,
+            mpsc::Receiver<Arc<super::producer_v3::SubmittedTeacherQueryV3>>,
         )>,
         ArenaError,
     > {
@@ -473,7 +490,7 @@ impl RoventNativeCaptureRegistration {
     pub(crate) fn try_rollback_unstarted_speculative_root_v3(
         &self,
         root: &SpeculativeRootV3,
-    ) -> Result<Option<bool>, ArenaError> {
+    ) -> Result<Option<RoventRouteRollbackV3>, ArenaError> {
         let registered = match self.registered.try_lock() {
             Ok(value) => value,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
@@ -492,22 +509,26 @@ impl RoventNativeCaptureRegistration {
             || root.unattributed_count() != 0
             || registered.values().any(|entry| matches!(entry,
                 RegisteredInputCapture::LockV3 { admission, .. } if root.matches_admission(admission))) {
-            return Ok(Some(false));
+            return Ok(Some(RoventRouteRollbackV3::NotUnstarted));
         }
         match root.try_has_registered_tickets()? {
             None => return Ok(None),
-            Some(true) => return Ok(Some(false)),
+            Some(true) => return Ok(Some(RoventRouteRollbackV3::NotUnstarted)),
             Some(false) => {}
         }
         let Some(index) = roots
             .iter()
             .position(|entry| entry.same_original_route(root))
         else {
-            return Ok(Some(false));
+            return Ok(Some(RoventRouteRollbackV3::NotUnstarted));
         };
         root.route.installed.store(false, Ordering::Release);
         roots.remove(index);
-        Ok(Some(true))
+        Ok(Some(RoventRouteRollbackV3::RolledBack(
+            RoventUnstartedRouteRollbackV3 {
+                original: root.clone(),
+            },
+        )))
     }
     pub(super) fn same_original_owner(&self, other: &Self) -> bool {
         let same = Arc::ptr_eq(&self.registered, &other.registered)
@@ -1651,7 +1672,7 @@ impl RoventNativeInputObserver {
                             } else if let Some(result) = query {
                                 match result {
                                     Ok(query) => {
-                                        let _ = route.try_send(&ticket, query);
+                                        let _ = route.try_send(&ticket, Arc::new(query));
                                     }
                                     Err(error) => ticket.preparation_failed(error),
                                 }
