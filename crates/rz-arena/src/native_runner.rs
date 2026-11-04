@@ -717,6 +717,150 @@ struct NativeRunBundle<S: NativeProviderDeclaration> {
     v6_supervisor: Option<NativeV6Supervisor>,
 }
 
+/// NoGame preparation reuses the original bundle's existing quarantine on
+/// drop. It deliberately has no execution entrypoint or paired receipt.
+#[cfg(target_os = "linux")]
+pub(crate) struct PreparedNoGameSmokeOwner {
+    bundle: NativeRunBundle<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>,
+    proxy: Option<Arc<std::fs::File>>,
+    arguments: Vec<std::ffi::OsString>,
+    rejected_control: Option<Box<dyn NativeV6Control>>,
+}
+
+/// Failure returns the same preparation owner; a future spawn must never be
+/// hidden behind this declaration-only error path.
+#[cfg(target_os = "linux")]
+pub(crate) struct NoGameSmokePreparationFailure {
+    pub(crate) error: ArenaError,
+    pub(crate) original: PreparedNoGameSmokeOwner,
+}
+
+#[cfg(target_os = "linux")]
+struct NoGameRetainedControl {
+    execution: Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>,
+    sockets: Arc<crate::pals_adaptive_launch::PalsV6RoleSockets>,
+    control: Arc<Mutex<crate::pals_adaptive_launch::SmokeDeadlineControl>>,
+}
+
+#[cfg(target_os = "linux")]
+impl NativeV6Control for NoGameRetainedControl {
+    fn original_execution(
+        &self,
+    ) -> Option<&Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>> {
+        Some(&self.execution)
+    }
+
+    fn original_role_sockets(
+        &self,
+    ) -> Option<&Arc<crate::pals_adaptive_launch::PalsV6RoleSockets>> {
+        Some(&self.sockets)
+    }
+
+    fn poll_run(
+        &mut self,
+        _custody: &crate::process::SpawnCustody,
+        _until: std::time::Instant,
+    ) -> Result<(), ArenaError> {
+        let _retained = &self.control;
+        Err(ArenaError::Invalid(
+            "NoGame smoke execution is not connected".into(),
+        ))
+    }
+
+    fn poll_cleanup(
+        &mut self,
+        _custody: &crate::process::SpawnCustody,
+        _until: std::time::Instant,
+    ) -> Result<(), ArenaError> {
+        let _retained = &self.control;
+        Err(ArenaError::Invalid(
+            "NoGame smoke execution is not connected".into(),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PreparedNoGameSmokeOwner {
+    /// Prepare without spawning. The exact owner, live control and any later
+    /// unresolved custody/output use NativeRunBundle's existing retention path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn assemble(
+        owner: NativeLaunchOwner<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>,
+        smoke: &Arc<Mutex<crate::pals_adaptive_launch::ProxyEntryFunctionalSmokeOwnerV1>>,
+        execution: &Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>,
+        sockets: &Arc<crate::pals_adaptive_launch::PalsV6RoleSockets>,
+        role: rz_experiments::NativeEngineRole,
+        owner_id: [u8; 16],
+        owner_epoch: u64,
+        request_ids: [u64; 2],
+    ) -> Result<Self, Box<NoGameSmokePreparationFailure>> {
+        let mut original = Self {
+            bundle: NativeRunBundle {
+                owner: Some(owner),
+                process: None,
+                receipt: None,
+                receipt_artifact: None,
+                original_error: None,
+                guarded_preflight_failures: Vec::new(),
+                probe_evidence: None,
+                spawn_custody: crate::process::SpawnCustody::default(),
+                physical_guard_required: true,
+                v6_supervisor: None,
+            },
+            proxy: None,
+            arguments: Vec::new(),
+            rejected_control: None,
+        };
+        let prepared = {
+            let source = original
+                .bundle
+                .owner
+                .as_ref()
+                .expect("fresh original owner");
+            crate::pals_adaptive_launch::DirectSmokeBinding::bind(
+                source,
+                smoke,
+                execution,
+                sockets,
+                &mut original.bundle.spawn_custody,
+                role,
+                owner_id,
+                owner_epoch,
+                request_ids,
+            )
+            .map(|binding| {
+                (
+                    Arc::clone(binding.proxy()),
+                    Arc::clone(binding.control()),
+                    binding.common_arguments().to_vec(),
+                )
+            })
+        };
+        let (proxy, control, arguments) = match prepared {
+            Ok(value) => value,
+            Err(error) => return Err(Box::new(NoGameSmokePreparationFailure { error, original })),
+        };
+        original.proxy = Some(proxy);
+        original.arguments = arguments;
+        let control: Box<dyn NativeV6Control> = Box::new(NoGameRetainedControl {
+            execution: Arc::clone(execution),
+            sockets: Arc::clone(sockets),
+            control,
+        });
+        match NativeV6Supervisor::new(execution, control) {
+            Ok(supervisor) => original.bundle.v6_supervisor = Some(supervisor),
+            Err(rejection) => {
+                original.rejected_control = Some(rejection.control);
+                return Err(Box::new(NoGameSmokePreparationFailure {
+                    error: rejection.error,
+                    original,
+                }));
+            }
+        }
+        Ok(original)
+    }
+}
+
 /// Original probe output retained after a storage failure.  Taking this value
 /// transfers evidence custody to the caller; it is not a GPU reservation.
 pub struct GuardedPreflightEvidence {
