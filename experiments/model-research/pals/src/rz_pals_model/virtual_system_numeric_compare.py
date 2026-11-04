@@ -141,7 +141,163 @@ def _validate_run(run, group, bindings, producer):
         raise ValueError("numerical producer/provider/physical completion differs")
 
 
-def compare(plan_path, plan_sha256, reference_dir, native_dir):
+def _digest_array(value, name):
+    """Decode Rust's [u8; 32] JSON without accepting bools as bytes."""
+    if (type(value) is not list or len(value) != 32
+            or any(type(item) is not int or not 0 <= item <= 255 for item in value)):
+        raise ValueError("invalid SHA-256 bytes: " + name)
+    return bytes(value).hex()
+
+
+def _control_inventory(inventory, bindings):
+    """Compare static inventory declarations with the selected model plan."""
+    if (type(inventory) is not dict
+            or inventory.get("schema") != "rovezero.pals-virtual-static-control-inventory.v1"
+            or inventory.get("actual_provider_placement") != "not_observed"
+            or inventory.get("cpu_allowlist") != "not_created"
+            or inventory.get("artifact_kind") != "fresh"
+            or inventory.get("manifest_sha256") != bindings.get("export_manifest_sha256")):
+        raise ValueError("control inventory does not describe the plan's model")
+    expected_graphs = bindings.get("graphs")
+    graph_entries = inventory.get("graphs")
+    if type(expected_graphs) is not dict or type(graph_entries) is not list:
+        raise ValueError("control graph roster missing")
+    inventory_graphs = {}
+    for graph in graph_entries:
+        if type(graph) is not dict or type(graph.get("role")) is not str or graph["role"] in inventory_graphs:
+            raise ValueError("invalid or duplicate control inventory graph")
+        inventory_graphs[graph["role"]] = graph.get("sha256")
+    if inventory_graphs != expected_graphs:
+        raise ValueError("control inventory graph identities differ from the plan")
+    return expected_graphs
+
+
+def _control_witness(witness, inventory, bindings, inventory_sha256):
+    """Cross-check a producer's witness; do not manufacture fresh GPU evidence.
+
+    The Rust producer is responsible for validating actual named placements and
+    profile events. This reader checks the separately retained declarations,
+    identities and coherent counts; it does not replay ORT's placement gate.
+    """
+    if (type(witness) is not dict or type(inventory) is not dict
+            or witness.get("schema") != "rovezero.pals-virtual-system-cuda-placement.v1"
+            or witness.get("layout") != inventory.get("layout")
+            or witness.get("artifact_kind") != "fresh"
+            or inventory.get("artifact_kind") != "fresh"
+            or witness.get("optimization") != "disable"
+            or witness.get("physical_completion") != "not_inferred"
+            or type(witness.get("declared_device_id")) is not int
+            or witness["declared_device_id"] < 0):
+        raise ValueError("invalid system CUDA placement witness scope")
+    if (_digest_array(witness.get("inventory_sha256"), "inventory") != inventory_sha256
+            or _digest_array(witness.get("manifest_sha256"), "manifest") != bindings.get("export_manifest_sha256")
+            or _digest_array(witness.get("ort_sha256"), "ORT") != bindings.get("runtime_library_sha256")):
+        raise ValueError("control witness inventory, model or ORT identity differs")
+    runtime_identity = _digest_array(witness.get("system_runtime_identity_sha256"), "system runtime")
+    expected_graphs = _control_inventory(inventory, bindings)
+    placements = witness.get("initialization")
+    kernels = witness.get("kernels")
+    if type(placements) is not list or type(kernels) is not dict or set(kernels) != set(expected_graphs):
+        raise ValueError("control witness graph coverage differs")
+    seen = set()
+    for placement in placements:
+        if type(placement) is not dict or type(placement.get("role")) is not str:
+            raise ValueError("invalid graph placement")
+        role = placement["role"]
+        counts = [placement.get(key) for key in ("assigned_nodes", "cuda_nodes", "approved_cpu_control_nodes")]
+        if (role in seen or role not in expected_graphs
+                or _digest_array(placement.get("graph_sha256"), "graph") != expected_graphs[role]
+                or placement.get("optimization") != "disable"
+                or any(type(value) is not int or value < 0 for value in counts)
+                or counts[0] == 0 or counts[1] == 0 or counts[0] != counts[1] + counts[2]
+                or type(placement.get("approved_transfers")) is not list):
+            raise ValueError("control witness placement identity or counts differ")
+        _digest_array(placement.get("log_sha256"), "placement log")
+        seen.add(role)
+    if seen != set(expected_graphs):
+        raise ValueError("control witness does not cover every graph")
+    for role, value in kernels.items():
+        if (type(value) is not dict or type(value.get("cuda_kernels")) is not int
+                or value["cuda_kernels"] <= 0 or type(value.get("neural_kernels")) is not int
+                or value["neural_kernels"] <= 0):
+            raise ValueError("control witness lacks CUDA neural kernel observations")
+        _digest_array(value.get("profile_sha256"), "kernel profile")
+    if "shared_pc" in kernels:
+        pc = kernels["shared_pc"]
+        if any(type(pc.get(key)) is not int or pc[key] <= 0
+               for key in ("proposer_private_kernels", "critic_private_kernels")):
+            raise ValueError("control witness lacks one of the P/C private branches")
+    libraries = bindings.get("system_cuda_libraries")
+    mapped, missing = witness.get("mapped_roles"), witness.get("missing_optional_roles")
+    if (type(libraries) is not list or type(mapped) is not list or type(missing) is not list
+            or any(type(role) is not str for role in mapped + missing)):
+        raise ValueError("system library observation roster missing")
+    registered = {item["role"]: item["required_mapping"] for item in libraries}
+    if (len(mapped) != len(set(mapped)) or len(missing) != len(set(missing))
+            or set(mapped) & set(missing) or set(mapped) | set(missing) != set(registered)
+            or any(required and role not in mapped for role, required in registered.items())
+            or any(registered[role] for role in missing)):
+        raise ValueError("system library observation does not match the registered roster")
+    return {"inventory_sha256": inventory_sha256,
+            "manifest_sha256": bindings["export_manifest_sha256"],
+            "ort_sha256": bindings["runtime_library_sha256"],
+            "system_runtime_identity_sha256": runtime_identity,
+            "declared_device_id": witness["declared_device_id"],
+            "graph_roles": sorted(seen), "mapped_roles": mapped,
+            "missing_optional_roles": missing,
+            "verification_scope": "producer_witness_fields_and_cross_artifact_identity_only",
+            "profiles_replayed": False, "current_mapping": "not_attested",
+            "physical_completion": "not_attested", "process_exit": "not_attested"}
+
+
+def _control_evidence(plan_sha256, bindings, inventory_path, inventory_sha256,
+                      observation_path, observation_sha256, witness_path):
+    """Read optional capture evidence without making it a numerical prerequisite."""
+    for value in (inventory_sha256, observation_sha256):
+        if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError("registered control evidence SHA-256 required")
+    seen = set()
+    inventory, actual_inventory = _load(inventory_path, seen, [0])
+    observation, actual_observation = _load(observation_path, seen, [0])
+    if actual_inventory != inventory_sha256 or actual_observation != observation_sha256:
+        raise ValueError("control evidence bytes differ from registered SHA-256")
+    _control_inventory(inventory, bindings)
+    if (type(observation) is not dict
+            or observation.get("schema") != "rovezero.virtual-system-cuda-placement-observation.v1"
+            or observation.get("plan_sha256") != plan_sha256
+            or observation.get("inventory_sha256") != inventory_sha256
+            or observation.get("manifest_sha256") != bindings.get("export_manifest_sha256")):
+        raise ValueError("control observation does not describe this plan and inventory")
+    status = observation.get("final_status")
+    if status not in ("verified", "mapping_unavailable", "unregistered_or_preexisting_mappings"):
+        raise ValueError("unrecognized system placement observation status")
+    result = {"observation_sha256": actual_observation, "inventory_sha256": actual_inventory,
+              "producer_status": status,
+              "reader_verification": "cross_artifact_fields_only" if status == "verified" else "not_available",
+              "profile_scope": observation.get("profile_scope"),
+              "first_registered_role_coverage_status": observation.get("first_registered_role_coverage_status"),
+              "inventory_producer_source_sha256": inventory.get("producer_source_sha256"),
+              "inventory_producer_provenance": "not_independently_attested",
+              "same_numeric_run": "not_attested",
+              "physical_completion": "not_attested", "process_exit": "not_attested",
+              "current_mapping": "not_attested"}
+    if status == "verified":
+        if witness_path is None:
+            raise ValueError("verified control observation requires its original witness")
+        witness, actual_witness = _load(witness_path, seen, [0])
+        if observation.get("witness_sha256") != actual_witness:
+            raise ValueError("actual placement witness differs from capture observation")
+        result.update(_control_witness(witness, inventory, bindings, actual_inventory))
+        result["witness_sha256"] = actual_witness
+    elif witness_path is not None or observation.get("witness_sha256") is not None:
+        raise ValueError("unavailable mapping cannot issue a verified placement witness")
+    return result
+
+
+def compare(plan_path, plan_sha256, reference_dir, native_dir, *,
+            control_inventory=None, control_inventory_sha256=None,
+            placement_observation=None, placement_observation_sha256=None,
+            placement_witness=None):
     if type(plan_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", plan_sha256) is None:
         raise ValueError("registered plan SHA-256 required")
     seen, plan_total = set(), [0]
@@ -208,7 +364,7 @@ def compare(plan_path, plan_sha256, reference_dir, native_dir):
             case_count += 1
     if case_count != expected_cases:
         raise ValueError("numerical plan was not fully compared")
-    return {"domain": REPORT_DOMAIN, "status": "passed", "plan_sha256": actual_plan_sha,
+    result = {"domain": REPORT_DOMAIN, "status": "passed", "plan_sha256": actual_plan_sha,
             "comparison": "fixed_input_fresh_b1_cpu_torch_vs_system_cuda_raw",
             "coverage_scope": "declared_plan_only",
             "observed_role_buckets": sorted({(group["role"], group["line_bucket"]) for group in plan["groups"]}),
@@ -221,6 +377,27 @@ def compare(plan_path, plan_sha256, reference_dir, native_dir):
             "v5_numerical_acceptance": False,
             "native_completion_scope": "producer_reported_per_request_not_independent_process_or_device_fence",
             "rules_legality": "not_attested", "performance": "not_measured", "strength": "not_measured"}
+    control_args = (control_inventory, control_inventory_sha256,
+                    placement_observation, placement_observation_sha256)
+    if any(value is not None for value in control_args) or placement_witness is not None:
+        try:
+            if any(value is None for value in control_args):
+                raise ValueError("explicit control inventory and placement observation pins required")
+            result["control_evidence"] = _control_evidence(
+                actual_plan_sha, bindings, control_inventory, control_inventory_sha256,
+                placement_observation, placement_observation_sha256, placement_witness)
+            result["control_evidence_status"] = "observed"
+        except Exception as error:
+            # A separate malformed or unavailable placement artifact must not
+            # erase the independently completed numerical comparison. The CLI
+            # reports this partial outcome with its own nonzero exit code.
+            result["control_evidence_status"] = "failed"
+            result["control_evidence"] = {"error_type": type(error).__name__,
+                                          "error": str(error)[:2048],
+                                          "current_mapping": "not_attested",
+                                          "physical_completion": "not_attested",
+                                          "process_exit": "not_attested"}
+    return result
 
 
 def main():
@@ -230,13 +407,26 @@ def main():
     parser.add_argument("--reference-dir", required=True, type=Path)
     parser.add_argument("--native-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--control-inventory", type=Path)
+    parser.add_argument("--control-inventory-sha256")
+    parser.add_argument("--placement-observation", type=Path)
+    parser.add_argument("--placement-observation-sha256")
+    parser.add_argument("--placement-witness", type=Path)
     args = parser.parse_args()
     if not args.output.is_absolute():
         raise ValueError("absolute comparison output path required")
-    result = compare(args.plan, args.plan_sha256, args.reference_dir, args.native_dir)
+    result = compare(args.plan, args.plan_sha256, args.reference_dir, args.native_dir,
+                     control_inventory=args.control_inventory,
+                     control_inventory_sha256=args.control_inventory_sha256,
+                     placement_observation=args.placement_observation,
+                     placement_observation_sha256=args.placement_observation_sha256,
+                     placement_witness=args.placement_witness)
     item = nc._publish(result, args.output, 0)
-    print(json.dumps({"domain": REPORT_DOMAIN, "status": "written", "sha256": item["sha256"], "bytes": item["bytes"]}))
+    print(json.dumps({"domain": REPORT_DOMAIN, "status": "written", "sha256": item["sha256"],
+                      "bytes": item["bytes"], "numerical_status": result["status"],
+                      "control_evidence_status": result.get("control_evidence_status", "not_requested")}))
+    return 2 if result.get("control_evidence_status") == "failed" else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

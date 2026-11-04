@@ -56,7 +56,7 @@ class SystemComparisonTests(unittest.TestCase):
         return [{"name": "scalar", "dtype": "f32_le", "shape": [1],
                  "bytes": list(struct.pack("<f", payload["scalar"]))}]
 
-    def execute(self):
+    def execute(self, **kwargs):
         plan_bytes = json.dumps(self.plan).encode("utf-8")
         plan_path = self.root / "plan.json"
         plan_path.write_bytes(plan_bytes)
@@ -70,7 +70,7 @@ class SystemComparisonTests(unittest.TestCase):
               mock.patch.object(nc, "python_input", side_effect=lambda value: value),
               mock.patch.object(nc, "captured_tensors", side_effect=self.tensor_for)):
             return comparator.compare(plan_path, hashlib.sha256(plan_bytes).hexdigest(),
-                                      self.ref_dir, self.native_dir)
+                                      self.ref_dir, self.native_dir, **kwargs)
 
     def test_success_reports_declared_plan_and_no_gpu_acceptance(self):
         result = self.execute()
@@ -102,6 +102,129 @@ class SystemComparisonTests(unittest.TestCase):
             result = self.execute()
         self.assertEqual(result["cases"], 1)
         self.assertGreater(result["reference_bytes_read"] + result["native_bytes_read"], raw_size + 32)
+
+    def test_invalid_optional_control_preserves_numerical_result(self):
+        result = self.execute(control_inventory=self.root / "missing.json")
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["control_evidence_status"], "failed")
+        self.assertEqual(result["control_evidence"]["error_type"], "ValueError")
+        self.assertEqual(result["kernel_placement"], "unknown")
+
+    def test_cli_publishes_numerical_report_before_partial_exit(self):
+        output = self.root / "comparison.json"
+        partial = {"status": "passed", "control_evidence_status": "failed"}
+        argv = ["compare", "--plan", str(self.root / "plan.json"), "--plan-sha256", "ignored",
+                "--reference-dir", str(self.ref_dir), "--native-dir", str(self.native_dir),
+                "--output", str(output)]
+        with (mock.patch("sys.argv", argv), mock.patch.object(comparator, "compare", return_value=partial),
+              mock.patch.object(nc, "_publish", return_value={"sha256": "observed", "bytes": 7}) as publish,
+              mock.patch("builtins.print")):
+            self.assertEqual(comparator.main(), 2)
+        publish.assert_called_once_with(partial, output, 0)
+
+
+class OptionalSystemControlEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).absolute()
+        self.plan_sha = self.digest(b"plan")
+        self.manifest_sha = self.digest(b"manifest")
+        self.ort_sha = self.digest(b"ort")
+        self.graphs = {"public": self.digest(b"public"), "shared_pc": self.digest(b"shared")}
+        self.bindings = {"export_manifest_sha256": self.manifest_sha,
+                         "runtime_library_sha256": self.ort_sha, "graphs": self.graphs,
+                         "system_cuda_libraries": [{"role": "ort-core", "required_mapping": True},
+                                                   {"role": "optional", "required_mapping": False}]}
+        self.inventory = {"schema": "rovezero.pals-virtual-static-control-inventory.v1",
+                          "actual_provider_placement": "not_observed", "cpu_allowlist": "not_created",
+                          "manifest_sha256": self.manifest_sha, "layout": "virtual_review_shared_pc_if_v1",
+                          "artifact_kind": "fresh",
+                          "graphs": [{"role": role, "sha256": digest} for role, digest in self.graphs.items()]}
+        placements = [{"role": role, "graph_sha256": list(bytes.fromhex(digest)),
+                       "log_sha256": self.digest_array(b"log"), "assigned_nodes": 2,
+                       "cuda_nodes": 1, "approved_cpu_control_nodes": 1,
+                       "optimization": "disable", "approved_transfers": []}
+                      for role, digest in self.graphs.items()]
+        kernels = {role: {"profile_sha256": self.digest_array(role.encode()), "cuda_kernels": 2,
+                          "neural_kernels": 1, "proposer_private_kernels": 1,
+                          "critic_private_kernels": 1} for role in self.graphs}
+        self.inventory_path, self.inventory_sha = self.write("inventory.json", self.inventory)
+        self.witness = {"schema": "rovezero.pals-virtual-system-cuda-placement.v1",
+                        "inventory_sha256": list(bytes.fromhex(self.inventory_sha)),
+                        "manifest_sha256": list(bytes.fromhex(self.manifest_sha)),
+                        "ort_sha256": list(bytes.fromhex(self.ort_sha)),
+                        "system_runtime_identity_sha256": self.digest_array(b"system"),
+                        "declared_device_id": 0, "mapped_roles": ["ort-core"],
+                        "missing_optional_roles": ["optional"], "layout": self.inventory["layout"],
+                        "artifact_kind": "fresh", "optimization": "disable", "initialization": placements,
+                        "kernels": kernels, "physical_completion": "not_inferred"}
+
+    @staticmethod
+    def digest(value):
+        return hashlib.sha256(value).hexdigest()
+
+    @staticmethod
+    def digest_array(value):
+        return list(hashlib.sha256(value).digest())
+
+    def write(self, name, value):
+        path = self.root / name
+        raw = json.dumps(value, sort_keys=True).encode("utf-8")
+        path.write_bytes(raw)
+        return path, self.digest(raw)
+
+    def read(self, status="verified", *, witness=None, observation_updates=None):
+        witness_path = None
+        witness_sha = None
+        if status == "verified":
+            witness_path, witness_sha = self.write("witness.json", self.witness if witness is None else witness)
+        observation = {"schema": "rovezero.virtual-system-cuda-placement-observation.v1",
+                       "plan_sha256": self.plan_sha, "inventory_sha256": self.inventory_sha,
+                       "manifest_sha256": self.manifest_sha, "final_status": status,
+                       "witness_sha256": witness_sha, "profile_scope": "registered_cases",
+                       "first_registered_role_coverage_status": "verified"}
+        if observation_updates:
+            observation.update(observation_updates)
+        path, sha = self.write("observation.json", observation)
+        return comparator._control_evidence(self.plan_sha, self.bindings, self.inventory_path,
+                                            self.inventory_sha, path, sha, witness_path)
+
+    def test_verified_evidence_is_only_a_cross_artifact_observation(self):
+        result = self.read()
+        self.assertEqual(result["producer_status"], "verified")
+        self.assertEqual(result["reader_verification"], "cross_artifact_fields_only")
+        self.assertEqual(result["graph_roles"], ["public", "shared_pc"])
+        self.assertFalse(result["profiles_replayed"])
+        self.assertEqual(result["physical_completion"], "not_attested")
+        self.assertEqual(result["process_exit"], "not_attested")
+        self.assertEqual(result["current_mapping"], "not_attested")
+        self.assertEqual(result["same_numeric_run"], "not_attested")
+
+    def test_unavailable_mapping_stays_unknown_without_a_witness(self):
+        result = self.read("mapping_unavailable")
+        self.assertEqual(result["producer_status"], "mapping_unavailable")
+        self.assertNotIn("witness_sha256", result)
+        self.assertEqual(result["current_mapping"], "not_attested")
+
+    def test_mismatched_plan_and_graph_are_rejected(self):
+        with self.assertRaises(ValueError):
+            self.read(observation_updates={"plan_sha256": self.digest(b"other")})
+        witness = copy.deepcopy(self.witness)
+        witness["initialization"][0]["graph_sha256"] = self.digest_array(b"other graph")
+        with self.assertRaises(ValueError):
+            self.read(witness=witness)
+
+    def test_required_mapping_and_private_branch_cannot_be_fabricated(self):
+        witness = copy.deepcopy(self.witness)
+        witness["mapped_roles"] = []
+        witness["missing_optional_roles"] = ["ort-core", "optional"]
+        with self.assertRaises(ValueError):
+            self.read(witness=witness)
+        witness = copy.deepcopy(self.witness)
+        witness["kernels"]["shared_pc"]["critic_private_kernels"] = 0
+        with self.assertRaises(ValueError):
+            self.read(witness=witness)
 
 
 if __name__ == "__main__":
