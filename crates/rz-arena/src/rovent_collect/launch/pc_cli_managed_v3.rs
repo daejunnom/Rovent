@@ -7,6 +7,20 @@ use std::collections::BTreeMap;
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
+#[derive(Debug)]
+pub(crate) enum ManagedDeadlineErrorV3 {
+    Namespace(super::managed_output_fd_v2::ManagedTimeNamespaceErrorV2),
+    OriginalPlanDiffers,
+    NamespaceOwnerDiffers,
+    Clock(ArenaError),
+}
+
+impl From<ArenaError> for ManagedDeadlineErrorV3 {
+    fn from(error: ArenaError) -> Self {
+        Self::Clock(error)
+    }
+}
+
 /// Raw proposed descriptors in the supervisor's /2 handoff order. They are
 /// not opened, duplicated, closed, or treated as ownership by this parser.
 pub(crate) struct ManagedCollectionCliV3 {
@@ -20,10 +34,26 @@ pub(crate) struct ManagedCollectionCliV3 {
 }
 
 impl ManagedCollectionCliV3 {
-    /// Preserve the parent's original same-namespace monotonic ceilings.
-    /// Sampling Instant first gives a conservative conversion rather than a
-    /// fresh relative window. The parent must still enforce both deadlines.
-    pub(crate) fn remaining_deadlines(&self) -> Result<(Instant, Instant), ArenaError> {
+    /// Observe the same authenticated parent's and current thread's time
+    /// namespace before interpreting its original monotonic ceilings. This
+    /// is a point-in-time observation, not proof against a later setns or of
+    /// where the parent originally created the supplied deadline. The caller
+    /// must pass an independent local bootstrap ceiling for this observation.
+    pub(crate) fn remaining_deadlines(
+        &self,
+        observation: &mut super::managed_output_fd_v2::ObservedManagedPlanLeaseV2,
+        local_bootstrap_until: Instant,
+    ) -> Result<(Instant, Instant), ManagedDeadlineErrorV3> {
+        let pin = &self.selection.plan_pin;
+        if !observation.matches_plan(&pin.path, pin.bytes, &pin.sha256) {
+            return Err(ManagedDeadlineErrorV3::OriginalPlanDiffers);
+        }
+        let namespace = observation
+            .observe_same_time_namespace(local_bootstrap_until)
+            .map_err(ManagedDeadlineErrorV3::Namespace)?;
+        if !namespace.matches_original(observation) {
+            return Err(ManagedDeadlineErrorV3::NamespaceOwnerDiffers);
+        }
         let entry = Instant::now();
         let now = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
             .map_err(|_| invalid("managed V3 monotonic clock unavailable"))?;
