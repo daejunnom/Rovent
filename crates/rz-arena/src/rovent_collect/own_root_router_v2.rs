@@ -699,50 +699,56 @@ impl RoventNnuecCollectionHooksV2 for RoventOwnRootRouterV2 {
                 }
                 previous
             };
-            match bridge.try_prepared_for_same_owner(previous) {
-                Ok(Some(true)) => {}
-                Ok(None) => {
-                    state.store(READY, Ordering::Release);
-                    reservation.settled = true;
-                    return Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending { admission });
-                }
-                Ok(Some(false)) => {
-                    // This router owns the reservation and has not called
-                    // bridge.admit; the native marker must still be installed
-                    // before independent NN execution can proceed.
-                    let outcome = self.defer_serialized(
-                        port,
-                        admission,
-                        AdaptiveCollectionError::new(
-                            AdaptiveCollectionStage::Dispatch,
-                            "OwnCollectionWorkerUnavailable",
-                            "the original root worker is unavailable before observer installation",
-                        ),
-                    );
-                    match &outcome {
-                        Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending { .. }) => {
-                            state.store(READY, Ordering::Release)
-                        }
-                        Ok(RoventNnuecCollectionAdmissionOutcomeV2::DeferredNoCapture {
-                            ..
-                        }) => state.store(DEFERRED, Ordering::Release),
-                        _ => state.store(FAILED, Ordering::Release),
+            // A previously sealed same-root attempt can only retry its
+            // no-capture marker. It no longer needs a running worker, and
+            // routing through the generic worker-unavailable branch would
+            // replace the retained original before-start reason.
+            if !bridge.before_start_seal_matches(&admission) {
+                match bridge.try_prepared_for_same_owner(previous) {
+                    Ok(Some(true)) => {}
+                    Ok(None) => {
+                        state.store(READY, Ordering::Release);
+                        reservation.settled = true;
+                        return Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending { admission });
                     }
-                    reservation.settled = true;
-                    return outcome;
-                }
-                Err(error) => {
-                    state.store(PREINSTALL_FAILED, Ordering::Release);
-                    reservation.settled = true;
-                    return Err(RoventNnuecCollectionAdmissionFailureV2 {
-                        error: AdaptiveManagerError::Collection(AdaptiveCollectionError::new(
-                            AdaptiveCollectionStage::Dispatch,
-                            "OwnPreparedOwner",
-                            error.to_string(),
-                        )),
-                        admission,
-                        owners: Box::new((Arc::clone(bridge), error)),
-                    });
+                    Ok(Some(false)) => {
+                        // This router owns the reservation and has not called
+                        // bridge.admit; the native marker must still be installed
+                        // before independent NN execution can proceed.
+                        let outcome = self.defer_serialized(
+                            port,
+                            admission,
+                            AdaptiveCollectionError::new(
+                                AdaptiveCollectionStage::Dispatch,
+                                "OwnCollectionWorkerUnavailable",
+                                "the original root worker is unavailable before observer installation",
+                            ),
+                        );
+                        match &outcome {
+                            Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending { .. }) => {
+                                state.store(READY, Ordering::Release)
+                            }
+                            Ok(RoventNnuecCollectionAdmissionOutcomeV2::DeferredNoCapture {
+                                ..
+                            }) => state.store(DEFERRED, Ordering::Release),
+                            _ => state.store(FAILED, Ordering::Release),
+                        }
+                        reservation.settled = true;
+                        return outcome;
+                    }
+                    Err(error) => {
+                        state.store(PREINSTALL_FAILED, Ordering::Release);
+                        reservation.settled = true;
+                        return Err(RoventNnuecCollectionAdmissionFailureV2 {
+                            error: AdaptiveManagerError::Collection(AdaptiveCollectionError::new(
+                                AdaptiveCollectionStage::Dispatch,
+                                "OwnPreparedOwner",
+                                error.to_string(),
+                            )),
+                            admission,
+                            owners: Box::new((Arc::clone(bridge), error)),
+                        });
+                    }
                 }
             }
             let mut last = match self.last_deferred.try_lock() {

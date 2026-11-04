@@ -764,7 +764,9 @@ impl RoventNnuecCollectionBridgeV2 {
                 // that its observer installation has not started. A later
                 // admission has not entered this original bridge, however,
                 // and must not be revoked as though it owned that attempt.
-                if original.same_original_admission(&admission) {
+                if original.same_original_admission(&admission)
+                    && !self.before_start_seal_matches(&admission)
+                {
                     Ok(RoventNnuecCollectionAdmissionOutcomeV2::PendingUncertain { admission })
                 } else {
                     Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending { admission })
