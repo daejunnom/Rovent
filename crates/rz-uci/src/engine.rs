@@ -2,6 +2,13 @@
 //! Model loading and physical execution remain the injected factory's responsibility.
 
 pub mod diagnostics;
+#[cfg(feature = "pals-adaptive")]
+mod priority_cancel;
+#[cfg(feature = "pals-adaptive")]
+pub use priority_cancel::{
+    PriorityCancelAcknowledgment, PriorityCancelApplicationFailure, PriorityCancelHandle,
+    PriorityCancelObservation, PriorityCancelRequest,
+};
 mod driver_output;
 use driver_output::DriverOutputEnvelope;
 mod driver_start;
@@ -498,6 +505,8 @@ pub struct EngineProcess {
     clock: ProcessClock,
     identity: EngineIdentity,
     go_admission_observer: Option<GoAdmissionObserver>,
+    #[cfg(feature = "pals-adaptive")]
+    priority_cancel: Option<priority_cancel::PriorityCancelOwner>,
 }
 impl EngineProcess {
     /// CPU/PALS evidence is distinct from the legacy evaluator's native
@@ -526,6 +535,8 @@ impl EngineProcess {
                 author: "RoveZero contributors".into(),
             },
             go_admission_observer: None,
+            #[cfg(feature = "pals-adaptive")]
+            priority_cancel: None,
         }
     }
     /// Search-only startup. No neural descriptor or evaluator is constructed.
@@ -542,6 +553,8 @@ impl EngineProcess {
             clock,
             identity,
             go_admission_observer: None,
+            #[cfg(feature = "pals-adaptive")]
+            priority_cancel: None,
         }
     }
     /// Session validates the declared identity before starting protocol service.
@@ -555,6 +568,24 @@ impl EngineProcess {
     pub fn with_go_admission_observer(mut self, observer: GoAdmissionObserver) -> Self {
         self.go_admission_observer = Some(observer);
         self
+    }
+
+    /// Install one optional mailbox owned by this exact process. The request
+    /// cancels whichever search is active when the original Owner observes it;
+    /// it does not close future admission, stop UCI, or prove physical drain.
+    #[cfg(feature = "pals-adaptive")]
+    pub fn install_priority_cancel(
+        &mut self,
+    ) -> Result<PriorityCancelHandle, contract::ContractError> {
+        if self.priority_cancel.is_some() {
+            return Err(failure(
+                contract::ErrorCode::InvalidInput,
+                "priority cancel is already installed",
+            ));
+        }
+        let (owner, handle) = priority_cancel::PriorityCancelOwner::new(self.clock.epoch());
+        self.priority_cancel = Some(owner);
+        Ok(handle)
     }
 }
 
@@ -2843,7 +2874,12 @@ pub fn serve<O: Write, D: Write>(
         clock,
         identity,
         go_admission_observer,
+        #[cfg(feature = "pals-adaptive")]
+        priority_cancel,
     } = process;
+    // Keep the unique mailbox owner until all existing shutdown work ends.
+    #[cfg(feature = "pals-adaptive")]
+    let _priority_owner = priority_cancel;
     if settings.max_workers == 0
         || settings.shutdown_limit.is_zero()
         || settings.search.max_simulations == 0
@@ -2933,10 +2969,16 @@ pub fn serve<O: Write, D: Write>(
     let timer_events = sender.clone();
     let timer_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let timer_flag = Arc::clone(&timer_stop);
+    #[cfg(feature = "pals-adaptive")]
+    let priority_observer = _priority_owner.as_ref().map(|owner| owner.observer());
     let timer = thread::spawn(move || {
         let mut delivered = None;
         while !timer_flag.load(Ordering::Acquire) {
             if let Ok(owner) = timer_owner.lock() {
+                #[cfg(feature = "pals-adaptive")]
+                if let Some(priority) = &priority_observer {
+                    priority.apply(&owner);
+                }
                 if owner.pending_bestmove.as_ref().is_some_and(|pending| {
                     Instant::now() >= pending.until || owner.workers.iter().any(Worker::is_finished)
                 }) {
@@ -2951,6 +2993,11 @@ pub fn serve<O: Write, D: Write>(
                         .is_ok()
                 {
                     delivered = Some(ticket);
+                }
+            } else {
+                #[cfg(feature = "pals-adaptive")]
+                if let Some(priority) = &priority_observer {
+                    priority.owner_poisoned();
                 }
             }
             thread::sleep(Duration::from_millis(1));
@@ -3154,6 +3201,247 @@ mod tests {
         > {
             unreachable!("quit without go must not invoke a search")
         }
+    }
+
+    #[cfg(feature = "pals-adaptive")]
+    #[test]
+    fn priority_cancel_closes_if_original_process_is_dropped_before_serve() {
+        let mut process = EngineProcess::with_search_driver(
+            Arc::new(CloseObservedDriver {
+                state: crate::search_driver::DriverPhysicalCompletion::Confirmed,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            Arc::new(OwnerRegistry::default()),
+            ProcessClock::new(contract::ProcessEpoch(81)),
+        );
+        let control = process.install_priority_cancel().unwrap();
+        assert!(process.install_priority_cancel().is_err());
+        drop(process);
+        assert!(control.observe().owner_closed);
+        assert_eq!(control.request(), PriorityCancelRequest::OwnerClosed);
+        assert_eq!(control.observe().acknowledgment, None);
+        assert!(!control.observe().physical_completion_observed);
+    }
+
+    #[cfg(feature = "pals-adaptive")]
+    #[test]
+    fn priority_cancel_is_observed_while_uci_queue_and_output_are_blocked() {
+        use std::io;
+        use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
+
+        struct BlockFirstWrite {
+            entered: Option<mpsc::SyncSender<()>>,
+            release: mpsc::Receiver<()>,
+        }
+        impl io::Write for BlockFirstWrite {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                    match self.release.recv_timeout(Duration::from_secs(5)) {
+                        Ok(()) => {}
+                        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                            return Err(io::Error::new(io::ErrorKind::TimedOut, "fixture release"));
+                        }
+                    }
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut process = EngineProcess::with_search_driver(
+            Arc::new(CloseObservedDriver {
+                state: crate::search_driver::DriverPhysicalCompletion::Confirmed,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            Arc::new(OwnerRegistry::default()),
+            ProcessClock::new(contract::ProcessEpoch(82)),
+        );
+        let control = process.install_priority_cancel().unwrap();
+        // This fixture owns its queue capacity; it does not pin the engine's
+        // production queue size as a performance or compatibility constant.
+        let capacity = 4;
+        let (sender, events) = mpsc::sync_channel(capacity);
+        let child_sender = sender.clone();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let child = thread::spawn(move || {
+            let mut output = BlockFirstWrite {
+                entered: Some(entered_tx),
+                release: release_rx,
+            };
+            serve(
+                events,
+                child_sender,
+                &mut output,
+                &mut Vec::new(),
+                process,
+                EngineSettings::default(),
+            )
+        });
+        sender.send(Event::Line("uci".into())).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut saturated = false;
+        for _ in 0..=capacity {
+            match sender.try_send(Event::RejectedInput {
+                code: "OwnerWake",
+                message: String::new(),
+            }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    saturated = true;
+                    break;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    panic!("fixture service ended before queue saturation")
+                }
+            }
+        }
+        if !saturated {
+            let _ = release_tx.send(());
+            panic!("fixture queue did not reach capacity");
+        }
+        assert_eq!(control.request(), PriorityCancelRequest::Recorded);
+        assert_eq!(control.request(), PriorityCancelRequest::AlreadyRecorded);
+        let until = Instant::now() + Duration::from_secs(3);
+        while control.observe().acknowledgment.is_none() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let observation = control.observe();
+        // Always release the test writer before asserting so no test worker is stranded.
+        let _ = release_tx.send(());
+        let mut quit = Event::Line("quit".into());
+        let quit_until = Instant::now() + Duration::from_secs(3);
+        let mut quit_sent = false;
+        while Instant::now() < quit_until {
+            match sender.try_send(quit) {
+                Ok(()) => {
+                    quit_sent = true;
+                    break;
+                }
+                Err(TrySendError::Full(event)) => {
+                    quit = event;
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+        }
+        assert_eq!(
+            observation.acknowledgment,
+            Some(PriorityCancelAcknowledgment::NoActiveSearch)
+        );
+        assert!(!observation.physical_completion_observed);
+        assert!(quit_sent, "fixture quit was not enqueued");
+        while !child.is_finished() && Instant::now() < quit_until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(child.is_finished(), "fixture service did not terminate");
+        assert!(child.join().unwrap().is_ok());
+        assert!(control.observe().owner_closed);
+    }
+
+    #[cfg(feature = "pals-adaptive")]
+    #[test]
+    fn priority_cancel_reaches_original_active_search_without_claiming_drain() {
+        use std::sync::mpsc;
+
+        struct WaitingDriver {
+            started: mpsc::SyncSender<()>,
+            canceled: mpsc::SyncSender<()>,
+        }
+        impl crate::search_driver::SearchSessionDriver for WaitingDriver {
+            fn kind(&self) -> crate::search_driver::SearchKind {
+                crate::search_driver::SearchKind::Cpu
+            }
+            fn implementation(&self) -> contract::Digest {
+                contract::Digest([13; 32])
+            }
+            fn identity(&self) -> EngineIdentity {
+                EngineIdentity {
+                    name: "cancel fixture".into(),
+                    author: "test".into(),
+                }
+            }
+            fn run(
+                &self,
+                _: &Position,
+                context: &crate::search_driver::SearchSessionContext,
+                _: &mut dyn FnMut(BoardMove),
+            ) -> Result<
+                crate::search_driver::SearchSessionReport,
+                crate::search_driver::SearchSessionFailure,
+            > {
+                let _ = self.started.send(());
+                let until = Instant::now() + Duration::from_secs(5);
+                while !context.control.cancellation.load(Ordering::Acquire)
+                    && Instant::now() < until
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                if context.control.cancellation.load(Ordering::Acquire) {
+                    let _ = self.canceled.send(());
+                }
+                Err(crate::search_driver::SearchSessionFailure {
+                    physical_completion: crate::search_driver::DriverPhysicalCompletion::Confirmed,
+                    code: "CpuCancelFixture",
+                    detail: "fixture ended".into(),
+                })
+            }
+        }
+
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (canceled_tx, canceled_rx) = mpsc::sync_channel(1);
+        let mut process = EngineProcess::with_search_driver(
+            Arc::new(WaitingDriver {
+                started: started_tx,
+                canceled: canceled_tx,
+            }),
+            Arc::new(OwnerRegistry::default()),
+            ProcessClock::new(contract::ProcessEpoch(83)),
+        );
+        let control = process.install_priority_cancel().unwrap();
+        let (sender, events) = event_channel();
+        let child_sender = sender.clone();
+        let child = thread::spawn(move || {
+            serve(
+                events,
+                child_sender,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                process,
+                EngineSettings::default(),
+            )
+        });
+        sender.send(Event::Line("go infinite".into())).unwrap();
+        let started = started_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+        if started {
+            let _ = control.request();
+        }
+        let canceled = canceled_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+        let ack_until = Instant::now() + Duration::from_secs(3);
+        while control.observe().acknowledgment.is_none() && Instant::now() < ack_until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let observation = control.observe();
+        let _ = sender.try_send(Event::Line("quit".into()));
+        let until = Instant::now() + Duration::from_secs(5);
+        while !child.is_finished() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            started && canceled,
+            "fixture search did not observe cancellation"
+        );
+        assert_eq!(
+            observation.acknowledgment,
+            Some(PriorityCancelAcknowledgment::ActiveSearch)
+        );
+        assert!(!observation.physical_completion_observed);
+        assert!(child.is_finished(), "fixture service did not terminate");
+        let _ = child.join().unwrap(); // The CPU fixture deliberately returns an error.
+        assert!(control.observe().owner_closed);
     }
 
     #[test]
