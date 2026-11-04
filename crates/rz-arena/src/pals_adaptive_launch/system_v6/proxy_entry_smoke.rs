@@ -275,6 +275,20 @@ fn smoke_sources() -> &'static [(&'static str, &'static [u8])] {
             include_bytes!("../../../../rz-uci/src/pals_system_proxy/finish.rs"),
         ),
         (
+            "proxy_session_shutdown_report",
+            include_bytes!(
+                "../../../../rz-uci/src/pals_system_proxy/finish/session_shutdown_report_v1.rs"
+            ),
+        ),
+        (
+            "proxy_parent_deadline",
+            include_bytes!("../../../../rz-uci/src/pals_system_proxy/parent.rs"),
+        ),
+        (
+            "child_parent_deadline",
+            include_bytes!("../../../../rz-uci/src/rovent_bootstrap/launch/system_parent.rs"),
+        ),
+        (
             "proxy_relay",
             include_bytes!("../../../../rz-uci/src/pals_system_proxy/relay.rs"),
         ),
@@ -309,6 +323,22 @@ fn smoke_sources() -> &'static [(&'static str, &'static [u8])] {
         (
             "proxy_bootstrap",
             include_bytes!("../../../../rz-uci/src/pals_adaptive_bootstrap.rs"),
+        ),
+        (
+            "child_v6_pipeline",
+            include_bytes!("../../../../rz-uci/src/pals_adaptive_bootstrap/system_v6/pipeline.rs"),
+        ),
+        (
+            "child_v6_driver_lifecycle",
+            include_bytes!(
+                "../../../../rz-uci/src/pals_adaptive_bootstrap/system_v6/driver_lifecycle.rs"
+            ),
+        ),
+        (
+            "child_v6_entry",
+            include_bytes!(
+                "../../../../rz-uci/src/pals_adaptive_bootstrap/system_v6/child_entry.rs"
+            ),
         ),
     ]
 }
