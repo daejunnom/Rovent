@@ -177,6 +177,7 @@ pub(crate) struct PcCollectionOwnersV3 {
     native: Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
     supervisor: Arc<Mutex<PcWorkerSupervisorV3>>,
     driver_custody: Arc<Mutex<SupervisorStartCustodyV3>>,
+    launch_claimed: std::sync::atomic::AtomicBool,
 }
 
 #[allow(dead_code)]
@@ -224,6 +225,7 @@ impl PcCollectionOwnersV3 {
             native,
             supervisor,
             driver_custody,
+            launch_claimed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -243,10 +245,15 @@ impl PcCollectionOwnersV3 {
         &self.driver_custody
     }
 
-    /// Remove the pre-registered driver only when its original custody proves
-    /// no worker was started. Unknown/running states remain in the registry.
-    pub(crate) fn release_unstarted_driver(&self) -> Result<bool, &'static str> {
-        SupervisorStartCustodyV3::release_no_worker(&self.driver_custody)
+    /// Retain the typed proof for this exact original driver before any
+    /// no-worker release. Running or ambiguous states remain in custody.
+    pub(crate) fn seal_unstarted_driver(
+        &self,
+    ) -> Result<
+        Option<crate::rovent_collect::pc_worker_v3::PcSupervisorNoWorkerProofV3>,
+        &'static str,
+    > {
+        SupervisorStartCustodyV3::seal_no_worker(&self.driver_custody, &self.native)
     }
 
     /// Resource validation is separate and precedes any worker start.
@@ -281,6 +288,139 @@ impl PcCollectionOwnersV3 {
                 control,
             )
         })?
+    }
+
+    /// Invoke the original resource supervisor with the same pre-retained
+    /// inputs, bridge and driver. This is intentionally unreachable without
+    /// an original managed output owner; a path or an input hash cannot
+    /// manufacture that capability. The caller must retain this bundle and
+    /// the returned outcome while completing physical settlement.
+    pub(crate) fn run_with_original_output(
+        self: &Arc<Self>,
+        output: &Arc<ManagedOutputOwnerV3>,
+        arguments: Vec<String>,
+    ) -> Result<PcCollectionRunV3, ArenaError> {
+        check(
+            output.matches_inputs(&self.inputs),
+            "Collection output owner differs",
+        )?;
+        let pin = self.inputs.resource_plan_pin()?;
+        // The original supervisor is already retained in the recovery registry.
+        // Retain this same output owner there before any launch callback.
+        self.supervisor
+            .try_lock()
+            .map_err(|_| invalid("Collection supervisor unavailable"))?
+            .register_output(output)
+            .map_err(invalid)?;
+        check(
+            self.launch_claimed
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok(),
+            "Collection original owner already used",
+        )?;
+        let validate_owner = Arc::clone(self);
+        let start_owner = Arc::clone(self);
+        let outcome =
+            crate::rovent_resource_scope::launch::run_pc_collection_with_resources_v3_post_auth(
+                pin,
+                arguments,
+                &self.native,
+                Box::new(move |lock, directory, lock_file| {
+                    validate_owner
+                        .validate_original_boundary(lock, directory, lock_file)
+                        .map_err(
+                            |error| rz_uci::rovent_bootstrap::launch::RoventLaunchError {
+                                stage: "collection input validation",
+                                detail: error.to_string(),
+                            },
+                        )
+                }),
+                Box::new(move |gate, issuer| {
+                    start_owner.start_verified(gate, issuer).map_err(|error| {
+                        rz_uci::rovent_bootstrap::launch::RoventLaunchError {
+                            stage: "collection supervisor start",
+                            detail: error.to_owned(),
+                        }
+                    })
+                }),
+            );
+        Ok(PcCollectionRunV3 {
+            owners: Arc::clone(self),
+            output: Arc::clone(output),
+            outcome,
+            pending_stop: None,
+            stop_authorized: false,
+        })
+    }
+}
+
+/// The result retains the same original owners; it is not a settlement,
+/// durable-publication receipt, or GPU completion proof.
+#[allow(dead_code)]
+pub(crate) struct PcCollectionRunV3 {
+    owners: Arc<PcCollectionOwnersV3>,
+    output: Arc<ManagedOutputOwnerV3>,
+    outcome: crate::rovent_resource_scope::launch::RoventPcCollectionResourceOutcomeV3,
+    pending_stop: Option<crate::rovent_collect::pc_hooks_lock_v3::PcSupervisorStopAuthorizationV3>,
+    stop_authorized: bool,
+}
+
+impl PcCollectionRunV3 {
+    /// Advance the same driver's physical shutdown without waiting. A native
+    /// fence alone is insufficient: the bridge must first seal every original
+    /// root and teacher before it issues the exact supervisor authorization.
+    pub(crate) fn try_join_driver(
+        &mut self,
+    ) -> Result<Option<crate::rovent_collect::pc_worker_v3::PcSupervisorJoinedProofV3>, &'static str>
+    {
+        if !self.stop_authorized {
+            if self.pending_stop.is_none() {
+                let Some(fence) = self.owners.native.native_session_fence() else {
+                    return Ok(None);
+                };
+                self.pending_stop = self
+                    .owners
+                    .bridge
+                    .try_authorize_supervisor_stop(&fence, &self.owners.supervisor)?;
+            }
+            let Some(authorization) = self.pending_stop.take() else {
+                return Ok(None);
+            };
+            let mut custody = match self.owners.driver_custody.try_lock() {
+                Ok(custody) => custody,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    self.pending_stop = Some(authorization);
+                    return Ok(None);
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.pending_stop = Some(authorization);
+                    return Err("P-C supervisor custody poisoned");
+                }
+            };
+            match custody.authorize_stop(authorization) {
+                Ok(()) => self.stop_authorized = true,
+                Err((authorization, reason)) => {
+                    self.pending_stop = Some(authorization);
+                    return Err(reason);
+                }
+            }
+        }
+        {
+            let mut custody = match self.owners.driver_custody.try_lock() {
+                Ok(custody) => custody,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err("P-C supervisor custody poisoned");
+                }
+            };
+            custody.try_join();
+        }
+        SupervisorStartCustodyV3::joined_proof(&self.owners.driver_custody)
     }
 }
 
