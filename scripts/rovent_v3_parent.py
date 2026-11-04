@@ -607,7 +607,7 @@ def run(args, *, containment=None, started=None, outcome=None):
 
 
 def _managed_control(path, maximum=1024 * 1024):
-    from rovent_before_native_owner import open_directory, read_control, relative
+    from rovent_v3_input_snapshot import open_directory, read_control, relative
     path = Path(path)
     if not path.is_absolute() or _secret_name(path.name):
         raise ValueError("explicit non-secret absolute control file required")
@@ -685,7 +685,7 @@ def run_managed(plan_path):
     import hashlib
     from managed_outputs import OutputLease
     from managed_process import OwnedProcessGroup, ProcessNotSpawned, run_group
-    from rovent_before_native_owner import copy_pin, open_directory, protect_output, relative, unique_json
+    from rovent_v3_input_snapshot import copy_pin, open_directory, protect_output, relative, unique_json
     from rovent_cgroup_owner import CgroupOwner, CgroupSetupError, entry_command
 
     started = time.monotonic()
