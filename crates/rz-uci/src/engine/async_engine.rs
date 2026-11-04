@@ -310,7 +310,7 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
         if !ORIGINAL_SLOT_DROP_RECOVERY_IMPLEMENTED {
             return Err(InPlaceTransferStatus::NotReady);
         }
-        if self.transferred {
+        if self.transferred || self.run.is_some() {
             return Err(InPlaceTransferStatus::AlreadyTransferred);
         }
         if max_output_bytes == 0 || poll_interval.is_zero() {
