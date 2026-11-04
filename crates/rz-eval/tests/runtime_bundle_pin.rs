@@ -181,18 +181,22 @@ fn alias_manifest_binds_closed_declarations_and_preserves_legacy_digest() {
         assert!(!format!("{invalid:?}").contains("/lib/"));
     }
     let json = manifest_json(&aliases);
-    assert!(CudaRuntimeBundleSpec::from_json(&json.replacen(
-        "\"target\":",
-        "\"unknown\":0,\"target\":",
-        1
-    ))
-    .is_err());
-    assert!(CudaRuntimeBundleSpec::from_json(&json.replacen(
-        "\"target\":",
-        "\"filename\":\"duplicate\",\"target\":",
-        1
-    ))
-    .is_err());
+    assert!(
+        CudaRuntimeBundleSpec::from_json(&json.replacen(
+            "\"target\":",
+            "\"unknown\":0,\"target\":",
+            1
+        ))
+        .is_err()
+    );
+    assert!(
+        CudaRuntimeBundleSpec::from_json(&json.replacen(
+            "\"target\":",
+            "\"filename\":\"duplicate\",\"target\":",
+            1
+        ))
+        .is_err()
+    );
     assert_eq!(legacy.digest().unwrap(), legacy_digest);
 }
 
@@ -324,490 +328,70 @@ fn debug_does_not_disclose_raw_hashes_or_unvalidated_paths() {
     assert!(!format!("{invalid:?}").contains("/private/bootstrap"));
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
-    use super::*;
-    use std::{
-        fs,
-        os::unix::fs::{symlink, MetadataExt, PermissionsExt},
-        path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
-    };
-    static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
-
-    struct Fixture {
-        root: PathBuf,
-        source: PathBuf,
-        output: PathBuf,
-    }
-
-    fn payload(file: &RuntimeBundleFile) -> Vec<u8> {
-        format!(
-            "authored fake bundle bytes; role={:?}; filename={}; no native execution\n",
-            file.role, file.filename
-        )
-        .into_bytes()
-    }
-
-    impl Fixture {
-        fn new(spec: &mut CudaRuntimeBundleSpec) -> Self {
-            let base = std::env::var_os("RUNNER_TEMP")
-                .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-                .join("RoveZero")
-                .join("tmp")
-                .join("native-bundle-tests");
-            fs::create_dir_all(&base).unwrap();
-            let root = base.canonicalize().unwrap().join(format!(
-                "{}-{}",
-                std::process::id(),
-                NEXT_TEST.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&root).unwrap();
-            let source = root.join("source");
-            let output = root.join("output");
-            fs::create_dir(&source).unwrap();
-            fs::create_dir(&output).unwrap();
-            for file in &mut spec.files {
-                let bytes = payload(file);
-                file.bytes = bytes.len() as u64;
-                file.sha256 = hex(&bytes);
-                fs::write(source.join(&file.filename), bytes).unwrap();
-            }
-            Self {
-                root,
-                source,
-                output,
-            }
-        }
-
-        fn bundle_directory(&self) -> PathBuf {
-            let entries: Vec<_> = fs::read_dir(&self.output)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .collect();
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].parent(), Some(self.output.as_path()));
-            assert!(entries[0].is_dir());
-            entries[0].clone()
-        }
-
-        fn remove_owned_files(directory: &Path) {
-            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
-            for entry in fs::read_dir(directory).unwrap() {
-                let path = entry.unwrap().path();
-                assert_eq!(path.parent(), Some(directory));
-                // Only authored files in this test's directly owned directories.
-                assert!(!fs::symlink_metadata(&path).unwrap().is_dir());
-                fs::remove_file(path).unwrap();
-            }
-            fs::remove_dir(directory).unwrap();
-        }
-
-        fn release(self) {
-            for entry in fs::read_dir(&self.output).unwrap() {
-                let path = entry.unwrap().path();
-                assert_eq!(path.parent(), Some(self.output.as_path()));
-                if path.is_dir() {
-                    Self::remove_owned_files(&path);
-                } else {
-                    fs::remove_file(path).unwrap();
-                }
-            }
-            Self::remove_owned_files(&self.source);
-            fs::remove_dir(&self.output).unwrap();
-            fs::remove_dir(&self.root).unwrap();
-        }
-    }
-
-    #[test]
-    fn explicit_aliases_share_original_inodes_reuse_and_preserve_v1_entry() {
-        use rz_eval::runtime_pin::{RuntimeCache, RuntimeStorageOrigin};
-        let mut aliased = alias_spec();
-        let fixture = Fixture::new(&mut aliased);
-        fs::set_permissions(&fixture.output, fs::Permissions::from_mode(0o700)).unwrap();
-        let cache = RuntimeCache::open(&fixture.output).unwrap();
-        let mut legacy = aliased.clone();
-        legacy.schema_version = 1;
-        legacy.loader_aliases = None;
-        let legacy_pin = cache.cuda_bundle(&fixture.source, &legacy).unwrap();
-        let legacy_directory = fixture.bundle_directory();
-        let legacy_core_inode = fs::metadata(legacy_directory.join(CORE)).unwrap().ino();
-        let first = cache.cuda_bundle(&fixture.source, &aliased).unwrap();
-        assert_eq!(first.storage().origin, RuntimeStorageOrigin::CacheCreated);
-        let directory = fs::read_dir(&fixture.output)
+// Legacy manifest parsing remains available for historical receipts. New native
+// library bundle copies are intentionally unavailable in all product paths.
+#[test]
+fn direct_legacy_bundle_copy_is_rejected_before_opening_paths() {
+    use rz_eval::error::FailureKind;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let base = std::env::temp_dir().join(format!(
+        "rovezero-disabled-direct-bundle-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|entry| {
-                entry
-                    .file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .starts_with("cuda-alias-v2-")
-            })
-            .unwrap();
-        assert_eq!(fs::read_dir(&legacy_directory).unwrap().count(), 19);
-        assert_eq!(
-            fs::metadata(legacy_directory.join(CORE)).unwrap().ino(),
-            legacy_core_inode
-        );
-        assert_eq!(fs::read_dir(&directory).unwrap().count(), 27);
-        assert_eq!(first.bundle_files().unwrap().len(), 19);
-        assert_eq!(
-            first.bundle_spec().unwrap().digest().unwrap(),
-            aliased.digest().unwrap()
-        );
-        for alias in aliased.loader_aliases.as_ref().unwrap() {
-            let link = directory.join(&alias.filename);
-            let target = directory.join(&alias.target);
-            assert!(fs::symlink_metadata(&link)
-                .unwrap()
-                .file_type()
-                .is_symlink());
-            assert_eq!(fs::read_link(&link).unwrap(), Path::new(&alias.target));
-            let via_link = fs::File::open(&link).unwrap().metadata().unwrap();
-            let original = fs::File::open(&target).unwrap().metadata().unwrap();
-            assert_eq!(
-                (via_link.dev(), via_link.ino()),
-                (original.dev(), original.ino())
-            );
-            assert_eq!(original.nlink(), 1);
-            assert_eq!(original.permissions().mode() & 0o777, 0o400);
-            assert_eq!(fs::read(link).unwrap(), fs::read(target).unwrap());
-        }
-        for file in &aliased.files {
-            fs::remove_file(fixture.source.join(&file.filename)).unwrap();
-        }
-        let second = cache.cuda_bundle(&fixture.source, &aliased).unwrap();
-        assert_eq!(second.storage().origin, RuntimeStorageOrigin::CacheReused);
-        assert_eq!(second.storage().cache_key, first.storage().cache_key);
-        assert_eq!(
-            second.storage().bytes,
-            aliased.files.iter().map(|file| file.bytes).sum::<u64>()
-        );
-        let cloned = first.clone();
-        drop(first);
-        assert_eq!(cloned.bundle_digest(), second.bundle_digest());
-        // A subsequent entry's quota scan must validate the closed aliases, not
-        // count their target payload twice or accept arbitrary symlink entries.
-        let cpu_source = fixture.source.join("cpu.fixture");
-        fs::write(&cpu_source, FAKE_BYTES).unwrap();
-        drop(cache.library(&cpu_source, &hex(FAKE_BYTES)).unwrap());
-        assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 3);
-        drop(legacy_pin);
-        drop(cloned);
-        drop(second);
-        fixture.release();
-    }
-
-    #[test]
-    fn alias_cache_rejects_external_chained_regular_and_hardlink_replacements() {
-        use rz_eval::runtime_pin::RuntimeCache;
-        for corruption in [
-            "absolute",
-            "relative-external",
-            "wrong-pair",
-            "chained-target",
-            "regular-alias",
-            "hardlink-alias",
-            "hardlink-target",
-            "missing",
-            "extra",
-        ] {
-            let mut spec = alias_spec();
-            let fixture = Fixture::new(&mut spec);
-            fs::set_permissions(&fixture.output, fs::Permissions::from_mode(0o700)).unwrap();
-            let cache = RuntimeCache::open(&fixture.output).unwrap();
-            drop(cache.cuda_bundle(&fixture.source, &spec).unwrap());
-            let directory = fixture.bundle_directory();
-            let alias = &spec.loader_aliases.as_ref().unwrap()[0];
-            let link = directory.join(&alias.filename);
-            let target = directory.join(&alias.target);
-            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-            match corruption {
-                "absolute" => {
-                    fs::remove_file(&link).unwrap();
-                    symlink(fixture.source.join(&alias.target), &link).unwrap();
-                }
-                "relative-external" => {
-                    fs::remove_file(&link).unwrap();
-                    symlink(format!("../../source/{}", alias.target), &link).unwrap();
-                }
-                "wrong-pair" => {
-                    fs::remove_file(&link).unwrap();
-                    symlink("libcudnn_cnn.so.9", &link).unwrap();
-                }
-                "chained-target" => {
-                    fs::remove_file(&target).unwrap();
-                    symlink(fixture.source.join(&alias.target), &target).unwrap();
-                }
-                "regular-alias" => {
-                    fs::remove_file(&link).unwrap();
-                    fs::write(&link, fs::read(&target).unwrap()).unwrap();
-                    fs::set_permissions(&link, fs::Permissions::from_mode(0o400)).unwrap();
-                }
-                "hardlink-alias" => {
-                    fs::remove_file(&link).unwrap();
-                    fs::hard_link(&target, &link).unwrap();
-                }
-                "hardlink-target" => {
-                    fs::hard_link(&target, fixture.source.join("outside-hardlink.fixture"))
-                        .unwrap();
-                }
-                "missing" => {
-                    fs::remove_file(&link).unwrap();
-                }
-                "extra" => {
-                    symlink("libcudnn.so.9", directory.join("undeclared-alias.so")).unwrap();
-                }
-                _ => unreachable!(),
-            }
-            fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
-            assert!(
-                cache.cuda_bundle(&fixture.source, &spec).is_err(),
-                "{corruption}"
-            );
-            if corruption != "missing" {
-                let core = spec
-                    .files
-                    .iter()
-                    .find(|file| file.filename == CORE)
-                    .unwrap();
-                assert!(
-                    cache
-                        .library(&fixture.source.join(CORE), &hex(&payload(core)))
-                        .is_err(),
-                    "a quota scan must also reject {corruption}"
-                );
-            }
-            // The cache never repairs a published entry after a rejection.
-            assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 1);
-            fixture.release();
-        }
-    }
-
-    #[test]
-    fn source_hardlinks_are_rejected_and_aliases_are_not_copied_from_source() {
-        let mut spec = alias_spec();
-        let fixture = Fixture::new(&mut spec);
-        let source = fixture.source.join(CUDA);
-        fs::hard_link(&source, fixture.source.join("hardlink.fixture")).unwrap();
-        assert!(
-            RuntimeLibraryPin::copy_cuda_bundle(&fixture.source, &fixture.output, &spec).is_err()
-        );
-        assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 0);
-        fs::remove_file(fixture.source.join("hardlink.fixture")).unwrap();
-        // An undeclared external alias in the caller's mutable source is never
-        // consulted. The owned alias is generated only from the closed manifest.
-        let alias = &spec.loader_aliases.as_ref().unwrap()[0];
-        symlink(
-            "/unopened-external-target",
-            fixture.source.join(&alias.filename),
-        )
-        .unwrap();
-        let pin =
-            RuntimeLibraryPin::copy_cuda_bundle(&fixture.source, &fixture.output, &spec).unwrap();
-        let directory = fixture.bundle_directory();
-        assert_eq!(
-            fs::read_link(directory.join(&alias.filename)).unwrap(),
-            Path::new(&alias.target)
-        );
-        drop(pin);
-        fixture.release();
-    }
-
-    #[test]
-    fn copied_bundle_is_immutable_from_source_and_survives_pin_clone() {
-        let mut spec = spec();
-        let fixture = Fixture::new(&mut spec);
-        let pin =
-            RuntimeLibraryPin::copy_cuda_bundle(&fixture.source, &fixture.output, &spec).unwrap();
-        let directory = fixture.bundle_directory();
-        assert_eq!(
-            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
-            0o500
-        );
-        let core = spec
-            .files
-            .iter()
-            .find(|file| file.role == Role::Core)
-            .unwrap();
-        let expected_core_digest: [u8; 32] = Sha256::digest(payload(core)).into();
-        assert_eq!(pin.binary_digest(), expected_core_digest);
-        assert_eq!(pin.bundle_digest(), Some(spec.digest().unwrap()));
-        let mut expected_files = spec.files.clone();
-        expected_files.sort_unstable_by(|left, right| left.filename.cmp(&right.filename));
-        assert_eq!(pin.bundle_files().unwrap(), expected_files.as_slice());
-        for file in &spec.files {
-            let owned = directory.join(&file.filename);
-            assert_eq!(
-                fs::metadata(&owned).unwrap().permissions().mode() & 0o777,
-                0o400
-            );
-            fs::write(
-                fixture.source.join(&file.filename),
-                b"source replaced after issue",
-            )
-            .unwrap();
-            assert_eq!(fs::read(owned).unwrap(), payload(file));
-        }
-        let debug = format!("{pin:?}");
-        assert!(!debug.contains(fixture.root.to_str().unwrap()));
-        assert!(!debug.contains(&spec.files[0].sha256));
-        let cloned = pin.clone();
-        drop(pin);
-        assert_eq!(cloned.bundle_digest(), Some(spec.digest().unwrap()));
-        assert_eq!(cloned.bundle_files().unwrap(), expected_files.as_slice());
-        for file in &spec.files {
-            assert_eq!(
-                fs::read(directory.join(&file.filename)).unwrap(),
-                payload(file)
-            );
-        }
-        drop(cloned);
-        fixture.release();
-    }
-
-    #[test]
-    fn shared_bundle_reuses_all_nineteen_files_without_source_or_duplicate_copy() {
-        use rz_eval::runtime_pin::{RuntimeCache, RuntimeStorageOrigin};
-        let mut spec = spec();
-        let fixture = Fixture::new(&mut spec);
-        fs::set_permissions(&fixture.output, fs::Permissions::from_mode(0o700)).unwrap();
-        let cache = RuntimeCache::open(&fixture.output).unwrap();
-        let first = cache.cuda_bundle(&fixture.source, &spec).unwrap();
-        assert_eq!(first.storage().origin, RuntimeStorageOrigin::CacheCreated);
-        let directory = fixture.bundle_directory();
-        for file in &spec.files {
-            fs::remove_file(fixture.source.join(&file.filename)).unwrap();
-        }
-        let second = cache.cuda_bundle(&fixture.source, &spec).unwrap();
-        assert_eq!(second.storage().origin, RuntimeStorageOrigin::CacheReused);
-        assert_eq!(first.bundle_digest(), second.bundle_digest());
-        assert_eq!(first.storage().cache_key, second.storage().cache_key);
-        assert_eq!(
-            second.storage().bytes,
-            spec.files.iter().map(|file| file.bytes).sum::<u64>()
-        );
-        assert_eq!(fs::read_dir(&directory).unwrap().count(), 19);
-        assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 1);
-        for file in &spec.files {
-            assert_eq!(
-                fs::read(directory.join(&file.filename)).unwrap(),
-                payload(file)
-            );
-        }
-        drop(first);
-        drop(second);
-        fixture.release();
-    }
-
-    #[test]
-    fn failed_cached_bundle_copy_cleans_staging_and_lock_and_can_retry() {
-        use rz_eval::runtime_pin::RuntimeCache;
-        let mut spec = spec();
-        let fixture = Fixture::new(&mut spec);
-        fs::set_permissions(&fixture.output, fs::Permissions::from_mode(0o700)).unwrap();
-        let cache = RuntimeCache::open(&fixture.output).unwrap();
-        let last = spec.files.iter().max_by_key(|file| &file.filename).unwrap();
-        fs::write(fixture.source.join(&last.filename), b"late corrupt source").unwrap();
-        assert!(cache.cuda_bundle(&fixture.source, &spec).is_err());
-        assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 0);
-        fs::write(fixture.source.join(&last.filename), payload(last)).unwrap();
-        drop(cache.cuda_bundle(&fixture.source, &spec).unwrap());
-        fixture.release();
-    }
-
-    #[test]
-    fn changed_cached_provider_is_rejected_even_with_a_valid_original_bundle() {
-        use rz_eval::runtime_pin::RuntimeCache;
-        let mut spec = spec();
-        let fixture = Fixture::new(&mut spec);
-        fs::set_permissions(&fixture.output, fs::Permissions::from_mode(0o700)).unwrap();
-        let cache = RuntimeCache::open(&fixture.output).unwrap();
-        drop(cache.cuda_bundle(&fixture.source, &spec).unwrap());
-        let directory = fixture.bundle_directory();
-        let provider = directory.join(CUDA);
-        fs::set_permissions(&provider, fs::Permissions::from_mode(0o600)).unwrap();
-        let size = fs::metadata(&provider).unwrap().len();
-        fs::write(&provider, vec![b'!'; size as usize]).unwrap();
-        fs::set_permissions(&provider, fs::Permissions::from_mode(0o400)).unwrap();
-        assert!(cache.cuda_bundle(&fixture.source, &spec).is_err());
-        assert_eq!(fs::read(&provider).unwrap(), vec![b'!'; size as usize]);
-        assert_eq!(
-            fs::read(fixture.source.join(CUDA)).unwrap(),
-            payload(
-                spec.files
-                    .iter()
-                    .find(|file| file.filename == CUDA)
-                    .unwrap()
-            )
-        );
-        fixture.release();
-    }
-
-    #[test]
-    fn late_hash_or_length_failure_cleans_only_unpublished_bundle() {
-        for wrong_length in [false, true] {
-            let mut spec = spec();
-            // Establish the valid, per-file source identities before corrupting
-            // one manifest entry; Fixture::new must not repair that corruption.
-            let fixture = Fixture::new(&mut spec);
-            if wrong_length {
-                spec.files[1].bytes += 1;
-            } else {
-                spec.files[1].sha256 = hex(b"different authored fixture");
-            }
-            let preserved = fixture.output.join("unrelated-authored.fixture");
-            fs::write(&preserved, b"preserve this unrelated test file").unwrap();
-            assert!(
-                RuntimeLibraryPin::copy_cuda_bundle(&fixture.source, &fixture.output, &spec)
-                    .is_err()
-            );
-            assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 1);
-            assert_eq!(
-                fs::read(preserved).unwrap(),
-                b"preserve this unrelated test file"
-            );
-            assert_eq!(
-                fs::read(fixture.source.join(CORE)).unwrap(),
-                payload(&spec.files[0])
-            );
-            fixture.release();
-        }
-    }
-
-    #[test]
-    fn source_symlink_and_symlink_root_are_rejected_without_copy() {
-        let mut spec = spec();
-        let fixture = Fixture::new(&mut spec);
-        let library = fixture.source.join(CUDA);
-        fs::rename(&library, fixture.source.join("cuda-target.fixture")).unwrap();
-        symlink(fixture.source.join("cuda-target.fixture"), &library).unwrap();
-        assert!(
-            RuntimeLibraryPin::copy_cuda_bundle(&fixture.source, &fixture.output, &spec).is_err()
-        );
-        assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 0);
-        fs::remove_file(&library).unwrap();
-        fs::rename(fixture.source.join("cuda-target.fixture"), &library).unwrap();
-        let alias = fixture.root.join("source-alias");
-        symlink(&fixture.source, &alias).unwrap();
-        assert!(RuntimeLibraryPin::copy_cuda_bundle(&alias, &fixture.output, &spec).is_err());
-        assert_eq!(fs::read_dir(&fixture.output).unwrap().count(), 0);
-        fs::remove_file(alias).unwrap();
-        fixture.release();
-    }
+            .as_nanos()
+    ));
+    let source = base.join("not-created-source");
+    let output = base.join("not-created-output");
+    assert!(!base.exists());
+    let error = RuntimeLibraryPin::copy_cuda_bundle(&source, &output, &spec()).unwrap_err();
+    assert_eq!(error.kind, FailureKind::BackendUnavailable);
+    assert!(
+        !base.exists(),
+        "rejected copy must not create output or read inputs"
+    );
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
-fn nonlinux_gpu_bundle_is_explicitly_unavailable_before_any_copy() {
-    let error = RuntimeLibraryPin::copy_cuda_bundle(
-        std::path::Path::new("unopened-source"),
-        std::path::Path::new("unopened-output"),
-        &spec(),
-    )
-    .unwrap_err();
-    assert!(error.detail.contains("require Linux"));
+fn legacy_bundle_cache_request_is_rejected_without_creating_a_bundle() {
+    use rz_eval::{error::FailureKind, runtime_pin::RuntimeCache};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    struct EmptyCache(std::path::PathBuf);
+    impl Drop for EmptyCache {
+        fn drop(&mut self) {
+            // Only remove our own empty directory; unexpected contents survive.
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+    let base = std::env::temp_dir().canonicalize().unwrap().join(format!(
+        "rovezero-disabled-bundle-cache-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    assert!(!base.exists());
+    let _cleanup = EmptyCache(base.clone());
+    let cache = RuntimeCache::open(&base).unwrap();
+    let source = base.join("not-created-source");
+    let error = cache.cuda_bundle(&source, &spec()).unwrap_err();
+    assert_eq!(error.kind, FailureKind::BackendUnavailable);
+    let mut checkpoint_called = false;
+    let error = cache
+        .prepare_cuda_artifact_tree(&source, &spec(), &mut |_| {
+            checkpoint_called = true;
+            Ok(())
+        })
+        .unwrap_err();
+    assert_eq!(error.kind, FailureKind::BackendUnavailable);
+    assert!(
+        !checkpoint_called,
+        "rejected preparation must not consume credit"
+    );
+    assert!(!source.exists());
+    assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+    drop(cache);
 }

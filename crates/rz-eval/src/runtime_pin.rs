@@ -6,12 +6,11 @@
 //! The caller must supply a private output root whose ancestors it controls.
 //! Its owner must not chmod, replace or remove bootstrap copies. This is an
 //! ownership contract, not protection against hostile code with the same OS UID.
-//! Shared content-addressed copies are verified again on every cache hit. The
-//! legacy private-copy API remains available for explicitly isolated callers.
+//! Shared CPU content-addressed copies are verified again on every cache hit.
 //! Runtime pins are retained for process lifetime once passed to ORT. No
-//! runtime/provider assets are downloaded. CPU copies contain one library. A
-//! Linux CUDA bundle copies only the explicitly declared, verified libraries;
-//! resolving and loading their complete dependency closure is a separate gate.
+//! runtime/provider assets are downloaded. Historical CUDA bundle declarations
+//! remain readable, but bundle copying is disabled; system CUDA has its own
+//! runtime and lifetime boundary.
 
 use crate::{
     asset,
@@ -588,15 +587,14 @@ impl RuntimeLibraryPin {
         }
     }
 
-    /// Copy an explicitly described Linux CUDA library bundle into one private
-    /// directory. The caller controls both roots and output-root ancestors.
-    /// Extra source files are never enumerated or copied. This does not resolve
-    /// ELF dependencies or execute native code; bootstrap must do those checks.
+    /// Historical CUDA bundle metadata remains readable, but new bundle
+    /// copies are disabled. Use the registered system CUDA runtime instead.
     pub fn copy_cuda_bundle(
         source_root: &Path,
         output_root: &Path,
         spec: &CudaRuntimeBundleSpec,
     ) -> Result<Self, BackendError> {
+        refuse_legacy_cuda_bundle()?;
         spec.validate()?;
         #[cfg(target_os = "linux")]
         {
@@ -782,6 +780,14 @@ impl RuntimeLibraryPin {
     pub(crate) fn path(&self) -> &Path {
         &self.0.path
     }
+}
+
+fn refuse_legacy_cuda_bundle() -> Result<(), BackendError> {
+    Err(BackendError::new(
+        K::BackendUnavailable,
+        S::Backend,
+        "legacy CUDA library bundle execution is disabled; use a system CUDA runtime",
+    ))
 }
 
 #[cfg(target_os = "linux")]

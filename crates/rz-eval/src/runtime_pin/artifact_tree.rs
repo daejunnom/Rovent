@@ -18,7 +18,6 @@ impl std::fmt::Debug for PreparedCudaArtifactTree {
             .finish_non_exhaustive()
     }
 }
-
 /// 위임된 root 자체를 제외한 정확한 하위 항목 관측. bytes는 regular
 /// payload와 symlink 문자열의 st_size 합이며 target payload를 중복하지 않는다.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,16 +59,15 @@ impl PreparedCudaArtifactTreeObservation {
 }
 
 impl RuntimeCache {
-    /// DSO를 load하지 않고 기존 cache publish/hash 경로로 최종 항목을 준비한다.
-    /// checkpoint(0)은 취소·원 deadline 확인, 양수는 다음 bounded read의
-    /// 보수적 선청구다. 짧은 read·EOF probe도 선청구하며 실패 뒤 환불하지 않는다.
-    /// callback 오류는 cache 재시도나 정상 성공으로 바꾸지 않는다.
+    /// 이전 CUDA bundle artifact tree의 신규 준비를 명시적으로 거절한다.
+    /// 기존 bundle metadata 조회는 별도 parser를 통해 유지한다.
     pub fn prepare_cuda_artifact_tree(
         &self,
         source_root: &Path,
         spec: &CudaRuntimeBundleSpec,
         checkpoint: &mut dyn FnMut(u64) -> Result<(), BackendError>,
     ) -> Result<PreparedCudaArtifactTree, BackendError> {
+        refuse_legacy_cuda_bundle()?;
         #[cfg(target_os = "linux")]
         {
             let pin = self.cuda_bundle_observed(source_root, spec, checkpoint)?;
@@ -454,7 +452,3 @@ impl PreparedInner {
         Ok(observed)
     }
 }
-
-#[cfg(all(test, target_os = "linux"))]
-#[path = "artifact_tree_tests.rs"]
-mod tests;

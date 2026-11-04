@@ -288,30 +288,37 @@ fn backend_is_explicit_and_cpu_cannot_carry_cuda_assets() {
 }
 
 #[test]
-fn cuda_roster_and_aliases_are_preserved_through_content_cache_reuse() {
+fn cuda_roster_is_readable_but_bundle_execution_is_unavailable() {
     let fixture = Fixture::new();
     let assets = fixture.cuda(true);
     let plan = v5_plan(PalsModelBackendV3::OrtCuda, &assets).unwrap();
     assert_eq!(plan.cuda.as_ref().unwrap().spec.files.len(), 19);
     let cache = RuntimeCache::open(&fixture.root.join("shared-cache")).unwrap();
-    let pin = pin_plan(
+    assert_eq!(
+        plan.cuda
+            .as_ref()
+            .unwrap()
+            .spec
+            .loader_aliases
+            .as_ref()
+            .unwrap()
+            .len(),
+        2
+    );
+    let error = pin_plan(
         &cache,
         &fixture.root,
         &plan,
         SnapshotGuards::capture(&fixture.root, fixture.root_cap(), &plan).unwrap(),
     )
-    .unwrap();
-    assert_eq!(pin.storage().origin, RuntimeStorageOrigin::CacheCreated);
-    assert_eq!(pin.bundle_spec().unwrap().loader_aliases.unwrap().len(), 2);
-    let reused = pin_plan(
-        &cache,
-        &fixture.root,
-        &plan,
-        SnapshotGuards::capture(&fixture.root, fixture.root_cap(), &plan).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(reused.storage().origin, RuntimeStorageOrigin::CacheReused);
-    assert_eq!(pin.bundle_digest(), reused.bundle_digest());
+    .unwrap_err();
+    assert_eq!(error.kind, K::BackendUnavailable);
+    assert_eq!(
+        fs::read_dir(fixture.root.join("shared-cache"))
+            .unwrap()
+            .count(),
+        0
+    );
 }
 
 #[test]
