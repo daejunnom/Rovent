@@ -406,6 +406,15 @@ fn matches_original_run_window(
 }
 
 impl RetainedOriginalArenaGrant {
+    /// Reobserve the actual original grant stream and direct peer ancestry.
+    /// This does not assert the remote stream is still open.
+    pub(super) fn verify_original_peer(&self) -> io::Result<()> {
+        if observe_peer(&self.stream)? != self.peer {
+            return Err(invalid("original arena grant peer changed"));
+        }
+        Ok(())
+    }
+
     /// Compare both held endpoints to the original recorded peer and process
     /// tree. This does not prove the grant channel is still open or that the
     /// cancellation listener belongs to a particular role.

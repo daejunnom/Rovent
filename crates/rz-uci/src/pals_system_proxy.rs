@@ -10,6 +10,9 @@ mod arena_grant_channel;
 #[allow(dead_code)]
 mod arena_launch_inputs;
 #[allow(dead_code)]
+mod proxy_entry_smoke_v1;
+pub use proxy_entry_smoke_v1::ProxyEntryFunctionalSmokeV1;
+#[allow(dead_code)]
 mod cancel_control_v1;
 mod cli_v6;
 mod deadline_grant;
@@ -19,6 +22,16 @@ mod parent;
 #[allow(dead_code)]
 mod protocol;
 pub mod relay;
+
+/// Explicit smoke route remains guarded until the original run/cleanup owner,
+/// scope delivery, listener and release consumers are connected.
+pub fn run_entry_smoke_guarded(_arguments: &[String], entry: Instant) -> io::Result<()> {
+    let _local_entry = ProxyEntryFunctionalSmokeV1::from_local_entry(entry);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "PALS proxy entry smoke awaits original arena owner and physical supervision",
+    ))
+}
 
 pub(crate) fn run_guarded_cli(arguments: &[String]) -> io::Result<()> {
     cli_v6::run_guarded_cli(arguments)
