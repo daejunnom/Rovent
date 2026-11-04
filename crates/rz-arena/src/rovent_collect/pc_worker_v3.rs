@@ -83,6 +83,7 @@ pub(crate) struct PcRootRecoveryV3 {
     // cancellation, an aggregate acknowledgement, or permission to reuse it.
     abort_before_route: bool,
     sealed_abort_before_route: bool,
+    aborted_pre_route_release: Option<Result<(), &'static str>>,
     diagnostics: Vec<(String, TeacherDiagnostics)>,
     prepared: Option<PcPreparedRootV3>,
     custodian: TeacherRecoveryCustodianV3,
@@ -132,6 +133,7 @@ impl PcRootRecoveryV3 {
             aggregate: None,
             abort_before_route: false,
             sealed_abort_before_route: false,
+            aborted_pre_route_release: None,
             diagnostics: Vec::new(),
             prepared: None,
             custodian: TeacherRecoveryCustodianV3::new(),
@@ -1875,11 +1877,40 @@ fn prepare_root_step_v3(
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             state.try_drain_teacher_before_route(cleanup_deadline)
         }));
-        if let Err(payload) = result {
-            state.panic = Some(payload);
-            state
-                .failure
-                .get_or_insert_with(|| "P-C V3 pre-route abort drain panicked".into());
+        let release = match result {
+            Ok(ready) => ready && state.panic.is_none() && state.aborted_pre_route_release.is_none(),
+            Err(payload) => {
+                state.panic = Some(payload);
+                state.failure.get_or_insert_with(|| "P-C V3 pre-route abort drain panicked".into());
+                false
+            }
+        };
+        // The hook reacquires this exact recovery. Never call it while the
+        // original guard is held; Busy keeps both the aggregate and owner.
+        drop(state);
+        if release {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                bridge.try_release_aborted_pre_route(&admission, recovery)
+            }));
+            let mut state = recovery.lock().map_err(|_| "P-C V3 recovery poisoned")?;
+            match outcome {
+                Ok(Ok(Some(true))) => state.aborted_pre_route_release = Some(Ok(())),
+                Ok(Ok(None)) => {},
+                Ok(Ok(Some(false))) => {
+                    let error = "P-C V3 pre-route release rejected";
+                    state.aborted_pre_route_release = Some(Err(error));
+                    state.failure.get_or_insert_with(|| error.into());
+                }
+                Ok(Err(error)) => {
+                    state.aborted_pre_route_release = Some(Err(error));
+                    state.failure.get_or_insert_with(|| error.into());
+                }
+                Err(payload) => {
+                    state.panic = Some(payload);
+                    state.failure.get_or_insert_with(|| "P-C V3 pre-route release panicked".into());
+                    state.aborted_pre_route_release = Some(Err("P-C V3 pre-route release panicked"));
+                }
+            }
         }
         return Ok(PcPrepareStepV3::Pending);
     }
