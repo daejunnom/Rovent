@@ -12,6 +12,7 @@
 //! handle within the still-running process; it is not a process-lifetime fence.
 
 use std::any::Any;
+use std::collections::TryReserveError;
 use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, mpsc};
@@ -21,6 +22,67 @@ use std::thread::{self, JoinHandle};
 pub struct OutputBatch {
     pub protocol: Vec<u8>,
     pub diagnostics: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum OutputEncodingError {
+    LengthOverflow,
+    Limit { required: usize, limit: usize },
+    Allocation(TryReserveError),
+}
+
+/// Prepare exactly the same stream bytes as the synchronous runner without
+/// consuming the original event result. Allocation or a declared byte bound
+/// failure leaves all original protocol and diagnostic values with the caller.
+pub fn encode_event_output<S>(
+    result: &crate::SessionResult<S>,
+    limit: usize,
+) -> Result<OutputBatch, OutputEncodingError> {
+    let protocol_len = result
+        .protocol
+        .iter()
+        .try_fold(0usize, |sum, line| {
+            sum.checked_add(line.len())?.checked_add(1)
+        })
+        .ok_or(OutputEncodingError::LengthOverflow)?;
+    let diagnostics_len = result
+        .diagnostics
+        .iter()
+        .try_fold(0usize, |sum, item| {
+            sum.checked_add(item.code.len())?
+                .checked_add(2)?
+                .checked_add(item.message.len())?
+                .checked_add(1)
+        })
+        .ok_or(OutputEncodingError::LengthOverflow)?;
+    let required = protocol_len
+        .checked_add(diagnostics_len)
+        .ok_or(OutputEncodingError::LengthOverflow)?;
+    if required > limit {
+        return Err(OutputEncodingError::Limit { required, limit });
+    }
+    let mut protocol = Vec::new();
+    protocol
+        .try_reserve_exact(protocol_len)
+        .map_err(OutputEncodingError::Allocation)?;
+    let mut diagnostics = Vec::new();
+    diagnostics
+        .try_reserve_exact(diagnostics_len)
+        .map_err(OutputEncodingError::Allocation)?;
+    for line in &result.protocol {
+        protocol.extend_from_slice(line.as_bytes());
+        protocol.push(b'\n');
+    }
+    for item in &result.diagnostics {
+        diagnostics.extend_from_slice(item.code.as_bytes());
+        diagnostics.extend_from_slice(b": ");
+        diagnostics.extend_from_slice(item.message.as_bytes());
+        diagnostics.push(b'\n');
+    }
+    Ok(OutputBatch {
+        protocol,
+        diagnostics,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

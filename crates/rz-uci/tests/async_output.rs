@@ -1,6 +1,8 @@
 use rz_uci::runner::async_output::{
-    AsyncOutputOwner, OutputBatch, OutputFailure, OutputPhase, OutputRecovery, SubmitError,
+    AsyncOutputOwner, OutputBatch, OutputEncodingError, OutputFailure, OutputPhase, OutputRecovery,
+    SubmitError, encode_event_output,
 };
+use rz_uci::{Diagnostic, SessionResult};
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -181,4 +183,27 @@ fn retained_allocation_limit_returns_the_original_batch() {
     }
     owner.request_close();
     assert!(recover(owner).failure.is_none());
+}
+
+#[test]
+fn event_output_encoding_matches_sync_format_and_keeps_original_on_limit() {
+    let original: SessionResult<()> = SessionResult {
+        protocol: vec!["id name 예시".into(), "uciok".into()],
+        diagnostics: vec![Diagnostic {
+            code: "Example",
+            message: "상태".into(),
+        }],
+        effects: Vec::new(),
+        accepted: true,
+    };
+    let expected_protocol = "id name 예시\nuciok\n".as_bytes();
+    let expected_diagnostics = "Example: 상태\n".as_bytes();
+    let required = expected_protocol.len() + expected_diagnostics.len();
+    let output = encode_event_output(&original, required).unwrap();
+    assert_eq!(output.protocol, expected_protocol);
+    assert_eq!(output.diagnostics, expected_diagnostics);
+    assert!(matches!(encode_event_output(&original, required - 1),
+        Err(OutputEncodingError::Limit { required: actual, .. }) if actual == required));
+    assert_eq!(original.protocol[0], "id name 예시");
+    assert_eq!(original.diagnostics[0].message, "상태");
 }
