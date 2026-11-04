@@ -8,14 +8,19 @@ use super::own_hooks_lock_v3::{
     OwnPrepareOutcomeV3, OwnPreparedRootV3, OwnReserveOutcomeV3, OwnRootRequestV3,
     RoventOwnCollectionBridgeV3,
 };
-use super::policy_row_pipeline_v3::PolicyRowPipelineOwnerV3;
+use super::policy_row_pipeline_v3::{PolicyRootRetainedOwnerV3, PolicyRowPipelineOwnerV3};
 use super::speculative_route_v3::{SpeculativeReceiverV3, SpeculativeRootV3};
+use super::teacher::v3_policy_consumer::{
+    TeacherPolicyConsumerOwnerV3, TeacherPolicyConsumerProgressV3, TeacherPolicyConsumerStartV3,
+    TeacherProcessedOwnerV3,
+};
 use super::teacher::v3_pump::{TeacherPumpSetupErrorV3, TeacherPumpStepV3, TeacherPumpV3};
 use super::teacher::v3_session::{
     RoventCollectionTeacherSessionV3, TeacherPrepareErrorV3, TeacherSessionStageStateV3,
     TeacherSessionStagingV3, TeacherStartErrorV3,
 };
 use super::writer_lock_v3::RoventCorpusWriterLockV3;
+use super::{ArenaError, invalid};
 use rz_uci::pals_adaptive::{
     AdaptiveCollectionError, RoventBoardCollectionWorkerKeyV3,
     RoventBoardCollectionWorkerSpawnFailureV3, RoventBoardCollectionWorkerV3,
@@ -37,7 +42,11 @@ pub(crate) struct OwnRootRecoveryV3 {
     pub(super) receiver: Option<Arc<Mutex<SpeculativeReceiverV3>>>,
     pub(super) owner: Option<RoventCollectionOwnerLockV3>,
     pub(super) pump: Option<Arc<Mutex<TeacherPumpV3>>>,
+    pub(super) consumer: Option<TeacherPolicyConsumerOwnerV3>,
+    pub(super) processed: Option<TeacherProcessedOwnerV3>,
+    pub(super) consumer_failure: Option<ArenaError>,
     pub(super) pipeline: PolicyRowPipelineOwnerV3,
+    pub(super) retained_policy: Option<PolicyRootRetainedOwnerV3>,
     pub(super) pump_error: Option<TeacherPumpSetupErrorV3>,
     pub(super) pump_unknown: bool,
     pub(super) worker_key: Option<RoventBoardCollectionWorkerKeyV3>,
@@ -73,11 +82,15 @@ impl OwnRootRecoveryV3 {
             request,
             inputs,
             pipeline,
+            retained_policy: None,
             stage: None,
             route: None,
             receiver: None,
             owner: None,
             pump: None,
+            consumer: None,
+            processed: None,
+            consumer_failure: None,
             pump_error: None,
             pump_unknown: false,
             worker_key: None,
@@ -358,11 +371,11 @@ pub(crate) fn prepare_own_root_step_v3(
         return Ok(OwnPrepareStepV3::Pending);
     }
     let mut state = recovery.lock().map_err(|_| "Own /3 recovery poisoned")?;
-    if state.published {
-        return Ok(OwnPrepareStepV3::Published);
-    }
     if state.failure.is_some() {
         return Ok(OwnPrepareStepV3::Failed);
+    }
+    if state.published {
+        return Ok(OwnPrepareStepV3::Published);
     }
     if state.request.is_revoked() {
         state.failure = Some("Own /3 original request revoked; retain staged owners".into());
@@ -404,6 +417,29 @@ pub(crate) fn prepare_own_root_step_v3(
     let Some(startup) = bridge.startup() else {
         return Ok(OwnPrepareStepV3::Pending);
     };
+    if state.processed.is_none() {
+        let capacity = state.inputs.plan().teacher_tickets_per_root as usize;
+        match TeacherProcessedOwnerV3::new(admission.clone(), capacity) {
+            Ok(owner) => state.processed = Some(owner),
+            Err(error) => {
+                state.consumer_failure = Some(error);
+                state.failure = Some("Own /3 processed completion owner unavailable".into());
+                return Ok(OwnPrepareStepV3::Failed);
+            }
+        }
+    }
+    if state.retained_policy.is_none() {
+        let capacity = usize::try_from(state.inputs.plan().maximum_records)
+            .map_err(|_| "Own /3 policy retention capacity overflow")?;
+        match PolicyRootRetainedOwnerV3::try_new(&state.pipeline, admission.clone(), capacity) {
+            Ok(Some(owner)) => state.retained_policy = Some(owner),
+            Ok(None) => return Ok(OwnPrepareStepV3::Pending),
+            Err(error) => {
+                state.failure = Some(error.into());
+                return Ok(OwnPrepareStepV3::Failed);
+            }
+        }
+    }
     if state.stage.is_none() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             RoventCollectionTeacherSessionV3::prepare_staged(
@@ -556,7 +592,11 @@ pub(crate) fn prepare_own_root_step_v3(
                     break;
                 };
                 if let Ok(mut original) = original_root.try_lock() {
-                    let pump = original.pump.as_ref().map(Arc::clone);
+                    let pump = if original.pump_failure.is_none() {
+                        original.pump.as_ref().map(Arc::clone)
+                    } else {
+                        None
+                    };
                     let failure = if let Some(pump) = pump {
                         let value = match pump.try_lock() {
                             Ok(mut owner) => owner.try_pump().err(),
@@ -570,6 +610,17 @@ pub(crate) fn prepare_own_root_step_v3(
                         original.pump_failure_count = original.pump_failure_count.saturating_add(1);
                         if original.pump_failure.is_none() {
                             original.pump_failure = Some(error);
+                        }
+                    }
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        original.try_drive_consumer()
+                    }));
+                    if let Err(payload) = outcome {
+                        original.retain_panic(payload);
+                        if original.consumer_failure.is_none() {
+                            original.consumer_failure = Some(invalid(
+                                "Own /3 policy consumer outcome unknown after panic",
+                            ));
                         }
                     }
                 }
@@ -671,6 +722,121 @@ impl OwnRootRecoveryV3 {
             self.additional_panics.push(payload);
         }
     }
+
+    /// Run only on the retained root worker. Busy and not-ready observations
+    /// preserve the original consumer, completion, target and output owners.
+    fn try_drive_consumer(&mut self) {
+        if !self.published || self.consumer_failure.is_some() {
+            return;
+        }
+        let Some(stage) = self.stage.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let session = match stage.try_lock() {
+            Ok(stage) => stage.session(),
+            Err(_) => None,
+        };
+        let (
+            Some(session),
+            Some(pump),
+            Some(route),
+            Some(observer),
+            Some(processed),
+            Some(retained),
+        ) = (
+            session,
+            self.pump.as_ref().map(Arc::clone),
+            self.route.as_ref(),
+            self.owner.as_ref(),
+            self.processed.as_ref(),
+            self.retained_policy.as_ref(),
+        )
+        else {
+            return;
+        };
+        if self.consumer.is_none() {
+            match TeacherPolicyConsumerOwnerV3::try_new(
+                &session,
+                &pump,
+                route,
+                observer,
+                &self.pipeline,
+                processed,
+                retained,
+            ) {
+                Ok(TeacherPolicyConsumerStartV3::Ready(consumer)) => self.consumer = Some(consumer),
+                Ok(TeacherPolicyConsumerStartV3::Busy | TeacherPolicyConsumerStartV3::NotReady) => {
+                    return;
+                }
+                Err(error) => {
+                    self.consumer_failure = Some(error);
+                    return;
+                }
+            }
+        }
+        let consumer = self.consumer.as_ref().expect("consumer retained").clone();
+        match consumer.try_matches_registered_owners(
+            &session,
+            &pump,
+            route,
+            observer,
+            &self.pipeline,
+            processed,
+            retained,
+        ) {
+            Ok(Some(true)) => {}
+            Ok(None) => return,
+            Ok(Some(false)) => {
+                self.consumer_failure =
+                    Some(invalid("Own /3 original policy consumer owner changed"));
+                return;
+            }
+            Err(error) => {
+                self.consumer_failure = Some(invalid(error));
+                return;
+            }
+        }
+        let mut consumer = match consumer.try_lock() {
+            Ok(Some(consumer)) => consumer,
+            Ok(None) => return,
+            Err(error) => {
+                self.consumer_failure = Some(invalid(error));
+                return;
+            }
+        };
+        use super::teacher::v3_policy_consumer::TeacherPolicyConsumerV3;
+        let steps: [fn(
+            &mut TeacherPolicyConsumerV3,
+        ) -> Result<TeacherPolicyConsumerProgressV3, ArenaError>; 9] = [
+            TeacherPolicyConsumerV3::try_transfer_completion,
+            TeacherPolicyConsumerV3::try_seal,
+            TeacherPolicyConsumerV3::try_transfer_retired,
+            TeacherPolicyConsumerV3::try_prepare_sealed,
+            TeacherPolicyConsumerV3::try_prepare_candidate,
+            TeacherPolicyConsumerV3::try_transfer_capability,
+            TeacherPolicyConsumerV3::try_append_policy,
+            TeacherPolicyConsumerV3::try_retain_appended,
+            TeacherPolicyConsumerV3::try_retain_processed_completion,
+        ];
+        for step in steps {
+            match step(&mut consumer) {
+                Ok(
+                    TeacherPolicyConsumerProgressV3::Rejected
+                    | TeacherPolicyConsumerProgressV3::Unknown,
+                ) => {
+                    self.consumer_failure = Some(invalid(
+                        "Own /3 policy consumer rejected or uncertain; original owner retained",
+                    ));
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.consumer_failure = Some(error);
+                    return;
+                }
+            }
+        }
+    }
     /// Best-effort cancellation of this same root after preparation failure.
     /// This is only a request: owner, workers and unresolved results remain
     /// retained until their own physical and handoff evidence is collected.
@@ -705,6 +871,7 @@ impl OwnRootRecoveryV3 {
     /// Retire the actual teacher scope only after all physical workers join;
     /// a pending query, unconsumed completion or missing aggregate stays held.
     fn try_drain_teacher(&mut self, handoff: &RoventBoardRootHandoffV3, deadline: Instant) -> bool {
+        self.try_drive_consumer();
         self.try_request_teacher_shutdown(deadline);
         let Some(stage) = self.stage.as_ref().map(Arc::clone) else {
             return false;

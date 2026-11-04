@@ -614,6 +614,19 @@ impl RoventOwnCollectionBridgeV3 {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.try_join(handoff)));
         match result {
             Ok(Ok(Some(custody))) => {
+                let same_recovery = slot.recovery.as_ref().is_some_and(|original| {
+                    custody
+                        .original_worker()
+                        .downcast_ref::<Weak<Mutex<OwnRootRecoveryV3>>>()
+                        .is_some_and(|returned| Weak::ptr_eq(returned, &Arc::downgrade(original)))
+                });
+                if !same_recovery {
+                    // The joined owner is still the original worker outcome;
+                    // retain it but never promote it to matching recovery.
+                    slot.joined = Some(custody);
+                    slot.join_unknown = true;
+                    return Err("Own /3 joined worker recovery differs");
+                }
                 slot.join_complete = true;
                 slot.joined = Some(custody);
                 Ok(true)
