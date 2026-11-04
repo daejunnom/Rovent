@@ -122,6 +122,24 @@ class NoticeTests(unittest.TestCase):
             with mock.patch.object(managed_outputs, "_read", return_value={**record, "state": "active"}):
                 self.assertFalse(parent._failed_acquire_retained(lease))
 
+    def test_same_lease_finish_recovery_distinguishes_intent_state(self):
+        lease = mock.Mock()
+        lease.live_finish_observation.return_value = {"phase": "active_before_intent"}
+        lease.live_handoff_observation.return_value = {"state": "suspended"}
+        self.assertTrue(parent._recover_same_live_finish(lease, "original_status"))
+        lease.resume_live.assert_called_once()
+        lease.finish.assert_called_once_with(status="original_status", tree_gone=True)
+        lease.reset_mock()
+        lease.live_finish_observation.return_value = {"phase": "terminal_pending"}
+        self.assertTrue(parent._recover_same_live_finish(lease, "original_status"))
+        lease.recover_live_terminal.assert_called_once_with()
+        lease.finish.assert_not_called()
+        lease.reset_mock()
+        lease.live_finish_observation.return_value = {"phase": "unknown"}
+        self.assertFalse(parent._recover_same_live_finish(lease, "original_status"))
+        lease.finish.assert_not_called()
+        lease.recover_live_terminal.assert_not_called()
+
 
 @unittest.skipUnless(sys.platform == "linux", "requires Linux procfs and Unix peer credentials")
 class ParentCpuFixtureTests(unittest.TestCase):

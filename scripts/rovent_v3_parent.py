@@ -557,6 +557,22 @@ def _failed_acquire_retained(lease):
         return False
 
 
+def _recover_same_live_finish(lease, status):
+    """Resume only this owner's already-known terminal operation."""
+    phase = lease.live_finish_observation()["phase"]
+    if phase == "terminal_pending":
+        lease.recover_live_terminal()
+        return True
+    if phase == "terminal_verified_released":
+        return True
+    if phase == "active_before_intent" and status is not None:
+        if lease.live_handoff_observation()["state"] == "suspended":
+            lease.resume_live(deadline=time.monotonic() + 2.0)
+        lease.finish(status=status, tree_gone=True)
+        return True
+    return False
+
+
 def _scope_observation(owner, stage):
     """Optional readback; absence never substitutes for a configured limit."""
     value = {"schema": "rz-rovent-v3-managed-scope-observation/1", "stage": stage,
@@ -673,6 +689,7 @@ def run_managed(plan_path):
     acquired = False
     partial_publication_unknown = False
     finish_attempted = False
+    finish_status = None
     cancel_requested = [False]
     previous_handlers = {}
 
@@ -877,15 +894,44 @@ def run_managed(plan_path):
                                         and native_outcome.get("workload_empty") is True)
         if original_child_unsettled:
             raise RuntimeError("original native session remains unknown")
+        observation = {
+            "schema": "rz-rovent-v3-managed-parent-observation/1",
+            "output": str(output), "input_lock_sha256": lock_sha,
+            "smoke_result": result,
+            "session": "reported_by_original_product",
+            "original_process_group": "no_live_members_observed",
+            "original_workload_cgroup": "empty_observed",
+            "gpu_device_fence": "not_observed",
+            "lease_finish": "pending_at_observation",
+            "limits_before_close": _scope_observation(owner, "after_native_before_close"),
+        }
+        receipt_path = output / "managed-parent-observation.json"
+        receipt_error = None
+        try:
+            receipt_fd = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(receipt_fd, "wb") as stream:
+                stream.write(json.dumps(observation, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as error:
+            # Optional evidence failure is separate from the observed session.
+            receipt_error = type(error).__name__
         owner.close(native_leaf)
         owner = None
         # This finite catalog operation happens after native/session closure;
         # it is not extra native or GPU execution time.
         lease.resume_live(deadline=time.monotonic() + 2.0)
         suspended = False
+        finish_status = "v3_parent_smoke_complete" if result == 0 else "v3_parent_smoke_failed"
         finish_attempted = True
-        lease.finish(status="v3_parent_smoke_complete" if result == 0 else "v3_parent_smoke_failed",
-                     tree_gone=True)
+        lease.finish(status=finish_status, tree_gone=True)
+        lease_observation = lease.live_finish_observation()
+        _report({"schema": "rz-rovent-v3-managed-parent-result/1", "output": str(output),
+                 "smoke_result": result, "session": "reported_by_original_product",
+                 "gpu_device_fence": "not_observed", "lease_finish": lease_observation["phase"],
+                 "lease_marker": str(output / ".rovezero-output.json"),
+                 "managed_observation": str(receipt_path) if receipt_error is None else None,
+                 "managed_observation_error": receipt_error})
         lease = None
         return result
     except BaseException as error:
@@ -903,13 +949,10 @@ def run_managed(plan_path):
                     owner = None
             except BaseException:
                 pass
-        if lease is not None and acquired and finish_attempted:
+        if (lease is not None and acquired and finish_attempted
+                and owner is None and not original_child_unsettled):
             try:
-                phase = lease.live_finish_observation()["phase"]
-                if phase == "terminal_pending":
-                    lease.recover_live_terminal()
-                    lease = None
-                elif phase == "terminal_verified_released":
+                if _recover_same_live_finish(lease, finish_status):
                     lease = None
             except BaseException:
                 pass
@@ -919,9 +962,9 @@ def run_managed(plan_path):
                 if suspended:
                     lease.resume_live(deadline=time.monotonic() + 2.0)
                     suspended = False
+                finish_status = "v3_parent_cleanup_failed" if native_attempted else "v3_parent_prepare_failed"
                 finish_attempted = True
-                lease.finish(status="v3_parent_cleanup_failed" if native_attempted else "v3_parent_prepare_failed",
-                             tree_gone=True)
+                lease.finish(status=finish_status, tree_gone=True)
                 lease = None
             except BaseException:
                 pass
@@ -957,19 +1000,15 @@ def run_managed(plan_path):
                 if lease is not None and acquired and owner is None and not original_child_unsettled:
                     try:
                         if finish_attempted:
-                            phase = lease.live_finish_observation()["phase"]
-                            if phase == "terminal_pending":
-                                lease.recover_live_terminal()
-                                lease = None
-                            elif phase == "terminal_verified_released":
+                            if _recover_same_live_finish(lease, finish_status):
                                 lease = None
                         else:
                             if suspended:
                                 lease.resume_live(deadline=time.monotonic() + 2.0)
                                 suspended = False
+                            finish_status = "v3_parent_cleanup_failed" if native_attempted else "v3_parent_prepare_failed"
                             finish_attempted = True
-                            lease.finish(status="v3_parent_cleanup_failed" if native_attempted else "v3_parent_prepare_failed",
-                                         tree_gone=True)
+                            lease.finish(status=finish_status, tree_gone=True)
                             lease = None
                     except BaseException:
                         pass
