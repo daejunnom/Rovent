@@ -79,14 +79,7 @@ impl PcCollectionRootRunV3 {
                             admission: admission.clone(),
                             owners: Box::new(()),
                         });
-                    let mut panics = state.panics.lock().unwrap_or_else(|p| p.into_inner());
-                    if panics.0.is_none() {
-                        panics.0 = Some(payload);
-                    } else if panics.1.is_none() {
-                        panics.1 = Some(payload);
-                    } else {
-                        std::mem::forget(payload);
-                    }
+                    state.retain_panic(payload);
                     return Err(AdaptiveManagerError::Invalid(
                         "P/C V3 admission callback panicked",
                     ));
@@ -272,7 +265,7 @@ impl PcCollectionRootRunV3 {
                 }
                 Ok(Err(error)) => return Err(error),
                 Err(payload) => {
-                    state.panics.lock().unwrap_or_else(|p| p.into_inner()).1 = Some(payload);
+                    state.retain_panic(payload);
                     return Err(AdaptiveManagerError::Invalid(
                         "P/C V3 revoke callback panicked",
                     ));
@@ -359,14 +352,7 @@ impl PcCollectionRootRunV3 {
                                 .retention_failure = Some(error);
                         }
                         RoventPcDeferredCleanupFailureV3::Panic(payload) => {
-                            let mut panics = state.panics.lock().unwrap_or_else(|p| p.into_inner());
-                            if panics.0.is_none() {
-                                panics.0 = Some(payload);
-                            } else if panics.1.is_none() {
-                                panics.1 = Some(payload);
-                            } else {
-                                std::mem::forget(payload);
-                            }
+                            state.retain_panic(payload);
                         }
                         RoventPcDeferredCleanupFailureV3::Busy => {}
                     }
@@ -443,7 +429,7 @@ impl PcCollectionRootRunV3 {
             })) {
                 Ok(result) => result?,
                 Err(payload) => {
-                    state.panics.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                    state.retain_panic(payload);
                     return Err(AdaptiveManagerError::Invalid(
                         "P/C V3 handoff callback panicked",
                     ));
@@ -489,7 +475,7 @@ impl PcCollectionRootRunV3 {
             })) {
                 Ok(result) => result?,
                 Err(payload) => {
-                    state.panics.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                    state.retain_panic(payload);
                     return Err(AdaptiveManagerError::Invalid(
                         "P/C V3 handoff callback panicked",
                     ));
@@ -557,7 +543,7 @@ impl PcCollectionRootRunV3 {
                     }
                     Err(payload) => {
                         self.custody_take_uncertain = true;
-                        state.panics.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                        state.retain_panic(payload);
                         return Err(AdaptiveManagerError::Invalid(
                             "P/C V3 custody callback panicked",
                         ));
@@ -608,7 +594,7 @@ impl PcCollectionRootRunV3 {
                     }
                     Err(payload) => {
                         self.custody_return_uncertain = true;
-                        state.panics.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                        state.retain_panic(payload);
                         return Err(AdaptiveManagerError::Invalid(
                             "P/C V3 return callback panicked",
                         ));

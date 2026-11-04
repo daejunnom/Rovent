@@ -3792,11 +3792,7 @@ impl RoventPcSessionDriver {
                 v3_observation(&manager, RoventPcRevokeOriginV2::RunEnded),
             ) {
                 if let Some(payload) = original_panic.take() {
-                    collection
-                        .panics
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .0 = Some(payload);
+                    collection.retain_panic(payload);
                 }
                 *collection
                     .recovery_root
@@ -3893,11 +3889,7 @@ impl RoventPcSessionDriver {
         if let Some(payload) = original_panic {
             #[cfg(target_os = "linux")]
             if let Some(collection) = &self.collection_v3 {
-                collection
-                    .panics
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .0 = Some(payload);
+                collection.retain_panic(payload);
                 *collection
                     .recovery_root
                     .lock()

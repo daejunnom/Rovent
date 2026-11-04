@@ -31,7 +31,7 @@ pub(crate) struct RoventPcCollectionStateV3 {
     pub(crate) cleanup_context: Mutex<Option<crate::search_driver::SearchSessionContext>>,
     pub(crate) recovery_root: Mutex<Option<super::pc_collection_v3_root::PcCollectionRootRunV3>>,
     pub(crate) admission_failure: Mutex<Option<RoventPcCollectionAdmissionFailureV3>>,
-    pub(crate) panics: Mutex<(Option<Box<dyn Any + Send>>, Option<Box<dyn Any + Send>>)>,
+    panics: Mutex<Vec<Box<dyn Any + Send>>>,
 }
 
 impl RoventPcCollectionStateV3 {
@@ -51,7 +51,17 @@ impl RoventPcCollectionStateV3 {
             cleanup_context: Mutex::new(None),
             recovery_root: Mutex::new(None),
             admission_failure: Mutex::new(None),
-            panics: Mutex::new((None, None)),
+            panics: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn retain_panic(&self, payload: Box<dyn Any + Send>) {
+        let mut panics = self.panics.lock().unwrap_or_else(|p| p.into_inner());
+        if panics.try_reserve(1).is_ok() {
+            panics.push(payload);
+        } else {
+            // Never drop an unclassified original owner on allocation failure.
+            std::mem::forget(payload);
         }
     }
 }
