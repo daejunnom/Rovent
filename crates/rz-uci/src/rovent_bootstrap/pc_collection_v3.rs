@@ -1,0 +1,529 @@
+//! Original V3 P/C collection owners. No V2 admission or receipt is recreated.
+
+use super::RoventStartupControl;
+use super::pc_session::RoventPcSessionManager;
+use crate::pals_adaptive::{
+    AdaptiveCollectionError, AdaptiveCollectionObserverBoxV3, AdaptiveManagerError,
+    RoleOnlyCollectionV3Rejection, RoleOnlyShutdownReceipt, RoventCollectionRootAdmissionV3,
+    RoventNativeCollectionOriginV3, RoventNoCaptureRootCapabilityV3,
+    RoventRoleOnlyNoCaptureFenceV3, RoventTeacherScopePhysicalAckV3,
+};
+use crate::pals_native::ticketed::VirtualReviewTicketOutput;
+use crate::rovent_external_launch::RoventTeacherScopeAggregateAckV3;
+use rz_search::pals::engine::pc_port::PcPortQuestion;
+use std::{
+    any::Any,
+    sync::{Arc, Mutex, OnceLock, atomic::AtomicBool, mpsc},
+};
+
+/// Internal custody remains with the original P/C session. A reported root
+/// closure alone does not release a pending teacher or an unresolved marker.
+pub(crate) struct RoventPcCollectionStateV3 {
+    pub(crate) origin: RoventNativeCollectionOriginV3,
+    pub(crate) hooks: Arc<dyn RoventPcCollectionHooksV3>,
+    pub(crate) outstanding: AtomicBool,
+    pub(crate) handoff: Mutex<Option<Arc<Mutex<RoventPcCollectionHandoffV3>>>>,
+    pub(crate) custody: Mutex<Option<Arc<Mutex<RoventPcCollectionRootCustodyV3>>>>,
+    pub(crate) no_capture:
+        Mutex<Option<(RoventNoCaptureRootCapabilityV3, AdaptiveCollectionError)>>,
+    pub(crate) deferred_cleanup: Mutex<Option<Arc<Mutex<RoventPcDeferredCleanupV3>>>>,
+    pub(crate) prior_cleanup_failures: Mutex<Vec<Arc<Mutex<RoventPcDeferredCleanupV3>>>>,
+    pub(crate) cleanup_context: Mutex<Option<crate::search_driver::SearchSessionContext>>,
+    pub(crate) admission_failure: Mutex<Option<RoventPcCollectionAdmissionFailureV3>>,
+    pub(crate) panics: Mutex<(Option<Box<dyn Any + Send>>, Option<Box<dyn Any + Send>>)>,
+}
+
+impl RoventPcCollectionStateV3 {
+    pub(crate) fn new(
+        origin: RoventNativeCollectionOriginV3,
+        hooks: Arc<dyn RoventPcCollectionHooksV3>,
+    ) -> Self {
+        Self {
+            origin,
+            hooks,
+            outstanding: AtomicBool::new(false),
+            handoff: Mutex::new(None),
+            custody: Mutex::new(None),
+            no_capture: Mutex::new(None),
+            deferred_cleanup: Mutex::new(None),
+            prior_cleanup_failures: Mutex::new(Vec::new()),
+            cleanup_context: Mutex::new(None),
+            admission_failure: Mutex::new(None),
+            panics: Mutex::new((None, None)),
+        }
+    }
+}
+
+/// This handoff is constructed only after the same manager's root fence and
+/// settlement. Teacher completion and corpus publication remain separate.
+pub struct RoventPcCollectionHandoffV3 {
+    pub(crate) admission: RoventCollectionRootAdmissionV3,
+    pub(crate) observer: AdaptiveCollectionObserverBoxV3<PcPortQuestion, VirtualReviewTicketOutput>,
+    pub(crate) settlement: Result<(), AdaptiveCollectionError>,
+    pub(crate) native_fence: RoleOnlyShutdownReceipt,
+    teacher_physical_ack: Option<RoventTeacherScopePhysicalAckV3>,
+    teacher_aggregate_ack: Option<RoventTeacherScopeAggregateAckV3>,
+}
+
+impl RoventPcCollectionHandoffV3 {
+    pub(crate) fn new(
+        admission: RoventCollectionRootAdmissionV3,
+        observer: AdaptiveCollectionObserverBoxV3<PcPortQuestion, VirtualReviewTicketOutput>,
+        settlement: Result<(), AdaptiveCollectionError>,
+        native_fence: RoleOnlyShutdownReceipt,
+    ) -> Self {
+        Self {
+            admission,
+            observer,
+            settlement,
+            native_fence,
+            teacher_physical_ack: None,
+            teacher_aggregate_ack: None,
+        }
+    }
+
+    pub fn submit_teacher_physical_ack(
+        &mut self,
+        ack: RoventTeacherScopePhysicalAckV3,
+    ) -> Result<(), RoventTeacherScopePhysicalAckV3> {
+        if self.teacher_physical_ack.is_some() || !ack.matches_admission(&self.admission) {
+            return Err(ack);
+        }
+        self.teacher_physical_ack = Some(ack);
+        Ok(())
+    }
+
+    pub fn submit_teacher_aggregate_ack(
+        &mut self,
+        ack: RoventTeacherScopeAggregateAckV3,
+    ) -> Result<(), RoventTeacherScopeAggregateAckV3> {
+        if self.teacher_aggregate_ack.is_some() || !ack.matches_admission(&self.admission) {
+            return Err(ack);
+        }
+        self.teacher_aggregate_ack = Some(ack);
+        Ok(())
+    }
+
+    pub fn teacher_aggregate_ack(&self) -> Option<&RoventTeacherScopeAggregateAckV3> {
+        self.teacher_aggregate_ack.as_ref()
+    }
+
+    pub fn parts_mut(
+        &mut self,
+    ) -> (
+        &RoventCollectionRootAdmissionV3,
+        &mut AdaptiveCollectionObserverBoxV3<PcPortQuestion, VirtualReviewTicketOutput>,
+        &Result<(), AdaptiveCollectionError>,
+        &RoleOnlyShutdownReceipt,
+    ) {
+        (
+            &self.admission,
+            &mut self.observer,
+            &self.settlement,
+            &self.native_fence,
+        )
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        RoventCollectionRootAdmissionV3,
+        AdaptiveCollectionObserverBoxV3<PcPortQuestion, VirtualReviewTicketOutput>,
+        Result<(), AdaptiveCollectionError>,
+        RoleOnlyShutdownReceipt,
+        Option<RoventTeacherScopePhysicalAckV3>,
+        Option<RoventTeacherScopeAggregateAckV3>,
+    ) {
+        (
+            self.admission,
+            self.observer,
+            self.settlement,
+            self.native_fence,
+            self.teacher_physical_ack,
+            self.teacher_aggregate_ack,
+        )
+    }
+}
+
+/// The original joined orchestration worker and the same root handoff.
+/// Teacher physical and aggregate completion have separate evidence.
+pub struct RoventPcCollectionRootCustodyV3 {
+    handoff: Arc<Mutex<RoventPcCollectionHandoffV3>>,
+    original_worker: Box<dyn Any + Send>,
+}
+
+/// An unresolved no-capture marker cleanup, retained with its exact root and
+/// native fence. This is not evidence of marker removal or teacher retirement.
+pub struct RoventPcDeferredCleanupV3 {
+    pub(crate) capability: RoventNoCaptureRootCapabilityV3,
+    pub(crate) reason: AdaptiveCollectionError,
+    pub(crate) fence: RoventRoleOnlyNoCaptureFenceV3,
+    pub(crate) failure: RoventPcDeferredCleanupFailureV3,
+    pub(crate) retention_failure: Option<AdaptiveManagerError>,
+}
+
+pub enum RoventPcDeferredCleanupFailureV3 {
+    Busy,
+    Error(AdaptiveManagerError),
+    Panic(Box<dyn Any + Send>),
+}
+
+impl RoventPcDeferredCleanupV3 {
+    pub fn capability(&self) -> &RoventNoCaptureRootCapabilityV3 {
+        &self.capability
+    }
+    pub fn reason(&self) -> &AdaptiveCollectionError {
+        &self.reason
+    }
+    pub fn fence(&self) -> &RoventRoleOnlyNoCaptureFenceV3 {
+        &self.fence
+    }
+    pub fn failure(&self) -> &RoventPcDeferredCleanupFailureV3 {
+        &self.failure
+    }
+    pub fn retention_failure(&self) -> Option<&AdaptiveManagerError> {
+        self.retention_failure.as_ref()
+    }
+}
+impl RoventPcCollectionRootCustodyV3 {
+    fn from_joined_worker(
+        handoff: Arc<Mutex<RoventPcCollectionHandoffV3>>,
+        original_worker: Box<dyn Any + Send>,
+    ) -> Self {
+        Self {
+            handoff,
+            original_worker,
+        }
+    }
+    pub fn matches_handoff(&self, handoff: &Arc<Mutex<RoventPcCollectionHandoffV3>>) -> bool {
+        Arc::ptr_eq(&self.handoff, handoff)
+    }
+    pub fn handoff(&self) -> &Arc<Mutex<RoventPcCollectionHandoffV3>> {
+        &self.handoff
+    }
+    pub fn original_worker(&self) -> &(dyn Any + Send) {
+        self.original_worker.as_ref()
+    }
+    pub fn into_parts(self) -> (Arc<Mutex<RoventPcCollectionHandoffV3>>, Box<dyn Any + Send>) {
+        (self.handoff, self.original_worker)
+    }
+}
+
+pub type RootHandoffV3 = Arc<Mutex<RoventPcCollectionHandoffV3>>;
+/// Receiver records the exact same-root handoff actually delivered to worker.
+pub struct RoventPcRootHandoffReceiverV3 {
+    receiver: mpsc::Receiver<RootHandoffV3>,
+    admission: RoventCollectionRootAdmissionV3,
+    received: Arc<Mutex<Option<RootHandoffV3>>>,
+}
+impl RoventPcRootHandoffReceiverV3 {
+    pub fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<RootHandoffV3>, AdaptiveManagerError> {
+        let handoff = match self.receiver.recv_timeout(timeout) {
+            Ok(value) => value,
+            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(AdaptiveManagerError::Invalid(
+                    "V3 root handoff channel closed",
+                ));
+            }
+        };
+        if !handoff
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .admission
+            .same_original_admission(&self.admission)
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "V3 worker received another root",
+            ));
+        }
+        let mut received = self.received.lock().unwrap_or_else(|p| p.into_inner());
+        if received.is_some() {
+            return Err(AdaptiveManagerError::Invalid(
+                "V3 worker received duplicate handoff",
+            ));
+        }
+        *received = Some(Arc::clone(&handoff));
+        Ok(Some(handoff))
+    }
+}
+pub type RoventPcRootWorkerTaskV3 =
+    Box<dyn FnOnce(RoventPcRootHandoffReceiverV3) -> Box<dyn Any + Send> + Send + 'static>;
+
+/// Owns the exact orchestration thread and admission. A worker result is not
+/// evidence of teacher physical completion or corpus publication.
+#[must_use]
+pub struct RoventPcCollectionWorkerV3 {
+    key: RoventPcCollectionWorkerKeyV3,
+    admission: RoventCollectionRootAdmissionV3,
+    sender: mpsc::SyncSender<RootHandoffV3>,
+    received: Arc<Mutex<Option<RootHandoffV3>>>,
+    thread: Option<std::thread::JoinHandle<Box<dyn Any + Send>>>,
+}
+
+/// The owner retains this token to recover an unresolved worker from the
+/// process-local quarantine. It does not imply completion or authorization.
+#[derive(Clone)]
+pub struct RoventPcCollectionWorkerKeyV3(Arc<()>);
+struct QuarantinedPcWorkerV3 {
+    key: RoventPcCollectionWorkerKeyV3,
+    admission: RoventCollectionRootAdmissionV3,
+    sender: mpsc::SyncSender<RootHandoffV3>,
+    received: Arc<Mutex<Option<RootHandoffV3>>>,
+    thread: std::thread::JoinHandle<Box<dyn Any + Send>>,
+}
+fn quarantined_pc_workers_v3() -> &'static Mutex<Vec<QuarantinedPcWorkerV3>> {
+    static WORKERS: OnceLock<Mutex<Vec<QuarantinedPcWorkerV3>>> = OnceLock::new();
+    WORKERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub struct RoventPcCollectionWorkerSpawnFailureV3 {
+    pub admission: RoventCollectionRootAdmissionV3,
+    pub error: std::io::Error,
+    pub task: RoventPcRootWorkerTaskV3,
+}
+
+pub enum RoventPcCollectionWorkerJoinFailureV3 {
+    WrongRoot,
+    AlreadyJoined,
+    Panicked(Box<dyn Any + Send>),
+    CompletedWithoutHandoff(Box<dyn Any + Send>),
+}
+
+impl RoventPcCollectionWorkerV3 {
+    pub fn spawn(
+        admission: RoventCollectionRootAdmissionV3,
+        task: RoventPcRootWorkerTaskV3,
+    ) -> Result<Self, RoventPcCollectionWorkerSpawnFailureV3> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let received = Arc::new(Mutex::new(None));
+        let worker_receiver = RoventPcRootHandoffReceiverV3 {
+            receiver,
+            admission: admission.clone(),
+            received: Arc::clone(&received),
+        };
+        // A failed thread creation must return the original task and its owners.
+        let slot = Arc::new(Mutex::new(Some(task)));
+        let worker_slot = Arc::clone(&slot);
+        let thread = std::thread::Builder::new()
+            .name("rovent-pc-collection-v3".to_owned())
+            .spawn(move || {
+                let task = worker_slot
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+                    .expect("original V3 worker task");
+                task(worker_receiver)
+            });
+        match thread {
+            Ok(thread) => Ok(Self {
+                key: RoventPcCollectionWorkerKeyV3(Arc::new(())),
+                admission,
+                sender,
+                received,
+                thread: Some(thread),
+            }),
+            Err(error) => {
+                let task = slot
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+                    .expect("failed spawn retains V3 worker task");
+                Err(RoventPcCollectionWorkerSpawnFailureV3 {
+                    admission,
+                    error,
+                    task,
+                })
+            }
+        }
+    }
+
+    pub fn sender(&self) -> mpsc::SyncSender<RootHandoffV3> {
+        self.sender.clone()
+    }
+
+    pub fn recovery_key(&self) -> RoventPcCollectionWorkerKeyV3 {
+        self.key.clone()
+    }
+
+    /// Recover only the original process-local worker matching this token.
+    pub fn recover(key: &RoventPcCollectionWorkerKeyV3) -> Option<Self> {
+        let mut workers = quarantined_pc_workers_v3()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let index = workers
+            .iter()
+            .position(|worker| Arc::ptr_eq(&worker.key.0, &key.0))?;
+        let owner = workers.swap_remove(index);
+        Some(Self {
+            key: owner.key,
+            admission: owner.admission,
+            sender: owner.sender,
+            received: owner.received,
+            thread: Some(owner.thread),
+        })
+    }
+
+    pub fn try_join(
+        &mut self,
+        handoff: &RootHandoffV3,
+    ) -> Result<Option<RoventPcCollectionRootCustodyV3>, RoventPcCollectionWorkerJoinFailureV3>
+    {
+        if !handoff
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .admission
+            .same_original_admission(&self.admission)
+        {
+            return Err(RoventPcCollectionWorkerJoinFailureV3::WrongRoot);
+        }
+        let thread = self
+            .thread
+            .as_ref()
+            .ok_or(RoventPcCollectionWorkerJoinFailureV3::AlreadyJoined)?;
+        if !thread.is_finished() {
+            return Ok(None);
+        }
+        match self.thread.take().expect("checked V3 worker handle").join() {
+            Ok(original_worker) => {
+                if !self
+                    .received
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .is_some_and(|received| Arc::ptr_eq(received, handoff))
+                {
+                    return Err(
+                        RoventPcCollectionWorkerJoinFailureV3::CompletedWithoutHandoff(
+                            original_worker,
+                        ),
+                    );
+                }
+                Ok(Some(RoventPcCollectionRootCustodyV3::from_joined_worker(
+                    Arc::clone(handoff),
+                    original_worker,
+                )))
+            }
+            Err(payload) => Err(RoventPcCollectionWorkerJoinFailureV3::Panicked(payload)),
+        }
+    }
+}
+
+impl Drop for RoventPcCollectionWorkerV3 {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            quarantined_pc_workers_v3()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(QuarantinedPcWorkerV3 {
+                    key: self.key.clone(),
+                    admission: self.admission.clone(),
+                    sender: self.sender.clone(),
+                    received: Arc::clone(&self.received),
+                    thread,
+                });
+        }
+    }
+}
+
+pub enum RoventPcCollectionAdmissionOutcomeV3 {
+    Installed,
+    /// This exact admission did not start an observer or teacher.
+    Pending {
+        admission: RoventCollectionRootAdmissionV3,
+    },
+    /// Installation is unknown; the original attempt must be retained.
+    PendingUncertain {
+        admission: RoventCollectionRootAdmissionV3,
+    },
+    DeferredNoCapture {
+        capability: RoventNoCaptureRootCapabilityV3,
+        reason: AdaptiveCollectionError,
+    },
+}
+
+pub struct RoventPcCollectionAdmissionFailureV3 {
+    pub error: AdaptiveManagerError,
+    pub admission: RoventCollectionRootAdmissionV3,
+    pub owners: Box<dyn Any + Send>,
+}
+
+/// A borrowed original manager; this port cannot manufacture an admission.
+pub struct RoventPcCollectionAdmissionPortV3<'a> {
+    pub(crate) manager: &'a mut RoventPcSessionManager,
+}
+impl RoventPcCollectionAdmissionPortV3<'_> {
+    pub fn no_capture_capability(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<RoventNoCaptureRootCapabilityV3, AdaptiveManagerError> {
+        self.manager.no_capture_root_v3(admission)
+    }
+    pub fn install(
+        &mut self,
+        admission: RoventCollectionRootAdmissionV3,
+        observer: AdaptiveCollectionObserverBoxV3<PcPortQuestion, VirtualReviewTicketOutput>,
+    ) -> Result<(), RoleOnlyCollectionV3Rejection<PcPortQuestion, VirtualReviewTicketOutput>> {
+        self.manager
+            .install_collection_observer_v3(admission, observer)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventPcCustodyReturnV3 {
+    Accepted,
+    Busy,
+}
+
+/// Callbacks are nonblocking, root-scoped and retain their original owners.
+pub trait RoventPcCollectionHooksV3: Send + Sync {
+    fn register_startup_control(
+        &self,
+        control: &RoventStartupControl,
+    ) -> Result<(), AdaptiveManagerError>;
+    fn admit(
+        &self,
+        port: &mut RoventPcCollectionAdmissionPortV3<'_>,
+        admission: RoventCollectionRootAdmissionV3,
+    ) -> Result<RoventPcCollectionAdmissionOutcomeV3, RoventPcCollectionAdmissionFailureV3>;
+    fn pump_root(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<(), AdaptiveManagerError>;
+    fn revoke_root(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<(), AdaptiveManagerError>;
+    /// A timing/state observation only; it does not grant V2 ownership.
+    fn revoke_root_observed(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+        _observation: super::pc_session::RoventPcRevokeObservationV2,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.revoke_root(admission)
+    }
+    fn finish_deferred(
+        &self,
+        capability: &RoventNoCaptureRootCapabilityV3,
+        fence: &RoventRoleOnlyNoCaptureFenceV3,
+    ) -> Result<crate::pals_adaptive::AdaptiveCollectionBoundaryV2, AdaptiveManagerError>;
+    fn retain_deferred_cleanup(
+        &self,
+        cleanup: Arc<Mutex<RoventPcDeferredCleanupV3>>,
+    ) -> Result<RoventPcCustodyReturnV3, AdaptiveManagerError>;
+    fn handoff_sender_root(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<mpsc::SyncSender<Arc<Mutex<RoventPcCollectionHandoffV3>>>, AdaptiveManagerError>;
+    fn try_take_root_custody(
+        &self,
+        handoff: &Arc<Mutex<RoventPcCollectionHandoffV3>>,
+    ) -> Result<Option<RoventPcCollectionRootCustodyV3>, AdaptiveManagerError>;
+    fn return_root_custody(
+        &self,
+        custody: Arc<Mutex<RoventPcCollectionRootCustodyV3>>,
+    ) -> Result<RoventPcCustodyReturnV3, AdaptiveManagerError>;
+}

@@ -7,6 +7,8 @@ use super::launch::storage::{
     RoventStorageOwnedRuntimeRegistrationV3, RoventStoragePreparedTransferV3,
 };
 use super::nnuec_source::LoadedRoventNnuecSource;
+#[cfg(target_os = "linux")]
+use super::pc_collection_v3::{RoventPcCollectionHooksV3, RoventPcCollectionStateV3};
 use super::process_boundary::{
     VerifiedOwnedRoventProcessBoundaryV2, VerifiedOwnedRoventProcessBoundaryV3,
 };
@@ -1253,6 +1255,8 @@ pub struct RoventPcSessionDriver {
     collection_hooks: RoventPcCollectionHooks,
     collection_origin_v2: Option<RoventNativeCollectionOriginV2>,
     collection_hooks_v2: Option<Arc<dyn RoventPcCollectionHooksV2>>,
+    #[cfg(target_os = "linux")]
+    collection_v3: Option<RoventPcCollectionStateV3>,
     collection_v2_outstanding: AtomicBool,
     retained_collection_handoff_v2: Mutex<Option<Arc<Mutex<RoventPcCollectionHandoffV2>>>>,
     retained_collection_custody_v2: Mutex<Option<Arc<Mutex<RoventPcCollectionRootCustodyV2>>>>,
@@ -1446,10 +1450,66 @@ impl RoventPcSessionDriver {
         identity: EngineIdentity,
         root_policy: RoventRootAdmissionPolicy,
     ) -> Result<Self, SearchSessionFailure> {
+        Self::new_v3_in_slots_inner(
+            prepared_slot,
+            loaded_slot,
+            process,
+            clock,
+            owners,
+            identity,
+            root_policy,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+    }
+
+    /// The original V3 hook stays in the caller's assembly slot until all
+    /// validation has succeeded. No V2 admission is synthesized.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_v3_collection_in_slots(
+        prepared_slot: &mut Option<PreparedRoventNativeV3<PcPortQuestion>>,
+        loaded_slot: &mut Option<LoadedRoventNnuecSource<rz_experiments::RoventInputLockV3>>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        hooks_slot: &mut Option<Arc<dyn RoventPcCollectionHooksV3>>,
+    ) -> Result<Self, SearchSessionFailure> {
+        Self::new_v3_in_slots_inner(
+            prepared_slot,
+            loaded_slot,
+            process,
+            clock,
+            owners,
+            identity,
+            root_policy,
+            Some(hooks_slot),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_v3_in_slots_inner(
+        prepared_slot: &mut Option<PreparedRoventNativeV3<PcPortQuestion>>,
+        loaded_slot: &mut Option<LoadedRoventNnuecSource<rz_experiments::RoventInputLockV3>>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        #[cfg(target_os = "linux")] hooks_slot: Option<
+            &mut Option<Arc<dyn RoventPcCollectionHooksV3>>,
+        >,
+    ) -> Result<Self, SearchSessionFailure> {
         let prepared = prepared_slot
             .as_ref()
             .ok_or_else(|| failure("RoventPcV3Custody", "original prepared owner is absent"))?;
         let loaded = loaded_slot.as_ref();
+        #[cfg(target_os = "linux")]
+        let collection_requested = hooks_slot.as_ref().is_some_and(|slot| slot.is_some());
+        #[cfg(not(target_os = "linux"))]
+        let collection_requested = false;
         let build = (|| -> Result<_, SearchSessionFailure> {
             let sources = prepared.sources();
             sources
@@ -1515,7 +1575,9 @@ impl RoventPcSessionDriver {
                     ));
                 }
             }
-            if sources.collection_preload_sources().is_some()
+            if (sources.collection_preload_sources().is_some() != collection_requested)
+                || (sources.lock().manifest.purpose == rz_experiments::RoventPurpose::Collection)
+                    != collection_requested
                 || prepared.snapshot().mode.has_native_r()
                 || prepared.snapshot().process_epoch != clock.epoch().0
                 || !runtime_matches
@@ -1603,6 +1665,16 @@ impl RoventPcSessionDriver {
             selective_policy,
             frontier_limits,
         ) = build?;
+        #[cfg(target_os = "linux")]
+        let collection_origin = if collection_requested {
+            Some(
+                RoventNativeCollectionOriginV3::from_loaded_ready(prepared).map_err(|error| {
+                    SearchSessionFailure::debug("RoventPcV3CollectionOrigin", &error)
+                })?,
+            )
+        } else {
+            None
+        };
         let issuer: AdaptiveRulesOwnerIssuer = Arc::new(move || owners.allocate());
         // After validation and preparation, the same originals are moved
         // only into the finished driver. Neither slot was touched on error.
@@ -1611,6 +1683,13 @@ impl RoventPcSessionDriver {
             .expect("validated V3 prepared owner")
             .into_parts();
         let loaded = loaded_slot.take();
+        #[cfg(target_os = "linux")]
+        let collection_v3 = collection_origin.map(|origin| {
+            let hooks = hooks_slot
+                .and_then(Option::take)
+                .expect("validated V3 collection hook owner");
+            RoventPcCollectionStateV3::new(origin, hooks)
+        });
         Ok(Self {
             sources: PcSources::V3(sources),
             original_v2_owner: Some(original_owner),
@@ -1627,6 +1706,8 @@ impl RoventPcSessionDriver {
             collection_hooks: RoventPcCollectionHooks::default(),
             collection_origin_v2: None,
             collection_hooks_v2: None,
+            #[cfg(target_os = "linux")]
+            collection_v3,
             collection_v2_outstanding: AtomicBool::new(false),
             retained_collection_handoff_v2: Mutex::new(None),
             retained_collection_custody_v2: Mutex::new(None),
@@ -1941,6 +2022,8 @@ impl RoventPcSessionDriver {
             collection_hooks: RoventPcCollectionHooks::default(),
             collection_origin_v2,
             collection_hooks_v2,
+            #[cfg(target_os = "linux")]
+            collection_v3: None,
             collection_v2_outstanding: AtomicBool::new(false),
             retained_collection_handoff_v2: Mutex::new(None),
             retained_collection_custody_v2: Mutex::new(None),
@@ -2255,6 +2338,8 @@ impl RoventPcSessionDriver {
             collection_hooks,
             collection_origin_v2: None,
             collection_hooks_v2: None,
+            #[cfg(target_os = "linux")]
+            collection_v3: None,
             collection_v2_outstanding: AtomicBool::new(false),
             retained_collection_handoff_v2: Mutex::new(None),
             retained_collection_custody_v2: Mutex::new(None),
@@ -3274,6 +3359,43 @@ impl RoventPcSessionDriver {
         let mut v2_admission_failure = None;
         let mut v2_current_admission = None;
         let mut no_capture_v2 = None;
+        #[cfg(target_os = "linux")]
+        let mut v3_root = super::pc_collection_v3_root::PcCollectionRootRunV3::default();
+        #[cfg(target_os = "linux")]
+        if let Some(collection) = &self.collection_v3 {
+            *collection
+                .cleanup_context
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(context.clone());
+        }
+        #[cfg(target_os = "linux")]
+        let v3_observation = |manager: &Manager, origin| {
+            let now = Instant::now();
+            RoventPcRevokeObservationV2 {
+                origin,
+                elapsed_from_start: context
+                    .original_time_budget
+                    .and_then(|budget| now.checked_duration_since(budget.start)),
+                context_acceptance: match context.accepts() {
+                    Ok(true) => RoventPcContextAcceptanceV2::Accepted,
+                    Ok(false) => RoventPcContextAcceptanceV2::Rejected,
+                    Err(_) => RoventPcContextAcceptanceV2::Unavailable,
+                },
+                soft_expired: context.soft_expired(now),
+                manager_phase: manager.phase(),
+                goal: manager
+                    .driver()
+                    .port()
+                    .rovent_frontier_receipt()
+                    .map(|receipt| receipt.snapshot.goal),
+                role_calls_admitted: manager.role_call_budget_usage().0,
+                role_calls_reserved: manager.role_call_budget_usage().1,
+                role_call_limit: manager.role_call_limit(),
+                role_call_limit_reached: manager.role_call_limit_reached(),
+                manager_failures: manager.failures().count(),
+                driver_complete_at_revoke: manager.driver_is_complete(),
+            }
+        };
         let run = catch_unwind(AssertUnwindSafe(
             || -> Result<(), crate::pals_adaptive::AdaptiveManagerError> {
                 manager.register_cleanup_deadline(context.shutdown_deadline)?;
@@ -3292,6 +3414,21 @@ impl RoventPcSessionDriver {
                     (&self.collection_hooks.root_admission, collection_admission)
                 {
                     observer(&mut manager, admission)?;
+                }
+                #[cfg(target_os = "linux")]
+                if let Some(collection) = &self.collection_v3 {
+                    let root = match &root_admission {
+                        PcRootAdmission::V3(root) => Arc::clone(root),
+                        _ => return Err(AdaptiveManagerError::Invalid("P/C V3 root owner absent")),
+                    };
+                    v3_root.admit(
+                        collection,
+                        &mut manager,
+                        root,
+                        root_budget,
+                        self.selective_policy,
+                        context,
+                    )?;
                 }
                 if let Some(origin) = &self.collection_origin_v2 {
                     let original_root = match &root_admission {
@@ -3573,6 +3710,15 @@ impl RoventPcSessionDriver {
                     if let Some(pump) = &self.collection_hooks.cooperative {
                         pump()?;
                     }
+                    #[cfg(target_os = "linux")]
+                    if let Some(collection) = &self.collection_v3 {
+                        v3_root.pump_or_revoke(
+                            collection,
+                            &manager,
+                            context,
+                            v3_observation(&manager, RoventPcRevokeOriginV2::LoopCondition),
+                        )?;
+                    }
                     if let Some(actor) =
                         shared_actor.as_ref().and_then(|owner| owner.actor.as_ref())
                     {
@@ -3638,6 +3784,28 @@ impl RoventPcSessionDriver {
             Ok(result) => (Some(result), None),
             Err(payload) => (None, Some(payload)),
         };
+        #[cfg(target_os = "linux")]
+        if let Some(collection) = &self.collection_v3 {
+            if let Err(error) = v3_root.revoke_after_run(
+                collection,
+                context,
+                v3_observation(&manager, RoventPcRevokeOriginV2::RunEnded),
+            ) {
+                if let Some(payload) = original_panic.take() {
+                    collection
+                        .panics
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .0 = Some(payload);
+                }
+                *state = State::Manager(manager);
+                self.closed.store(true, Ordering::Release);
+                return Err(SearchSessionFailure::debug(
+                    "RoventPcV3CollectionRevoke",
+                    &error,
+                ));
+            }
+        }
         if v2_hook_started && !v2_hook_revoked {
             if let Some(hook) = &self.collection_hooks_v2 {
                 let result = loop {
@@ -3719,6 +3887,20 @@ impl RoventPcSessionDriver {
             }
         }
         if let Some(payload) = original_panic {
+            #[cfg(target_os = "linux")]
+            if let Some(collection) = &self.collection_v3 {
+                collection
+                    .panics
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0 = Some(payload);
+                *state = State::Manager(manager);
+                self.closed.store(true, Ordering::Release);
+                return Err(physical_unknown_at(
+                    "RoventPcRootExecution",
+                    "root panic and original V3 collection owners retained",
+                ));
+            }
             if v2_hook_started {
                 self.retained_collection_panic_v2
                     .lock()
@@ -3772,6 +3954,25 @@ impl RoventPcSessionDriver {
                 return Err(physical_unknown_at("RoventPcShutdownReceipt", error));
             }
         };
+        #[cfg(target_os = "linux")]
+        if let Some(collection) = &self.collection_v3 {
+            if let Err(error) = v3_root.settle_after_shutdown(collection, &mut manager, context) {
+                *collection
+                    .cleanup_context
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(context.clone());
+                *state = State::Manager(manager);
+                self.closed.store(true, Ordering::Release);
+                return Err(SearchSessionFailure::debug(
+                    "RoventPcV3CollectionSettlement",
+                    &error,
+                ));
+            }
+            *collection
+                .cleanup_context
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+        }
         let no_capture = self
             .retained_no_capture_v2
             .lock()
@@ -4640,6 +4841,44 @@ impl RoventPcSessionDriver {
                         *state = State::Manager(manager);
                         return Err(SearchSessionFailure::physical_completion_unknown());
                     }
+                    #[cfg(target_os = "linux")]
+                    if let Some(collection) = &self.collection_v3 {
+                        let pending_context = collection
+                            .cleanup_context
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
+                        if let Some(context) = pending_context {
+                            let has_marker = collection
+                                .no_capture
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .is_some();
+                            if has_marker {
+                                let mut recovery =
+                                    super::pc_collection_v3_root::PcCollectionRootRunV3::default();
+                                if let Err(error) = recovery.settle_after_shutdown(
+                                    collection,
+                                    &mut manager,
+                                    &context,
+                                ) {
+                                    *state = State::Manager(manager);
+                                    return Err(SearchSessionFailure::debug(
+                                        "RoventPcV3CleanupRecovery",
+                                        &error,
+                                    ));
+                                }
+                                *collection
+                                    .cleanup_context
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner()) = None;
+                            }
+                        }
+                        if collection.outstanding.load(Ordering::Acquire) {
+                            *state = State::Manager(manager);
+                            return Err(SearchSessionFailure::physical_completion_unknown());
+                        }
+                    }
                     let sources = match manager.into_sources() {
                         Ok(value) => value,
                         Err((manager, _)) => {
@@ -4821,6 +5060,10 @@ impl Drop for RoventPcSessionDriver {
             }
             if let Some(hooks) = self.collection_hooks_v2.take() {
                 std::mem::forget(hooks);
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(collection) = self.collection_v3.take() {
+                std::mem::forget(collection);
             }
             if let Some(handoff) = self
                 .retained_collection_handoff_v2

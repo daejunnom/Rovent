@@ -15,6 +15,10 @@ pub use nnuec_session::{
     RoventNnuecCollectionObserverRejectionV2,
 };
 pub mod nnuec_source;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+pub mod pc_collection_v3;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+mod pc_collection_v3_root;
 pub mod pc_session;
 mod pinned;
 use pinned::NativeInputLock;
