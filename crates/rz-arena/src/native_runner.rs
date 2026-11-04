@@ -740,6 +740,51 @@ struct NoGameRetainedControl {
     execution: Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>,
     sockets: Arc<crate::pals_adaptive_launch::PalsV6RoleSockets>,
     control: Arc<Mutex<crate::pals_adaptive_launch::SmokeDeadlineControl>>,
+    /// Frame-delivery observations stay with this owner; they do not prove
+    /// process exit, acknowledgement, or device completion.
+    grants: [Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2],
+}
+
+#[cfg(target_os = "linux")]
+impl NoGameRetainedControl {
+    fn poll_smoke(
+        &mut self,
+        custody: &crate::process::SpawnCustody,
+        until: std::time::Instant,
+        cleanup: bool,
+    ) -> Result<(), ArenaError> {
+        let observed = {
+            let mut control = match self.control.try_lock() {
+                Ok(control) => control,
+                // The same control and every partial frame remain owned; the
+                // bounded supervisor can retry on a later tick.
+                Err(TryLockError::WouldBlock) => return Ok(()),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(ArenaError::Io(
+                        "NoGame original control owner poisoned".into(),
+                    ));
+                }
+            };
+            if cleanup {
+                control.poll_cleanup(custody, until)?
+            } else {
+                control.poll_run(custody, until)?
+            }
+        };
+        if let Some(observation) = observed {
+            let index = match observation.scope.phase {
+                rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Run => 0,
+                rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Cleanup => 1,
+            };
+            if self.grants[index].is_some() {
+                return Err(ArenaError::Integrity(
+                    "duplicate NoGame grant observation".into(),
+                ));
+            }
+            self.grants[index] = Some(observation);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -758,24 +803,18 @@ impl NativeV6Control for NoGameRetainedControl {
 
     fn poll_run(
         &mut self,
-        _custody: &crate::process::SpawnCustody,
-        _until: std::time::Instant,
+        custody: &crate::process::SpawnCustody,
+        until: std::time::Instant,
     ) -> Result<(), ArenaError> {
-        let _retained = &self.control;
-        Err(ArenaError::Invalid(
-            "NoGame smoke execution is not connected".into(),
-        ))
+        self.poll_smoke(custody, until, false)
     }
 
     fn poll_cleanup(
         &mut self,
-        _custody: &crate::process::SpawnCustody,
-        _until: std::time::Instant,
+        custody: &crate::process::SpawnCustody,
+        until: std::time::Instant,
     ) -> Result<(), ArenaError> {
-        let _retained = &self.control;
-        Err(ArenaError::Invalid(
-            "NoGame smoke execution is not connected".into(),
-        ))
+        self.poll_smoke(custody, until, true)
     }
 }
 
@@ -846,6 +885,7 @@ impl PreparedNoGameSmokeOwner {
             execution: Arc::clone(execution),
             sockets: Arc::clone(sockets),
             control,
+            grants: [None, None],
         });
         match NativeV6Supervisor::new(execution, control) {
             Ok(supervisor) => original.bundle.v6_supervisor = Some(supervisor),
