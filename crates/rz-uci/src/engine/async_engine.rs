@@ -21,7 +21,9 @@ pub enum AsyncEngineStartFailure<O: Write + Send + 'static, D: Write + Send + 's
         process: EngineProcess,
         events: Receiver<Event>,
         sender: SyncSender<Event>,
-        output: AsyncOutputOwner<O, D>,
+        output: Option<AsyncOutputOwner<O, D>>,
+        output_close_requested: bool,
+        output_recovery: Option<Result<OutputRecovery<O, D>, Box<dyn std::any::Any + Send>>>,
         close: PriorityCloseHandle,
     },
     Prepared {
@@ -29,6 +31,85 @@ pub enum AsyncEngineStartFailure<O: Write + Send + 'static, D: Write + Send + 's
         custody: AsyncPreparedStartFailure<O, D>,
     },
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnstartedWriterRecoveryStatus {
+    NotUnstarted,
+    CloseNotRequested,
+    Pending,
+    Recovered,
+    WorkerPanicked,
+    OriginalOwnerMissing,
+}
+impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartFailure<O, D> {
+    /// Explicitly request a drain only for the unstarted path. This is not a
+    /// writer join or a statement about GPU/native completion.
+    pub fn request_unstarted_writer_close(&mut self) -> bool {
+        match self {
+            Self::Unstarted {
+                output: Some(output),
+                output_close_requested,
+                ..
+            } => {
+                output.request_close();
+                *output_close_requested = true;
+                true
+            }
+            _ => false,
+        }
+    }
+    /// Preserve the same output owner on Pending and the exact recovery or
+    /// original worker panic after a nonblocking join. Prepared is excluded.
+    pub fn try_recover_unstarted_writer(&mut self) -> UnstartedWriterRecoveryStatus {
+        let Self::Unstarted {
+            output,
+            output_close_requested,
+            output_recovery,
+            ..
+        } = self
+        else {
+            return UnstartedWriterRecoveryStatus::NotUnstarted;
+        };
+        if let Some(recovered) = output_recovery {
+            return if recovered.is_ok() {
+                UnstartedWriterRecoveryStatus::Recovered
+            } else {
+                UnstartedWriterRecoveryStatus::WorkerPanicked
+            };
+        }
+        if !*output_close_requested {
+            return UnstartedWriterRecoveryStatus::CloseNotRequested;
+        }
+        let Some(original) = output.take() else {
+            return UnstartedWriterRecoveryStatus::OriginalOwnerMissing;
+        };
+        match original.try_recover() {
+            Err(original) => {
+                *output = Some(original);
+                UnstartedWriterRecoveryStatus::Pending
+            }
+            Ok(recovered) => {
+                let status = if recovered.is_ok() {
+                    UnstartedWriterRecoveryStatus::Recovered
+                } else {
+                    UnstartedWriterRecoveryStatus::WorkerPanicked
+                };
+                *output_recovery = Some(recovered);
+                status
+            }
+        }
+    }
+    pub fn unstarted_writer_recovery(
+        &self,
+    ) -> Option<&Result<OutputRecovery<O, D>, Box<dyn std::any::Any + Send>>> {
+        match self {
+            Self::Unstarted {
+                output_recovery, ..
+            } => output_recovery.as_ref(),
+            _ => None,
+        }
+    }
+}
+
 /// The original prepared owner and all still-owned output inputs. This is a
 /// retained failure, not a release or re-admission authority.
 pub struct AsyncPreparedStartFailure<O: Write + Send + 'static, D: Write + Send + 'static> {
@@ -102,7 +183,9 @@ pub fn start_async<O: Write + Send + 'static, D: Write + Send + 'static>(
             process,
             events,
             sender,
-            output,
+            output: Some(output),
+            output_close_requested: false,
+            output_recovery: None,
             close,
         });
     }
@@ -122,7 +205,9 @@ pub fn start_async<O: Write + Send + 'static, D: Write + Send + 'static>(
             process,
             events,
             sender,
-            output,
+            output: Some(output),
+            output_close_requested: false,
+            output_recovery: None,
             close,
         });
     }
@@ -134,7 +219,9 @@ pub fn start_async<O: Write + Send + 'static, D: Write + Send + 'static>(
                 process: rejected.process,
                 events: rejected.events,
                 sender: rejected.sender,
-                output,
+                output: Some(output),
+                output_close_requested: false,
+                output_recovery: None,
                 close,
             });
         }
@@ -402,5 +489,86 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineRun<O, D> 
     }
     pub fn pending_count(&self) -> usize {
         self.driver.pending().len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refused_start_recovers_original_unstarted_writer() {
+        struct NeverFactory;
+        impl EvaluatorFactory for NeverFactory {
+            fn profile(&self) -> EvaluatorProfile {
+                panic!("guard must reject before factory use")
+            }
+            fn create(
+                &self,
+                _: ProcessClock,
+                _: SearchAuthority,
+            ) -> Result<Box<dyn ManagedEvaluator>, contract::ContractError> {
+                panic!("guard must reject before runtime creation")
+            }
+            fn input_key(
+                &self,
+                _: &RulesState,
+                _: &[contract::Move],
+            ) -> Result<contract::EvalInputKey, contract::ContractError> {
+                panic!("guard must reject before encoding")
+            }
+        }
+        let factory: Arc<dyn EvaluatorFactory> = Arc::new(NeverFactory);
+        let mut process = EngineProcess::new(
+            factory.clone(),
+            Arc::new(OwnerRegistry::default()),
+            ProcessClock::new(contract::ProcessEpoch(81)),
+        );
+        let close = process.install_priority_close().unwrap();
+        let (sender, events) = event_channel();
+        let output = AsyncOutputOwner::start(Vec::<u8>::new(), Vec::<u8>::new(), 1, 256)
+            .ok()
+            .unwrap();
+        let mut rejected = match start_async(
+            events,
+            sender,
+            process,
+            EngineSettings::default(),
+            output,
+            close,
+            256,
+            Duration::from_millis(1),
+        ) {
+            Err(failure) => failure,
+            Ok(_) => panic!("unsettled custody guard must reject"),
+        };
+        assert_eq!(
+            rejected.try_recover_unstarted_writer(),
+            UnstartedWriterRecoveryStatus::CloseNotRequested
+        );
+        assert!(rejected.request_unstarted_writer_close());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match rejected.try_recover_unstarted_writer() {
+                UnstartedWriterRecoveryStatus::Recovered => break,
+                UnstartedWriterRecoveryStatus::Pending if Instant::now() < deadline => {
+                    std::thread::yield_now()
+                }
+                _ => panic!("original output worker failed to join"),
+            }
+        }
+        let original = rejected
+            .unstarted_writer_recovery()
+            .unwrap()
+            .as_ref()
+            .ok()
+            .unwrap();
+        assert!(original.protocol.is_empty());
+        assert!(original.diagnostics.is_empty());
+        assert!(original.failure.is_none());
+        let AsyncEngineStartFailure::Unstarted { process, .. } = &rejected else {
+            panic!("wrong owner")
+        };
+        assert!(Arc::ptr_eq(process.factory.as_ref().unwrap(), &factory));
     }
 }
