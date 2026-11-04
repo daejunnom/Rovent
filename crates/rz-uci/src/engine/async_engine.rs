@@ -13,6 +13,215 @@ type Handler =
 type Dispatch = Box<dyn FnMut(Effect<RulesSearchPosition>) -> Result<(), EngineError> + Send>;
 type Driver<O, D> = AsyncServeDriver<RulesUciPort, O, D, Handler, Dispatch>;
 
+/// Inputs remain in this original slot during borrowed setup. A prepared
+/// session is not a running engine, a native authorization, or GPU evidence.
+pub struct AsyncEngineStartSlot<O: Write + Send + 'static, D: Write + Send + 'static> {
+    process: EngineProcess,
+    events: Receiver<Event>,
+    sender: SyncSender<Event>,
+    output: AsyncOutputOwner<O, D>,
+    close: PriorityCloseHandle,
+    settings: EngineSettings,
+    preflight: Option<(
+        crate::contracts::SessionScope,
+        crate::contracts::ContractSessionOwner,
+        Session<RulesUciPort>,
+    )>,
+    preflight_failure: Option<EngineError>,
+    staged: Option<InPlaceStagedEngine>,
+}
+struct InPlaceStagedEngine {
+    owner: Arc<Mutex<Owner>>,
+    session: Session<RulesUciPort>,
+    timer_stop: Arc<std::sync::atomic::AtomicBool>,
+    timer: Option<JoinHandle<()>>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InPlaceTimerStatus {
+    NotReady,
+    Started,
+    RetainedFailure,
+    IdentityMismatch,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InPlacePreflightStatus {
+    Ready,
+    RetainedFailure,
+    IdentityMismatch,
+}
+impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<O, D> {
+    pub fn new(
+        process: EngineProcess,
+        events: Receiver<Event>,
+        sender: SyncSender<Event>,
+        output: AsyncOutputOwner<O, D>,
+        close: PriorityCloseHandle,
+        settings: EngineSettings,
+    ) -> Self {
+        Self {
+            process,
+            events,
+            sender,
+            output,
+            close,
+            settings,
+            preflight: None,
+            preflight_failure: None,
+            staged: None,
+        }
+    }
+    /// Calls only the shared pre-worker setup while all original inputs stay
+    /// in this slot. An original failure is retained and is not retried.
+    pub fn preflight(&mut self) -> InPlacePreflightStatus {
+        if self.preflight_failure.is_some() {
+            return InPlacePreflightStatus::RetainedFailure;
+        }
+        if self.preflight.is_some() || self.staged.is_some() {
+            return InPlacePreflightStatus::Ready;
+        }
+        if !self
+            .process
+            .priority_close
+            .as_ref()
+            .is_some_and(|owner| owner.matches(&self.close))
+        {
+            return InPlacePreflightStatus::IdentityMismatch;
+        }
+        match engine_preflight(&self.process, self.settings) {
+            Ok(original) => {
+                self.preflight = Some(original);
+                InPlacePreflightStatus::Ready
+            }
+            Err(error) => {
+                self.preflight_failure = Some(error);
+                InPlacePreflightStatus::RetainedFailure
+            }
+        }
+    }
+    /// Prepare the original session and owner in this slot before starting the
+    /// timer. The original EngineProcess, event endpoints, output and priority
+    /// owner never leave this slot, including when OS thread creation fails.
+    pub fn try_start_timer(&mut self) -> InPlaceTimerStatus {
+        // Same local guard as start_async until this entire slot can survive
+        // unknown/drop and hand its original timer and session to the caller.
+        const ORIGINAL_SLOT_DROP_RECOVERY_IMPLEMENTED: bool = false;
+        if !ORIGINAL_SLOT_DROP_RECOVERY_IMPLEMENTED {
+            return InPlaceTimerStatus::NotReady;
+        }
+        if self.preflight_failure.is_some() {
+            return InPlaceTimerStatus::RetainedFailure;
+        }
+        if self
+            .staged
+            .as_ref()
+            .is_some_and(|stage| stage.timer.is_some())
+        {
+            return InPlaceTimerStatus::Started;
+        }
+        if self.staged.is_none() {
+            let Some((scope, session_owner, session)) = self.preflight.take() else {
+                return InPlaceTimerStatus::NotReady;
+            };
+            let clock = self.process.clock.clone();
+            let owner = Arc::new(Mutex::new(Owner {
+                session_owner,
+                active: None,
+                scope: Arc::new(Mutex::new(scope)),
+                evaluation_scope: scope.evaluation().map(|scope| Arc::new(Mutex::new(scope))),
+                factory: self.process.factory.clone(),
+                driver: self.process.driver.clone(),
+                ids: Arc::clone(&clock.ids),
+                clock,
+                settings: self.settings,
+                workers: Vec::new(),
+                pending_failures: VecDeque::new(),
+                pending_bestmove: None,
+                ponder: None,
+                held_ponder_bestmove: None,
+                admitted_ponder_report: None,
+                pending_original_go: None,
+                pending_close: None,
+                fence_failure: None,
+                diagnostics: Arc::new(Mutex::new(Vec::new())),
+                go_admission_observer: self.process.go_admission_observer.clone(),
+                go_sequence: 0,
+            }));
+            self.staged = Some(InPlaceStagedEngine {
+                owner,
+                session,
+                timer_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                timer: None,
+            });
+        }
+        let Some(close_owner) = self
+            .process
+            .priority_close
+            .as_ref()
+            .filter(|owner| owner.matches(&self.close))
+        else {
+            return InPlaceTimerStatus::IdentityMismatch;
+        };
+        let observer = close_owner.observer();
+        let Some(stage) = self.staged.as_mut() else {
+            return InPlaceTimerStatus::NotReady;
+        };
+        let timer_owner = Arc::clone(&stage.owner);
+        let timer_flag = Arc::clone(&stage.timer_stop);
+        let timer_events = self.sender.clone();
+        let timer = std::thread::Builder::new().spawn(move || {
+            let mut delivered = None;
+            while !timer_flag.load(Ordering::Acquire) {
+                if let Ok(owner) = timer_owner.lock() {
+                    if observer.apply_under_owner_lock(&owner) {
+                        let _ = timer_events.try_send(Event::RejectedInput {
+                            code: "OwnerWake",
+                            message: String::new(),
+                        });
+                    }
+                    if owner.pending_bestmove.as_ref().is_some_and(|pending| {
+                        Instant::now() >= pending.until
+                            || owner.workers.iter().any(Worker::is_finished)
+                    }) {
+                        let _ = timer_events.try_send(Event::RejectedInput {
+                            code: "OwnerWake",
+                            message: String::new(),
+                        });
+                    }
+                    if let Some(ticket) = owner.deadline_ticket(delivered.as_ref(), Instant::now())
+                        && timer_events
+                            .try_send(Event::Deadline(ticket.clone()))
+                            .is_ok()
+                    {
+                        delivered = Some(ticket);
+                    }
+                } else {
+                    observer.owner_poisoned();
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        match timer {
+            Ok(timer) => {
+                stage.timer = Some(timer);
+                InPlaceTimerStatus::Started
+            }
+            Err(error) => {
+                self.preflight_failure = Some(EngineError::TimerSpawn(error));
+                InPlaceTimerStatus::RetainedFailure
+            }
+        }
+    }
+    pub fn preflight_failure(&self) -> Option<&EngineError> {
+        self.preflight_failure.as_ref()
+    }
+    pub fn output_observation(&self) -> OutputSnapshot {
+        self.output.observation()
+    }
+    pub fn close_observation(&self) -> PriorityCloseObservation {
+        self.close.observe()
+    }
+}
+
 /// Original inputs or the already-started timer/session remain together with
 /// their error. Prepared custody does not claim the timer or device is done.
 pub enum AsyncEngineStartFailure<O: Write + Send + 'static, D: Write + Send + 'static> {
