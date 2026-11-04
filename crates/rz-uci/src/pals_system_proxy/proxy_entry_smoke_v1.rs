@@ -59,7 +59,7 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn source_observation(value: PalsSystemSourceObservationV6) -> &'static str {
+pub(super) fn source_observation(value: PalsSystemSourceObservationV6) -> &'static str {
     match value {
         PalsSystemSourceObservationV6::Verified => "verified",
         PalsSystemSourceObservationV6::Missing => "unknown",
@@ -77,7 +77,7 @@ fn same_scope(left: &DeadlineScope, right: &DeadlineScope) -> bool {
         && left.request_id != right.request_id
 }
 
-fn local_startup_cap(
+pub(super) fn local_startup_cap(
     entry: Instant,
     cap_ms: u64,
     run_until: Instant,
@@ -105,6 +105,10 @@ impl ProxyEntryFunctionalSmokeV1 {
     /// first statement. This API itself cannot prove the capture location.
     pub fn from_local_entry(entry: Instant) -> Self {
         Self { entry }
+    }
+
+    pub(super) fn local_entry(&self) -> Instant {
+        self.entry
     }
 
     /// Only the distinct functional-smoke route uses two original grants. The
