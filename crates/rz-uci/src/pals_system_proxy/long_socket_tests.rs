@@ -83,10 +83,27 @@ struct Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
-            if !matches!(child.try_wait(), Ok(Some(_))) {
-                let _ = child.kill();
+            let settled = match child.try_wait() {
+                Ok(Some(_)) => true,
+                Ok(None) => {
+                    let _ = child.kill();
+                    let until = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break true,
+                            Ok(None) if Instant::now() < until => {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            _ => break false,
+                        }
+                    }
+                }
+                Err(_) => false,
+            };
+            if !settled {
+                // Preserve the fixture if the exact child did not terminate.
+                return;
             }
-            let _ = child.wait();
         }
         if self.root.parent() != Some(self.base.as_path()) {
             return;
