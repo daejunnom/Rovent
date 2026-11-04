@@ -405,20 +405,34 @@ impl RoventOwnCollectionBridgeV3 {
 
     /// Sticky game abort closes new admission and requests cancellation for
     /// each original root. It is not a physical-completion observation.
-    pub(crate) fn try_request_game_abort(&self) -> Result<bool, &'static str> {
+    pub(crate) fn try_request_game_abort(&self) -> Result<bool, String> {
         self.game.request_abort();
         let state = match self.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::WouldBlock) => return Ok(false),
-            Err(TryLockError::Poisoned(_)) => return Err("Own /3 root custody poisoned"),
+            Err(TryLockError::Poisoned(_)) => return Err("Own /3 root custody poisoned".into()),
         };
+        let mut pending = false;
+        let mut first_error = None;
         for slot in &state.slots {
             slot.revoked.store(true, Ordering::Release);
             if let Some(route) = &slot.route {
                 route.cancel_all();
+                match route.try_revoke_all_targets() {
+                    Ok(Some(())) => {}
+                    Ok(None) => pending = true,
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error.to_string());
+                        }
+                    }
+                }
             }
         }
-        Ok(true)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(!pending),
+        }
     }
 
     pub(crate) fn capture_registration(&self) -> &RoventNativeCaptureRegistration {

@@ -242,6 +242,8 @@ pub(crate) struct OwnWorkerSupervisorV3 {
     roots: Vec<Arc<Mutex<OwnRootRecoveryV3>>>,
     startup_deadline: Instant,
     cleanup_deadline: Instant,
+    abort_revoke_pending: bool,
+    abort_revoke_error: Option<String>,
 }
 
 impl OwnWorkerSupervisorV3 {
@@ -285,19 +287,24 @@ impl OwnWorkerSupervisorV3 {
             roots,
             startup_deadline,
             cleanup_deadline,
+            abort_revoke_pending: false,
+            abort_revoke_error: None,
         })
     }
 
     /// One bounded supervisor pass, never invoked from the native manager.
     /// Failures retain every original root and do not skip its cleanup.
     pub(crate) fn step(&mut self) -> Result<(), String> {
-        if self.bridge.game().abort_requested()
-            && !self
-                .bridge
-                .try_request_game_abort()
-                .map_err(str::to_owned)?
-        {
-            return Ok(());
+        if self.bridge.game().abort_requested() {
+            match self.bridge.try_request_game_abort() {
+                Ok(done) => self.abort_revoke_pending = !done,
+                Err(error) => {
+                    self.abort_revoke_pending = true;
+                    if self.abort_revoke_error.is_none() {
+                        self.abort_revoke_error = Some(error);
+                    }
+                }
+            }
         }
         if self.pending_request.is_none()
             && self.roots.len() < usize::from(self.bridge.inputs().plan().maximum_roots)
