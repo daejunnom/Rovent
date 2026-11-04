@@ -8,7 +8,8 @@
 //! and retain the same driver and output owner on every unfinished exit.
 
 use super::async_output::{
-    AsyncOutputOwner, OutputBatch, OutputEncodingError, SubmitError, encode_event_output,
+    AsyncOutputOwner, OutputBatch, OutputEncodingError, OutputRecovery, SubmitError,
+    encode_event_output,
 };
 use super::{Event, handle_event};
 use crate::{Effect, PositionPort, Session, SessionResult};
@@ -80,6 +81,15 @@ pub struct AsyncServeExit<E> {
     pub cleanup_failures: Vec<AsyncServeFailure<E>>,
 }
 
+/// This describes only the original output thread, not engine/GPU completion.
+pub enum OutputRecoveryPoll<O, D> {
+    DriverNotSealed,
+    Pending,
+    Recovered(OutputRecovery<O, D>),
+    WorkerPanicked(Box<dyn Any + Send>),
+    AlreadyRecovered,
+}
+
 /// Pins one original session, event receiver, output owner and reducer pair
 /// across yields. The pending FIFO and close-issued state never move to a new
 /// invocation or a caller-supplied replacement owner.
@@ -92,7 +102,7 @@ where
 {
     session: Session<P>,
     events: Receiver<Event>,
-    output: AsyncOutputOwner<O, D>,
+    output: Option<AsyncOutputOwner<O, D>>,
     max_output_bytes: usize,
     poll_interval: Duration,
     handle: H,
@@ -113,7 +123,7 @@ where
 {
     pub session: Session<P>,
     pub events: Receiver<Event>,
-    pub output: AsyncOutputOwner<O, D>,
+    pub output: Option<AsyncOutputOwner<O, D>>,
     pub handle: H,
     pub dispatch: F,
     pub pending: VecDeque<PendingEvent<P::Snapshot>>,
@@ -141,7 +151,7 @@ where
         Self {
             session,
             events,
-            output,
+            output: Some(output),
             max_output_bytes,
             poll_interval,
             handle,
@@ -163,8 +173,27 @@ where
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested
     }
-    pub fn output(&self) -> &AsyncOutputOwner<O, D> {
-        &self.output
+    pub fn output(&self) -> Option<&AsyncOutputOwner<O, D>> {
+        self.output.as_ref()
+    }
+
+    /// Never waits. A still-running output owner is restored into this same
+    /// driver unchanged; session, pending FIFO and close state never move.
+    pub fn try_finish_output(&mut self) -> OutputRecoveryPoll<O, D> {
+        if !self.sealed {
+            return OutputRecoveryPoll::DriverNotSealed;
+        }
+        let Some(owner) = self.output.take() else {
+            return OutputRecoveryPoll::AlreadyRecovered;
+        };
+        match owner.try_recover() {
+            Err(original) => {
+                self.output = Some(original);
+                OutputRecoveryPoll::Pending
+            }
+            Ok(Ok(recovered)) => OutputRecoveryPoll::Recovered(recovered),
+            Ok(Err(payload)) => OutputRecoveryPoll::WorkerPanicked(payload),
+        }
     }
 
     /// Explicitly hand back all original owners and pending records. This is
@@ -197,10 +226,18 @@ where
                 cleanup_failures: Vec::new(),
             };
         }
+        let Some(output) = self.output.as_ref() else {
+            self.sealed = true;
+            return AsyncServeExit {
+                status: AsyncServeStatus::Failed,
+                failure: Some(AsyncServeFailure::OriginalStateSealed),
+                cleanup_failures: Vec::new(),
+            };
+        };
         let exit = serve_events_with_async_handler(
             &mut self.session,
             &self.events,
-            &self.output,
+            output,
             self.max_output_bytes,
             self.poll_interval,
             poll,

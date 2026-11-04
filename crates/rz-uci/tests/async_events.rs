@@ -1,7 +1,7 @@
 use rz_uci::runner::async_events::{
-    AsyncControl, AsyncServeDriver, AsyncServeFailure, AsyncServeStatus,
+    AsyncControl, AsyncServeDriver, AsyncServeFailure, AsyncServeStatus, OutputRecoveryPoll,
 };
-use rz_uci::runner::async_output::{AsyncOutputOwner, OutputBatch};
+use rz_uci::runner::async_output::{AsyncOutputOwner, OutputBatch, OutputFailure};
 use rz_uci::{
     Diagnostic, Effect, EngineIdentity, Event, ParserLimits, PositionPort, PositionSpec,
     PreparedPosition, Session, handle_event,
@@ -175,7 +175,7 @@ fn full_output_retains_current_and_close_output_in_original_order() {
     assert!(driver.pending().is_empty());
     let parts = driver.into_parts();
     assert!(parts.pending.is_empty());
-    let owner = parts.output;
+    let owner = parts.output.unwrap();
     let mut owner = owner;
     let result = loop {
         owner = match owner.try_recover() {
@@ -233,7 +233,7 @@ fn control_panic_retains_session_without_implicit_shutdown_retry() {
     let parts = driver.into_parts();
     assert!(parts.sealed);
     assert!(!parts.shutdown_requested);
-    finish_empty(parts.output);
+    finish_empty(parts.output.unwrap());
 }
 
 #[test]
@@ -264,7 +264,7 @@ fn explicit_unknown_control_retains_session_without_reducer_or_dispatch() {
     ));
     let parts = driver.into_parts();
     assert!(parts.sealed);
-    finish_empty(parts.output);
+    finish_empty(parts.output.unwrap());
 }
 
 #[test]
@@ -299,7 +299,7 @@ fn cooperative_yield_keeps_live_session_and_resumes_same_driver() {
     assert!(driver.session_closed());
     let parts = driver.into_parts();
     assert!(parts.sealed);
-    finish_empty(parts.output);
+    finish_empty(parts.output.unwrap());
 }
 
 #[test]
@@ -344,7 +344,7 @@ fn deferred_owner_close_is_not_forced_or_reissued_after_yield() {
     assert_eq!(parts.pending.len(), 1);
     assert!(parts.shutdown_requested);
     assert!(!parts.sealed);
-    finish_empty(parts.output);
+    finish_empty(parts.output.unwrap());
 }
 
 #[test]
@@ -375,7 +375,7 @@ fn encoding_limit_preserves_original_and_closes_original_session() {
     assert!(driver.session_closed());
     let parts = driver.into_parts();
     assert!(parts.sealed);
-    finish_empty(parts.output);
+    finish_empty(parts.output.unwrap());
 }
 
 #[test]
@@ -409,5 +409,152 @@ fn output_failure_does_not_force_close_while_owner_defers_eof() {
     let parts = driver.into_parts();
     assert!(parts.sealed);
     assert!(parts.shutdown_requested);
-    finish_empty(parts.output);
+    finish_empty(parts.output.unwrap());
+}
+
+#[test]
+fn nonblocking_writer_recovery_keeps_original_driver_when_pending() {
+    let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+    let writer = GatedWriter {
+        gate: Arc::clone(&gate),
+        bytes: Vec::new(),
+    };
+    let owner = match AsyncOutputOwner::start(writer, Vec::<u8>::new(), 2, 4096) {
+        Ok(owner) => owner,
+        Err(_) => panic!("cannot create fixture output owner"),
+    };
+    owner
+        .try_submit(OutputBatch {
+            protocol: b"first".to_vec(),
+            diagnostics: vec![],
+        })
+        .unwrap();
+    {
+        let (mutex, condition) = &*gate;
+        let state = mutex.lock().unwrap();
+        let (state, timeout) = condition
+            .wait_timeout_while(state, Duration::from_secs(2), |s| !s.0)
+            .unwrap();
+        assert!(!timeout.timed_out() && state.0);
+    }
+    let (sender, events) = mpsc::sync_channel(1);
+    sender.send(Event::Line("quit".into())).unwrap();
+    let mut driver = AsyncServeDriver::new(
+        session(),
+        events,
+        owner,
+        4096,
+        Duration::from_millis(1),
+        handle_event,
+        |_| Ok::<_, &'static str>(()),
+    );
+    assert!(matches!(
+        driver.try_finish_output(),
+        OutputRecoveryPoll::DriverNotSealed
+    ));
+    assert_eq!(
+        driver.drive(|| AsyncControl::Continue).status,
+        AsyncServeStatus::OutputQueued
+    );
+    assert!(matches!(
+        driver.try_finish_output(),
+        OutputRecoveryPoll::Pending
+    ));
+    assert!(driver.output().is_some());
+    assert!(driver.session_closed());
+    assert!(driver.shutdown_requested());
+    assert!(driver.pending().is_empty());
+    {
+        let (mutex, condition) = &*gate;
+        mutex.lock().unwrap().1 = true;
+        condition.notify_all();
+    }
+    let until = Instant::now() + Duration::from_secs(3);
+    let recovered = loop {
+        match driver.try_finish_output() {
+            OutputRecoveryPoll::Pending if Instant::now() < until => thread::yield_now(),
+            OutputRecoveryPoll::Recovered(recovered) => break recovered,
+            _ => panic!("fixture original writer did not finish"),
+        }
+    };
+    assert!(Arc::ptr_eq(&recovered.protocol.gate, &gate));
+    assert_eq!(recovered.protocol.bytes, b"first");
+    assert!(recovered.failure.is_none());
+    assert!(driver.output().is_none());
+    assert!(matches!(
+        driver.try_finish_output(),
+        OutputRecoveryPoll::AlreadyRecovered
+    ));
+    assert!(driver.session_closed());
+    assert!(driver.pending().is_empty());
+}
+
+enum FailingWriter {
+    Io,
+    Panic,
+}
+impl Write for FailingWriter {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Io => Err(io::Error::other("fixture output failure")),
+            Self::Panic => panic!("fixture output panic"),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn writer_recovery_keeps_io_and_panic_as_distinct_original_results() {
+    for panic_expected in [false, true] {
+        let writer = if panic_expected {
+            FailingWriter::Panic
+        } else {
+            FailingWriter::Io
+        };
+        let owner = match AsyncOutputOwner::start(writer, Vec::<u8>::new(), 1, 4096) {
+            Ok(owner) => owner,
+            Err(_) => panic!("cannot create fixture output owner"),
+        };
+        owner
+            .try_submit(OutputBatch {
+                protocol: b"data".to_vec(),
+                diagnostics: vec![],
+            })
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        while !owner.observation().worker_finished && Instant::now() < until {
+            thread::yield_now();
+        }
+        assert!(owner.observation().worker_finished);
+        let (_sender, events) = mpsc::sync_channel(1);
+        let mut driver = AsyncServeDriver::new(
+            session(),
+            events,
+            owner,
+            4096,
+            Duration::from_millis(1),
+            handle_event,
+            |_| Ok::<_, &'static str>(()),
+        );
+        assert_eq!(
+            driver.drive(|| AsyncControl::Continue).status,
+            AsyncServeStatus::Failed
+        );
+        let recovered = loop {
+            match driver.try_finish_output() {
+                OutputRecoveryPoll::Pending if Instant::now() < until => thread::yield_now(),
+                OutputRecoveryPoll::Recovered(recovered) => break recovered,
+                _ => panic!("fixture writer recovery unavailable"),
+            }
+        };
+        assert!(if panic_expected {
+            matches!(recovered.failure, Some(OutputFailure::Panic(_)))
+        } else {
+            matches!(recovered.failure, Some(OutputFailure::Io(_)))
+        });
+        assert_eq!(recovered.partial.unwrap().batch.protocol, b"data");
+        assert!(driver.output().is_none());
+    }
 }
