@@ -13,6 +13,40 @@ pub mod runtime_assets;
 mod startup_snapshot;
 mod system_v6;
 
+/// Borrowed evidence from one retained lifecycle and its original close.
+/// This is a session-scoped report, not a device-wide GPU fence.
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+pub(crate) struct OriginalLifecycleSessionEvidence<'a> {
+    source: &'a crate::pals_adaptive_startup::PinnedPalsSystemStartupV6,
+    parent: &'a crate::rovent_bootstrap::launch::ConnectedParent,
+    receipt: &'a crate::pals_adaptive::AdaptiveSessionProcessReceipt,
+}
+
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+impl<'a> OriginalLifecycleSessionEvidence<'a> {
+    fn new(
+        source: &'a crate::pals_adaptive_startup::PinnedPalsSystemStartupV6,
+        parent: &'a crate::rovent_bootstrap::launch::ConnectedParent,
+        receipt: &'a crate::pals_adaptive::AdaptiveSessionProcessReceipt,
+    ) -> Self {
+        Self {
+            source,
+            parent,
+            receipt,
+        }
+    }
+
+    pub(crate) fn source(&self) -> &crate::pals_adaptive_startup::PinnedPalsSystemStartupV6 {
+        self.source
+    }
+    pub(crate) fn parent(&self) -> &crate::rovent_bootstrap::launch::ConnectedParent {
+        self.parent
+    }
+    pub(crate) fn receipt(&self) -> &crate::pals_adaptive::AdaptiveSessionProcessReceipt {
+        self.receipt
+    }
+}
+
 use crate::EngineIdentity;
 use crate::engine::{EngineSettings, OwnerRegistry, ProcessClock};
 use crate::pals_adaptive::{

@@ -78,6 +78,16 @@ pub(super) struct V6Pipeline {
             std::io::Error,
         >,
     >,
+    shutdown_report_stream: Option<std::os::unix::net::UnixStream>,
+    shutdown_report_delivery: Option<
+        Result<
+            Result<
+                crate::pals_system_proxy::finish::session_shutdown_report_v1::ReportedSessionShutdownAckV1,
+                crate::pals_system_proxy::finish::PalsReleaseSendFailureV6,
+            >,
+            std::io::Error,
+        >,
+    >,
     checker_start: Option<Result<Option<bool>, SearchSessionFailure>>,
     pre_service_finish: Option<FinishObservationV6>,
     failure: Option<V6PipelineFailure>,
@@ -123,6 +133,8 @@ impl V6Pipeline {
             lifecycle: None,
             service_panic: None,
             release_delivery: None,
+            shutdown_report_stream: None,
+            shutdown_report_delivery: None,
             checker_start: None,
             pre_service_finish: None,
             failure: None,
@@ -180,11 +192,81 @@ impl V6Pipeline {
         self.release_delivery.as_ref()
     }
 
+    /// Send only the original lifecycle's session-scoped shutdown report.
+    /// This is a separate optional protocol from the existing v1 claim; the
+    /// same original socket remains held after a partial exchange or failure.
+    pub(super) fn deliver_session_shutdown_report_once(&mut self, cleanup_cancelled: &AtomicBool) {
+        if self.shutdown_report_delivery.is_some() {
+            return;
+        }
+        if self.release_delivery.is_some() {
+            self.shutdown_report_delivery = Some(Err(std::io::Error::other(
+                "original finish channel already used by v1 session claim",
+            )));
+            return;
+        }
+        let result = (|| {
+            let lifecycle = self
+                .lifecycle
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("original lifecycle unavailable"))?;
+            let parent = self
+                .parent
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("original parent unavailable"))?;
+            let admission = self
+                .admission
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("original admission unavailable"))?;
+            let evidence = lifecycle.original_session_evidence(&self.source, parent, admission)?;
+            let stream = self.source.open_cleanup_parent_stream(
+                &self.parent_socket,
+                self.parent_pid,
+                parent,
+                admission,
+                self.original_cleanup_until,
+                cleanup_cancelled,
+            )?;
+            self.shutdown_report_stream = Some(stream);
+            Ok(
+                crate::pals_system_proxy::finish::session_shutdown_report_v1::send_report(
+                    &evidence,
+                    self.shutdown_report_stream
+                        .as_mut()
+                        .expect("original stream retained"),
+                    self.original_cleanup_until,
+                    cleanup_cancelled,
+                ),
+            )
+        })();
+        self.shutdown_report_delivery = Some(result);
+    }
+
+    pub(super) fn session_shutdown_report_delivery(
+        &self,
+    ) -> Option<
+        &Result<
+            Result<
+                crate::pals_system_proxy::finish::session_shutdown_report_v1::ReportedSessionShutdownAckV1,
+                crate::pals_system_proxy::finish::PalsReleaseSendFailureV6,
+            >,
+            std::io::Error,
+        >,
+    >{
+        self.shutdown_report_delivery.as_ref()
+    }
+
     /// Deliver the exact producer-only session-release claim to the same
     /// original parent. The transport outcome is independent of the actual
     /// finish receipt and is never a device-wide GPU fence.
     pub(super) fn deliver_release_once(&mut self, cleanup_cancelled: &AtomicBool) {
         if self.release_delivery.is_some() {
+            return;
+        }
+        if self.shutdown_report_delivery.is_some() {
+            self.release_delivery = Some(Err(std::io::Error::other(
+                "original finish channel already selected for shutdown report",
+            )));
             return;
         }
         let result = (|| {
@@ -546,6 +628,23 @@ impl V6Pipeline {
         };
         if observation == FinishObservationV6::OwnerScopesClosed {
             self.deliver_release_once(cleanup_cancelled);
+        }
+        observation
+    }
+
+    /// Explicit alternative to the v1 claim. Both protocols use the same
+    /// one-shot finish listener, so callers must select one before cleanup.
+    pub(super) fn finish_observation_with_session_report(
+        &mut self,
+        until: Instant,
+        cleanup_cancelled: &AtomicBool,
+    ) -> FinishObservationV6 {
+        let observation = match self.lifecycle.as_mut() {
+            Some(lifecycle) => lifecycle.finish_until(until),
+            None => FinishObservationV6::ServiceNotReturned,
+        };
+        if observation == FinishObservationV6::OwnerScopesClosed {
+            self.deliver_session_shutdown_report_once(cleanup_cancelled);
         }
         observation
     }

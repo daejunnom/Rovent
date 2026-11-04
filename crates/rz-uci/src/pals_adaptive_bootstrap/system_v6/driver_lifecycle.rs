@@ -14,9 +14,12 @@ use crate::{
     search_driver::{SearchSessionDriver, SearchSessionFailure},
 };
 use std::{
+    io,
     sync::{Arc, mpsc},
     time::Instant,
 };
+
+use super::super::OriginalLifecycleSessionEvidence;
 
 /// A result of a single finish request, not permission to exit the process.
 /// An error remains attached to the original owner for later examination.
@@ -50,6 +53,52 @@ pub(super) struct PalsSystemDriverLifecycleV6 {
 }
 
 impl PalsSystemDriverLifecycleV6 {
+    /// Bind the original close receipt to this lifecycle's actual startup,
+    /// admission and live parent. No unrelated same-epoch receipt is accepted.
+    pub(super) fn original_session_evidence<'a>(
+        &'a self,
+        source: &'a Arc<crate::pals_adaptive_startup::PinnedPalsSystemStartupV6>,
+        parent: &'a Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+        admission: &'a Arc<crate::rovent_bootstrap::launch::PalsPostImageAdmissionV6>,
+    ) -> io::Result<OriginalLifecycleSessionEvidence<'a>> {
+        use crate::pals_adaptive::NativeSessionReleaseSource;
+        use rz_experiments::NativeRuntimeSourceV6;
+
+        let invalid = || io::Error::other("original V6 lifecycle session evidence unavailable");
+        let original = self.original.transferred.as_ref().ok_or_else(invalid)?;
+        let receipt = self.closed_receipt.as_ref().ok_or_else(invalid)?;
+        let lock = source.lock();
+        let NativeRuntimeSourceV6::SystemCuda(runtime) = &lock.config.system_runtime_lock.runtime
+        else {
+            return Err(invalid());
+        };
+        if !Arc::ptr_eq(source, &original.cpu.original_source)
+            || !Arc::ptr_eq(parent, &original.parent)
+            || !Arc::ptr_eq(admission, &original.admission)
+            || !admission.belongs_to_parent(parent)
+            || !parent.matches(
+                lock.config.process_generation,
+                &lock.canonical_sha256,
+                runtime.cuda_device_id,
+            )
+            || receipt.epoch().0 != lock.config.process_generation
+            || !receipt.permits_process_close()
+            || !receipt.native_owner_joined()
+            || !receipt.native_physical_shutdown_confirmed()
+            || !receipt.native_session_release().is_some_and(|release| {
+                release.source() == NativeSessionReleaseSource::OriginalReport
+            })
+        {
+            return Err(invalid());
+        }
+        parent.ensure_live()?;
+        Ok(OriginalLifecycleSessionEvidence::new(
+            source.as_ref(),
+            parent.as_ref(),
+            receipt,
+        ))
+    }
+
     /// Consume the assembly result as one unit. This preserves its original
     /// source/CPU intent, parent, admission, external capability, archive and
     /// both observation channels; no caller can recombine unrelated owners.
