@@ -29,6 +29,144 @@ pub struct ManagedOutputInheritedFds {
     _exclusive_channel: Arc<()>,
 }
 
+/// Exact inherited input directory and plan-file descriptors. This is only
+/// an OS-level owner: authentication and association with a managed output
+/// lease must be established separately by the live supervisor.
+pub struct ManagedInputInheritedFds {
+    directory: File,
+    plan: File,
+}
+
+/// Four dedicated inherited descriptors from one proposed /2 handoff.
+/// This container is not an authenticated owner or output-write capability.
+pub struct ManagedCollectionInheritedFds {
+    output: ManagedOutputInheritedFds,
+    input: ManagedInputInheritedFds,
+}
+impl ManagedCollectionInheritedFds {
+    /// This must be called at the single-threaded child entry, before any
+    /// inherited descriptor can be closed, reused or its socket options changed.
+    pub fn seal_exclusive(
+        channel_fd: RawFd,
+        output_fd: RawFd,
+        input_directory_fd: RawFd,
+        plan_fd: RawFd,
+    ) -> io::Result<Self> {
+        let fds = [channel_fd, output_fd, input_directory_fd, plan_fd];
+        if fds.iter().any(|fd| *fd < 3)
+            || (0..fds.len()).any(|i| (i + 1..fds.len()).any(|j| fds[i] == fds[j]))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "four distinct non-standard inherited descriptors are required",
+            ));
+        }
+        let input = ManagedInputInheritedFds::seal_exclusive(input_directory_fd, plan_fd)?;
+        let output = ManagedOutputInheritedFds::seal_exclusive(output_fd, channel_fd)?;
+        Ok(Self { output, input })
+    }
+    pub fn into_parts(self) -> (ManagedOutputInheritedFds, ManagedInputInheritedFds) {
+        (self.output, self.input)
+    }
+}
+
+impl ManagedInputInheritedFds {
+    /// The caller must seal the dedicated inherited descriptors before any
+    /// other thread can close, reuse or alter them. This never reopens a path.
+    pub fn seal_exclusive(directory_fd: RawFd, plan_fd: RawFd) -> io::Result<Self> {
+        if directory_fd == plan_fd {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "input directory and plan descriptors are the same",
+            ));
+        }
+        let directory = File::from(duplicate(directory_fd)?);
+        let plan = File::from(duplicate(plan_fd)?);
+        if !directory.metadata()?.is_dir() || !plan.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "input directory or plan descriptor has the wrong type",
+            ));
+        }
+        for fd in [directory.as_raw_fd(), plan.as_raw_fd()] {
+            // SAFETY: F_GETFL only observes existing descriptor status flags.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE != libc::O_RDONLY {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "input descriptors must be readable and read-only",
+                ));
+            }
+        }
+        mark_original_cloexec(directory_fd, directory.as_raw_fd())?;
+        mark_original_cloexec(plan_fd, plan.as_raw_fd())?;
+        Ok(Self { directory, plan })
+    }
+
+    pub fn directory_identity(&self) -> io::Result<(u64, u64)> {
+        let info = self.directory.metadata()?;
+        if !info.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "input directory identity changed type",
+            ));
+        }
+        Ok((info.dev(), info.ino()))
+    }
+
+    pub fn plan_identity(&self) -> io::Result<(u64, u64, u64)> {
+        let info = self.plan.metadata()?;
+        if !info.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "input plan identity changed type",
+            ));
+        }
+        Ok((info.dev(), info.ino(), info.len()))
+    }
+
+    /// Duplicate the held kernel objects, not a pathname. Neither duplicate
+    /// by itself attests immutability, supervisor liveness, or output rights.
+    pub fn try_clone_directory(&self) -> io::Result<File> {
+        self.directory.try_clone()
+    }
+    pub fn try_clone_plan(&self) -> io::Result<File> {
+        self.plan.try_clone()
+    }
+}
+
+/// Return a fresh non-secret request-session discriminator. Nonblocking
+/// entropy failure is explicit; this value is not an authorization token.
+pub fn managed_output_session_nonce() -> io::Result<[u8; 16]> {
+    let mut nonce = [0_u8; 16];
+    let mut filled = 0;
+    while filled < nonce.len() {
+        // SAFETY: the output pointer and length cover the remaining live
+        // buffer. GRND_NONBLOCK prevents unbounded entropy-source waiting.
+        let count = unsafe {
+            libc::getrandom(
+                nonce[filled..].as_mut_ptr().cast(),
+                nonce.len() - filled,
+                libc::GRND_NONBLOCK,
+            )
+        };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "empty system random response",
+            ));
+        }
+        filled += count as usize;
+    }
+    Ok(nonce)
+}
+
 struct ChannelRegistration {
     owner: Weak<()>,
     original_fd: RawFd,
@@ -468,6 +606,56 @@ mod tests {
     use super::*;
     use nix::sys::socket::{socketpair, AddressFamily, SockFlag};
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn four_inherited_descriptors_keep_original_input_and_plan() {
+        let output = File::open(".").expect("working directory");
+        let input = File::open(".").expect("input directory");
+        let plan = File::open("Cargo.toml").expect("crate manifest as bounded input fixture");
+        let (child, _parent) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .expect("seqpacket pair");
+        let original_input = input.metadata().expect("input stat");
+        let original_plan = plan.metadata().expect("plan stat");
+        assert!(
+            ManagedCollectionInheritedFds::seal_exclusive(
+                child.as_raw_fd(),
+                output.as_raw_fd(),
+                input.as_raw_fd(),
+                input.as_raw_fd()
+            )
+            .is_err(),
+            "descriptor aliases must be rejected"
+        );
+        let combined = ManagedCollectionInheritedFds::seal_exclusive(
+            child.as_raw_fd(),
+            output.as_raw_fd(),
+            input.as_raw_fd(),
+            plan.as_raw_fd(),
+        )
+        .expect("four original descriptors");
+        let (_output_owner, input_owner) = combined.into_parts();
+        assert_eq!(
+            input_owner.directory_identity().expect("input identity"),
+            (original_input.dev(), original_input.ino())
+        );
+        assert_eq!(
+            input_owner.plan_identity().expect("plan identity"),
+            (
+                original_plan.dev(),
+                original_plan.ino(),
+                original_plan.len()
+            )
+        );
+        assert!(
+            plan.metadata().is_ok(),
+            "the caller retains the inherited original"
+        );
+    }
 
     #[test]
     fn inherited_seqpacket_retains_original_directory_and_kernel_sender() {

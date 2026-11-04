@@ -21,6 +21,7 @@ pub use linux::{
 };
 #[cfg(target_os = "linux")]
 pub use managed_output::{
+    managed_output_session_nonce, ManagedCollectionInheritedFds, ManagedInputInheritedFds,
     ManagedOutputInheritedFds, ManagedOutputPacket, ManagedOutputPeerCredentials,
 };
 
