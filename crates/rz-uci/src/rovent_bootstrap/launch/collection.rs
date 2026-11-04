@@ -37,11 +37,12 @@ pub type RoventOwnBoardCollectionHooksV2 = dyn RoventBoardCollectionHooksV2<
     crate::rovent_bootstrap::RoventNativeBackend<AdaptivePortQuestion>,
 >;
 
+pub type SealedTeacherObservations = Arc<Mutex<Option<Vec<SealedTeacherPreparationObservation>>>>;
+
 pub(super) struct CollectionLaunchV2<'a> {
     pub(super) teacher_selections: Vec<RoventTeacherSourceSelection>,
     pub(super) sealed_teacher_indices: Vec<usize>,
-    pub(super) sealed_observations:
-        Option<Arc<Mutex<Option<Vec<SealedTeacherPreparationObservation>>>>>,
+    pub(super) sealed_observations: Option<SealedTeacherObservations>,
     pub(super) observer: Box<dyn VirtualReviewCollectionObserver>,
     pub(super) hooks: CollectionHooksV2,
     pub(super) admit_resource:
@@ -233,7 +234,7 @@ pub fn run_pc_collection_v2_with_sealed_policy<'a>(
     hooks: Arc<dyn RoventPcCollectionHooksV2>,
     admit_resource: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
     sealed_teacher_indices: Vec<usize>,
-    sealed_observations: Arc<Mutex<Option<Vec<SealedTeacherPreparationObservation>>>>,
+    sealed_observations: SealedTeacherObservations,
 ) -> Result<(), RoventPcCollectionLaunchFailureV2> {
     run_collection_v2(
         arguments,
@@ -293,7 +294,7 @@ fn run_collection_v2<'a, H: ?Sized>(
     hooks: CollectionHooksV2,
     admit_resource: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
     sealed_teacher_indices: Vec<usize>,
-    sealed_observations: Option<Arc<Mutex<Option<Vec<SealedTeacherPreparationObservation>>>>>,
+    sealed_observations: Option<SealedTeacherObservations>,
 ) -> Result<(), RoventCollectionLaunchFailureV2<H>> {
     let startup_attempt = Arc::new(AtomicBool::new(false));
     let native_settled = Arc::new(AtomicBool::new(false));

@@ -106,8 +106,10 @@ pub fn compiled_system_source_inventory_v3() -> Result<CompiledSourceInventoryV5
     Ok(inventory)
 }
 
+type EmbeddedSourceComponent<'a> = (&'a str, &'a [(&'a str, &'a [u8])]);
+
 fn selected_runtime_inventory(
-    components: &[(&str, &[(&str, &[u8])])],
+    components: &[EmbeddedSourceComponent<'_>],
 ) -> Result<CompiledSourceInventoryV5, ManifestError> {
     let mut inventory = CompiledSourceInventoryV5::new();
     for &(name, files) in components {
