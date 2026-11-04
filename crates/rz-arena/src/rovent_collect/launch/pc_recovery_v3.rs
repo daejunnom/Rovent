@@ -282,8 +282,7 @@ impl PcRunRecoveryKeyV3 {
             TryLockError::Poisoned(_) => PcRunRecoveryRecordErrorV3::Poisoned,
         })?;
         let original = guard.as_mut().ok_or(PcRunRecoveryRecordErrorV3::Invalid)?;
-        if original.state != PcRunRecoveryStateV3::Executing
-            || !Arc::ptr_eq(outcome.original_collection(), original.owners.native())
+        if !outcome.matches_original_collection(original.owners.native())
             || !original
                 .outcome_key
                 .as_ref()
@@ -291,8 +290,16 @@ impl PcRunRecoveryKeyV3 {
         {
             return Err(PcRunRecoveryRecordErrorV3::Invalid);
         }
-        original.state = PcRunRecoveryStateV3::Returned;
-        Ok(())
+        match original.state {
+            PcRunRecoveryStateV3::Executing => {
+                original.state = PcRunRecoveryStateV3::Returned;
+                Ok(())
+            }
+            // Re-observing the same original outcome must not overwrite a
+            // retained panic or reject a concurrent prior observation.
+            PcRunRecoveryStateV3::Returned | PcRunRecoveryStateV3::Panicked => Ok(()),
+            PcRunRecoveryStateV3::Prepared => Err(PcRunRecoveryRecordErrorV3::Invalid),
+        }
     }
 
     /// Obtain the exact key issued by the original outcome. Recovering through
