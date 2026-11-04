@@ -542,6 +542,16 @@ impl PcCollectionRunV3 {
         self.recovery.clone()
     }
 
+    /// Observe this run's game join independently of physical settlement.
+    /// The same recovery key can poll retained settled custody after this run
+    /// is dropped; no game result is a GPU or publication completion proof.
+    pub(crate) fn poll_game_join(
+        &self,
+    ) -> Result<super::pc_recovery_v3::PcGameJoinObservationV3, PcDriverEvidenceErrorV3> {
+        let outcome = (!self.settled).then_some(&self.outcome);
+        self.recovery.poll_game_join(outcome, &self.owners.bridge)
+    }
+
     /// Nonblocking progress for this original run. Pre-admission driver
     /// retirement is independent of native/resource/output settlement. The
     /// original before-native recovery may wait only until `poll_until`,
