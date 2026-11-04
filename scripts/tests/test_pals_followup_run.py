@@ -97,55 +97,47 @@ class FollowupPlanTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             wrapper.model_plan(args, self.root / "validator")
 
-    def test_cuda_control_inventory_is_explicit_pinned_and_bound_to_export(self):
-        export = self.root / "control-export.json"
+    def test_system_cuda_plan_requires_its_config_and_preserves_cpu_and_legacy_boundaries(self):
+        export = self.root / "export.json"
         export_sha = self.write(export, {"config": {}})
-        fixtures, runtime, bundle = (self.root / name for name in ("fixtures", "runtime", "bundle"))
-        for path in (fixtures, runtime, bundle):
+        fixtures, runtime = (self.root / name for name in ("fixtures", "runtime"))
+        for path in (fixtures, runtime):
             path.write_bytes(b"pinned input")
         digest = hashlib.sha256(b"pinned input").hexdigest()
-        inventory = self.root / "inventory.json"
-        value = {"schema": "rovezero.pals-static-control-inventory.v2",
-                 "manifest_sha256": export_sha, "actual_provider_placement": "not_observed",
-                 "cpu_allowlist": "not_created"}
-        inventory_sha = self.write(inventory, value)
+        config = self.root / "system-config.json"
+        config_sha = self.write(config, {"libraries": []})
         args = argparse.Namespace(export=export, export_sha256=export_sha,
             model_profile="legacy_summary_v1", fixtures=fixtures, fixtures_sha256=digest,
             runtime=runtime, runtime_sha256=digest, model_report=self.output / "numeric.json",
-            runtime_cache=self.output, provider="cuda-control", cuda_bundle=bundle,
-            cuda_bundle_sha256=digest, control_inventory=inventory,
-            control_inventory_sha256=inventory_sha)
-        for provider in ("cuda-control", "cuda-control-conv-default"):
-            args.provider = provider
-            command, evidence = wrapper.model_plan(args, self.root / "validator")
-            self.assertEqual(command[-2:], [str(inventory), inventory_sha])
-            self.assertEqual(command[7], provider)
-            self.assertTrue(evidence["native_placement_audit_required"])
-            if provider == "cuda-control":
-                self.assertNotIn("cudnn_conv_search_diagnostic", evidence)
+            runtime_cache=self.output, provider="cuda-system", cuda_bundle=None,
+            cuda_bundle_sha256=None, control_inventory=None, control_inventory_sha256=None,
+            system_cuda_config=config, system_cuda_config_sha256=config_sha)
+        command, evidence = wrapper.model_plan(args, self.root / "validator")
+        self.assertEqual(command[-3:], [str(self.output), str(config), config_sha])
+        self.assertEqual(command[7], "cuda-system")
+        self.assertEqual(evidence["system_cuda_config_sha256"], config_sha)
+        self.assertEqual(evidence["actual_gpu_kernel_placement"], "unknown")
+        for alteration in ("legacy", "partial_pin", "wrong_pin", "bundle", "control", "cpu_with_config"):
+            invalid = copy.copy(args)
+            if alteration == "legacy":
+                invalid.provider = "cuda-control"
+            elif alteration == "partial_pin":
+                invalid.system_cuda_config_sha256 = None
+            elif alteration == "wrong_pin":
+                invalid.system_cuda_config_sha256 = hashlib.sha256(b"different").hexdigest()
+            elif alteration == "bundle":
+                invalid.cuda_bundle = config
+            elif alteration == "control":
+                invalid.control_inventory = config
             else:
-                observation = evidence["cudnn_conv_search_diagnostic"]
-                self.assertEqual(observation["cudnn_conv_algo_search_requested"], "DEFAULT")
-                self.assertEqual(observation["native_loading_profile_requested"], "eager-cuda12-cudnn9-v1")
-                self.assertIs(observation["tf32_requested"], False)
-                for name in ("actual_cudnn_plan", "numerical_note", "tf32_actual", "tf32_retry"):
-                    self.assertEqual(observation[name], "unknown")
-                self.assertEqual(observation["backend_execution_descriptor"], "requires_loaded_checker_receipt")
-                for name in ("production_default_changed", "warm_success_claim", "pilot_success_claim"):
-                    self.assertIs(observation[name], False)
-            for alteration in ("ordinary_provider", "partial_pin", "another_export", "invented_placement"):
-                invalid = copy.copy(args)
-                if alteration == "ordinary_provider":
-                    invalid.provider = "cuda"
-                elif alteration == "partial_pin":
-                    invalid.control_inventory_sha256 = None
-                else:
-                    changed = dict(value)
-                    changed["manifest_sha256" if alteration == "another_export" else "actual_provider_placement"] = "unknown"
-                    invalid.control_inventory_sha256 = self.write(inventory, changed)
-                with self.subTest(provider=provider, alteration=alteration), self.assertRaises(ValueError):
-                    wrapper.model_plan(invalid, self.root / "validator")
-                inventory.write_text(json.dumps(value), encoding="utf-8")
+                invalid.provider = "cpu"
+            with self.subTest(alteration=alteration), self.assertRaises(ValueError):
+                wrapper.model_plan(invalid, self.root / "validator")
+        args.provider = "cpu"
+        args.system_cuda_config = args.system_cuda_config_sha256 = None
+        command, evidence = wrapper.model_plan(args, self.root / "validator")
+        self.assertEqual(command[-2:], ["cpu", str(self.output)])
+        self.assertNotIn("system_cuda_config_sha256", evidence)
 
     def gc_args(self, value):
         path = self.root / "external-gc.json"
@@ -389,10 +381,10 @@ class DriverLookupTests(unittest.TestCase):
             self.assertEqual(evidence["status"],
                              "available" if code == 0 else "lookup_or_supervision_failed")
 
-    def model_argv(self, provider="cuda", resource="colab-observed", execute=True):
+    def model_argv(self, provider="cuda-system", resource="colab-observed", execute=True):
         files = {"binary": b"fixture executable", "export": json.dumps({
             "config": {"profile": "legacy_summary_v1"}}).encode(),
-            "runtime": b"fixture runtime", "fixtures": b"{}", "cuda-bundle": b"{}"}
+            "runtime": b"fixture runtime", "fixtures": b"{}", "system-cuda-config": b"{}"}
         argv = ["wrapper", "--receipt", str(self.receipt), "--cpu-affinity", "0", "2",
                 "--resource-profile", resource, "--seconds", "100"]
         for name in ("binary",):
@@ -405,8 +397,8 @@ class DriverLookupTests(unittest.TestCase):
         argv += ["model-check", "--model-profile", "legacy_summary_v1", "--provider", provider,
                  "--runtime-cache", str(self.root / "runtime-cache"),
                  "--model-report", str(self.root / "model-report.json")]
-        for name in ("export", "runtime", "fixtures", "cuda-bundle"):
-            if name == "cuda-bundle" and provider == "cpu":
+        for name in ("export", "runtime", "fixtures", "system-cuda-config"):
+            if name == "system-cuda-config" and provider == "cpu":
                 continue
             path = self.root / name
             path.write_bytes(files[name])
@@ -638,7 +630,9 @@ class DriverLookupTests(unittest.TestCase):
             argv = self.model_argv()
             flag = lambda name: argv[argv.index("--" + name) + 1]
             expected = [flag(name) for name in ("binary", "export", "export-sha256", "runtime",
-                        "runtime-sha256", "fixtures", "model-report", "provider", "runtime-cache", "cuda-bundle")]
+                        "runtime-sha256", "fixtures", "model-report", "provider")]
+            expected += [str(Path(flag("model-report")).parent), flag("system-cuda-config"),
+                         flag("system-cuda-config-sha256")]
             with self.subTest(data=data):
                 code, receipt, lookup, native = self.execute(argv, self.captured_probe(data),
                     lookup_completed_at=8, native_completed_at=9)
@@ -680,9 +674,9 @@ class DriverLookupTests(unittest.TestCase):
                 self.assertFalse(receipt["child_spawned"])
 
     def test_planning_cpu_and_strict_local_do_not_run_host_lookup(self):
-        cases = (("cuda", "colab-observed", False),
+        cases = (("cuda-system", "colab-observed", False),
                  ("cpu", "colab-observed", True),
-                 ("cuda", "strict-local", True))
+                 ("cuda-system", "strict-local", True))
         for index, (provider, resource, execute) in enumerate(cases):
             self.receipt = self.root / f"no-lookup-{index}.json"
             with self.subTest(provider=provider, resource=resource, execute=execute):

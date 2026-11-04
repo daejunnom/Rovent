@@ -395,55 +395,47 @@ def model_plan(args, binary):
             or descriptor.get("model_semantics") != "rovezero.pals-model-semantics.v2"
             or descriptor.get("encoding_schema") != "rovezero.pals-board-records.v2"):
         raise ValueError("new model semantics and encoding must be actual V2")
+    if args.provider not in ("cpu", "cuda-system"):
+        raise ValueError("legacy CUDA bundle execution is disabled; choose cuda-system with a pinned system config")
+    system_config = getattr(args, "system_cuda_config", None)
+    system_config_sha = getattr(args, "system_cuda_config_sha256", None)
+    if getattr(args, "cuda_bundle", None) is not None or getattr(args, "cuda_bundle_sha256", None) is not None:
+        raise ValueError("CUDA bundle execution is disabled; do not pass legacy bundle inputs")
+    if getattr(args, "control_inventory", None) is not None or getattr(args, "control_inventory_sha256", None) is not None:
+        raise ValueError("CUDA control inventory is not supported by the system checker")
+    if args.provider == "cuda-system":
+        if system_config is None or system_config_sha is None:
+            raise ValueError("system CUDA requires an independently pinned system config")
+        system_config = pinned(system_config, system_config_sha, 64 * 1024)
+    elif system_config is not None or system_config_sha is not None:
+        raise ValueError("CPU validation cannot silently inherit system CUDA configuration")
     fixtures = pinned(args.fixtures, args.fixtures_sha256, 32 * 1024 * 1024)
     runtime = pinned(args.runtime, args.runtime_sha256, 1024 * 1024 * 1024)
     report = outside_git(args.model_report)
-    cache = outside_git(args.runtime_cache)
     if report.exists() or not report.parent.is_dir():
         raise ValueError("new model report under existing outside-Git parent required")
+    # The Rust CLI retains a positional cache argument for compatibility, but
+    # cuda-system never opens it. Do not gate that path on an unused cache.
+    if args.provider == "cpu":
+        if args.runtime_cache is None:
+            raise ValueError("CPU validation requires an outside-Git runtime cache")
+        cache = outside_git(args.runtime_cache)
+    else:
+        cache = report.parent
     command = [str(binary), str(export), args.export_sha256, str(runtime), args.runtime_sha256,
                str(fixtures), str(report), args.provider, str(cache)]
-    if args.provider != "cpu":
-        if args.cuda_bundle is None or args.cuda_bundle_sha256 is None:
-            raise ValueError("CUDA validation needs an independently pinned actual runtime bundle")
-        bundle = pinned(args.cuda_bundle, args.cuda_bundle_sha256, 256 * 1024)
-        command.append(str(bundle))
-    elif args.cuda_bundle is not None or args.cuda_bundle_sha256 is not None:
-        raise ValueError("CPU validation cannot silently inherit CUDA assets")
-    inventory_path = getattr(args, "control_inventory", None)
-    inventory_sha = getattr(args, "control_inventory_sha256", None)
-    control = args.provider in ("cuda-control", "cuda-control-shim", "cuda-control-conv-default")
-    if control:
-        if inventory_path is None or inventory_sha is None:
-            raise ValueError("CUDA control validation requires an explicit pinned metadata inventory")
-        inventory = pinned(inventory_path, inventory_sha, 1024 * 1024)
-        static = bounded_json(inventory, 1024 * 1024)
-        if (static.get("schema") != "rovezero.pals-static-control-inventory.v2"
-                or static.get("manifest_sha256") != args.export_sha256
-                or static.get("actual_provider_placement") != "not_observed"
-                or static.get("cpu_allowlist") != "not_created"):
-            raise ValueError("static control inventory does not describe this exact export")
-        # Native Rust reconstructs provenance and audits placement before Run.
-        # Static input alone grants neither blanket CPU fallback nor CUDA success.
-        command.extend((str(inventory), inventory_sha))
-    elif inventory_path is not None or inventory_sha is not None:
-        raise ValueError("metadata inventory requires an explicit CUDA control provider")
+    if args.provider == "cuda-system":
+        command.extend((str(system_config), system_config_sha))
     details = {"model_profile": profile, "export_sha256": args.export_sha256,
                "fixture_sha256": args.fixtures_sha256, "provider": args.provider,
-               "cuda_control_inventory_sha256": inventory_sha if control else None,
-               "native_placement_audit_required": control,
+               "cuda_control_inventory_sha256": None,
+               "native_placement_audit_required": False,
                "numeric_reference_only": True, "strength_eligible": False}
-    if args.provider == "cuda-control-conv-default":
-        details["cudnn_conv_search_diagnostic"] = {
-            "scope": "single_requested_option_no_observed_cudnn_plan",
-            "cudnn_conv_algo_search_requested": "DEFAULT",
-            "native_loading_profile_requested": "eager-cuda12-cudnn9-v1",
-            "backend_execution_descriptor": "requires_loaded_checker_receipt",
-            "actual_cudnn_plan": "unknown", "numerical_note": "unknown",
-            "tf32_requested": False, "tf32_actual": "unknown", "tf32_retry": "unknown",
-            "production_default_changed": False, "warm_success_claim": False,
-            "pilot_success_claim": False, "failure_cause": "not_proven",
-        }
+    if args.provider == "cuda-system":
+        details.update(system_cuda_config_sha256=system_config_sha,
+                       system_runtime_origin="requires_native_mapping_observation",
+                       actual_gpu_kernel_placement="unknown",
+                       physical_completion="requires_native_and_supervisor_evidence")
     return command, details
 
 
@@ -475,11 +467,14 @@ def main():
     model.add_argument("--fixtures-sha256", required=True)
     model.add_argument("--runtime", type=Path, required=True)
     model.add_argument("--runtime-sha256", required=True)
-    model.add_argument("--runtime-cache", type=Path, required=True)
+    model.add_argument("--runtime-cache", type=Path,
+                       help="required for CPU; unused by cuda-system")
     model.add_argument("--model-report", type=Path, required=True)
-    model.add_argument("--provider", choices=("cpu", "cuda", "cuda-device", "cuda-control", "cuda-control-shim", "cuda-control-conv-default"), default="cpu")
+    model.add_argument("--provider", choices=("cpu", "cuda-system", "cuda", "cuda-device", "cuda-control", "cuda-control-shim", "cuda-control-conv-default"), default="cpu")
     model.add_argument("--cuda-bundle", type=Path)
     model.add_argument("--cuda-bundle-sha256")
+    model.add_argument("--system-cuda-config", type=Path)
+    model.add_argument("--system-cuda-config-sha256")
     model.add_argument("--control-inventory", type=Path)
     model.add_argument("--control-inventory-sha256")
     args = parser.parse_args()
