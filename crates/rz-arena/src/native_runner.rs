@@ -754,6 +754,7 @@ struct IndependentNoGameOwners {
     grants: Arc<Mutex<[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]>>,
     cancel_not_granted: Arc<AtomicBool>,
     cancel_failure: Arc<std::sync::OnceLock<Arc<ArenaError>>>,
+    raw_persistence_started: AtomicBool,
 }
 
 /// Limits and tree-watch declaration derived from this selected snapshot.
@@ -934,6 +935,85 @@ pub(crate) struct IndependentNoGameRawEvidence {
     pub(crate) grants: Arc<Mutex<[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]>>,
     pub(crate) cancel_not_granted: bool,
     pub(crate) cancel_failure: Option<Arc<ArenaError>>,
+}
+
+/// Borrowed original evidence; observing or persisting this view does not
+/// transfer ownership or assert physical completion.
+#[cfg(target_os = "linux")]
+pub(crate) struct IndependentNoGameEvidenceView<'a> {
+    pub(crate) plan_sha256: &'a str,
+    pub(crate) role: rz_experiments::NativeEngineRole,
+    pub(crate) owner_id: [u8; 16],
+    pub(crate) owner_epoch: u64,
+    pub(crate) process: Option<&'a ProcessOutput>,
+    pub(crate) original_error: Option<&'a ArenaError>,
+    pub(crate) failures: &'a [String],
+    pub(crate) observation: Option<&'a crate::process::OriginalSmokeUciObservation>,
+    pub(crate) cancel_not_granted: bool,
+    pub(crate) cancel_failure: Option<&'a ArenaError>,
+    pub(crate) physical_or_process_completion_unknown: bool,
+    grants: &'a Mutex<[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]>,
+    control: &'a Mutex<crate::pals_adaptive_launch::SmokeDeadlineControl>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) enum IndependentNoGameBorrowResult<T> {
+    Observed(T),
+    Busy,
+    Poisoned,
+}
+
+/// Each write is independently reported; a failed or partial file remains in
+/// the original directory, and no result implies a physical GPU fence.
+#[cfg(target_os = "linux")]
+pub(crate) struct IndependentNoGamePersistence {
+    pub(crate) files: Vec<(String, Result<(), ArenaError>)>,
+    pub(crate) directory_sync: Result<(), ArenaError>,
+}
+
+#[cfg(target_os = "linux")]
+impl IndependentNoGameEvidenceView<'_> {
+    /// Short read-only observation. Keep callbacks nonblocking; no ownership
+    /// or physical authority is transferred by this mutex borrow.
+    pub(crate) fn with_grants<T>(
+        &self,
+        inspect: impl FnOnce(&[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]) -> T,
+    ) -> IndependentNoGameBorrowResult<T> {
+        match self.grants.try_lock() {
+            Ok(guard) => {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inspect(&guard)));
+                drop(guard);
+                match result {
+                    Ok(value) => IndependentNoGameBorrowResult::Observed(value),
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            }
+            Err(TryLockError::WouldBlock) => IndependentNoGameBorrowResult::Busy,
+            Err(TryLockError::Poisoned(_)) => IndependentNoGameBorrowResult::Poisoned,
+        }
+    }
+
+    /// The caller may inspect the exact control's offsets and first error;
+    /// Busy/Poisoned are unknown observations, not a successful cancel.
+    pub(crate) fn with_control<T>(
+        &self,
+        inspect: impl FnOnce(&crate::pals_adaptive_launch::SmokeDeadlineControl) -> T,
+    ) -> IndependentNoGameBorrowResult<T> {
+        match self.control.try_lock() {
+            Ok(guard) => {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inspect(&guard)));
+                drop(guard);
+                match result {
+                    Ok(value) => IndependentNoGameBorrowResult::Observed(value),
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            }
+            Err(TryLockError::WouldBlock) => IndependentNoGameBorrowResult::Busy,
+            Err(TryLockError::Poisoned(_)) => IndependentNoGameBorrowResult::Poisoned,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1165,6 +1245,7 @@ impl PreparedIndependentNoGameOwner {
                 grants: Arc::new(Mutex::new([None, None])),
                 cancel_not_granted: Arc::new(AtomicBool::new(false)),
                 cancel_failure: Arc::new(std::sync::OnceLock::new()),
+                raw_persistence_started: AtomicBool::new(false),
             }),
             process: None,
             spawn_custody: crate::process::SpawnCustody::default(),
@@ -1193,6 +1274,187 @@ impl PreparedIndependentNoGameOwner {
     /// May include bytes read before an interrupted supervisor returns.
     pub(crate) fn observation(&self) -> Option<&crate::process::OriginalSmokeUciObservation> {
         self.owners.as_ref()?.observation.as_ref()
+    }
+
+    /// The original owner, output buffers and errors stay in place even if
+    /// physical completion is unknown, the callback fails or it unwinds.
+    pub(crate) fn with_raw_evidence<T, E>(
+        &self,
+        persist: impl FnOnce(IndependentNoGameEvidenceView<'_>) -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        let Some(owners) = self.owners.as_ref() else {
+            return Ok(None);
+        };
+        let binding = &owners._binding;
+        let execution = binding.execution();
+        persist(IndependentNoGameEvidenceView {
+            plan_sha256: binding.snapshot().plan.sha256(),
+            role: binding.snapshot().role,
+            owner_id: execution.owner_id(),
+            owner_epoch: execution.owner_epoch(),
+            process: self.process.as_ref(),
+            original_error: self.original_error.as_ref(),
+            failures: &self.failures,
+            observation: owners.observation.as_ref(),
+            cancel_not_granted: owners.cancel_not_granted.load(Ordering::Acquire),
+            cancel_failure: owners.cancel_failure.get().map(Arc::as_ref),
+            physical_or_process_completion_unknown: self.unresolved(),
+            grants: owners.grants.as_ref(),
+            control: binding.control().as_ref(),
+        })
+        .map(Some)
+    }
+
+    /// Explicitly persist borrowed raw buffers under the original pinned
+    /// output directory. Existing names are never overwritten. The caller
+    /// still owns the original evidence even if all writes and sync succeed.
+    pub(crate) fn persist_raw_evidence(
+        &self,
+        basename: &str,
+    ) -> Result<IndependentNoGamePersistence, ArenaError> {
+        if !crate::native_launch::safe_output_basename(basename) {
+            return Err(ArenaError::Invalid(
+                "NoGame evidence basename invalid".into(),
+            ));
+        }
+        let owners = self
+            .owners
+            .as_ref()
+            .ok_or_else(|| ArenaError::Invalid("NoGame original owner unavailable".into()))?;
+        let snapshot = owners._binding.snapshot();
+        let cap = snapshot.plan.input().budget.max_output_bytes;
+        let process = self.process.as_ref();
+        let observed = owners.observation.as_ref();
+        if process.is_none()
+            && observed.is_none()
+            && self.original_error.is_none()
+            && self.failures.is_empty()
+            && !owners.cancel_not_granted.load(Ordering::Acquire)
+            && owners.cancel_failure.get().is_none()
+        {
+            return Err(ArenaError::Invalid(
+                "NoGame evidence is not yet available".into(),
+            ));
+        }
+        let mut files: Vec<(String, &[u8])> = Vec::new();
+        if let Some(process) = process {
+            files.push((format!("{basename}.stdout"), &process.stdout));
+            files.push((format!("{basename}.stderr"), &process.stderr));
+        }
+        if let Some(observation) = observed {
+            if !observation.buffered_stdout().is_empty() {
+                files.push((
+                    format!("{basename}.observed-stdout"),
+                    observation.buffered_stdout(),
+                ));
+            }
+            if !observation.buffered_stderr().is_empty() {
+                files.push((
+                    format!("{basename}.observed-stderr"),
+                    observation.buffered_stderr(),
+                ));
+            }
+        }
+        let grant_observation = match owners.grants.try_lock() {
+            Ok(grants) => serde_json::json!({
+                "state": "observed",
+                "items": grants.iter().flatten().map(|grant| serde_json::json!({
+                    "phase": match grant.scope.phase {
+                        rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Run => "run",
+                        rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Cleanup => "cleanup",
+                    },
+                    "request_id": grant.scope.request_id,
+                    "peer_pid": grant.peer_pid,
+                    "peer_start_ticks": grant.peer_start_ticks,
+                    "completion_observed_during_cleanup": grant.completion_observed_during_cleanup,
+                })).collect::<Vec<_>>(),
+            }),
+            Err(TryLockError::WouldBlock) => serde_json::json!({"state":"busy"}),
+            Err(TryLockError::Poisoned(_)) => serde_json::json!({"state":"poisoned"}),
+        };
+        let control_observation = match owners._binding.control().try_lock() {
+            Ok(control) => {
+                let progress = control.progress();
+                serde_json::json!({
+                    "state": "observed",
+                    "challenge_written": progress.challenge_written,
+                    "request_read": progress.request_read,
+                    "grant_written": progress.grant_written,
+                    "retained_grants": progress.retained_grants,
+                    "interrupted_grants": progress.interrupted_grants,
+                    "run_closed": progress.no_game_run_closed,
+                    "first_failure": progress.first_failure,
+                    "cancel_offsets_and_ack": control.no_game_cancel_offsets(),
+                })
+            }
+            Err(TryLockError::WouldBlock) => serde_json::json!({"state":"busy"}),
+            Err(TryLockError::Poisoned(_)) => serde_json::json!({"state":"poisoned"}),
+        };
+        let summary = serde_json::to_vec(&serde_json::json!({
+            "scope": "original_nogame_observations_not_physical_fence",
+            "owner_id": owners._binding.execution().owner_id(),
+            "owner_epoch": owners._binding.execution().owner_epoch(),
+            "plan_sha256": snapshot.plan.sha256(),
+            "physical_or_process_completion_unknown": self.unresolved(),
+            "process_receipt": process.map(|p| &p.receipt),
+            "original_error": self.original_error.as_ref().map(ToString::to_string),
+            "failures": self.failures,
+            "cancel_not_granted": owners.cancel_not_granted.load(Ordering::Acquire),
+            "cancel_failure": owners.cancel_failure.get().map(ToString::to_string),
+            "grant_observation": grant_observation,
+            "control_observation": control_observation,
+            "uci_attempt_started": observed.map(|o| o.attempt_started()),
+            "uci_attempt_returned": observed.map(|o| o.attempt_returned()),
+            "uci_exchange_observed": observed.map(|o| o.uci_exchange_observed()),
+        }))
+        .map_err(|_| ArenaError::Io("NoGame evidence summary encoding failed".into()))?;
+        let raw_total = files
+            .iter()
+            .try_fold(0u64, |sum, (_, bytes)| {
+                sum.checked_add(u64::try_from(bytes.len()).ok()?)
+            })
+            .ok_or_else(|| ArenaError::Budget("NoGame evidence bytes overflow".into()))?;
+        if raw_total > cap {
+            return Err(ArenaError::Budget(
+                "NoGame raw evidence exceeds original output budget".into(),
+            ));
+        }
+        // At most one internal persistence attempt per original scope. This
+        // bounds this consumer across partial writes and repeated basenames;
+        // it is not a total directory/disk quota. The caller can still borrow
+        // the original data for recovery through its own storage policy.
+        owners
+            .raw_persistence_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                ArenaError::Invalid("NoGame internal evidence persistence already attempted".into())
+            })?;
+        let mut files: Vec<_> = files
+            .into_iter()
+            .map(|(name, bytes)| {
+                let result = linux::put_directory(&snapshot.directory, &name, bytes, cap);
+                (name, result)
+            })
+            .collect();
+        let summary_name = format!("{basename}.summary.json");
+        let summary_result = linux::put_directory(
+            &snapshot.directory,
+            &summary_name,
+            &summary,
+            cap - raw_total,
+        );
+        files.push((summary_name, summary_result));
+        let directory_sync = crate::native_launch::linux::readable_directory_pin(
+            &snapshot.directory,
+        )
+        .and_then(|dir| {
+            dir.sync_all()
+                .map_err(|_| ArenaError::Io("NoGame evidence directory sync failed".into()))
+        });
+        Ok(IndependentNoGamePersistence {
+            files,
+            directory_sync,
+        })
     }
 
     /// Keep the original optional resource observation owner with this same
@@ -3125,6 +3387,17 @@ pub(crate) mod linux {
         bytes: &[u8],
         cap: u64,
     ) -> Result<ArtifactRef, ArenaError> {
+        put_directory(&owner.snapshot.directory, name, bytes, cap)?;
+        Ok(artifact(owner, name, bytes))
+    }
+
+    /// Common exclusive evidence writer. A failed/partial file is retained.
+    pub(super) fn put_directory(
+        directory: &Dir,
+        name: &str,
+        bytes: &[u8],
+        cap: u64,
+    ) -> Result<(), ArenaError> {
         if bytes.len() as u64 > cap {
             return Err(ArenaError::Budget(
                 "native evidence exceeds reserved bytes".into(),
@@ -3137,22 +3410,18 @@ pub(crate) mod linux {
             .follow(FollowSymlinks::No)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .mode(0o600);
-        let mut file = owner
-            .snapshot
-            .directory
-            .open_with(name, &options)
-            .map_err(|_| {
-                ArenaError::Io(
-                    "cannot create exclusive native evidence; prior/partial bytes retained".into(),
-                )
-            })?;
+        let mut file = directory.open_with(name, &options).map_err(|_| {
+            ArenaError::Io(
+                "cannot create exclusive native evidence; prior/partial bytes retained".into(),
+            )
+        })?;
         use std::io::Write;
         file.write_all(bytes)
             .and_then(|()| file.sync_all())
             .map_err(|_| {
                 ArenaError::Io("cannot finish native evidence; partial bytes retained".into())
             })?;
-        Ok(artifact(owner, name, bytes))
+        Ok(())
     }
     pub(crate) fn read_file(directory: &Dir, name: &str, cap: u64) -> Result<Vec<u8>, ArenaError> {
         let mut options = OpenOptions::new();
