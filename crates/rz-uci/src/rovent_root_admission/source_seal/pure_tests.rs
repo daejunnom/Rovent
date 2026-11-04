@@ -215,9 +215,16 @@ fn v3_source_preserves_actual_owner_and_rejects_original_cancel_and_expiry() {
         .allocation_clock()
         .verify_against(admitted.descriptor(), owner.v3().unwrap())
         .unwrap();
+    assert!(admitted.try_accepts_original().unwrap());
+    {
+        let _held = ctx.current.lock().unwrap();
+        let busy = admitted.try_accepts_original().unwrap_err();
+        assert_eq!(busy.code, ErrorCode::ResourceExhausted);
+    }
 
     let canceled = prepare();
     ctx.control.cancel();
+    assert!(!admitted.try_accepts_original().unwrap());
     match canceled.into_initial().unwrap() {
         InitialAdmissionOutcomeV3::StoppedInitial(stopped) => {
             assert_eq!(stopped.stop_reason(), InitialStopReason::Canceled);

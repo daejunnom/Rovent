@@ -217,6 +217,12 @@ impl RoventRootAdmissionV3 {
     pub fn original_context(&self) -> &SearchSessionContext {
         &self.core.context
     }
+    /// Nonblocking observation of this original root's existing authority.
+    /// Contention and poison stay errors; a revoked, canceled or expired
+    /// root returns false. This does not issue or extend any authority.
+    pub fn try_accepts_original(&self) -> Result<bool, rz_contracts::ContractError> {
+        self.core.context.try_accepts()
+    }
     pub fn root_snapshot(&self) -> &PositionSnapshot {
         &self.core.snapshot
     }
