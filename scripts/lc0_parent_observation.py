@@ -26,8 +26,10 @@ _UNCLAIMED_CUSTODIES = []
 class OriginalAdmission:
     """Retain the first authenticated parent stream for one original child.
 
-    This capability does not imply native entry or completion. The future
-    process owner must retain it until that original lifetime is resolved.
+    The future process owner must construct this from the actual first
+    admission, keep its ordering and process identity, and retain it until
+    that original lifetime is resolved. This class cannot prove that a caller
+    supplied the first handshake, nor does it imply native entry or completion.
     """
 
     def __init__(self, handshake):
