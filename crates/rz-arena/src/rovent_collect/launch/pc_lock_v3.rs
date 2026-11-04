@@ -413,6 +413,27 @@ impl PcCollectionOwnersV3 {
             .register_output(output)
             .map_err(invalid)?;
         check(
+            !self
+                .launch_claimed
+                .load(std::sync::atomic::Ordering::Acquire),
+            "Collection original owner already used",
+        )?;
+        // Both composite and outcome recovery owners exist before any
+        // resource preparation or native callback can begin.
+        let outcome_key =
+            crate::rovent_resource_scope::launch::RoventPcCollectionRecoveryKeyV3::prepare_for(
+                &self.native,
+            );
+        let outcome_reservation = outcome_key
+            .reserve()
+            .ok_or_else(|| invalid("Collection original outcome already reserved"))?;
+        let recovery = super::pc_recovery_v3::PcRunRecoveryKeyV3::prepare(
+            Arc::clone(self),
+            Arc::clone(output),
+            outcome_key.clone(),
+        )
+        .map_err(|_| invalid("Collection original recovery registration failed"))?;
+        check(
             self.launch_claimed
                 .compare_exchange(
                     false,
@@ -423,11 +444,13 @@ impl PcCollectionOwnersV3 {
                 .is_ok(),
             "Collection original owner already used",
         )?;
+        recovery.begin().map_err(invalid)?;
         let validate_owner = Arc::clone(self);
         let start_owner = Arc::clone(self);
         let validate_output = Arc::clone(output);
-        let outcome =
-            crate::rovent_resource_scope::launch::run_pc_collection_with_resources_v3_post_auth(
+        let resource_recovery = recovery.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::rovent_resource_scope::launch::run_pc_collection_with_resources_v3_preowned(
                 pin,
                 arguments,
                 &self.native,
@@ -457,11 +480,47 @@ impl PcCollectionOwnersV3 {
                         }
                     })
                 }),
-            );
+                Box::new(move |resource| {
+                    resource_recovery
+                        .register_resource(Arc::clone(resource))
+                        .map_err(|_| "Collection original resource retention failed")
+                }),
+                outcome_reservation,
+            )
+        }));
+        let outcome = match outcome {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_reservation)) => {
+                return Err(invalid("Collection outcome reservation owner differs"));
+            }
+            Err(payload) => match recovery.record_panic(payload) {
+                Ok(()) => {
+                    return Err(invalid(
+                        "Collection original launch panicked; custody retained",
+                    ));
+                }
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+        };
+        // The identical outcome key was already registered before execution;
+        // failure to update this observation does not discard the outcome.
+        let (recovery_recorded, recovery_error) = match recovery.try_record_outcome_key(&outcome) {
+            Ok(()) => (true, None),
+            Err(super::pc_recovery_v3::PcRunRecoveryRecordErrorV3::Busy) => (false, None),
+            Err(super::pc_recovery_v3::PcRunRecoveryRecordErrorV3::Poisoned) => {
+                (false, Some("Collection recovery slot poisoned"))
+            }
+            Err(super::pc_recovery_v3::PcRunRecoveryRecordErrorV3::Invalid) => {
+                (false, Some("Collection recovery outcome differs"))
+            }
+        };
         Ok(PcCollectionRunV3 {
             owners: Arc::clone(self),
             output: Arc::clone(output),
             outcome,
+            recovery,
+            recovery_recorded,
+            recovery_error,
             pending_stop: None,
             stop_authorized: false,
             pending_joined: None,
@@ -481,6 +540,9 @@ pub(crate) struct PcCollectionRunV3 {
     owners: Arc<PcCollectionOwnersV3>,
     output: Arc<ManagedOutputOwnerV3>,
     outcome: crate::rovent_resource_scope::launch::RoventPcCollectionResourceOutcomeV3,
+    recovery: super::pc_recovery_v3::PcRunRecoveryKeyV3,
+    recovery_recorded: bool,
+    recovery_error: Option<&'static str>,
     pending_stop: Option<crate::rovent_collect::pc_hooks_lock_v3::PcSupervisorStopAuthorizationV3>,
     stop_authorized: bool,
     pending_joined: Option<crate::rovent_collect::pc_worker_v3::PcSupervisorJoinedProofV3>,
@@ -638,6 +700,23 @@ impl PcCollectionRunV3 {
         Option<crate::rovent_resource_scope::launch::RoventPcCollectionSettledOutcomeV3>,
         &'static str,
     > {
+        if let Some(error) = self.recovery_error {
+            return Err(error);
+        }
+        if !self.recovery_recorded {
+            match self.recovery.try_record_outcome_key(&self.outcome) {
+                Ok(()) => self.recovery_recorded = true,
+                Err(super::pc_recovery_v3::PcRunRecoveryRecordErrorV3::Busy) => return Ok(None),
+                Err(super::pc_recovery_v3::PcRunRecoveryRecordErrorV3::Poisoned) => {
+                    self.recovery_error = Some("Collection recovery slot poisoned");
+                    return Err("Collection recovery slot poisoned");
+                }
+                Err(super::pc_recovery_v3::PcRunRecoveryRecordErrorV3::Invalid) => {
+                    self.recovery_error = Some("Collection recovery outcome differs");
+                    return Err("Collection recovery outcome differs");
+                }
+            }
+        }
         if !self.joined_offered {
             match self.poll_pre_native_driver().map_err(|error| match error {
                 PcDriverEvidenceErrorV3::Poisoned(reason)
@@ -767,6 +846,34 @@ impl ManagedOutputStateV3 {
             || (held.dev(), held.ino()) != (current.dev(), current.ino())
         {
             return Err(std::io::Error::other("managed chunks binding changed"));
+        }
+        Ok(())
+    }
+
+    /// Observe the same retained file under the current leaf without
+    /// following a replacement link. This does not exclude later mutation.
+    fn check_chunk_leaf_binding(
+        &self,
+        file: &cap_std::fs::File,
+        leaf: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        let held = file.metadata()?;
+        let named = self
+            .chunks
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("managed chunks missing"))?
+            .symlink_metadata(leaf)?;
+        if !held.is_file()
+            || !named.is_file()
+            || (
+                cap_fs_ext::MetadataExt::dev(&held),
+                cap_fs_ext::MetadataExt::ino(&held),
+            ) != (
+                cap_fs_ext::MetadataExt::dev(&named),
+                cap_fs_ext::MetadataExt::ino(&named),
+            )
+        {
+            return Err(std::io::Error::other("managed chunk leaf binding changed"));
         }
         Ok(())
     }
@@ -919,9 +1026,11 @@ impl ManagedOutputOwnerV3 {
                 .open_with(leaf, &options)?;
             state.observation.verify_live(self.deadline)?;
             state.check_chunks_binding()?;
+            state.check_chunk_leaf_binding(&file, leaf)?;
             file.write_all(bytes)?;
             state.observation.verify_live(self.deadline)?;
             state.check_chunks_binding()?;
+            state.check_chunk_leaf_binding(&file, leaf)?;
             file.sync_all()?;
             state.observation.verify_live(self.deadline)?;
             state.check_chunks_binding()?;
@@ -934,6 +1043,7 @@ impl ManagedOutputOwnerV3 {
                 .sync_all()?;
             state.observation.verify_live(self.deadline)?;
             state.check_chunks_binding()?;
+            state.check_chunk_leaf_binding(&file, leaf)?;
             Ok(())
         })();
         match result {

@@ -1859,6 +1859,9 @@ struct PcCollectionRecoveryOwnersV3 {
 
 struct PcCollectionRecoverySlotV3 {
     owners: Mutex<Option<PcCollectionRecoveryOwnersV3>>,
+    reserved: std::sync::atomic::AtomicBool,
+    collection:
+        Option<std::sync::Weak<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>>,
 }
 
 impl Drop for PcCollectionRecoverySlotV3 {
@@ -1880,7 +1883,96 @@ impl Drop for PcCollectionRecoverySlotV3 {
 #[derive(Clone)]
 pub struct RoventPcCollectionRecoveryKeyV3(Arc<PcCollectionRecoverySlotV3>);
 
+/// Non-cloneable reservation for exactly one original outcome.
+pub(crate) struct PcCollectionOutcomeReservationV3 {
+    slot: Option<Arc<PcCollectionRecoverySlotV3>>,
+    in_flight: bool,
+}
+
+impl PcCollectionOutcomeReservationV3 {
+    fn matches_collection(
+        &self,
+        collection: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    ) -> bool {
+        self.slot
+            .as_ref()
+            .and_then(|slot| slot.collection.as_ref())
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|original| Arc::ptr_eq(&original, collection))
+    }
+
+    fn into_slot(mut self) -> Arc<PcCollectionRecoverySlotV3> {
+        self.slot
+            .take()
+            .expect("original outcome reservation remains owned")
+    }
+}
+
+impl Drop for PcCollectionOutcomeReservationV3 {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            // This reservation never reached an outcome; the same original
+            // owner may retry only when execution was never entered.
+            if !self.in_flight {
+                slot.reserved
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+}
+
 impl RoventPcCollectionRecoveryKeyV3 {
+    /// Reserve this original outcome slot before native/resource execution.
+    /// A key is custody only; it is not evidence of execution or completion.
+    pub(crate) fn prepare() -> Self {
+        Self(Arc::new(PcCollectionRecoverySlotV3 {
+            owners: Mutex::new(None),
+            reserved: std::sync::atomic::AtomicBool::new(false),
+            collection: None,
+        }))
+    }
+
+    pub(crate) fn prepare_for(
+        collection: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    ) -> Self {
+        Self(Arc::new(PcCollectionRecoverySlotV3 {
+            owners: Mutex::new(None),
+            reserved: std::sync::atomic::AtomicBool::new(false),
+            collection: Some(Arc::downgrade(collection)),
+        }))
+    }
+
+    pub(crate) fn matches_collection(
+        &self,
+        collection: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    ) -> bool {
+        self.0
+            .collection
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|original| Arc::ptr_eq(&original, collection))
+    }
+
+    pub(crate) fn reserve(&self) -> Option<PcCollectionOutcomeReservationV3> {
+        self.0
+            .reserved
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| PcCollectionOutcomeReservationV3 {
+                slot: Some(Arc::clone(&self.0)),
+                in_flight: false,
+            })
+    }
+
+    pub(crate) fn same_original(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn try_recover(&self) -> Result<Option<RoventPcCollectionResourceOutcomeV3>, &'static str> {
         let mut slot = self.0.owners.try_lock().map_err(|failure| match failure {
             std::sync::TryLockError::WouldBlock => "collection recovery slot busy",
@@ -2140,6 +2232,7 @@ pub fn run_pc_collection_with_resources_v3_control(
         Box::new(validate_collection),
         None,
         None,
+        None,
     )
 }
 
@@ -2174,6 +2267,7 @@ pub(crate) fn run_pc_collection_with_resources_v3_post_auth(
         validate_collection,
         Some(post_auth),
         None,
+        None,
     )
 }
 
@@ -2188,15 +2282,23 @@ pub(crate) fn run_pc_collection_with_resources_v3_preowned(
     validate_collection: PcCollectionValidationV3,
     post_auth: PcCollectionPostAuthV3,
     retain_resource: PcCollectionRetainResourceV3,
-) -> RoventPcCollectionResourceOutcomeV3 {
-    run_pc_collection_with_resources_v3_control_inner(
+    mut recovery: PcCollectionOutcomeReservationV3,
+) -> Result<RoventPcCollectionResourceOutcomeV3, PcCollectionOutcomeReservationV3> {
+    if !recovery.matches_collection(collection) {
+        return Err(recovery);
+    }
+    // From this point a panic may occur after physical work starts. Dropping
+    // the token must not make this original outcome slot reusable.
+    recovery.in_flight = true;
+    Ok(run_pc_collection_with_resources_v3_control_inner(
         pin,
         arguments,
         collection,
         validate_collection,
         Some(post_auth),
         Some(retain_resource),
-    )
+        Some(recovery),
+    ))
 }
 
 fn run_pc_collection_with_resources_v3_control_inner(
@@ -2206,6 +2308,7 @@ fn run_pc_collection_with_resources_v3_control_inner(
     validate_collection: PcCollectionValidationV3,
     post_auth: Option<PcCollectionPostAuthV3>,
     retain_resource: Option<PcCollectionRetainResourceV3>,
+    recovery: Option<PcCollectionOutcomeReservationV3>,
 ) -> RoventPcCollectionResourceOutcomeV3 {
     let native = run_native_with_resources_v3_inner(
         pin,
@@ -2233,9 +2336,13 @@ fn run_pc_collection_with_resources_v3_control_inner(
         driver_joined: None,
         #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
         driver_released: false,
-        recovery: Arc::new(PcCollectionRecoverySlotV3 {
-            owners: Mutex::new(None),
-        }),
+        recovery: recovery
+            .unwrap_or_else(|| {
+                RoventPcCollectionRecoveryKeyV3::prepare()
+                    .reserve()
+                    .expect("new original outcome is not reserved")
+            })
+            .into_slot(),
     }
 }
 
@@ -2799,6 +2906,18 @@ fn parent_and_leaf<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outcome_reservation_releases_only_before_execution() {
+        let key = RoventPcCollectionRecoveryKeyV3::prepare();
+        let unused = key.reserve().expect("first original reservation");
+        assert!(key.reserve().is_none());
+        drop(unused);
+        let mut entered = key.reserve().expect("unused reservation released");
+        entered.in_flight = true;
+        drop(entered);
+        assert!(key.reserve().is_none());
+    }
 
     #[test]
     fn provenance_rejection_pre_native_proof_requires_original_pre_scope_owner() {

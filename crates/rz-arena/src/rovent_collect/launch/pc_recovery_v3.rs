@@ -12,12 +12,11 @@
 use super::pc_lock_v3::{ManagedOutputOwnerV3, PcCollectionOwnersV3};
 use crate::rovent_collect::pc_hooks_lock_v3::PcSupervisorStopAuthorizationV3;
 use crate::rovent_collect::pc_worker_v3::{
-    PcSupervisorBeforeAdmissionJoinProofV3, PcSupervisorJoinedProofV3,
-    PcSupervisorNoWorkerProofV3, PcWorkerSupervisorV3,
+    PcSupervisorBeforeAdmissionJoinProofV3, PcSupervisorJoinedProofV3, PcSupervisorNoWorkerProofV3,
+    PcWorkerSupervisorV3,
 };
 use crate::rovent_resource_scope::launch::{
-    NativeResourceCustody, RoventPcCollectionRecoveryKeyV3,
-    RoventPcCollectionResourceOutcomeV3,
+    NativeResourceCustody, RoventPcCollectionRecoveryKeyV3, RoventPcCollectionResourceOutcomeV3,
 };
 use std::any::Any;
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
@@ -67,8 +66,12 @@ macro_rules! evidence_custody {
         ) -> Result<(), ($evidence, PcEvidenceCustodyErrorV3)> {
             let mut guard = match self.0.original.try_lock() {
                 Ok(guard) => guard,
-                Err(TryLockError::WouldBlock) => return Err((evidence, PcEvidenceCustodyErrorV3::Busy)),
-                Err(TryLockError::Poisoned(_)) => return Err((evidence, PcEvidenceCustodyErrorV3::Poisoned)),
+                Err(TryLockError::WouldBlock) => {
+                    return Err((evidence, PcEvidenceCustodyErrorV3::Busy))
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err((evidence, PcEvidenceCustodyErrorV3::Poisoned))
+                }
             };
             let Some(original) = guard.as_mut() else {
                 return Err((evidence, PcEvidenceCustodyErrorV3::Missing));
@@ -105,6 +108,13 @@ pub(crate) enum PcRunRecoveryStateV3 {
     Panicked,
 }
 
+#[derive(Debug)]
+pub(crate) enum PcRunRecoveryRecordErrorV3 {
+    Busy,
+    Poisoned,
+    Invalid,
+}
+
 struct OriginalPcRunV3 {
     owners: Arc<PcCollectionOwnersV3>,
     output: Arc<ManagedOutputOwnerV3>,
@@ -139,22 +149,32 @@ impl PcRunRecoveryKeyV3 {
     pub(crate) fn prepare(
         owners: Arc<PcCollectionOwnersV3>,
         output: Arc<ManagedOutputOwnerV3>,
-    ) -> Result<Self, (Arc<PcCollectionOwnersV3>, Arc<ManagedOutputOwnerV3>)> {
-        if !output.matches_inputs(owners.inputs()) {
-            return Err((owners, output));
+        outcome_key: RoventPcCollectionRecoveryKeyV3,
+    ) -> Result<
+        Self,
+        (
+            Arc<PcCollectionOwnersV3>,
+            Arc<ManagedOutputOwnerV3>,
+            RoventPcCollectionRecoveryKeyV3,
+        ),
+    > {
+        if !output.matches_inputs(owners.inputs())
+            || !outcome_key.matches_collection(owners.native())
+        {
+            return Err((owners, output, outcome_key));
         }
         // This lock covers only the in-memory registration, not a launch or
         // recovery operation. Concurrent independent registrations serialize
         // briefly rather than rejecting one merely because another arrived.
         let Ok(mut registry) = original_runs_v3().lock() else {
-            return Err((owners, output));
+            return Err((owners, output, outcome_key));
         };
         if registry
             .iter()
             .any(|slot| Arc::ptr_eq(&slot.supervisor, owners.supervisor()))
             || registry.try_reserve(1).is_err()
         {
-            return Err((owners, output));
+            return Err((owners, output, outcome_key));
         }
         let slot = Arc::new(PcRunRecoverySlotV3 {
             supervisor: Arc::clone(owners.supervisor()),
@@ -163,7 +183,7 @@ impl PcRunRecoveryKeyV3 {
                 output,
                 resource: None,
                 outcome: None,
-                outcome_key: None,
+                outcome_key: Some(outcome_key),
                 panic: None,
                 stop_authorization: None,
                 joined_proof: None,
@@ -204,7 +224,14 @@ impl PcRunRecoveryKeyV3 {
 
     /// Serialize the one transition into execution for this original slot.
     pub(crate) fn begin(&self) -> Result<(), &'static str> {
-        let mut guard = self.0.original.try_lock().map_err(|_| "P-C recovery slot unavailable")?;
+        // During Prepared no outcome/panic callback can run under this lock;
+        // wait only for this run's short registry observations so transient
+        // contention cannot strand its already reserved original driver.
+        let mut guard = self
+            .0
+            .original
+            .lock()
+            .map_err(|_| "P-C recovery slot poisoned")?;
         let original = guard.as_mut().ok_or("P-C original custody missing")?;
         if original.state != PcRunRecoveryStateV3::Prepared {
             return Err("P-C original attempt already started");
@@ -221,8 +248,12 @@ impl PcRunRecoveryKeyV3 {
         &self,
         resource: Arc<Mutex<NativeResourceCustody>>,
     ) -> Result<(), Arc<Mutex<NativeResourceCustody>>> {
-        let Ok(mut guard) = self.0.original.try_lock() else { return Err(resource) };
-        let Some(original) = guard.as_mut() else { return Err(resource) };
+        let Ok(mut guard) = self.0.original.try_lock() else {
+            return Err(resource);
+        };
+        let Some(original) = guard.as_mut() else {
+            return Err(resource);
+        };
         if original.state != PcRunRecoveryStateV3::Executing || original.resource.is_some() {
             return Err(resource);
         }
@@ -236,10 +267,18 @@ impl PcRunRecoveryKeyV3 {
         &self,
         outcome: RoventPcCollectionResourceOutcomeV3,
     ) -> Result<(), RoventPcCollectionResourceOutcomeV3> {
-        let Ok(mut guard) = self.0.original.try_lock() else { return Err(outcome) };
-        let Some(original) = guard.as_mut() else { return Err(outcome) };
+        let Ok(mut guard) = self.0.original.try_lock() else {
+            return Err(outcome);
+        };
+        let Some(original) = guard.as_mut() else {
+            return Err(outcome);
+        };
         if original.state != PcRunRecoveryStateV3::Executing
             || !Arc::ptr_eq(outcome.original_collection(), original.owners.native())
+            || !original
+                .outcome_key
+                .as_ref()
+                .is_some_and(|key| key.same_original(&outcome.recovery_key()))
         {
             return Err(outcome);
         }
@@ -257,14 +296,45 @@ impl PcRunRecoveryKeyV3 {
         &self,
         outcome: &RoventPcCollectionResourceOutcomeV3,
     ) -> Result<(), &'static str> {
-        let mut guard = self.0.original.try_lock().map_err(|_| "P-C recovery slot unavailable")?;
+        let mut guard = self
+            .0
+            .original
+            .try_lock()
+            .map_err(|_| "P-C recovery slot unavailable")?;
         let original = guard.as_mut().ok_or("P-C original custody missing")?;
         if original.state != PcRunRecoveryStateV3::Executing
             || !Arc::ptr_eq(outcome.original_collection(), original.owners.native())
+            || !original
+                .outcome_key
+                .as_ref()
+                .is_some_and(|key| key.same_original(&outcome.recovery_key()))
         {
             return Err("P-C original outcome differs or was already recorded");
         }
-        original.outcome_key = Some(outcome.recovery_key());
+        original.state = PcRunRecoveryStateV3::Returned;
+        Ok(())
+    }
+
+    /// Nonblocking update for a key that was already bound before execution.
+    /// The original outcome stays with the caller on every failure.
+    pub(crate) fn try_record_outcome_key(
+        &self,
+        outcome: &RoventPcCollectionResourceOutcomeV3,
+    ) -> Result<(), PcRunRecoveryRecordErrorV3> {
+        let mut guard = self.0.original.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => PcRunRecoveryRecordErrorV3::Busy,
+            TryLockError::Poisoned(_) => PcRunRecoveryRecordErrorV3::Poisoned,
+        })?;
+        let original = guard.as_mut().ok_or(PcRunRecoveryRecordErrorV3::Invalid)?;
+        if original.state != PcRunRecoveryStateV3::Executing
+            || !Arc::ptr_eq(outcome.original_collection(), original.owners.native())
+            || !original
+                .outcome_key
+                .as_ref()
+                .is_some_and(|key| key.same_original(&outcome.recovery_key()))
+        {
+            return Err(PcRunRecoveryRecordErrorV3::Invalid);
+        }
         original.state = PcRunRecoveryStateV3::Returned;
         Ok(())
     }
@@ -274,19 +344,39 @@ impl PcRunRecoveryKeyV3 {
     pub(crate) fn original_outcome_key(
         &self,
     ) -> Result<Option<RoventPcCollectionRecoveryKeyV3>, &'static str> {
-        let guard = self.0.original.try_lock().map_err(|_| "P-C recovery slot unavailable")?;
+        let guard = self
+            .0
+            .original
+            .try_lock()
+            .map_err(|_| "P-C recovery slot unavailable")?;
         let original = guard.as_ref().ok_or("P-C original custody missing")?;
         Ok(original.outcome_key.clone())
     }
 
-    evidence_custody!(put_stop_authorization, take_stop_authorization,
-        stop_authorization, PcSupervisorStopAuthorizationV3);
-    evidence_custody!(put_joined_proof, take_joined_proof,
-        joined_proof, PcSupervisorJoinedProofV3);
-    evidence_custody!(put_no_worker_proof, take_no_worker_proof,
-        no_worker_proof, PcSupervisorNoWorkerProofV3);
-    evidence_custody!(put_before_admission_join_proof, take_before_admission_join_proof,
-        before_admission_join_proof, PcSupervisorBeforeAdmissionJoinProofV3);
+    evidence_custody!(
+        put_stop_authorization,
+        take_stop_authorization,
+        stop_authorization,
+        PcSupervisorStopAuthorizationV3
+    );
+    evidence_custody!(
+        put_joined_proof,
+        take_joined_proof,
+        joined_proof,
+        PcSupervisorJoinedProofV3
+    );
+    evidence_custody!(
+        put_no_worker_proof,
+        take_no_worker_proof,
+        no_worker_proof,
+        PcSupervisorNoWorkerProofV3
+    );
+    evidence_custody!(
+        put_before_admission_join_proof,
+        take_before_admission_join_proof,
+        before_admission_join_proof,
+        PcSupervisorBeforeAdmissionJoinProofV3
+    );
 
     /// The caller catches the launch panic and transfers the original payload.
     /// A panic does not imply that no worker, native work, or GPU work started.
@@ -294,8 +384,12 @@ impl PcRunRecoveryKeyV3 {
         &self,
         payload: Box<dyn Any + Send>,
     ) -> Result<(), Box<dyn Any + Send>> {
-        let Ok(mut guard) = self.0.original.try_lock() else { return Err(payload) };
-        let Some(original) = guard.as_mut() else { return Err(payload) };
+        let Ok(mut guard) = self.0.original.try_lock() else {
+            return Err(payload);
+        };
+        let Some(original) = guard.as_mut() else {
+            return Err(payload);
+        };
         if original.state != PcRunRecoveryStateV3::Executing {
             return Err(payload);
         }
@@ -306,16 +400,28 @@ impl PcRunRecoveryKeyV3 {
 
     /// Read only a custody observation; resource registration is not a fence.
     pub(crate) fn observation(&self) -> Result<(PcRunRecoveryStateV3, bool, bool), &'static str> {
-        let guard = self.0.original.try_lock().map_err(|_| "P-C recovery slot unavailable")?;
+        let guard = self
+            .0
+            .original
+            .try_lock()
+            .map_err(|_| "P-C recovery slot unavailable")?;
         let original = guard.as_ref().ok_or("P-C original custody missing")?;
-        Ok((original.state, original.resource.is_some(), original.panic.is_some()))
+        Ok((
+            original.state,
+            original.resource.is_some(),
+            original.panic.is_some(),
+        ))
     }
 
     /// Clones preserve the original owners, and are not newly issued proofs.
     pub(crate) fn original_owners(
         &self,
     ) -> Result<(Arc<PcCollectionOwnersV3>, Arc<ManagedOutputOwnerV3>), &'static str> {
-        let guard = self.0.original.try_lock().map_err(|_| "P-C recovery slot unavailable")?;
+        let guard = self
+            .0
+            .original
+            .try_lock()
+            .map_err(|_| "P-C recovery slot unavailable")?;
         let original = guard.as_ref().ok_or("P-C original custody missing")?;
         Ok((Arc::clone(&original.owners), Arc::clone(&original.output)))
     }
@@ -325,7 +431,11 @@ impl PcRunRecoveryKeyV3 {
     pub(crate) fn original_resource(
         &self,
     ) -> Result<Option<Arc<Mutex<NativeResourceCustody>>>, &'static str> {
-        let guard = self.0.original.try_lock().map_err(|_| "P-C recovery slot unavailable")?;
+        let guard = self
+            .0
+            .original
+            .try_lock()
+            .map_err(|_| "P-C recovery slot unavailable")?;
         let original = guard.as_ref().ok_or("P-C original custody missing")?;
         Ok(original.resource.as_ref().map(Arc::clone))
     }
@@ -336,9 +446,15 @@ impl PcRunRecoveryKeyV3 {
         &self,
         action: impl FnOnce(&mut RoventPcCollectionResourceOutcomeV3) -> T,
     ) -> Result<Option<T>, &'static str> {
-        let mut guard = self.0.original.try_lock().map_err(|_| "P-C recovery slot unavailable")?;
+        let mut guard = self
+            .0
+            .original
+            .try_lock()
+            .map_err(|_| "P-C recovery slot unavailable")?;
         let original = guard.as_mut().ok_or("P-C original custody missing")?;
-        let Some(outcome) = original.outcome.as_mut() else { return Ok(None) };
+        let Some(outcome) = original.outcome.as_mut() else {
+            return Ok(None);
+        };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(outcome)));
         drop(guard);
         match result {
@@ -353,9 +469,15 @@ impl PcRunRecoveryKeyV3 {
         &self,
         action: impl FnOnce(&(dyn Any + Send)) -> T,
     ) -> Result<Option<T>, &'static str> {
-        let guard = self.0.original.try_lock().map_err(|_| "P-C recovery slot unavailable")?;
+        let guard = self
+            .0
+            .original
+            .try_lock()
+            .map_err(|_| "P-C recovery slot unavailable")?;
         let original = guard.as_ref().ok_or("P-C original custody missing")?;
-        let Some(payload) = original.panic.as_deref() else { return Ok(None) };
+        let Some(payload) = original.panic.as_deref() else {
+            return Ok(None);
+        };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(payload)));
         drop(guard);
         match result {
