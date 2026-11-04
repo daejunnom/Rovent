@@ -31,14 +31,12 @@ pub(crate) struct LongGameProfileV3 {
 pub(crate) enum LongGameProfileErrorV3 {
     WrongDomain,
     EmptyLimit,
-    ActiveExceedsGame,
-    WorkersExceedActive,
-    TeachersExceedWorkers,
 }
 
 impl LongGameProfileV3 {
-    /// Checks relationships only; callers separately pin bytes, validate
-    /// resource availability, and establish a real game/worker owner.
+    /// Checks the domain and required finite, nonzero limits. Zero teachers
+    /// explicitly disables teacher roots; the selected collection mode must
+    /// separately validate whether this is compatible with its roster.
     pub(crate) fn validate(&self) -> Result<(), LongGameProfileErrorV3> {
         if self.schema != LONG_GAME_PROFILE_DOMAIN {
             return Err(LongGameProfileErrorV3::WrongDomain);
@@ -47,21 +45,24 @@ impl LongGameProfileV3 {
             || self.maximum_game_root_admissions == 0
             || self.maximum_active_root_slots == 0
             || self.maximum_root_workers == 0
-            || self.maximum_simultaneous_teacher_roots == 0
             || self.maximum_retained_evidence_bytes == 0
         {
             return Err(LongGameProfileErrorV3::EmptyLimit);
         }
-        if u64::from(self.maximum_active_root_slots) > self.maximum_game_root_admissions {
-            return Err(LongGameProfileErrorV3::ActiveExceedsGame);
-        }
-        if self.maximum_root_workers > self.maximum_active_root_slots {
-            return Err(LongGameProfileErrorV3::WorkersExceedActive);
-        }
-        if self.maximum_simultaneous_teacher_roots > self.maximum_root_workers {
-            return Err(LongGameProfileErrorV3::TeachersExceedWorkers);
-        }
         Ok(())
+    }
+
+    /// A looser registered ceiling is valid: a tighter independent limit still
+    /// applies. These values are not a reservation or an ownership proof.
+    pub(crate) fn effective_root_worker_limit(&self) -> u64 {
+        self.maximum_game_root_admissions
+            .min(u64::from(self.maximum_active_root_slots))
+            .min(u64::from(self.maximum_root_workers))
+    }
+
+    pub(crate) fn effective_teacher_root_limit(&self) -> u64 {
+        self.effective_root_worker_limit()
+            .min(u64::from(self.maximum_simultaneous_teacher_roots))
     }
 }
 
