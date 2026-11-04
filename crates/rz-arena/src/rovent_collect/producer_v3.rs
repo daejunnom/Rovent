@@ -457,3 +457,375 @@ impl RoventCorpusProducerLockV3 {
         })
     }
 }
+
+const TICKET_ISSUING: u8 = 1;
+const TICKET_CANCELED: u8 = 2;
+const TICKET_ADMITTED: u8 = 4;
+const TICKET_ISSUE_UNKNOWN: u8 = 8;
+
+#[derive(Clone)]
+pub(crate) struct SpeculativeTicketAuthorityV3(std::sync::Arc<std::sync::atomic::AtomicU8>);
+impl SpeculativeTicketAuthorityV3 {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)))
+    }
+    /// Return whether an issuance claim was already acquired. This is not
+    /// proof of actual mailbox admission or physical completion.
+    pub(crate) fn cancel(&self) -> bool {
+        self.0
+            .fetch_or(TICKET_CANCELED, std::sync::atomic::Ordering::AcqRel)
+            & TICKET_ISSUING
+            != 0
+    }
+    pub(super) fn canceled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) & TICKET_CANCELED != 0
+    }
+    fn claim(&self) -> Result<SpeculativeIssuanceClaimV3, ArenaError> {
+        self.0
+            .compare_exchange(
+                0,
+                TICKET_ISSUING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| {
+                invalid("speculative ticket issuance canceled, already claimed, or unknown")
+            })?;
+        Ok(SpeculativeIssuanceClaimV3 {
+            authority: self.clone(),
+            resolved: false,
+        })
+    }
+}
+/// One claimed ticket immediately surrounding actual mailbox admission. The
+/// owner must mark the actual result. Unwind/unknown blocks retries.
+pub(crate) struct SpeculativeIssuanceClaimV3 {
+    authority: SpeculativeTicketAuthorityV3,
+    resolved: bool,
+}
+impl SpeculativeIssuanceClaimV3 {
+    /// Called only on the original mailbox's successful admission result.
+    pub(crate) fn admitted(mut self) {
+        self.authority
+            .0
+            .fetch_or(TICKET_ADMITTED, std::sync::atomic::Ordering::AcqRel);
+        self.resolved = true;
+    }
+    /// Called only when original mailbox admission is known not to have occurred.
+    pub(crate) fn rejected(mut self) {
+        self.authority
+            .0
+            .fetch_and(!TICKET_ISSUING, std::sync::atomic::Ordering::AcqRel);
+        self.resolved = true;
+    }
+}
+impl Drop for SpeculativeIssuanceClaimV3 {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.authority
+                .0
+                .fetch_or(TICKET_ISSUE_UNKNOWN, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+fn claim_speculative_issuance_v3(
+    root_revoked: &std::sync::atomic::AtomicBool,
+    root_canceled: &std::sync::atomic::AtomicBool,
+    root_targets_revoked: &std::sync::atomic::AtomicBool,
+    ticket: &SpeculativeTicketAuthorityV3,
+) -> Result<SpeculativeIssuanceClaimV3, ArenaError> {
+    use std::sync::atomic::Ordering;
+    root_revoked
+        .compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| invalid("speculative root is revoked"))?;
+    root_targets_revoked
+        .compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| invalid("speculative root targets are revoked"))?;
+    root_canceled
+        .compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| invalid("speculative root teacher admission is closed"))?;
+    ticket.claim()
+}
+
+/// Original native submission evidence for an optional speculative teacher.
+/// It is not NN acceptance, a retired record, a target, or a completion proof.
+/// Construction is restricted to the same private capture and root owner.
+pub(crate) struct SubmittedTeacherQueryV3 {
+    admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
+    producer_owner: std::sync::Arc<()>,
+    input: RoventSubmittedInputSeal,
+    anchor: rz_position::PositionSnapshot,
+    prefix: Vec<rz_position::BoardMove>,
+    submitted_prefix: Vec<u16>,
+    legal: Vec<u16>,
+    scalar_only: bool,
+    ticket_authority: SpeculativeTicketAuthorityV3,
+    native_cancellation: rz_uci::pals_native::ticketed::NativeTicketCancelObservation,
+    root_revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    root_canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    root_targets_revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SubmittedTeacherQueryV3 {
+    pub(crate) fn input_seal(&self) -> RoventSubmittedInputSeal {
+        RoventSubmittedInputSeal {
+            manifest_sha256: self.input.manifest_sha256.clone(),
+            ticket: self.input.ticket,
+            input_sha256: self.input.input_sha256.clone(),
+            selected_view_sha256: self.input.selected_view_sha256.clone(),
+            anchor: self.input.anchor.clone(),
+            role: self.input.role,
+            teacher_actor_id: self.input.teacher_actor_id.clone(),
+        }
+    }
+    pub(crate) fn admission(&self) -> &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3 {
+        &self.admission
+    }
+    pub(crate) fn ticket(&self) -> RoleTicketEnvelope {
+        self.input.ticket
+    }
+    pub(crate) fn has_policy_candidates(&self) -> bool {
+        !self.legal.is_empty()
+    }
+    pub(crate) fn requires_teacher(&self) -> bool {
+        self.input.teacher_actor_id.is_some() && self.has_policy_candidates()
+    }
+    /// Logical requests only; neither proves worker or device completion.
+    /// Root closure stops new submissions, while an already sealed result may
+    /// still join its valid original retirement if its ticket was not revoked.
+    pub(crate) fn is_ticket_canceled(&self) -> bool {
+        self.ticket_authority.canceled()
+            || self
+                .root_targets_revoked
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn is_canceled(&self) -> bool {
+        self.is_ticket_canceled()
+            || self.native_cancellation.is_canceled()
+            || self.root_revoked.load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .root_canceled
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// Observe cancellation and claim this exact ticket once. The independent
+    /// root/native observations and ticket CAS are not one atomic gate. A
+    /// concurrent later cancellation requires the mailbox owner to retain,
+    /// cancel and drain any admitted or unresolved teacher work.
+    pub(crate) fn try_claim_teacher_issuance(
+        &self,
+    ) -> Result<SpeculativeIssuanceClaimV3, ArenaError> {
+        // This CAS is against the exact native preparation cancellation
+        // word, not a later observer projection. It authorizes no NN result.
+        check(
+            self.native_cancellation.try_claim_submission(),
+            "original native ticket is canceled",
+        )?;
+        let claim = claim_speculative_issuance_v3(
+            &self.root_revoked,
+            &self.root_canceled,
+            &self.root_targets_revoked,
+            &self.ticket_authority,
+        )?;
+        if self.is_canceled() {
+            claim.rejected();
+            return Err(invalid(
+                "speculative query canceled before mailbox submission",
+            ));
+        }
+        Ok(claim)
+    }
+
+    /// Reconstruct and verify outside the native callback. This does not
+    /// acquire live-root, acceptance, execution or publication authority.
+    pub(crate) fn original_teacher_query_position(
+        &self,
+    ) -> Result<rz_position::Position, ArenaError> {
+        let mut position = rz_position::Position::from_snapshot(
+            &self.anchor,
+            rz_position::PositionLimits {
+                max_history_positions: 16_385,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        check(
+            self.prefix.len() <= 256 && packed(&self.prefix)? == self.submitted_prefix,
+            "speculative query prefix differs from original submitted input",
+        )?;
+        for movement in &self.prefix {
+            position
+                .make_move(*movement)
+                .map_err(|error| invalid(error.to_string()))?;
+        }
+        check(
+            exact_rules_anchor(&position)? == self.input.anchor,
+            "speculative query Rules anchor differs",
+        )?;
+        let legal = packed(&position.legal_moves())?;
+        if self.scalar_only {
+            check(
+                self.legal.is_empty(),
+                "speculative scalar query has candidates",
+            )?;
+        } else {
+            check(
+                legal.len() == self.legal.len()
+                    && self.legal.iter().all(|item| legal.contains(item)),
+                "speculative query candidates differ from Rules",
+            )?;
+        }
+        Ok(position)
+    }
+    /// Compare identity already retained by the original producer. This is
+    /// not a retirement witness or physical/target authority.
+    pub(crate) fn matches_original_identity(
+        &self,
+        admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
+        producer_owner: &std::sync::Arc<()>,
+        original: &RoventSubmittedInputSeal,
+    ) -> Result<(), ArenaError> {
+        check(
+            std::sync::Arc::ptr_eq(&self.producer_owner, producer_owner)
+                && self.admission.same_original_admission(admission)
+                && self.input.manifest_sha256 == original.manifest_sha256
+                && self.input.ticket == original.ticket
+                && self.input.input_sha256 == original.input_sha256
+                && self.input.selected_view_sha256 == original.selected_view_sha256
+                && self.input.anchor == original.anchor
+                && self.input.role == original.role
+                && self.input.teacher_actor_id == original.teacher_actor_id,
+            "speculative teacher query differs from retained original identity",
+        )
+    }
+    /// Only the actual producer-retired row can join an earlier query. This
+    /// comparison grants no native fence or label authority by itself.
+    pub(super) fn matches_original_row(
+        &self,
+        row: &RoventRetiredLockV3Record,
+    ) -> Result<(), ArenaError> {
+        let record = &row.record.0;
+        check(
+            std::sync::Arc::ptr_eq(&self.producer_owner, &row.producer_owner)
+                && self.admission.same_original_admission(&row.admission)
+                && self.input.manifest_sha256 == row.manifest_sha256
+                && self.input.ticket == row.ticket
+                && self.input.input_sha256 == record.input_sha256
+                && self.input.selected_view_sha256 == record.input.view_sha256
+                && self.input.anchor == record.input.rules_anchor
+                && self.input.role == record.input.role
+                && self.input.teacher_actor_id == record.lineage.teacher_actor_id,
+            "speculative teacher query differs from the original retired owner",
+        )
+    }
+}
+
+impl RoventCapturedInputV3 {
+    pub(super) fn speculative_teacher_required(&self) -> bool {
+        self.original
+            .original
+            .pending
+            .lineage
+            .teacher_actor_id
+            .is_some()
+            && !self.original.original.pending.input.legal_moves.is_empty()
+    }
+    /// Build only bounded immutable capture from the exact same submitted
+    /// ticket. Expensive replay and legal generation happen on the worker.
+    pub(super) fn speculative_teacher_query(
+        &self,
+        admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
+        view: &ReviewView,
+        input: &PalsVirtualReviewInput,
+        ticket_authority: SpeculativeTicketAuthorityV3,
+        native_cancellation: rz_uci::pals_native::ticketed::NativeTicketCancelObservation,
+        root_revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        root_canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        root_targets_revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<SubmittedTeacherQueryV3, ArenaError> {
+        check(
+            self.admission.same_original_admission(&admission),
+            "V3 teacher query admission differs from original capture",
+        )?;
+        let owner = self
+            .original
+            .producer_owner
+            .as_ref()
+            .ok_or_else(|| invalid("speculative producer owner missing"))?;
+        let anchor = view
+            .anchors()
+            .get(usize::from(input.query.anchors[0]))
+            .ok_or_else(|| invalid("speculative query anchor missing"))?
+            .snapshot
+            .clone();
+        let mut prefix = Vec::new();
+        prefix
+            .try_reserve_exact(view.query().prefix.len())
+            .map_err(|_| invalid("speculative prefix allocation"))?;
+        prefix.extend_from_slice(&view.query().prefix);
+        let original = &self.original.original.pending.input;
+        let mut submitted_prefix = Vec::new();
+        submitted_prefix
+            .try_reserve_exact(original.selected_view.query.prefix.len())
+            .map_err(|_| invalid("speculative submitted prefix allocation"))?;
+        submitted_prefix.extend_from_slice(&original.selected_view.query.prefix);
+        let mut legal = Vec::new();
+        legal
+            .try_reserve_exact(original.legal_moves.len())
+            .map_err(|_| invalid("speculative candidates allocation"))?;
+        legal.extend_from_slice(&original.legal_moves);
+        let scalar_only = matches!(
+            original.selected_view.query.purpose.as_str(),
+            "divergence_policy" | "task_policy"
+        );
+        Ok(SubmittedTeacherQueryV3 {
+            admission,
+            producer_owner: std::sync::Arc::clone(owner),
+            input: self.original.submitted_input_seal(),
+            anchor,
+            prefix,
+            submitted_prefix,
+            legal,
+            scalar_only,
+            ticket_authority,
+            native_cancellation,
+            root_revoked,
+            root_canceled,
+            root_targets_revoked,
+        })
+    }
+}
+#[cfg(test)]
+mod v3_issuance_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn cancel_and_unknown_do_not_reissue_a_ticket() {
+        let roots = AtomicBool::new(false);
+        let ticket = SpeculativeTicketAuthorityV3::new();
+        let claim = claim_speculative_issuance_v3(&roots, &roots, &roots, &ticket).unwrap();
+        assert!(ticket.cancel());
+        drop(claim);
+        assert!(claim_speculative_issuance_v3(&roots, &roots, &roots, &ticket).is_err());
+
+        let unknown = SpeculativeTicketAuthorityV3::new();
+        drop(claim_speculative_issuance_v3(&roots, &roots, &roots, &unknown).unwrap());
+        assert!(claim_speculative_issuance_v3(&roots, &roots, &roots, &unknown).is_err());
+    }
+
+    #[test]
+    fn known_rejection_may_retry_only_while_root_open() {
+        let root = AtomicBool::new(false);
+        let canceled = AtomicBool::new(false);
+        let targets = AtomicBool::new(false);
+        let ticket = SpeculativeTicketAuthorityV3::new();
+        claim_speculative_issuance_v3(&root, &canceled, &targets, &ticket)
+            .unwrap()
+            .rejected();
+        let claim = claim_speculative_issuance_v3(&root, &canceled, &targets, &ticket).unwrap();
+        root.store(true, Ordering::Release);
+        claim.rejected();
+        assert!(claim_speculative_issuance_v3(&root, &canceled, &targets, &ticket).is_err());
+    }
+}
