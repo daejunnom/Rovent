@@ -47,6 +47,7 @@ mod intervention;
 mod own_nnuec_lock_v2;
 pub(crate) mod own_publisher_v2;
 mod partial_collection_v1;
+pub mod partial_followup_v1;
 mod pc_lock_v2;
 pub use partial_collection_v1::{
     PartialCollectionReader, PartialCollectionReceipt, PartialCollectionSpec, read_partial_receipt,

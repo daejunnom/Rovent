@@ -389,18 +389,42 @@ impl RoventPcCollectionRunV2 {
             let mut accounting = PartialCollectionAccounting::new(spec.row_limit, spec.byte_limit)
                 .map_err(|e| invalid(format!("partial accounting: {e:?}")))?;
             account_flushed_chunks(directory, spec, &mut accounting, &pins).map_err(io)?;
-            for id in failures {
-                accounting
-                    .begin_row(&id)
-                    .map_err(|e| invalid(format!("partial failure accounting: {e:?}")))?;
-                accounting
-                    .record_failure(&id, &format!("in-memory-custody:{id}"), 0)
-                    .map_err(|e| invalid(format!("partial failure accounting: {e:?}")))?;
+            let chunk_bytes = pins
+                .iter()
+                .try_fold(0u64, |sum, pin| sum.checked_add(pin.bytes))
+                .ok_or_else(|| invalid("partial chunk byte count overflow"))?;
+            let remaining = spec
+                .byte_limit
+                .checked_sub(chunk_bytes)
+                .ok_or_else(|| invalid("partial chunk byte limit"))?;
+            let capture = self
+                .pump_consumer
+                .capture_partial_failures(directory, remaining)?;
+            let captured_ids: Vec<_> = capture
+                .as_ref()
+                .map(|(_, rows)| rows.iter().map(|(id, _)| id.clone()).collect())
+                .unwrap_or_default();
+            check(
+                captured_ids == failures,
+                "partial failure capture custody differs",
+            )?;
+            if let Some((_, rows)) = capture.as_ref() {
+                for (id, bytes) in rows {
+                    accounting
+                        .begin_row(id)
+                        .map_err(|e| invalid(format!("partial failure accounting: {e:?}")))?;
+                    accounting
+                        .record_failure(id, &format!("failure-evidence.jsonl#{id}"), *bytes)
+                        .map_err(|e| invalid(format!("partial failure accounting: {e:?}")))?;
+                }
             }
-            let receipt = accounting
+            let mut receipt = accounting
                 .finish(PartialEndReason::InputExhausted)
                 .map_err(|(e, _)| invalid(format!("partial accounting: {e:?}")))?
                 .with_chunks(pins);
+            if let Some((pin, _)) = capture {
+                receipt = receipt.with_failure_evidence(pin);
+            }
             write_partial_receipt(directory, spec, &receipt).map_err(io)?;
             Ok(())
         })();

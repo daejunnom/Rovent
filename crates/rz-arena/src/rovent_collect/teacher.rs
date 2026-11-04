@@ -17,6 +17,7 @@ pub(super) mod lock_v2_policy;
 #[allow(dead_code)]
 pub(super) mod lock_v2_row_pump;
 mod session;
+mod typed_failure_projection;
 mod v2_actor_preflight;
 #[cfg(feature = "pals-collection-onnx")]
 pub(super) mod v2_session;
@@ -377,7 +378,12 @@ fn validate_completed_teacher_opinions(
     pin: &RoventTeacherPin,
     outcome: &rz_search::external_cpu::ProfiledExternalOutcome,
 ) -> Result<(Vec<u16>, u16), ArenaError> {
-    validate_completed_teacher_opinions_classified(input, pin, outcome, &std::cell::Cell::new(false))
+    validate_completed_teacher_opinions_classified(
+        input,
+        pin,
+        outcome,
+        &std::cell::Cell::new(false),
+    )
 }
 
 // Set only where the conditional-policy eligibility check first fails,

@@ -128,7 +128,17 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
 }
 
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
-fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std::error::Error>> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V2CliOutcome {
+    StrictComplete,
+    PartialReceiptWritten,
+    Incomplete,
+}
+
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+fn run_lock_v2(
+    cli: LockV2Cli,
+) -> Result<(serde_json::Value, V2CliOutcome), Box<dyn std::error::Error>> {
     use rz_arena::rovent_collect::launch::{
         load_rovent_collection_lock_v2_plan, load_rovent_partial_collection_spec,
         run_rovent_own_nnuec_collection_lock_v2,
@@ -318,7 +328,14 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
                 "unsupported_or_invalid_fallback":sealed_fallback,"scope":"optional_preparation_only"}),
         );
     }
-    Ok((result, in_process_complete))
+    let outcome = if in_process_complete {
+        V2CliOutcome::StrictComplete
+    } else if partial_receipt_written {
+        V2CliOutcome::PartialReceiptWritten
+    } else {
+        V2CliOutcome::Incomplete
+    };
+    Ok((result, outcome))
 }
 
 /// This is a capacity, not a claim that that many roots were admitted,
@@ -344,11 +361,17 @@ fn main() -> std::process::ExitCode {
                 "V2 worker/cleanup timeouts do not limit the native UCI loop; an external finite process supervisor is required"
             );
             return match run_lock_v2(cli) {
-                Ok((observation, accepted)) => {
-                    if writeln!(std::io::stderr().lock(), "{observation}").is_err() || !accepted {
+                Ok((observation, outcome)) => {
+                    if writeln!(std::io::stderr().lock(), "{observation}").is_err() {
                         std::process::ExitCode::FAILURE
                     } else {
-                        std::process::ExitCode::SUCCESS
+                        match outcome {
+                            V2CliOutcome::StrictComplete => std::process::ExitCode::SUCCESS,
+                            V2CliOutcome::PartialReceiptWritten => std::process::ExitCode::from(
+                                rz_arena::rovent_collect::launch::partial_followup_v1::PARTIAL_COLLECTION_EXIT_CODE as u8,
+                            ),
+                            V2CliOutcome::Incomplete => std::process::ExitCode::FAILURE,
+                        }
                     }
                 }
                 Err(error) => {

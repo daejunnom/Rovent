@@ -78,6 +78,217 @@ pub(crate) enum FailedEvidence {
 }
 
 impl FailedEvidence {
+    /// Capture the serializable observation of the original sealed teacher.
+    /// The opaque owner, speculative guard and any GPU fence cannot be
+    /// reconstructed from these bytes. Never truncate a report or PV.
+    pub(crate) fn policy_failure_capture(
+        &self,
+        limit: usize,
+    ) -> Result<serde_json::Value, ArenaError> {
+        use std::fmt::Write as _;
+        struct LimitedText {
+            value: String,
+            limit: usize,
+        }
+        impl std::fmt::Write for LimitedText {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                if self
+                    .value
+                    .len()
+                    .checked_add(s.len())
+                    .is_none_or(|n| n > self.limit)
+                {
+                    return Err(std::fmt::Error);
+                }
+                self.value
+                    .try_reserve(s.len())
+                    .map_err(|_| std::fmt::Error)?;
+                self.value.push_str(s);
+                Ok(())
+            }
+        }
+        let Self::PolicyUnavailable(sealed) = self else {
+            return Err(invalid(
+                "partial capture requires original policy-unavailable seal",
+            ));
+        };
+        let dispatch = sealed.evidence.dispatch();
+        let completion = sealed.evidence.completion();
+        let outcome = completion
+            .result()
+            .as_ref()
+            .map_err(|_| invalid("partial teacher outcome missing"))?;
+        let attempt = completion
+            .attempt()
+            .ok_or_else(|| invalid("partial teacher attempt missing"))?;
+        check(
+            !outcome.conditional_policy_target_known,
+            "partial teacher policy unexpectedly known",
+        )?;
+        check(
+            completion.matches_dispatch_identity(dispatch)
+                && completion.issued_go().is_some()
+                && attempt.external.is_some(),
+            "partial original teacher identity or external attempt unavailable",
+        )?;
+        #[cfg(feature = "experimental-teacher-exact-observation")]
+        check(
+            completion.completed_exact_rank_set().is_none(),
+            "portable teacher exact-rank witness unsupported; original retained",
+        )?;
+        // Bound source arrays and the actual serde identity before creating
+        // the JSON projection; final encoded bytes are checked again on write.
+        struct Counter {
+            used: usize,
+            limit: usize,
+        }
+        impl std::io::Write for Counter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.used = self
+                    .used
+                    .checked_add(bytes.len())
+                    .filter(|n| *n <= self.limit)
+                    .ok_or_else(|| std::io::Error::other("portable identity exceeds budget"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let check_report =
+            |report: &rz_search::cpu_checker::ExternalCheckerReport| -> Result<(), ArenaError> {
+                let mut counter = Counter { used: 0, limit };
+                serde_json::to_writer(&mut counter, &report.identity)
+                    .map_err(|_| invalid("portable teacher identity exceeds budget"))?;
+                check(
+                    report.pv.len() <= limit / 4
+                        && report.observed_uci.name.len() <= limit
+                        && report
+                            .observed_uci
+                            .author
+                            .as_ref()
+                            .is_none_or(|author| author.len() <= limit),
+                    "portable teacher report exceeds budget",
+                )
+            };
+        check_report(&outcome.report.raw)?;
+        if let Some(report) = attempt
+            .external
+            .as_ref()
+            .and_then(|a| a.partial_report.as_ref())
+        {
+            check_report(report)?;
+        }
+        let mut raw = LimitedText {
+            value: String::new(),
+            limit,
+        };
+        write!(&mut raw, "{:?}", outcome.report)
+            .map_err(|_| invalid("partial raw report exceeds capture budget"))?;
+        let mut attempt_text = LimitedText {
+            value: String::new(),
+            limit,
+        };
+        write!(&mut attempt_text, "{attempt:?}")
+            .map_err(|_| invalid("partial attempt exceeds capture budget"))?;
+        let mut dispatch_text = LimitedText {
+            value: String::new(),
+            limit,
+        };
+        write!(&mut dispatch_text, "{dispatch:?}")
+            .map_err(|_| invalid("partial dispatch exceeds capture budget"))?;
+        let mut completion_text = LimitedText {
+            value: String::new(),
+            limit,
+        };
+        write!(&mut completion_text, "{completion:?}")
+            .map_err(|_| invalid("partial completion exceeds capture budget"))?;
+        let mut moves = 0usize;
+        for opinion in &outcome.opinions {
+            moves = moves
+                .checked_add(opinion.pv.len())
+                .ok_or_else(|| invalid("partial PV size overflow"))?;
+        }
+        check(
+            moves <= limit / 4 && outcome.opinions.len() <= limit / 16,
+            "partial opinions exceed capture budget",
+        )?;
+        use rz_search::cpu_checker::{ExternalBound, ExternalRawScore};
+        use rz_search::external_cpu::{ExternalControlAction, ExternalGoIssue};
+        let score = |s| match s {
+            ExternalRawScore::Centipawns(value) => {
+                serde_json::json!({"kind":"centipawns","value":value})
+            }
+            ExternalRawScore::MateMoves(value) => {
+                serde_json::json!({"kind":"mate_moves","value":value})
+            }
+            ExternalRawScore::Unknown => serde_json::json!({"kind":"unknown"}),
+        };
+        let bound = |b| match b {
+            ExternalBound::ExactReported => "exact_reported",
+            ExternalBound::Lower => "lower",
+            ExternalBound::Upper => "upper",
+            ExternalBound::Unknown => "unknown",
+        };
+        let go_issue = match completion.go_issue() {
+            ExternalGoIssue::NotIssued => "not_issued",
+            ExternalGoIssue::Unknown => "unknown",
+            ExternalGoIssue::Issued => "issued",
+        };
+        let stop_control = outcome.stop_control.map(|control| serde_json::json!({
+            "sequence":control.sequence,"action":match control.action {
+                ExternalControlAction::Continue => "continue", ExternalControlAction::Yield => "yield",
+                ExternalControlAction::Cancel => "cancel", ExternalControlAction::Revoked => "revoked",
+            }
+        }));
+        let controls = completion.controls();
+        let deadline = dispatch.original_deadline();
+        let opinions: Vec<_> = outcome.opinions.iter().map(|opinion| serde_json::json!({
+            "rank":opinion.rank,"depth":opinion.depth,"seldepth":opinion.seldepth,
+            "score":score(opinion.score),"bound":bound(opinion.bound),
+            "reported_wdl":opinion.reported_wdl,"pv":opinion.pv.iter().map(ToString::to_string).collect::<Vec<_>>()
+        })).collect();
+        let submitted = dispatch.id();
+        let returned = completion.id();
+        let soft_quantum_ns = u64::try_from(sealed.soft_quantum.as_nanos())
+            .map_err(|_| invalid("partial teacher quantum exceeds representation"))?;
+        Ok(serde_json::json!({
+            "dispatch":{"collection_owner":submitted.collection_owner,"sequence":submitted.sequence,
+                "process":super::process_json(dispatch.process_identity()),"constraint":dispatch.constraint(),
+                "original_deadline_debug":format!("{:?}",dispatch.original_deadline()),"original_debug":dispatch_text.value,
+                "original_deadline":{"clock_epoch":deadline.clock.0.0,"at_ns":deadline.at.0},
+                "soft_quantum_ns":soft_quantum_ns},
+            "completion":{"collection_owner":returned.collection_owner,"sequence":returned.sequence,
+                "matches_dispatch_identity":completion.matches_dispatch_identity(dispatch),
+                "process":completion.process_identity().map(super::process_json),
+                "go_issue":go_issue,"issued_go":completion.issued_go(),"issued_constraint":completion.issued_constraint(),
+                "controls":{"cancel_sequence":controls.cancel_sequence,"yield_sequence":controls.yield_sequence,
+                    "publish_sequence":controls.publish_sequence,"cancel_ack":controls.cancel_ack,
+                    "yield_ack":controls.yield_ack,"publish_ack":controls.publish_ack,"terminal":controls.terminal},
+                "timing_debug":format!("{:?}",completion.timing()),
+                "original_debug":completion_text.value},
+            "input_scope":super::collection::scope_json(dispatch.input_scope()),
+            "startup":{"actor_id":sealed.actor_id,"pin":sealed.registered.pin,
+                "canonical_sha256":sealed.startup.canonical_sha256(),"capability_sha256":sealed.startup.capability_sha256(),
+                "input_lock_sha256":sealed.startup.input_lock_sha256()},
+            "raw_report_debug":raw.value,"attempt_debug":attempt_text.value,"opinions":opinions,
+            "schema":"portable_teacher_observation_v1",
+            "raw_report":super::typed_failure_projection::external_report(&outcome.report.raw),
+            "attempt":super::typed_failure_projection::checker_attempt(attempt),
+            "profiled_report":{"profile":outcome.report.profile,"purpose":outcome.report.purpose,
+                "requested":outcome.report.requested,"issued":outcome.report.issued,
+                "issued_go":outcome.report.issued_go,"reported_node_overshoot":outcome.report.reported_node_overshoot,
+                "strict_native_nodes":outcome.report.strict_native_nodes,
+                "option_application_observed":outcome.report.option_application_observed,
+                "readiness_barrier_completed":outcome.report.readiness_barrier_completed},
+            "opaque_exclusions":["owner_capabilities","absolute_monotonic_instants",
+                "unretained_stdout_stderr","opaque_rules_history_snapshot"],
+            "requested_multipv":outcome.requested_multipv,"stop_control":stop_control,
+            // Completeness is limited to the explicitly defined portable
+            // observation, not ownership or omitted opaque process data.
+            "conditional_policy_target_known":false,"portable_observation_complete":true,"truncated":false
+        }))
+    }
     /// Separate an unavailable target from a worker failure without changing
     /// ownership, publication eligibility, or physical-completion evidence.
     pub(crate) fn classification(&self) -> &'static str {
@@ -86,10 +297,11 @@ impl FailedEvidence {
             Self::UnissuedRootRevoked => "unissued_after_root_revoke",
             Self::PolicyUnavailable(_) => "conditional_policy_unknown_first_observed",
             Self::SealRejected {
-                cause: TeacherPolicySealFailureV2::Native {
-                    kind: RoventTeacherPolicySealFailureKindV2::Cancelled,
-                    ..
-                },
+                cause:
+                    TeacherPolicySealFailureV2::Native {
+                        kind: RoventTeacherPolicySealFailureKindV2::Cancelled,
+                        ..
+                    },
                 ..
             } => "native_seal_cancelled",
             _ => "teacher_failure_or_unknown",

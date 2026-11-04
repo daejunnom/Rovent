@@ -34,6 +34,43 @@ struct FailureRowProjection<'a, T> {
     record: &'a T,
 }
 struct FailureRowBuffer(Vec<u8>);
+
+#[derive(serde::Serialize)]
+struct PartialFailureCapture<'a> {
+    schema: &'static str,
+    row_id: String,
+    original_row: &'a rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2,
+    error: String,
+    teacher_evidence: serde_json::Value,
+    observation_provenance: &'static str,
+    owner_reconstructable: bool,
+    physical_completion: &'static str,
+}
+
+struct LimitedCaptureBuffer {
+    data: Vec<u8>,
+    limit: usize,
+}
+impl std::io::Write for LimitedCaptureBuffer {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        if self
+            .data
+            .len()
+            .checked_add(input.len())
+            .is_none_or(|n| n > self.limit)
+        {
+            return Err(std::io::Error::other("partial failure capture byte limit"));
+        }
+        self.data
+            .try_reserve(input.len())
+            .map_err(|_| std::io::Error::other("partial failure allocation"))?;
+        self.data.extend_from_slice(input);
+        Ok(input.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 impl std::io::Write for FailureRowBuffer {
     fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
         const LIMIT: usize = rz_experiments::pals_data_v3::GENERATION_MAX_ROW_BYTES + 4096;
@@ -169,6 +206,135 @@ pub(crate) struct OwnPumpConsumerV2 {
 }
 
 impl OwnPumpConsumerV2 {
+    /// Called only after the original worker and receiver have joined. The
+    /// original failed objects remain locked in this owner. The new file is a
+    /// bounded serializable projection, never a reconstructed sealed owner.
+    pub(super) fn capture_partial_failures(
+        &self,
+        directory: &cap_std::fs::Dir,
+        byte_limit: u64,
+    ) -> Result<
+        Option<(
+            super::partial_collection_v1::PartialFailurePin,
+            Vec<(String, u64)>,
+        )>,
+        ArenaError,
+    > {
+        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+        use sha2::{Digest as _, Sha256};
+        use std::io::Write as _;
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|_| ArenaError::Invalid("partial failure custody busy or poisoned".into()))?;
+        if !state.items.is_empty()
+            || !state.commit_failures.is_empty()
+            || state.overflow_item.is_some()
+        {
+            return Err(ArenaError::Invalid(
+                "partial failure custody not drained".into(),
+            ));
+        }
+        if state.failed_items.is_empty() {
+            return Ok(None);
+        }
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut file = directory
+            .open_with("failure-evidence.jsonl", &options)
+            .map_err(|e| ArenaError::Io(format!("partial failure create: {e}")))?;
+        let mut total = 0u64;
+        let mut hash = Sha256::new();
+        let mut rows = Vec::new();
+        rows.try_reserve(state.failed_items.len())
+            .map_err(|_| ArenaError::Invalid("partial failure row allocation".into()))?;
+        for item in &state.failed_items {
+            let PumpItemV2::Failed {
+                row,
+                error,
+                evidence,
+            } = item
+            else {
+                return Err(ArenaError::Invalid("partial failure object differs".into()));
+            };
+            let left = byte_limit
+                .checked_sub(total)
+                .ok_or_else(|| ArenaError::Invalid("partial failure byte limit".into()))?;
+            let limit = usize::try_from(left).unwrap_or(usize::MAX);
+            let row_id = format!("failure-sequence-{}", row.record.0.native.retired_sequence);
+            let teacher_evidence = evidence.policy_failure_capture(limit)?;
+            if teacher_evidence
+                .get("portable_observation_complete")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return Err(ArenaError::Invalid(
+                    "partial failure evidence projection incomplete; original retained".into(),
+                ));
+            }
+            let (error_kind, error_payload) = match error {
+                ArenaError::Invalid(value) => ("Invalid", value),
+                ArenaError::Integrity(value) => ("Integrity", value),
+                ArenaError::Budget(value) => ("Budget", value),
+                ArenaError::Io(value) => ("Io", value),
+                // Display omits original data for other variants.
+                _ => {
+                    return Err(ArenaError::Invalid(
+                        "partial failure error variant unsupported; original retained".into(),
+                    ));
+                }
+            };
+            let mut error_text = LimitedCaptureBuffer {
+                data: Vec::new(),
+                limit,
+            };
+            write!(&mut error_text, "{error_kind}:{error_payload}")
+                .map_err(|e| ArenaError::Io(format!("partial failure error text: {e}")))?;
+            let error_text = String::from_utf8(error_text.data)
+                .map_err(|_| ArenaError::Invalid("partial failure error text UTF-8".into()))?;
+            let capture = PartialFailureCapture {
+                schema: "rz-rovent-partial-failure-evidence/1",
+                row_id: row_id.clone(),
+                original_row: &row.record,
+                error: error_text,
+                teacher_evidence,
+                observation_provenance: "retained_original_sealed_serializable_projection",
+                owner_reconstructable: false,
+                physical_completion: "not_attested",
+            };
+            let mut buffer = LimitedCaptureBuffer {
+                data: Vec::new(),
+                limit,
+            };
+            serde_json::to_writer(&mut buffer, &capture)
+                .map_err(|e| ArenaError::Io(format!("partial failure encoding: {e}")))?;
+            buffer
+                .write_all(b"\n")
+                .map_err(|e| ArenaError::Io(format!("partial failure newline: {e}")))?;
+            file.write_all(&buffer.data)
+                .map_err(|e| ArenaError::Io(format!("partial failure write: {e}")))?;
+            hash.update(&buffer.data);
+            let bytes = buffer.data.len() as u64;
+            total = total
+                .checked_add(bytes)
+                .ok_or_else(|| ArenaError::Invalid("partial failure bytes overflow".into()))?;
+            rows.push((row_id, bytes));
+        }
+        file.sync_all()
+            .map_err(|e| ArenaError::Io(format!("partial failure sync: {e}")))?;
+        Ok(Some((
+            super::partial_collection_v1::PartialFailurePin {
+                path: "failure-evidence.jsonl".into(),
+                bytes: total,
+                sha256: format!("{:x}", hash.finalize()),
+                rows: rows.len() as u64,
+            },
+            rows,
+        )))
+    }
     /// Stream original retained row projections without moving their owners.
     /// Only called after this same receiver's sender has joined. The bytes
     /// are failure evidence, never a corpus or a reconstructable authority.

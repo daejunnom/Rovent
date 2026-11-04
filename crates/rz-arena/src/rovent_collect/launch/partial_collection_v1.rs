@@ -1,9 +1,9 @@
 //! Accounting for an explicitly separate, incomplete collection observation.
 //!
-//! This type does not serialize a corpus, validate a row, persist evidence,
-//! transfer ownership, or establish native/physical completion. In particular,
-//! the supplied references and byte counts are declarations by the caller;
-//! they cannot substitute for the original sealed evidence or its owner.
+//! This type does not serialize a corpus, establish original row authority,
+//! transfer ownership, or establish native/physical completion. File hashes,
+//! sizes and record IDs are checked; the serializable failure projection cannot
+//! reconstruct or replace the original sealed evidence owner.
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
@@ -18,10 +18,13 @@ pub const PARTIAL_COLLECTION_SPEC_DOMAIN: &str = "rz-rovent-partial-collection-s
 const DIRECTORY: &str = "partial_collection";
 const FILE: &str = "partial_collection.json";
 const PENDING: &str = "partial_collection.pending.json";
+const FAILURE_FILE: &str = "failure-evidence.jsonl";
 const MAX_RECORDS: usize = 65_536;
 const MAX_RECEIPT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 256;
 const MAX_REFERENCE_BYTES: usize = 4096;
+const MAX_FAILURE_ROW_BYTES: u64 = 8 * 1024 * 1024;
+const FAILURE_DOMAIN: &str = "rz-rovent-partial-failure-evidence/1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PartialAccountingError {
@@ -80,6 +83,7 @@ pub struct PartialCollectionReceipt {
     byte_limit: u64,
     rows: BTreeMap<String, RowState>,
     chunks: Vec<PartialChunkPin>,
+    failure_evidence: Option<PartialFailurePin>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +99,15 @@ pub struct PartialCollectionSpec {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct PartialChunkPin {
+    pub(super) path: String,
+    pub(super) bytes: u64,
+    pub(super) sha256: String,
+    pub(super) rows: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PartialFailurePin {
     pub(super) path: String,
     pub(super) bytes: u64,
     pub(super) sha256: String,
@@ -142,6 +155,319 @@ impl PartialCollectionSpec {
 struct PartialStoredReceipt {
     spec: PartialCollectionSpec,
     receipt: PartialCollectionReceipt,
+}
+
+/// A serialization of observable values, not the original authority object.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialFailureEvidenceRow {
+    schema: String,
+    row_id: String,
+    original_row: serde_json::Value,
+    error: String,
+    teacher_evidence: serde_json::Value,
+    observation_provenance: String,
+    owner_reconstructable: bool,
+    physical_completion: String,
+}
+
+fn exact_keys(v: &serde_json::Value, keys: &[&str]) -> bool {
+    v.as_object()
+        .is_some_and(|m| m.len() == keys.len() && keys.iter().all(|k| m.contains_key(*k)))
+}
+fn optional_u64(v: &serde_json::Value) -> bool {
+    v.is_null() || v.as_u64().is_some()
+}
+fn optional_i64(v: &serde_json::Value) -> bool {
+    v.is_null() || v.as_i64().is_some()
+}
+fn portable_duration(v: &serde_json::Value) -> bool {
+    exact_keys(v, &["seconds", "nanoseconds"])
+        && v["seconds"].as_u64().is_some()
+        && v["nanoseconds"].as_u64().is_some_and(|n| n < 1_000_000_000)
+}
+fn portable_work(v: &serde_json::Value) -> bool {
+    exact_keys(v, &["nodes", "qnodes", "tt_hits"])
+        && ["nodes", "qnodes", "tt_hits"]
+            .iter()
+            .all(|k| optional_u64(&v[*k]))
+}
+fn portable_move(v: &serde_json::Value) -> bool {
+    let square = |s: &serde_json::Value| {
+        exact_keys(s, &["file", "rank"])
+            && ["file", "rank"]
+                .iter()
+                .all(|k| s[*k].as_u64().is_some_and(|n| n < 8))
+    };
+    exact_keys(v, &["from", "to", "promotion"])
+        && square(&v["from"])
+        && square(&v["to"])
+        && (v["promotion"].is_null()
+            || matches!(
+                v["promotion"].as_str(),
+                Some("pawn" | "knight" | "bishop" | "rook" | "queen" | "king")
+            ))
+}
+fn portable_report(v: &serde_json::Value) -> bool {
+    let keys = [
+        "identity",
+        "observed_uci",
+        "request_id",
+        "best_move",
+        "pv",
+        "score",
+        "bound",
+        "wdl_per_mille",
+        "perspective",
+        "requested_depth",
+        "reported_depth",
+        "seldepth",
+        "root_restricted",
+        "completion",
+        "work",
+        "elapsed",
+    ];
+    if !exact_keys(v, &keys)
+        || serde_json::from_value::<rz_search::cpu_checker::ExternalCheckerIdentity>(
+            v["identity"].clone(),
+        )
+        .is_err()
+        || !exact_keys(&v["observed_uci"], &["name", "author"])
+        || v["observed_uci"]["name"].as_str().is_none()
+        || !(v["observed_uci"]["author"].is_null() || v["observed_uci"]["author"].is_string())
+        || v["request_id"].as_u64().is_none()
+        || !(v["best_move"].is_null() || portable_move(&v["best_move"]))
+        || !v["pv"]
+            .as_array()
+            .is_some_and(|a| a.iter().all(portable_move))
+        || !matches!(
+            v["bound"].as_str(),
+            Some("exact_reported" | "lower" | "upper" | "unknown")
+        )
+        || !matches!(v["perspective"].as_str(), Some("white" | "black"))
+        || v["requested_depth"].as_u64().is_none()
+        || !optional_u64(&v["reported_depth"])
+        || !optional_u64(&v["seldepth"])
+        || v["root_restricted"].as_bool().is_none()
+        || !matches!(
+            v["completion"].as_str(),
+            Some(
+                "pending" | "best_move" | "stopped_deadline" | "stopped_canceled" | "stopped_yield"
+            )
+        )
+        || !portable_work(&v["work"])
+        || !portable_duration(&v["elapsed"])
+    {
+        return false;
+    }
+    let score = &v["score"];
+    let score_ok = match score["kind"].as_str() {
+        Some("unknown") => exact_keys(score, &["kind"]),
+        Some("centipawns" | "mate_moves") => {
+            exact_keys(score, &["kind", "value"]) && score["value"].as_i64().is_some()
+        }
+        _ => false,
+    };
+    let wdl_ok = v["wdl_per_mille"].is_null()
+        || v["wdl_per_mille"].as_array().is_some_and(|a| {
+            a.len() == 3
+                && a.iter()
+                    .all(|n| n.as_u64().is_some_and(|x| x <= u16::MAX as u64))
+        });
+    score_ok && wdl_ok
+}
+fn portable_attempt(v: &serde_json::Value) -> bool {
+    if !exact_keys(v, &["work", "elapsed", "external"])
+        || !portable_work(&v["work"])
+        || !portable_duration(&v["elapsed"])
+    {
+        return false;
+    }
+    let external = &v["external"];
+    if !exact_keys(external, &["request_id", "partial_report", "process"])
+        || external["request_id"].as_u64().is_none()
+        || !(external["partial_report"].is_null() || portable_report(&external["partial_report"]))
+    {
+        return false;
+    }
+    let p = &external["process"];
+    let keys = [
+        "process_identity",
+        "stop_sent",
+        "quit_sent",
+        "exit_observed",
+        "stdout_drained",
+        "stderr_drained",
+        "exit_code",
+        "exit_signal",
+        "cleanup_complete",
+        "quarantined",
+        "ownership_lost",
+        "stdout_bytes",
+        "stderr_bytes",
+    ];
+    let process = &p["process_identity"];
+    exact_keys(p, &keys)
+        && (process.is_null()
+            || (exact_keys(process, &["pid", "process_group", "proc_start_ticks"])
+                && process["pid"].as_u64().is_some()
+                && process["process_group"].as_i64().is_some()
+                && process["proc_start_ticks"].as_u64().is_some()))
+        && [
+            "stop_sent",
+            "quit_sent",
+            "exit_observed",
+            "stdout_drained",
+            "stderr_drained",
+            "cleanup_complete",
+            "quarantined",
+            "ownership_lost",
+        ]
+        .iter()
+        .all(|k| p[*k].as_bool().is_some())
+        && optional_i64(&p["exit_code"])
+        && optional_i64(&p["exit_signal"])
+        && p["stdout_bytes"].as_u64().is_some()
+        && p["stderr_bytes"].as_u64().is_some()
+}
+
+fn verify_failure_evidence(
+    directory: &Dir,
+    spec: &PartialCollectionSpec,
+    receipt: &PartialCollectionReceipt,
+) -> io::Result<()> {
+    let Some(pin) = &receipt.failure_evidence else {
+        return if receipt.failed_rows == 0 {
+            Ok(())
+        } else {
+            Err(invalid_partial("partial failure evidence missing"))
+        };
+    };
+    let total_chunks = receipt
+        .chunks
+        .iter()
+        .try_fold(0u64, |n, chunk| n.checked_add(chunk.bytes))
+        .ok_or_else(|| invalid_partial("partial evidence budget overflow"))?;
+    if total_chunks
+        .checked_add(pin.bytes)
+        .is_none_or(|n| n > spec.byte_limit)
+    {
+        return Err(invalid_partial("partial evidence budget"));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = directory.open_with(FAILURE_FILE, &options)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != pin.bytes {
+        return Err(invalid_partial("partial failure evidence file/size"));
+    }
+    let mut reader = BufReader::new(file.take(pin.bytes.saturating_add(1)));
+    let mut hash = Sha256::new();
+    let mut seen = BTreeSet::new();
+    let mut count = 0u64;
+    let mut size = 0u64;
+    loop {
+        let mut line = Vec::new();
+        let n = (&mut reader)
+            .take(MAX_FAILURE_ROW_BYTES + 1)
+            .read_until(b'\n', &mut line)?;
+        if n == 0 {
+            break;
+        }
+        if line.last() != Some(&b'\n') || n as u64 > MAX_FAILURE_ROW_BYTES + 1 {
+            return Err(invalid_partial(
+                "partial failure evidence row bound/newline",
+            ));
+        }
+        count += 1;
+        size = size
+            .checked_add(n as u64)
+            .ok_or_else(|| invalid_partial("partial failure evidence size overflow"))?;
+        if count > pin.rows {
+            return Err(invalid_partial("partial failure evidence rows"));
+        }
+        hash.update(&line);
+        let text =
+            std::str::from_utf8(&line[..n - 1]).map_err(|e| io::Error::other(e.to_string()))?;
+        let row: PartialFailureEvidenceRow =
+            rz_experiments::decode_json(text).map_err(|e| io::Error::other(e.to_string()))?;
+        let teacher = row
+            .teacher_evidence
+            .as_object()
+            .ok_or_else(|| invalid_partial("partial teacher evidence object"))?;
+        let exclusions = serde_json::json!([
+            "owner_capabilities",
+            "absolute_monotonic_instants",
+            "unretained_stdout_stderr",
+            "opaque_rules_history_snapshot"
+        ]);
+        let complete_teacher = ["dispatch", "completion", "input_scope", "startup"]
+            .iter()
+            .all(|key| teacher.get(*key).is_some_and(serde_json::Value::is_object))
+            && teacher.get("raw_report").is_some_and(portable_report)
+            && teacher.get("attempt").is_some_and(portable_attempt)
+            && teacher.get("profiled_report").is_some_and(|v| {
+                exact_keys(
+                    v,
+                    &[
+                        "profile",
+                        "purpose",
+                        "requested",
+                        "issued",
+                        "issued_go",
+                        "reported_node_overshoot",
+                        "strict_native_nodes",
+                        "option_application_observed",
+                        "readiness_barrier_completed",
+                    ],
+                )
+            })
+            && teacher
+                .get("requested_multipv")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+            && teacher.get("stop_control").is_some()
+            && teacher
+                .get("opinions")
+                .is_some_and(serde_json::Value::is_array)
+            && teacher.get("schema").and_then(serde_json::Value::as_str)
+                == Some("portable_teacher_observation_v1")
+            && teacher.get("opaque_exclusions") == Some(&exclusions);
+        let sequence = row
+            .original_row
+            .get("native")
+            .and_then(|v| v.get("retired_sequence"))
+            .and_then(serde_json::Value::as_u64);
+        if row.schema != FAILURE_DOMAIN
+            || row.error.is_empty()
+            || !row.original_row.is_object()
+            || row.observation_provenance != "retained_original_sealed_serializable_projection"
+            || row.owner_reconstructable
+            || row.physical_completion != "not_attested"
+            || !complete_teacher
+            || teacher.get("conditional_policy_target_known")
+                != Some(&serde_json::Value::Bool(false))
+            || teacher.get("portable_observation_complete") != Some(&serde_json::Value::Bool(true))
+            || teacher.get("truncated") != Some(&serde_json::Value::Bool(false))
+            || sequence.map(|n| format!("failure-sequence-{n}")) != Some(row.row_id.clone())
+            || !seen.insert(row.row_id.clone())
+        {
+            return Err(invalid_partial("partial failure evidence shape or scope"));
+        }
+        match receipt.rows.get(&row.row_id) {
+            Some(RowState::Failed {
+                evidence_reference,
+                bytes,
+                ..
+            }) if evidence_reference == &format!("{FAILURE_FILE}#{}", row.row_id)
+                && *bytes == n as u64 => {}
+            _ => return Err(invalid_partial("partial failure evidence identity")),
+        }
+    }
+    if count != pin.rows || size != pin.bytes || format!("{:x}", hash.finalize()) != pin.sha256 {
+        return Err(invalid_partial("partial failure evidence checksum/count"));
+    }
+    Ok(())
 }
 
 /// Create a fresh isolated output child. Existing directories are not reused.
@@ -336,6 +662,7 @@ pub(super) fn write_partial_receipt(
     spec.validate(&spec.collection_plan_sha256)?;
     receipt.validate(spec)?;
     verify_chunks(directory, spec, receipt)?;
+    verify_failure_evidence(directory, spec, receipt)?;
     let stored = PartialStoredReceipt {
         spec: spec.clone(),
         receipt: receipt.clone(),
@@ -397,6 +724,7 @@ fn read_partial_receipt_in(
     }
     stored.receipt.validate(spec)?;
     verify_chunks(directory, spec, &stored.receipt)?;
+    verify_failure_evidence(directory, spec, &stored.receipt)?;
     Ok(stored.receipt)
 }
 
@@ -424,6 +752,12 @@ impl PartialCollectionReader {
 
     pub fn receipt(&self) -> &PartialCollectionReceipt {
         &self.receipt
+    }
+
+    /// Readback checked only serialized evidence bytes and their declared
+    /// identities, not reconstructability of the native owner or completion.
+    pub fn failure_evidence_integrity_verified(&self) -> bool {
+        self.receipt.failure_evidence.is_some()
     }
 
     pub fn visit_chunk(
@@ -518,8 +852,22 @@ pub fn visit_partial_chunk(
 }
 
 impl PartialCollectionReceipt {
+    pub fn valid_rows(&self) -> usize {
+        self.valid_rows
+    }
+    pub fn failed_rows(&self) -> usize {
+        self.failed_rows
+    }
+    pub fn pending_rows(&self) -> usize {
+        self.pending_rows
+    }
+
     pub(super) fn with_chunks(mut self, chunks: Vec<PartialChunkPin>) -> Self {
         self.chunks = chunks;
+        self
+    }
+    pub(super) fn with_failure_evidence(mut self, pin: PartialFailurePin) -> Self {
+        self.failure_evidence = Some(pin);
         self
     }
     fn validate(&self, spec: &PartialCollectionSpec) -> io::Result<()> {
@@ -558,8 +906,8 @@ impl PartialCollectionReceipt {
                     policy_target_known,
                     failure_classification,
                 } => {
-                    if evidence_status != "in_memory_custody_not_durable"
-                        || *bytes != 0
+                    if evidence_status != "serialized_evidence_owner_not_reconstructable"
+                        || *bytes == 0
                         || *policy_target_known
                         || failure_classification != "conditional_policy_unknown_first_observed"
                     {
@@ -591,6 +939,17 @@ impl PartialCollectionReceipt {
             || (self.end_reason == PartialEndReason::InputExhausted && pending != 0)
         {
             return Err(invalid_partial("partial row accounting differs"));
+        }
+        match &self.failure_evidence {
+            Some(pin)
+                if failed > 0
+                    && pin.path == FAILURE_FILE
+                    && pin.bytes > 0
+                    && pin.bytes <= spec.byte_limit
+                    && pin.rows == failed as u64
+                    && digest_string(&pin.sha256) => {}
+            None if failed == 0 => {}
+            _ => return Err(invalid_partial("partial failure evidence pin")),
         }
         Ok(())
     }
@@ -676,15 +1035,13 @@ impl PartialCollectionAccounting {
         let total = self
             .declared_payload_bytes
             .checked_add(bytes)
-            .filter(|total| {
-                ((failure && bytes == 0) || (!failure && bytes > 0)) && *total <= self.byte_limit
-            })
+            .filter(|total| bytes > 0 && *total <= self.byte_limit)
             .ok_or(PartialAccountingError::ByteLimit)?;
         let state = if failure {
             RowState::Failed {
                 evidence_reference: reference.to_owned(),
                 bytes,
-                evidence_status: "in_memory_custody_not_durable".into(),
+                evidence_status: "serialized_evidence_owner_not_reconstructable".into(),
                 policy_target_known: false,
                 failure_classification: "conditional_policy_unknown_first_observed".into(),
             }
@@ -739,6 +1096,7 @@ impl PartialCollectionAccounting {
             byte_limit: self.byte_limit,
             rows: self.rows,
             chunks: Vec::new(),
+            failure_evidence: None,
         })
     }
 }
@@ -780,9 +1138,18 @@ mod tests {
         let mut state = PartialCollectionAccounting::new(8, 4096).unwrap();
         state.begin_row("failed").unwrap();
         state
-            .record_failure("failed", "in-memory-custody:failed", 0)
+            .record_failure("failed", "failure-evidence.jsonl#failed", 1)
             .unwrap();
-        let mut receipt = state.finish(PartialEndReason::InputExhausted).ok().unwrap();
+        let mut receipt = state
+            .finish(PartialEndReason::InputExhausted)
+            .ok()
+            .unwrap()
+            .with_failure_evidence(PartialFailurePin {
+                path: FAILURE_FILE.into(),
+                bytes: 1,
+                sha256: "0".repeat(64),
+                rows: 1,
+            });
         assert!(receipt.validate(&spec()).is_ok());
         receipt.status = "complete".into();
         assert!(receipt.validate(&spec()).is_err());
@@ -810,21 +1177,110 @@ mod tests {
         let parent = Dir::open_ambient_dir(&path, cap_std::ambient_authority()).unwrap();
         let output = create_partial_directory(&parent).unwrap();
         let mut state = PartialCollectionAccounting::new(8, 4096).unwrap();
-        state.begin_row("failed").unwrap();
+        state.begin_row("failure-sequence-1").unwrap();
+        let work = serde_json::json!({"nodes":null,"qnodes":null,"tt_hits":null});
+        let elapsed = serde_json::json!({"seconds":0,"nanoseconds":0});
+        let report = serde_json::json!({"identity":{"adapter_semantics":"fixture","binary_sha256":"a","launch_arguments_sha256":"b",
+            "declared_name":"fixture","declared_version":"fixture","declared_source":"fixture","declared_license":"fixture",
+            "options":{},"assets":[],"model_metadata":{"weights_sha256":null,"training":"unknown","declared_rights":null,"precision":null}},
+            "observed_uci":{"name":"fixture","author":null},"request_id":1,"best_move":null,"pv":[],
+            "score":{"kind":"unknown"},"bound":"unknown","wdl_per_mille":null,"perspective":"white","requested_depth":1,
+            "reported_depth":null,"seldepth":null,"root_restricted":false,"completion":"best_move","work":work,"elapsed":elapsed});
+        let attempt = serde_json::json!({"work":work,"elapsed":elapsed,"external":{"request_id":1,"partial_report":null,
+            "process":{"process_identity":null,"stop_sent":false,"quit_sent":false,"exit_observed":false,
+                "stdout_drained":false,"stderr_drained":false,"exit_code":null,"exit_signal":null,
+                "cleanup_complete":false,"quarantined":false,"ownership_lost":false,"stdout_bytes":0,"stderr_bytes":0}}});
+        let evidence = serde_json::json!({"schema":FAILURE_DOMAIN,"row_id":"failure-sequence-1",
+            "original_row":{"native":{"retired_sequence":1}},"error":"fixture only",
+            "teacher_evidence":{"schema":"portable_teacher_observation_v1","dispatch":{},"completion":{},"input_scope":{},"startup":{},
+                "raw_report":report, "attempt":attempt, "opinions":[],
+                "profiled_report":{"profile":{},"purpose":"teacher","requested":{},"issued":{},"issued_go":true,
+                    "reported_node_overshoot":null,"strict_native_nodes":false,"option_application_observed":false,"readiness_barrier_completed":true},
+                "requested_multipv":1,"stop_control":null,
+                "opaque_exclusions":["owner_capabilities","absolute_monotonic_instants","unretained_stdout_stderr","opaque_rules_history_snapshot"],
+                "conditional_policy_target_known":false,"portable_observation_complete":true,"truncated":false},
+            "observation_provenance":"retained_original_sealed_serializable_projection",
+            "owner_reconstructable":false,"physical_completion":"not_attested"});
+        let mut evidence_bytes = serde_json::to_vec(&evidence).unwrap();
+        evidence_bytes.push(b'\n');
+        std::fs::write(path.join(DIRECTORY).join(FAILURE_FILE), &evidence_bytes).unwrap();
         state
-            .record_failure("failed", "in-memory-custody:failed", 0)
+            .record_failure(
+                "failure-sequence-1",
+                "failure-evidence.jsonl#failure-sequence-1",
+                evidence_bytes.len() as u64,
+            )
             .unwrap();
-        let receipt = state.finish(PartialEndReason::InputExhausted).ok().unwrap();
+        let receipt = state
+            .finish(PartialEndReason::InputExhausted)
+            .ok()
+            .unwrap()
+            .with_failure_evidence(PartialFailurePin {
+                path: FAILURE_FILE.into(),
+                bytes: evidence_bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&evidence_bytes)),
+                rows: 1,
+            });
+        std::fs::write(path.join(DIRECTORY).join(FAILURE_FILE), b"corrupt\n").unwrap();
+        assert!(write_partial_receipt(&output, &spec(), &receipt).is_err());
+        assert!(!path.join(DIRECTORY).join(FILE).exists());
+        std::fs::write(path.join(DIRECTORY).join(FAILURE_FILE), &evidence_bytes).unwrap();
         write_partial_receipt(&output, &spec(), &receipt).unwrap();
         assert!(read_partial_receipt(&parent, &spec()).is_ok());
-        assert!(PartialCollectionReader::open(&parent, &spec()).is_ok());
+        {
+            use super::super::partial_followup_v1::{
+                FollowupDecision, FollowupDependency, FollowupResources,
+                PARTIAL_COLLECTION_EXIT_CODE, PriorResourceState, ProcessTreeState, ProducerExit,
+                decide_partial_followup,
+            };
+            let reader = PartialCollectionReader::open(&parent, &spec()).unwrap();
+            assert!(reader.failure_evidence_integrity_verified());
+            let decide = |dep, resources| {
+                decide_partial_followup(
+                    dep,
+                    resources,
+                    PriorResourceState::Unknown,
+                    ProducerExit::Exited(PARTIAL_COLLECTION_EXIT_CODE),
+                    ProcessTreeState::GoneObserved,
+                    Some(&reader),
+                )
+            };
+            assert_eq!(
+                decide(
+                    FollowupDependency::PartialInspection,
+                    FollowupResources::Isolated
+                ),
+                FollowupDecision::BlockedPartialEvidence
+            );
+            assert_eq!(
+                decide(
+                    FollowupDependency::StrictCorpus,
+                    FollowupResources::Isolated
+                ),
+                FollowupDecision::BlockedStrictCorpus
+            );
+            assert_eq!(
+                decide(
+                    FollowupDependency::Independent,
+                    FollowupResources::ReusesPrior
+                ),
+                FollowupDecision::BlockedSharedResource
+            );
+            assert_eq!(
+                decide(FollowupDependency::Independent, FollowupResources::Isolated),
+                FollowupDecision::Run
+            );
+        }
+        std::fs::write(path.join(DIRECTORY).join(FAILURE_FILE), b"corrupt\n").unwrap();
+        assert!(read_partial_receipt(&parent, &spec()).is_err());
+        std::fs::write(path.join(DIRECTORY).join(FAILURE_FILE), &evidence_bytes).unwrap();
         assert!(!path.join("publication.json").exists());
         assert!(!path.join(DIRECTORY).join("publication.json").exists());
         assert!(write_partial_receipt(&output, &spec(), &receipt).is_err());
         let receipt_path = path.join(DIRECTORY).join(FILE);
         let mut raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
-        raw["receipt"]["rows"]["failed"]["policy_target_known"] = true.into();
+        raw["receipt"]["rows"]["failure-sequence-1"]["policy_target_known"] = true.into();
         std::fs::write(&receipt_path, serde_json::to_vec(&raw).unwrap()).unwrap();
         assert!(read_partial_receipt(&parent, &spec()).is_err());
         drop(output);
@@ -871,7 +1327,7 @@ mod tests {
         let mut state = PartialCollectionAccounting::new(3, 100).unwrap();
         state.begin_row("bad").unwrap();
         state
-            .record_failure("bad", "in-memory-custody:bad", 0)
+            .record_failure("bad", "failure-evidence.jsonl#bad", 1)
             .unwrap();
         state.begin_row("good").unwrap();
         state.record_valid("good", "records/good", 30).unwrap();
@@ -886,11 +1342,11 @@ mod tests {
         assert_eq!(value["failed_rows"], 1);
         assert_eq!(
             value["rows"]["bad"]["evidence_reference"],
-            "in-memory-custody:bad"
+            "failure-evidence.jsonl#bad"
         );
         assert_eq!(
             value["rows"]["bad"]["evidence_status"],
-            "in_memory_custody_not_durable"
+            "serialized_evidence_owner_not_reconstructable"
         );
         assert_eq!(value["rows"]["bad"]["policy_target_known"], false);
         assert_eq!(
@@ -924,7 +1380,7 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error, PartialAccountingError::PendingRows);
-        state.record_failure("one", "evidence", 0).unwrap();
+        state.record_failure("one", "evidence", 1).unwrap();
         assert_eq!(
             state.record_valid("one", "record", 1),
             Err(PartialAccountingError::AlreadyResolved)
@@ -936,7 +1392,7 @@ mod tests {
                 receipt.pending_rows,
                 receipt.declared_payload_bytes
             ),
-            (1, 0, 0)
+            (1, 0, 1)
         );
     }
 
