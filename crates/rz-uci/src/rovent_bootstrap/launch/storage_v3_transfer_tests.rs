@@ -27,6 +27,15 @@ fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut value, "{byte:02x}").unwrap();
+    }
+    value
+}
+
 fn artifact(path: &str, bytes: &[u8]) -> ArtifactRef {
     ArtifactRef {
         path: path.into(),
@@ -104,7 +113,7 @@ fn v3_transfer_child_body() {
             index_entries_max: 16,
             index_bytes_max: 1024,
             load_bytes_max: 1024,
-            load_deadline_max_ms: 100,
+            load_deadline_max_ms: 10_000,
             record_payload_bytes_max: 1024,
             max_load_pins: 1,
         },
@@ -172,8 +181,8 @@ fn v3_transfer_child_body() {
             "search":{"node_unit":"rovent-position-visits/1","requested_nodes":null,
                 "depth_plies":null,"mate_moves":null,"registered_max_chess_plies":64,
                 "searchmoves":null,"search_configuration_sha256":search_digest,
-                "root_state_and_history_sha256":sha(b"root"),
-                "rules_profile_sha256":sha(b"rules")}
+                "root_state_and_history_sha256":hex(&rz_position::contracts::rules_snapshot_semantic_digest(&rz_position::Position::startpos().snapshot())),
+                "rules_profile_sha256":hex(&rz_position::contracts::profile_digest())}
         },
         "resources":{"cpu_quota_millicpus":2000,"pools":[
             {"actors":["manager","pc_caller"],"max_threads":1,"cpu_charge_millicpus":1000},
@@ -289,6 +298,9 @@ fn v3_transfer_child_body() {
 
     // Two independently prepared values contend for one original owner.
     let first = transfer.prepare(&boundary, &clock, implementation).unwrap();
+    let shared = Arc::new(
+        crate::rovent_bootstrap::product::SharedRoventStorageRegistration::new_prepared_v3(&first),
+    );
     let duplicate = transfer.prepare(&boundary, &clock, implementation).unwrap();
     let after_commit_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         first.commit().unwrap();
@@ -312,6 +324,13 @@ fn v3_transfer_child_body() {
     );
     assert!(owner.retains_root_capability());
     drop(registration);
+
+    crate::rovent_bootstrap::storage_lifecycle::v3_root_tests::run_original_v3_lifecycle(
+        Arc::clone(&lock),
+        &clock,
+        implementation,
+        shared,
+    );
 
     // An original cancellation is never reset or renewed. A separately
     // admitted owner shows cancellation after prepare leaves custody intact.

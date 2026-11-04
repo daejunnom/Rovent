@@ -77,6 +77,10 @@ impl StorageSetupRejection {
 mod observation;
 pub(crate) use observation::StorageLifecycleObservation;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "storage_lifecycle/v3_root_tests.rs"]
+pub(crate) mod v3_root_tests;
+
 pub(crate) enum StorageSemanticOwner<M: RoleModel + 'static = AdaptivePortModel> {
     Pc(Box<PcSemanticOwner<M>>),
     Pcr(Box<ResearcherPreparingOwner<M>>),
