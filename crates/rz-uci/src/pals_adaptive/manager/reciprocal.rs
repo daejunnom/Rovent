@@ -140,6 +140,19 @@ where
         let mut changed = false;
         let mut index = 0;
         while index < self.accepted_roles.len() {
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if self.accepted_roles[index]
+                .binding
+                .collection_consumption_pending
+                .is_some()
+                || self.accepted_roles[index]
+                    .binding
+                    .collection_ranking_pending
+                    .is_some()
+            {
+                index += 1;
+                continue;
+            }
             if self.accepted_roles[index].binding.consumption_unknown {
                 return Err(AdaptiveManagerError::Invalid(
                     "accepted role consumption remains unknown",
@@ -171,7 +184,7 @@ where
                                 }
                                 held.binding.consumption_recorded = true;
                                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                                if let Err(error) = collection::notify_adaptive_consumed_versioned(
+                                match collection::try_notify_adaptive_consumed_versioned(
                                     &mut self.collection_observer_v2,
                                     self.collection_admission_v2.as_ref(),
                                     self.native.native_acceptance_verifier().as_ref(),
@@ -179,7 +192,15 @@ where
                                     output.proposer_ranking_output(),
                                     true,
                                 ) {
-                                    self.record_failure(error.into());
+                                    Ok(collection::AdaptiveCollectionBoundaryV2::Busy) => {
+                                        held.binding.collection_consumption_pending = Some(true);
+                                    }
+                                    Ok(collection::AdaptiveCollectionBoundaryV2::Ready) => {}
+                                    Err(error) => {
+                                        held.binding.collection_observation_failed =
+                                            self.collection_is_v3();
+                                        self.record_failure(error.into());
+                                    }
                                 }
                             }
                             self.observe_cpu_pc_head(
@@ -212,6 +233,31 @@ where
             }
             match result {
                 Ok(true) => {
+                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                    if held.binding.collection_consumption_pending.is_some()
+                        || held.binding.collection_ranking_pending.is_some()
+                    {
+                        if self.collection_retired_pending.len() >= self.limits.role_tickets_max
+                            || self.collection_retired_pending.try_reserve(1).is_err()
+                        {
+                            held.binding.consumption_unknown = true;
+                            self.accepted_roles.insert(index, held);
+                            return Err(AdaptiveManagerError::PhysicalUnknown);
+                        }
+                        self.collection_retired_pending.push(held.binding);
+                    } else if held.binding.collection_observation_failed {
+                        if self.collection_failed_evidence.len() >= self.limits.role_tickets_max
+                            || self.collection_failed_evidence.try_reserve(1).is_err()
+                        {
+                            held.binding.consumption_unknown = true;
+                            self.accepted_roles.insert(index, held);
+                            return Err(AdaptiveManagerError::PhysicalUnknown);
+                        }
+                        self.collection_failed_evidence
+                            .push(RoventFailedCollectionEvidence {
+                                _binding: held.binding,
+                            });
+                    }
                     changed = true;
                 }
                 Ok(false) => {
@@ -302,7 +348,6 @@ where
                 }
                 return Ok(false);
             }
-            let id = self.issue_reciprocal_question()?;
             let accepted = held
                 .binding
                 .reciprocal_acceptance
@@ -321,7 +366,7 @@ where
                 held.binding.consumption_recorded = true;
                 self.record_role_consumption(source, held.binding.physical)?;
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                if let Err(error) = collection::notify_adaptive_consumed_versioned(
+                match collection::try_notify_adaptive_consumed_versioned(
                     &mut self.collection_observer_v2,
                     self.collection_admission_v2.as_ref(),
                     self.native.native_acceptance_verifier().as_ref(),
@@ -329,11 +374,26 @@ where
                     output,
                     false,
                 ) {
-                    self.record_failure(error.into());
-                    return Ok(false);
+                    Ok(collection::AdaptiveCollectionBoundaryV2::Busy) => {
+                        held.binding.collection_consumption_pending = Some(false);
+                    }
+                    Ok(collection::AdaptiveCollectionBoundaryV2::Ready) => {}
+                    Err(error) => {
+                        held.binding.collection_observation_failed = self.collection_is_v3();
+                        self.record_failure(error.into());
+                        return Ok(false);
+                    }
                 }
                 self.observe_cpu_pc_head(&held.binding.input, accepted, output);
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                if held.binding.collection_consumption_pending.is_some() {
+                    // Actual source consumption happened once. Preserve its
+                    // original binding; do not issue a dependent question
+                    // until the same observer has accepted this witness.
+                    return Ok(false);
+                }
             }
+            let id = self.issue_reciprocal_question()?;
             self.utility_role_committed(&work, accepted, output)?;
             let preparation = self.driver.prepare_accepted_role_reciprocal(
                 &work,
@@ -527,7 +587,7 @@ where
                 // Record that actual consumption once, using the original
                 // accepted proof and retained output just as on the peer path.
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                if let Err(error) = collection::notify_adaptive_consumed_versioned(
+                match collection::try_notify_adaptive_consumed_versioned(
                     &mut self.collection_observer_v2,
                     self.collection_admission_v2.as_ref(),
                     self.native.native_acceptance_verifier().as_ref(),
@@ -535,7 +595,14 @@ where
                     output,
                     false,
                 ) {
-                    self.record_failure(error.into());
+                    Ok(collection::AdaptiveCollectionBoundaryV2::Busy) => {
+                        held.binding.collection_consumption_pending = Some(false);
+                    }
+                    Ok(collection::AdaptiveCollectionBoundaryV2::Ready) => {}
+                    Err(error) => {
+                        held.binding.collection_observation_failed = self.collection_is_v3();
+                        self.record_failure(error.into());
+                    }
                 }
                 self.observe_cpu_pc_head(&held.binding.input, accepted, output);
             }

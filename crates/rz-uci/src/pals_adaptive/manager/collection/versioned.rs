@@ -186,6 +186,30 @@ impl<'a> RoventCollectionAcceptedWitnessV3<'a> {
             accepted,
         })
     }
+
+    /// An already-issued native acceptance is an observation, not a new
+    /// admission. Retry it against immutable owner and output identity even
+    /// after the root has been revoked.
+    fn observed(
+        admission: &'a RoventCollectionRootAdmissionV3,
+        verifier: &NativeVerifier,
+        accepted: &'a AcceptedRoleStep,
+        output: &rz_contracts::pals::RoleOutput,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        admission.validate_native_identity(verifier)?;
+        admission.validate_observed_output(accepted.ticket(), output)?;
+        if !accepted.validates_output(output) {
+            return Err(AdaptiveCollectionError::new(
+                AdaptiveCollectionStage::Accepted,
+                "AcceptedOutputMismatch",
+                "original accepted output differs",
+            ));
+        }
+        Ok(Self {
+            admission,
+            accepted,
+        })
+    }
     pub fn admission(&self) -> &RoventCollectionRootAdmissionV3 {
         self.admission
     }
@@ -230,6 +254,15 @@ impl RoventRootRankingAcceptanceV3 {
     }
     pub fn admission(&self) -> &RoventCollectionRootAdmissionV3 {
         &self.admission
+    }
+    /// Recheck only immutable root/output identity for this already-published
+    /// ranking; this grants no new root admission after revocation.
+    pub fn validate_observed_output(
+        &self,
+        output: &rz_contracts::pals::RoleOutput,
+    ) -> Result<(), AdaptiveCollectionError> {
+        self.admission
+            .validate_observed_ranking(&self.ranking, output)
     }
 }
 
@@ -453,6 +486,24 @@ impl<'a> VersionedCollectionAcceptedWitness<'a> {
             }
         }
     }
+
+    pub(crate) fn observed(
+        admission: &'a VersionedCollectionAdmission,
+        verifier: &NativeVerifier,
+        accepted: &'a AcceptedRoleStep,
+        output: &rz_contracts::pals::RoleOutput,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        match admission {
+            VersionedCollectionAdmission::V2(a) => {
+                RoventCollectionAcceptedWitnessV2::new(a, verifier, accepted, output).map(Self::V2)
+            }
+            #[cfg(target_os = "linux")]
+            VersionedCollectionAdmission::V3(a) => {
+                RoventCollectionAcceptedWitnessV3::observed(a, verifier, accepted, output)
+                    .map(Self::V3)
+            }
+        }
+    }
 }
 pub(crate) enum VersionedCollectionConsumedWitness<'a> {
     V2(RoventCollectionConsumedWitnessV2<'a>),
@@ -489,6 +540,26 @@ impl VersionedRootRankingAcceptance {
             #[cfg(target_os = "linux")]
             VersionedCollectionAdmission::V3(a) => {
                 RoventRootRankingAcceptanceV3::from_current_ranking(ranking, a).map(Self::V3)
+            }
+        }
+    }
+    pub(crate) fn from_observed_ranking(
+        ranking: &ProposerRankingPublished,
+        admission: &VersionedCollectionAdmission,
+        output: &rz_contracts::pals::RoleOutput,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        match admission {
+            VersionedCollectionAdmission::V2(a) => {
+                a.validate_output(&ranking.source().ticket, output)?;
+                RoventRootRankingAcceptanceV2::from_current_ranking(ranking, a).map(Self::V2)
+            }
+            #[cfg(target_os = "linux")]
+            VersionedCollectionAdmission::V3(a) => {
+                a.validate_observed_ranking(ranking, output)?;
+                Ok(Self::V3(RoventRootRankingAcceptanceV3 {
+                    ranking: ranking.clone(),
+                    admission: a.clone(),
+                }))
             }
         }
     }
@@ -787,6 +858,38 @@ pub(crate) fn notify_adaptive_consumed_versioned<Q, O>(
         output,
     )?;
     observer.adaptive_consumed(
+        VersionedCollectionConsumedWitness::new(witness),
+        after_error_readback,
+    )
+}
+
+/// Observe an already completed search consumption without repeating it when
+/// the same original observer is temporarily Busy.
+pub(crate) fn try_notify_adaptive_consumed_versioned<Q, O>(
+    observer: &mut Option<VersionedCollectionObserver<Q, O>>,
+    admission: Option<&VersionedCollectionAdmission>,
+    verifier: Option<&NativeVerifier>,
+    accepted: &AcceptedRoleStep,
+    output: &rz_contracts::pals::RoleOutput,
+    after_error_readback: bool,
+) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+    let Some(observer) = observer.as_mut() else {
+        return Ok(AdaptiveCollectionBoundaryV2::Ready);
+    };
+    let missing = || {
+        AdaptiveCollectionError::new(
+            AdaptiveCollectionStage::Accepted,
+            "OriginalOwnerUnavailable",
+            "consumption has no original admission or native verifier",
+        )
+    };
+    let witness = VersionedCollectionAcceptedWitness::observed(
+        admission.ok_or_else(missing)?,
+        verifier.ok_or_else(missing)?,
+        accepted,
+        output,
+    )?;
+    observer.try_adaptive_consumed(
         VersionedCollectionConsumedWitness::new(witness),
         after_error_readback,
     )

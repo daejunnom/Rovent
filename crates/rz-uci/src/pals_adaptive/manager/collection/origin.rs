@@ -1422,10 +1422,13 @@ impl RoventCollectionRootAdmissionV3 {
             || ticket.view.root_state != self.root_state
             || (ticket.role == Role::Validator && !self.original.original.snapshot.validator_loaded)
         {
-            return Err(reject("observed ticket is outside original /3 Collection root"));
+            return Err(reject(
+                "observed ticket is outside original /3 Collection root",
+            ));
         }
         let namespace = &self.original.original.namespace;
-        namespace.verify(ticket, output, Some(namespace.value_identity()))
+        namespace
+            .verify(ticket, output, Some(namespace.value_identity()))
             .map_err(|error| reject(error.to_string()))
     }
     pub(super) fn validate_ranking(
@@ -1437,6 +1440,19 @@ impl RoventCollectionRootAdmissionV3 {
             self.rules.as_ref(),
             |ticket| self.validate_ticket(ticket),
             "initial P publication is not from the original admitted /3 Rules owner",
+        )
+    }
+
+    pub(super) fn validate_observed_ranking(
+        &self,
+        ranking: &ProposerRankingPublished,
+        output: &rz_contracts::pals::RoleOutput,
+    ) -> Result<(), AdaptiveCollectionError> {
+        validate_collection_ranking(
+            ranking,
+            self.rules.as_ref(),
+            |ticket| self.validate_observed_output(ticket, output),
+            "published P ranking differs from the original /3 Rules owner",
         )
     }
 }
