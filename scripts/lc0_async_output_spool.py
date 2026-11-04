@@ -91,6 +91,8 @@ class AsyncOutputSpool:
             # Once start is called, even `ident is None` does not establish
             # that no native thread was created (start may be interrupted).
             start_invoked = True
+            if self._notification is not None:
+                self._notification.mark_writer_start_attempted()
             self._thread.start()
         except BaseException as original:
             if start_invoked:

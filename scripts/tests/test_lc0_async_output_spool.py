@@ -99,8 +99,11 @@ class AsyncOutputSpoolTests(unittest.TestCase):
             self.assertIs(owner._original_failure, failure)
             self.assertIsNone(owner._thread.ident)
             os.fstat(owner._fd)
+            with self.assertRaises(RuntimeError):
+                owner._notification.close_before_writer()
             # The mock proves no thread was created; this is fixture-only cleanup.
-            self.assertTrue(owner._notification.close_before_writer())
+            os.close(owner._notification._read)
+            os.close(owner._notification._write)
             os.close(owner._fd)
             owner._fd = None
 

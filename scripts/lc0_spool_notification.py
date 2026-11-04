@@ -38,6 +38,7 @@ class CoalescedSpoolNotification:
         self._coalesced = 0
         self._close_started = False
         self._close_status = "open"
+        self._start_attempted = False
         self._read = None
         self._write = None
         read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
@@ -120,24 +121,31 @@ class CoalescedSpoolNotification:
         with self._lock:
             return tuple(self._close_errors)
 
+    def mark_writer_start_attempted(self):
+        """Close the pre-start cleanup path before invoking Thread.start()."""
+        with self._lock:
+            if self._close_started or self._start_attempted:
+                raise RuntimeError("notification is closed or writer start was already attempted")
+            self._start_attempted = True
+
     def close_after_writer(self):
         """Close once only after the original writer thread is not alive.
 
         The owner additionally verifies that its own output FD was closed.
         A close error is unknown and must not be retried by descriptor number.
         """
-        if self._writer.ident is None or self._writer.is_alive():
-            raise RuntimeError("original spool writer is still alive")
-        return self._close_once()
+        return self._close_once(before_start=False)
 
     def close_before_writer(self):
         """Release a setup failure only if the original writer never started."""
-        if self._writer.ident is not None:
-            raise RuntimeError("original spool writer was started")
-        return self._close_once()
+        return self._close_once(before_start=True)
 
-    def _close_once(self):
+    def _close_once(self, *, before_start):
         with self._lock:
+            if before_start and (self._start_attempted or self._writer.ident is not None):
+                raise RuntimeError("original spool writer start was attempted")
+            if not before_start and (self._writer.ident is None or self._writer.is_alive()):
+                raise RuntimeError("original spool writer is still alive or start is unknown")
             if self._close_started:
                 return False
             self._close_started = True
