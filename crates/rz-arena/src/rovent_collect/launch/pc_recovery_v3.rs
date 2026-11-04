@@ -9,7 +9,9 @@
 //! consequently this WIP must not be enabled for repeated production runs.
 //! None of these operations establishes a fence, validates an output handoff,
 //! or authorizes settlement or resource release.
-use super::pc_lock_v3::{ManagedOutputOwnerV3, PcCollectionOwnersV3};
+use super::pc_lock_v3::{ManagedOutputCloseEvidenceV3, ManagedOutputOwnerV3, PcCollectionOwnersV3};
+use crate::rovent_collect::game_authority_v3::{GamePublishGuardV3, GameStepV3};
+use crate::rovent_collect::pc_hooks_lock_v3::{PcGameClosureProofV3, PcV3LaunchClosure};
 use crate::rovent_collect::pc_hooks_lock_v3::{
     PcSupervisorStopAuthorizationV3, RoventPcCollectionBridgeV3,
 };
@@ -18,12 +20,15 @@ use crate::rovent_collect::pc_worker_v3::{
     PcSupervisorJoinedProofV3, PcSupervisorNoWorkerProofV3, PcWorkerSupervisorV3,
     SupervisorStartCustodyV3,
 };
+use crate::rovent_collect::policy_row_pipeline_v3::PolicyFinalizationV3;
 use crate::rovent_resource_scope::launch::{
     NativeResourceCustody, RoventPcCollectionRecoveryKeyV3, RoventPcCollectionResourceOutcomeV3,
     RoventPcCollectionSettledOutcomeV3,
 };
 use std::any::Any;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
+use std::time::Instant;
 
 /// A busy original owner is pending, never a completed stop or join.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,6 +62,18 @@ pub(crate) enum PcRunRecoveryRecordErrorV3 {
     Invalid,
 }
 
+/// Publication observation only: independent of GPU and parent lease closure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PcOutputClosureV3 {
+    Pending,
+    Progress,
+    Published,
+    NoData,
+    Aborted,
+    Failed,
+    Unknown,
+}
+
 struct OriginalPcRunV3 {
     owners: Arc<PcCollectionOwnersV3>,
     output: Arc<ManagedOutputOwnerV3>,
@@ -70,6 +87,13 @@ struct OriginalPcRunV3 {
     joined_proof: Option<PcSupervisorJoinedProofV3>,
     game_join: PcGameJoinObservationV3,
     game_join_panic: Option<Box<dyn Any + Send>>,
+    output_game_proof: Option<PcGameClosureProofV3>,
+    output_game_closed: bool,
+    output_guard: Option<GamePublishGuardV3<PcWorkerSupervisorV3>>,
+    output_error: Option<super::ArenaError>,
+    output_panic: Option<Box<dyn Any + Send>>,
+    output_terminal: Option<PcOutputClosureV3>,
+    output_close: Option<ManagedOutputCloseEvidenceV3>,
     no_worker_proof: Option<PcSupervisorNoWorkerProofV3>,
     before_admission_join_proof: Option<PcSupervisorBeforeAdmissionJoinProofV3>,
     unstarted_released: bool,
@@ -149,6 +173,13 @@ impl PcRunRecoveryKeyV3 {
                 joined_proof: None,
                 game_join: PcGameJoinObservationV3::Pending,
                 game_join_panic: None,
+                output_game_proof: None,
+                output_game_closed: false,
+                output_guard: None,
+                output_error: None,
+                output_panic: None,
+                output_terminal: None,
+                output_close: None,
                 no_worker_proof: None,
                 before_admission_join_proof: None,
                 unstarted_released: false,
@@ -719,6 +750,187 @@ impl PcRunRecoveryKeyV3 {
             }
         };
         Ok(original.game_join)
+    }
+
+    /// Advance the exact settled game's output without asserting parent lease
+    /// or device completion. The cancellation source is supplied by the caller;
+    /// this method does not create or reset one. Finalization may perform
+    /// synchronous file I/O; the deadline cannot preempt a blocked syscall.
+    /// Call under process supervision, not from a native manager tick.
+    /// Original proof, guard, errors,
+    /// panic and close evidence remain in the same registered recovery slot.
+    pub(crate) fn poll_output_closure(
+        &self,
+        until: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<PcOutputClosureV3, PcDriverEvidenceErrorV3> {
+        let mut guard = match self.0.original.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(PcOutputClosureV3::Pending),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(PcDriverEvidenceErrorV3::Poisoned("recovery"));
+            }
+        };
+        let original = guard
+            .as_mut()
+            .ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(terminal) = original.output_terminal {
+                if original.output_close.is_none() {
+                    original.output_close = original.output.try_close();
+                }
+                return if original.output_close.is_some() {
+                    terminal
+                } else {
+                    PcOutputClosureV3::Pending
+                };
+            }
+            if Instant::now() >= until {
+                return PcOutputClosureV3::Pending;
+            }
+            let Some(settled) = original.settled.as_ref() else {
+                return PcOutputClosureV3::Pending;
+            };
+            if !Arc::ptr_eq(&settled.collection, original.owners.native()) {
+                return PcOutputClosureV3::Unknown;
+            }
+            if settled.native.is_err() {
+                original.output_terminal = Some(PcOutputClosureV3::Failed);
+                return PcOutputClosureV3::Progress;
+            }
+            let Some(joined) = settled.driver_joined.as_ref() else {
+                return PcOutputClosureV3::Pending;
+            };
+            let Some(closure) = settled
+                .hook_custody
+                .downcast_ref::<Arc<PcV3LaunchClosure>>()
+            else {
+                original.output_terminal = Some(PcOutputClosureV3::Unknown);
+                return PcOutputClosureV3::Progress;
+            };
+            if original.game_join == PcGameJoinObservationV3::Pending {
+                original.game_join = match original
+                    .owners
+                    .bridge()
+                    .try_bind_game_joined(joined, original.owners.driver_custody())
+                {
+                    Ok(None) => return PcOutputClosureV3::Pending,
+                    Ok(Some(true)) => PcGameJoinObservationV3::Bound,
+                    Ok(Some(false)) => PcGameJoinObservationV3::Refused,
+                    Err(error) => PcGameJoinObservationV3::Failed(error),
+                };
+            }
+            if original.game_join != PcGameJoinObservationV3::Bound {
+                original.output_terminal = Some(PcOutputClosureV3::Failed);
+                return PcOutputClosureV3::Progress;
+            }
+            if original.output_game_proof.is_none() {
+                match closure.try_game_proof(joined, original.owners.driver_custody()) {
+                    Ok(None) => return PcOutputClosureV3::Pending,
+                    Ok(Some(proof)) => original.output_game_proof = Some(proof),
+                    Err(error) => {
+                        original.output_error = Some(error);
+                        original.output_terminal = Some(PcOutputClosureV3::Failed);
+                        return PcOutputClosureV3::Progress;
+                    }
+                }
+            }
+            let proof = original.output_game_proof.as_ref().expect("proof retained");
+            if !original.output_game_closed {
+                match proof.game().try_close_pc(proof, &mut original.output_error) {
+                    GameStepV3::Ready | GameStepV3::Existing => original.output_game_closed = true,
+                    GameStepV3::Busy => return PcOutputClosureV3::Pending,
+                    GameStepV3::Aborted => {
+                        original.output_terminal = Some(PcOutputClosureV3::Aborted);
+                        return PcOutputClosureV3::Progress;
+                    }
+                    GameStepV3::Unknown => {
+                        original.output_terminal = Some(PcOutputClosureV3::Unknown);
+                        return PcOutputClosureV3::Progress;
+                    }
+                    _ => {
+                        original.output_terminal = Some(PcOutputClosureV3::Failed);
+                        return PcOutputClosureV3::Progress;
+                    }
+                }
+            }
+            if original.output_guard.is_none() {
+                match proof.game().try_begin_publication_pc(
+                    proof,
+                    &mut original.output_guard,
+                    &mut original.output_error,
+                ) {
+                    GameStepV3::Ready => {}
+                    GameStepV3::Busy => return PcOutputClosureV3::Pending,
+                    GameStepV3::Aborted => {
+                        original.output_terminal = Some(PcOutputClosureV3::Aborted);
+                        return PcOutputClosureV3::Progress;
+                    }
+                    GameStepV3::Unknown => {
+                        original.output_terminal = Some(PcOutputClosureV3::Unknown);
+                        return PcOutputClosureV3::Progress;
+                    }
+                    _ => {
+                        original.output_terminal = Some(PcOutputClosureV3::Failed);
+                        return PcOutputClosureV3::Progress;
+                    }
+                }
+            }
+            let publication_guard = original.output_guard.as_mut().expect("guard retained");
+            let step = match proof
+                .pipeline()
+                .try_finalize(publication_guard, until, cancel)
+            {
+                PolicyFinalizationV3::Pending => PcOutputClosureV3::Pending,
+                PolicyFinalizationV3::Progress => PcOutputClosureV3::Progress,
+                PolicyFinalizationV3::Published => PcOutputClosureV3::Published,
+                PolicyFinalizationV3::NoData => PcOutputClosureV3::NoData,
+                PolicyFinalizationV3::Aborted => PcOutputClosureV3::Aborted,
+                PolicyFinalizationV3::Failed => PcOutputClosureV3::Failed,
+                PolicyFinalizationV3::Unknown => PcOutputClosureV3::Unknown,
+            };
+            if !matches!(
+                step,
+                PcOutputClosureV3::Pending | PcOutputClosureV3::Progress
+            ) {
+                original.output_terminal = Some(step);
+                return PcOutputClosureV3::Progress;
+            }
+            step
+        }));
+        match result {
+            Ok(step) => Ok(step),
+            Err(payload) => {
+                original.output_panic = Some(payload);
+                original.output_terminal = Some(PcOutputClosureV3::Unknown);
+                Ok(PcOutputClosureV3::Progress)
+            }
+        }
+    }
+
+    /// Observe the same output-close evidence without moving its original owner.
+    pub(crate) fn output_close_status(
+        &self,
+    ) -> Result<
+        PcDriverPollV3<Option<super::pc_lock_v3::ManagedOutputCloseStatusV3>>,
+        PcDriverEvidenceErrorV3,
+    > {
+        let guard = match self.0.original.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(PcDriverEvidenceErrorV3::Poisoned("recovery"));
+            }
+        };
+        let original = guard
+            .as_ref()
+            .ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
+        Ok(PcDriverPollV3::Ready(
+            original
+                .output_close
+                .as_ref()
+                .map(|evidence| evidence.status()),
+        ))
     }
 
     /// Observe only this original run's game-join result, never GPU success.
