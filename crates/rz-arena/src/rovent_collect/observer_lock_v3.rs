@@ -282,7 +282,7 @@ impl RoventCollectionOwnerLockV3 {
             None => PipelineCapabilityV3::NotReady,
         })
     }
-    pub(crate) fn new_shared(
+    pub(super) fn new_shared(
         manifest: Arc<RoventCorpusManifestLockV3>,
         metadata: RoventCollectionMetadata,
         router: Arc<CaptureRouterV3>,
