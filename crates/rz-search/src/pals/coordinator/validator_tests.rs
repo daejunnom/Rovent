@@ -305,3 +305,62 @@ fn receipt_from_another_owner_is_rejected_with_owned_data_retained() {
             .is_err()
     );
 }
+
+#[test]
+fn revoked_validator_head_permit_is_custody_only_and_keeps_its_exact_source() {
+    let (mut registry, ticket, output) = submitted(RoleQueryPurpose::TaskPolicy);
+    registry
+        .complete_validator_task(RoleCompletion {
+            ticket,
+            physical: PhysicalRoleCompletion::Confirmed,
+            result: Ok(output),
+        })
+        .unwrap();
+    registry
+        .take_ready(deadline().clock, MonotonicTick(0))
+        .unwrap();
+    let (_, verifier) = super::super::NativeAcceptanceIssuer::new_pair();
+    registry
+        .register_native_acceptance_verifier(verifier)
+        .unwrap();
+    let permit = registry
+        .issue_native_acceptance(&ticket, deadline().clock, MonotonicTick(0))
+        .unwrap();
+    assert!(
+        registry
+            .validate_revoked_published_head_native_permit(&ticket, &permit)
+            .is_err()
+    );
+    registry.revoke_all();
+    let before = registry.cumulative_observation();
+    registry
+        .validate_revoked_published_head_native_permit(&ticket, &permit)
+        .unwrap();
+    assert!(
+        registry
+            .validate_revoked_reciprocal_native_permit(&ticket, &permit)
+            .is_err()
+    );
+    let mut foreign = ticket;
+    foreign.authority.root.0 += 1;
+    assert!(
+        registry
+            .validate_revoked_published_head_native_permit(&foreign, &permit)
+            .is_err()
+    );
+    let mut changed = ticket;
+    changed.question = Digest([99; 32]);
+    assert!(
+        registry
+            .validate_revoked_published_head_native_permit(&changed, &permit)
+            .is_err()
+    );
+    assert_eq!(registry.cumulative_observation(), before);
+    assert_eq!(registry.occupancy(), 1);
+    assert_eq!(registry.phase(ticket.id), Some(TicketPhase::Delivered));
+    assert!(
+        registry
+            .accept_validator_task(&ticket, deadline().clock, MonotonicTick(0))
+            .is_err()
+    );
+}

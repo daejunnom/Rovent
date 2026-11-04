@@ -20,6 +20,13 @@ fn invalid(message: &str) -> ArenaError {
     ArenaError::Invalid(message.into())
 }
 
+/// V5 CUDA captures identify a private bundle and require copying it.  A
+/// System CUDA execution needs a separate lock and child receipt; it must not
+/// reinterpret an existing V5 capture or silently choose another backend.
+pub(super) fn legacy_cuda_execution_disabled() -> ArenaError {
+    invalid("G0 legacy CUDA bundle execution is disabled; system CUDA execution is not yet connected")
+}
+
 fn backend_error(error: BackendError) -> ArenaError {
     // Keep the typed I/O/resource distinction and the bounded static stage,
     // without exposing native diagnostics or a private path.

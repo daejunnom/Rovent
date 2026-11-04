@@ -225,29 +225,43 @@ def _owned_file(root, relative):
     return target
 
 
-def _hash_file(path, maximum=MAX_CORPUS_BYTES, *, snapshot=None):
+def _hash_file(path, maximum=MAX_CORPUS_BYTES, *, snapshot=None, read_accounting=None):
     path = Path(path)
     if path.is_symlink() or getattr(path.stat(), "st_file_attributes", 0) & 0x400:
         raise ValueError("linked/reparse actual file cannot be pinned")
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
-    with os.fdopen(descriptor, "rb") as stream:
+    with os.fdopen(descriptor, "rb", buffering=0 if read_accounting is not None else -1) as stream:
         before = os.fstat(stream.fileno())
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= maximum:
             raise ValueError("actual file must be one bounded unlinked regular file")
-        result, count = hashlib.sha256(), 0
-        while block := stream.read(1024 * 1024):
-            count += len(block)
-            if count > maximum:
-                raise ValueError("actual file grew past registered output cap")
-            result.update(block)
-            if snapshot is not None:
-                snapshot.write(block)
-        after = os.fstat(stream.fileno())
-        now = Path(path).stat()
-        identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
-        if identity(before) != identity(after) or identity(after) != identity(now) or count != before.st_size:
-            raise ValueError("actual file changed during verification")
+        lease = None if read_accounting is None else read_accounting.reserve_external(before.st_size + 1)
+        try:
+            result, count = hashlib.sha256(), 0
+            while True:
+                amount = 1024 * 1024 if lease is None else min(1024 * 1024, before.st_size + 1 - count)
+                block = stream.read(amount)
+                if read_accounting is not None:
+                    read_accounting.charge_external(lease, len(block))
+                if not block:
+                    break
+                count += len(block)
+                if count > maximum or lease is not None and count > before.st_size:
+                    raise ValueError("actual file grew past registered output cap")
+                result.update(block)
+                if snapshot is not None:
+                    snapshot.write(block)
+            after = os.fstat(stream.fileno())
+            now = Path(path).stat()
+            identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+            if identity(before) != identity(after) or identity(after) != identity(now) or count != before.st_size:
+                raise ValueError("actual file changed during verification")
+            if read_accounting is not None:
+                read_accounting.finish_external(lease, expected_bytes=count)
+        except BaseException:
+            if lease is not None:
+                read_accounting.fail_external(lease)
+            raise
     return result.hexdigest(), count
 
 

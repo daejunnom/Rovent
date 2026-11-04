@@ -22,8 +22,10 @@ import time
 from .virtual_review import BUCKETS, INPUT_SCHEMA, prepare_payload, registered_encoding_sha256, validate_payload
 
 PLAN_DOMAIN = "rz-pals-numerical-case-plan-v5/1"
+SYSTEM_PLAN_DOMAIN = "rz-pals-numerical-case-plan-v6/1"
 G0_BOOTSTRAP_CASE_SPEC_DOMAIN = "rz-pals-g0-numerical-cases/2"
 RAW_DOMAIN = "rz-pals-numerical-raw-run-v5/1"
+SYSTEM_RAW_DOMAIN = "rz-pals-numerical-raw-run-v6/1"
 TENSOR_DOMAIN = "rz-pals-captured-tensor-bytes-v5/1"
 MAX_FILE_BYTES = 4 * 1024 * 1024
 MAX_MANIFEST_BYTES = 256 * 1024
@@ -34,6 +36,9 @@ _BINDINGS = {"model_profile", "model_schema", "model_semantics", "encoding_schem
              "model_semantic_sha256", "encoding_sha256", "model_epoch", "weights_sha256",
              "export_manifest_sha256", "graphs", "runtime_library_sha256", "cuda_libraries",
              "cuda_manifest_sha256", "backend", "precision", "tf32", "source_components"}
+_SYSTEM_BINDINGS = (_BINDINGS - {"cuda_libraries", "cuda_manifest_sha256"}) | {
+    "system_cuda_config_sha256", "system_cuda_libraries"
+}
 _G0_IMMUTABLE_BINDINGS = _BINDINGS - {"model_epoch", "weights_sha256", "export_manifest_sha256", "graphs"}
 _SOURCE = {"model_native", "model_encoding", "nn_runtime", "model_reference", "model_export"}
 _INTEGER = {"anchor_board", "record_anchor", "record_line_tokens", "candidates", "query_anchor",
@@ -88,6 +93,43 @@ def validate_bindings(value):
             raise ValueError("CPU binding cannot claim CUDA bundle")
     elif not cuda or not _sha(value["cuda_manifest_sha256"]):
         raise ValueError("CUDA binding requires registered native bundle")
+    return copy.deepcopy(value)
+
+
+def validate_system_bindings(value):
+    """Validate V6 identities without treating installed files as a V5 bundle.
+
+    These are declared identities; capture and mapping must be separately
+    observed by the native owner. No library is opened by this function.
+    """
+    if type(value) is not dict or set(value) != _SYSTEM_BINDINGS:
+        raise ValueError("exact V6 system CUDA numerical binding fields required")
+    if value["backend"] != "ort_cuda_system" or not _sha(value["system_cuda_config_sha256"]):
+        raise ValueError("explicit system CUDA backend and config digest required")
+    libraries = value["system_cuda_libraries"]
+    if type(libraries) is not list or not 1 <= len(libraries) <= 64:
+        raise ValueError("bounded system CUDA library roster required")
+    previous = None
+    by_role = {}
+    for item in libraries:
+        if (type(item) is not dict or set(item) != {"role", "sha256", "bytes", "required_mapping"}
+                or not _id(item["role"]) or previous is not None and previous >= item["role"]
+                or not _sha(item["sha256"]) or type(item["bytes"]) is not int
+                or not 0 < item["bytes"] < 2 ** 64 or type(item["required_mapping"]) is not bool):
+            raise ValueError("ordered unique system CUDA library identities required")
+        previous = item["role"]
+        by_role[item["role"]] = item
+    core = by_role.get("ort-core")
+    provider = by_role.get("ort-provider-cuda")
+    if (core is None or not core["required_mapping"] or core["sha256"] != value["runtime_library_sha256"]
+            or provider is None or not provider["required_mapping"]):
+        raise ValueError("required system ORT core and CUDA provider identities differ")
+    # Reuse the unchanged V5 validation of shared model/encoding/source fields.
+    # This temporary validation object is never returned or serialized.
+    shared = {k: copy.deepcopy(v) for k, v in value.items()
+              if k not in {"system_cuda_config_sha256", "system_cuda_libraries"}}
+    shared.update(backend="ort_cpu", cuda_libraries=[], cuda_manifest_sha256=None)
+    validate_bindings(shared)
     return copy.deepcopy(value)
 
 
@@ -194,6 +236,16 @@ def make_case_plan(bindings):
     return result
 
 
+def make_system_case_plan(bindings):
+    """Register the distinct V6 system CUDA plan without executing a model."""
+    bindings = validate_system_bindings(bindings)
+    roles = _ROLES if "validator" in bindings["graphs"] else _ROLES[:2]
+    result = {"schema_version": 6, "domain": SYSTEM_PLAN_DOMAIN, "bindings": bindings,
+              "invocation": "fresh", "batch": 1, "groups": _make_case_groups(roles)}
+    validate_system_case_plan(result)
+    return result
+
+
 def make_g0_bootstrap_case_spec(immutable_bindings):
     """Predeclare G0 math cases without identifiers for future generated assets.
 
@@ -267,6 +319,21 @@ def validate_case_plan(plan):
     if type(plan) is not dict or set(plan) != {"schema_version", "domain", "bindings", "invocation", "batch", "groups"} or type(plan["schema_version"]) is not int or plan["schema_version"] != 5 or plan["domain"] != PLAN_DOMAIN or plan["invocation"] != "fresh" or type(plan["batch"]) is not int or plan["batch"] != 1:
         raise ValueError("registered Fresh B1 case plan required")
     validate_bindings(plan["bindings"])
+    return _validate_case_groups(plan)
+
+
+def validate_system_case_plan(plan):
+    if (type(plan) is not dict
+            or set(plan) != {"schema_version", "domain", "bindings", "invocation", "batch", "groups"}
+            or type(plan["schema_version"]) is not int or plan["schema_version"] != 6
+            or plan["domain"] != SYSTEM_PLAN_DOMAIN or plan["invocation"] != "fresh"
+            or type(plan["batch"]) is not int or plan["batch"] != 1):
+        raise ValueError("registered system CUDA Fresh B1 case plan required")
+    validate_system_bindings(plan["bindings"])
+    return _validate_case_groups(plan)
+
+
+def _validate_case_groups(plan):
     if type(plan["groups"]) is not list or not 1 <= len(plan["groups"]) <= 32:
         raise ValueError("bounded case groups required")
     seen, group_ids, total = set(), set(), 0
@@ -319,6 +386,11 @@ def write_case_plan(bindings, destination):
     return _publish(make_case_plan(bindings), destination, 0)
 
 
+def write_system_case_plan(bindings, destination):
+    """Publish the system-specific plan without invoking a model or CUDA."""
+    return _publish(make_system_case_plan(bindings), destination, 0)
+
+
 def _regular_read(path, limit):
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= limit:
@@ -364,7 +436,7 @@ def _digest_asset(path, deadline):
     return digest.hexdigest()
 
 
-def _verify_model_checkpoint(model, checkpoint_path, expected_sha256, deadline, torch):
+def _verify_model_checkpoint(model, checkpoint_path, expected_sha256, deadline, torch, *, require_pt_suffix=True):
     """Same private file descriptor for pin/decode/pin; never mutate caller.
 
     A full generation checkpoint can include V and optimizer state. Such state
@@ -373,7 +445,7 @@ def _verify_model_checkpoint(model, checkpoint_path, expected_sha256, deadline, 
     This verifies mathematical weight identity, not training eligibility.
     """
     path = Path(checkpoint_path).expanduser()
-    if path.suffix != ".pt" or path.is_symlink():
+    if (require_pt_suffix and path.suffix != ".pt") or path.is_symlink():
         raise ValueError("owned regular .pt checkpoint required")
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 2 * 1024 ** 3:
@@ -432,10 +504,30 @@ def capture_reference(model, metadata, export_directory, plan, output_root, *, c
     captures actual model math only. It never starts ORT, runs an optimizer,
     consumes native outputs, writes a ``passed`` receipt or claims CUDA fences.
     """
+    return _capture_reference(model, metadata, export_directory, plan, output_root,
+                              checkpoint_path=checkpoint_path,
+                              expected_reference_source_sha256=expected_reference_source_sha256,
+                              max_seconds=max_seconds, execute=execute, system=False)
+
+
+def capture_system_reference(model, metadata, export_directory, plan, output_root, *, checkpoint_path, expected_reference_source_sha256, max_seconds=600, execute=False):
+    """Capture the same independent CPU math under the distinct V6 system plan.
+
+    The system identities are declarations for the native producer. Reference
+    execution never loads those libraries or establishes GPU completion.
+    """
+    return _capture_reference(model, metadata, export_directory, plan, output_root,
+                              checkpoint_path=checkpoint_path,
+                              expected_reference_source_sha256=expected_reference_source_sha256,
+                              max_seconds=max_seconds, execute=execute, system=True)
+
+
+def _capture_reference(model, metadata, export_directory, plan, output_root, *, checkpoint_path, expected_reference_source_sha256, max_seconds, execute, system):
     if execute is not True:
         raise ValueError("actual reference capture requires explicit execute=True")
     started = time.monotonic()
-    validate_case_plan(plan)
+    validate = validate_system_case_plan if system else validate_case_plan
+    validate(plan)
     bindings = plan["bindings"]
     actual_sources = source_pins()
     if (not _sha(expected_reference_source_sha256) or bindings["source_components"]["model_reference"] != expected_reference_source_sha256
@@ -495,15 +587,15 @@ def capture_reference(model, metadata, export_directory, plan, output_root, *, c
                 # Public tensors and graph-local latent are owned only by this
                 # call, rather than retained for the full case roster.
                 del raw, memory, data
-            receipt = {"schema_version": 5, "domain": RAW_DOMAIN, "run_id": "reference." + group["id"],
+            receipt = {"schema_version": 6 if system else 5, "domain": SYSTEM_RAW_DOMAIN if system else RAW_DOMAIN, "run_id": "reference." + group["id"],
                        "producer": "independent_pytorch_fp32", "producer_source_component": bindings["source_components"]["model_reference"], "bindings": bindings,
                        "invocation": "fresh", "batch": 1, "observed_provider": None, "completed_nn_inputs": 0, "public_cache_hits": 0,
                        "physical_completion_known": False, "cases": cases}
             item = _publish(receipt, Path(output_root) / ("reference." + group["id"] + ".json"), total)
             total += item["bytes"]; artifacts.append(item)
             del cases, receipt
-    return {"domain": RAW_DOMAIN, "producer": "independent_pytorch_fp32", "artifacts": artifacts, "bytes": total,
-            "cases": validate_case_plan(plan), "native_status": "not_run", "rules_certified": False,
+    return {"domain": SYSTEM_RAW_DOMAIN if system else RAW_DOMAIN, "producer": "independent_pytorch_fp32", "artifacts": artifacts, "bytes": total,
+            "cases": validate(plan), "native_status": "not_run", "rules_certified": False,
             "reference_software": {"torch_version": str(torch.__version__), "device": "cpu", "dtype": "fp32",
                                    "intra_threads": torch.get_num_threads(), "inter_threads": torch.get_num_interop_threads(),
                                    "tf32": False}}

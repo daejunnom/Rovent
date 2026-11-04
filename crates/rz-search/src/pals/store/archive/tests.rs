@@ -978,6 +978,192 @@ fn observation(state: StateId) -> Observation {
         execution: None,
     }
 }
+
+#[test]
+fn partial_line_observation_worklist_matches_original_closure_or_reports_unsupported() {
+    use super::partial_closure_cursor::{Cursor, Error};
+    let mut store = PalsStores::new(limits());
+    let root = store
+        .focus_actual_moves(Position::startpos().snapshot())
+        .unwrap();
+    let state = store.situations.get(root).unwrap().state;
+    let line_root = store.lines.root(state).unwrap();
+    let line = store
+        .lines
+        .append(line_root, &[mv("e2e4"), mv("e7e5")])
+        .unwrap();
+    let earlier = store.observations.append(observation(state)).unwrap();
+    let mut latest = observation(state);
+    latest.line = Some(line);
+    latest.supersedes = Some(earlier);
+    let latest = store.observations.append(latest).unwrap();
+    let mut seed = StorePins::default();
+    seed.observations.insert(latest);
+    let expected = store.retirement_dependency_closure(&seed, 128).unwrap();
+    let mut cursor = Cursor::new(seed.clone(), 128).unwrap();
+    while !cursor.step(&store, &mut || Ok(())).unwrap() {}
+    assert_eq!(cursor.into_completed().unwrap(), expected);
+
+    let mut cursor = Cursor::new(seed.clone(), 2).unwrap();
+    let error = loop {
+        match cursor.step(&store, &mut || Ok(())) {
+            Err(error) => break error,
+            Ok(false) => {}
+            Ok(true) => panic!("partial cursor unexpectedly fit the limit"),
+        }
+    };
+    assert!(matches!(error, Error::Store(StoreError::Capacity(_))));
+    assert!(matches!(
+        store.retirement_dependency_closure(&seed, 2),
+        Err(StoreError::Capacity(_))
+    ));
+    assert!(matches!(cursor.into_completed(), Err(Error::Unsupported)));
+
+    let mut cursor = Cursor::new(seed.clone(), 128).unwrap();
+    assert_eq!(
+        cursor.step(&store, &mut || Err(StoreError::CancelledConsumer)),
+        Err(Error::Store(StoreError::CancelledConsumer))
+    );
+    assert!(matches!(cursor.into_completed(), Err(Error::Unsupported)));
+    let mut unsupported = seed;
+    unsupported.situations.insert(root);
+    assert!(matches!(
+        Cursor::new(unsupported, 128),
+        Err(Error::Unsupported)
+    ));
+}
+
+#[test]
+fn partial_cursor_expected_edges_cover_pv_parent_supersedes_and_both_model_inputs() {
+    use super::partial_closure_cursor::{Cursor, Error};
+    let mut store = PalsStores::new(limits());
+    let mut position = Position::startpos();
+    let root = store.focus_actual_moves(position.snapshot()).unwrap();
+    let root_situation = store.situations.get(root).unwrap();
+    let state = root_situation.state;
+    let line_root = root_situation.focus;
+    let line_first = store.lines.append(line_root, &[mv("e2e4")]).unwrap();
+    let line_reply = store.lines.append(line_first, &[mv("e7e5")]).unwrap();
+    let line_pv = store.lines.append(line_root, &[mv("d2d4")]).unwrap();
+
+    // Typed synthetic Store fixtures; these do not attest a real CPU run.
+    let mut cpu = observation(state);
+    cpu.line = Some(line_first);
+    cpu.cpu_pv = Some(line_pv);
+    let cpu_id = store.observations.append(cpu).unwrap();
+    position.make_move(mv("e2e4")).unwrap();
+    let repaired_state = store.states.insert(position.snapshot()).unwrap();
+    let repaired = store
+        .observations
+        .append(context_model_observation(
+            repaired_state,
+            Color::Black,
+            [0.1, 0.2, 0.7],
+            43,
+        ))
+        .unwrap();
+    position.make_move(mv("e7e5")).unwrap();
+    let counter_state = store.states.insert(position.snapshot()).unwrap();
+    let counter = store
+        .observations
+        .append(context_model_observation(
+            counter_state,
+            Color::White,
+            [0.2, 0.3, 0.5],
+            43,
+        ))
+        .unwrap();
+    let mut conditional = model_observation(state, Color::White, [0.2, 0.3, 0.5]);
+    conditional.line = Some(line_reply);
+    conditional.supersedes = Some(cpu_id);
+    conditional.kind = ObservationKind::Refutation;
+    conditional.model_value_identity = None;
+    conditional.model_value_input = None;
+    conditional.score = RawScore::ConditionalWdl {
+        expectation: 0.2 - 0.5,
+        perspective: Color::White,
+        repaired,
+        counter,
+        context_revision: 43,
+    };
+    let conditional_id = store.observations.append(conditional.clone()).unwrap();
+    assert_eq!(
+        line_closure_edges(store.lines.get(line_reply).unwrap()),
+        [
+            Some(ClosureEdge::State(state)),
+            Some(ClosureEdge::Line(line_first)),
+        ]
+    );
+    assert_eq!(
+        observation_closure_edges(&conditional),
+        [
+            (Some(ClosureEdge::State(state)), false),
+            (Some(ClosureEdge::Line(line_reply)), true),
+            (None, true),
+            (Some(ClosureEdge::Observation(cpu_id)), true),
+            (Some(ClosureEdge::Observation(repaired)), true),
+            (Some(ClosureEdge::Observation(counter)), true),
+            (None, false),
+        ]
+    );
+    let mut conditional_repair = conditional.clone();
+    conditional_repair.score = RawScore::ConditionalRepairWdl {
+        expectation: 0.0,
+        perspective: Color::White,
+        before: repaired,
+        after: counter,
+        context_revision: 43,
+    };
+    assert_eq!(
+        observation_closure_edges(&conditional_repair),
+        observation_closure_edges(&conditional)
+    );
+    let mut seed = StorePins::default();
+    seed.observations.insert(conditional_id);
+    let expected = StorePins {
+        states: [state, repaired_state, counter_state].into_iter().collect(),
+        lines: [line_root, line_first, line_reply, line_pv]
+            .into_iter()
+            .collect(),
+        observations: [cpu_id, repaired, counter, conditional_id]
+            .into_iter()
+            .collect(),
+        situations: BTreeSet::new(),
+        executions: BTreeSet::new(),
+    };
+    let mut cursor = Cursor::new(seed.clone(), 128).unwrap();
+    while !cursor.step(&store, &mut || Ok(())).unwrap() {}
+    assert_eq!(cursor.into_completed().unwrap(), expected);
+    assert_eq!(
+        store.retirement_dependency_closure(&seed, 128).unwrap(),
+        expected
+    );
+
+    let TaskAdmission::Start(execution) = store
+        .request_task(
+            key(state),
+            TaskConsumer {
+                id: 711,
+                situation: root,
+                revision: 0,
+                generation: store.generation(),
+                deadline_tick: 100,
+            },
+            0,
+        )
+        .unwrap()
+    else {
+        panic!("fixture task must start")
+    };
+    let mut has_execution = observation(state);
+    has_execution.execution = Some(execution);
+    let id = store.observations.append(has_execution).unwrap();
+    let mut execution_seed = StorePins::default();
+    execution_seed.observations.insert(id);
+    let mut cursor = Cursor::new(execution_seed, 128).unwrap();
+    assert_eq!(cursor.step(&store, &mut || Ok(())), Err(Error::Unsupported));
+    assert!(matches!(cursor.into_completed(), Err(Error::Unsupported)));
+}
 fn key(state: StateId) -> TaskKey {
     TaskKey {
         state,
@@ -1771,6 +1957,707 @@ fn foreign_observation(
     o.execution = Some(execution);
     o.external_report = Some(Box::new(report));
     o
+}
+
+fn live_profiled_fixture(
+    store: &mut PalsStores,
+    requested: ProfiledExternalConstraint,
+) -> Observation {
+    let position = Position::startpos();
+    let root = store.focus_actual_moves(position.snapshot()).unwrap();
+    let state = store.situations.get(root).unwrap().state;
+    let mut key = foreign_key(state);
+    key.question = TaskQuestion::ProfiledExternal { requested };
+    key.requested_depth = requested.requested_depth().unwrap_or(0);
+    key.node_budget = requested.requested_nodes().unwrap_or(0);
+    let TaskAdmission::Start(execution) = store
+        .request_task(
+            key,
+            TaskConsumer {
+                id: 71,
+                situation: root,
+                revision: 0,
+                generation: store.generation(),
+                deadline_tick: 100,
+            },
+            0,
+        )
+        .unwrap()
+    else {
+        panic!("profiled archive task")
+    };
+    let pv = store.append_cpu_pv(&position, &[mv("e2e4")]).unwrap();
+    let mut raw = foreign_observation(state, execution, pv, mv("e2e4"), Color::White, 1);
+    let report = raw.external_report.as_mut().unwrap();
+    report.requested_depth = requested.requested_depth().unwrap_or(0);
+    raw.scope = EvidenceScope::ProfiledExternalUci {
+        requested,
+        issued: requested,
+        reported_depth: report.reported_depth,
+        seldepth: report.seldepth,
+        bound: report.bound,
+    };
+    raw
+}
+
+#[test]
+fn review_projection_keeps_pinned_observation_closure_and_rejects_limits() {
+    let mut store = PalsStores::new(limits());
+    let raw = live_profiled_fixture(
+        &mut store,
+        ProfiledExternalConstraint::Nodes { reported_nodes: 16 },
+    );
+    let observation = store.append_observation(raw.clone()).unwrap();
+    let mut seed = StorePins::default();
+    seed.observations.insert(observation);
+    let pin = store.pin_review(seed).unwrap();
+    let before = store.hot_stats();
+    let bytes = store
+        .project_review_store_closure(&pin, 128, 1 << 20, &mut || Ok(()))
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["schema"], "rz-pals-review-store-projection/1");
+    assert_eq!(value["observations"][0][0], observation.0);
+    assert_eq!(
+        value["observations"][0][1],
+        serde_json::to_value(ObservationWire::encode(&raw).unwrap()).unwrap()
+    );
+    assert!(!value["states"].as_array().unwrap().is_empty());
+    assert!(!value["lines"].as_array().unwrap().is_empty());
+    assert!(!value["executions"].as_array().unwrap().is_empty());
+    assert_eq!(before, store.hot_stats());
+    assert_eq!(
+        store.project_review_store_closure(&pin, 128, 1, &mut || Ok(())),
+        Err(StoreError::ArchiveByteBudget)
+    );
+    assert!(matches!(
+        store.project_review_store_closure(&pin, 1, 1 << 20, &mut || Ok(())),
+        Err(StoreError::Capacity(_))
+    ));
+    assert_eq!(
+        store.project_review_store_closure(&pin, 128, 1 << 20, &mut || Err(
+            StoreError::ArchiveDeadline
+        )),
+        Err(StoreError::ArchiveDeadline)
+    );
+    let other = PalsStores::new(limits());
+    assert_eq!(
+        other.project_review_store_closure(&pin, 128, 1 << 20, &mut || Ok(())),
+        Err(StoreError::StaleConsumer)
+    );
+    {
+        let _busy = store.review_pins.lock().unwrap();
+        assert_eq!(
+            store.project_review_store_closure(&pin, 128, 1 << 20, &mut || Ok(())),
+            Err(StoreError::ArchiveIo {
+                stage: "review projection pin registry busy",
+                kind: std::io::ErrorKind::WouldBlock
+            })
+        );
+    }
+    let mut calls = 0_usize;
+    store
+        .project_review_store_closure(&pin, 128, 1 << 20, &mut || {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    let final_call = calls;
+    calls = 0;
+    assert_eq!(
+        store.project_review_store_closure(&pin, 128, 1 << 20, &mut || {
+            calls += 1;
+            if calls == final_call {
+                Err(StoreError::CancelledConsumer)
+            } else {
+                Ok(())
+            }
+        }),
+        Err(StoreError::CancelledConsumer)
+    );
+    let mut calls = 0;
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = store.project_review_store_closure(&pin, 128, 1 << 20, &mut || {
+            calls += 1;
+            if calls == 3 {
+                panic!("control callback panic while registry is held");
+            }
+            Ok(())
+        });
+    }));
+    assert!(panic.is_err());
+    assert!(!store.review_pins.is_poisoned());
+    assert!(pin.validates(&store));
+    assert!(
+        store
+            .project_review_store_closure(&pin, 128, 1 << 20, &mut || Ok(()))
+            .is_ok()
+    );
+}
+
+#[test]
+fn retirement_writers_preserve_existing_wire_bytes_and_unpublished_source_values() {
+    let mut store = PalsStores::new(limits());
+    let raw = live_profiled_fixture(
+        &mut store,
+        ProfiledExternalConstraint::Nodes { reported_nodes: 16 },
+    );
+    let source = store.states.get(raw.state).unwrap().clone();
+    let pv = raw.cpu_pv.unwrap();
+    let before = store.hot_stats();
+    let mut actual = Vec::new();
+    store
+        .write_retirement_state(raw.state, &mut actual as &mut dyn Write)
+        .unwrap();
+    assert_eq!(
+        actual,
+        serde_json::to_vec(&StateWire::encode(raw.state, &source).unwrap()).unwrap()
+    );
+    actual.clear();
+    store.write_retirement_line(pv, &mut actual).unwrap();
+    assert_eq!(
+        actual,
+        serde_json::to_vec(&LineWire::encode(pv, store.lines.get(pv).unwrap())).unwrap()
+    );
+    actual.clear();
+    store
+        .write_retirement_observation_value(&raw, &mut actual)
+        .unwrap();
+    let expected = serde_json::to_vec(&ObservationWire::encode(&raw).unwrap()).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(store.hot_stats(), before);
+    assert_eq!(store.observations.len(), 0);
+    let report = raw.external_report.as_deref().unwrap();
+    actual.clear();
+    store
+        .write_retirement_external_report(report, &mut actual)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&actual).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(&expected).unwrap()["external"]
+    );
+    let observation = store.append_observation(raw.clone()).unwrap();
+    actual.clear();
+    store
+        .write_retirement_observation(observation, &mut actual)
+        .unwrap();
+    assert_eq!(actual, expected);
+    let record = crate::pals::engine::RoleRecord {
+        revision: 7,
+        parent_revision: Some(3),
+        supersedes_revision: Some(2),
+        origin_state: raw.state,
+        kind: crate::pals::engine::RecordKind::Counterexample,
+        line: vec![mv("e2e4")],
+        value: None,
+        completed_depth: 0,
+        score_scope: None,
+        cpu_observation: Some(observation),
+        perspective: Color::White,
+        critical: true,
+    };
+    actual.clear();
+    store
+        .write_retirement_role_record(&record, &mut actual)
+        .unwrap();
+    assert_eq!(
+        actual,
+        serde_json::to_vec(&RoleRecordWire::encode(&record).unwrap()).unwrap()
+    );
+    // An original source snapshot is not replaced by today's hot state/board.
+    let absent = StateId(usize::MAX);
+    actual.clear();
+    assert!(store.write_retirement_state(absent, &mut actual).is_err());
+    assert!(actual.is_empty());
+    store
+        .write_retirement_snapshot(absent, &source, &mut actual)
+        .unwrap();
+    assert_eq!(
+        actual,
+        serde_json::to_vec(&StateWire::encode(absent, &source).unwrap()).unwrap()
+    );
+    assert!(store.states.get(absent).is_err());
+    assert_eq!(store.observations.len(), 1);
+}
+
+#[test]
+fn retirement_writer_preserves_the_bounded_sink_io_failure() {
+    struct FailedWriter;
+    impl Write for FailedWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "authored bounded writer failure",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut store = PalsStores::new(limits());
+    let raw = live_profiled_fixture(
+        &mut store,
+        ProfiledExternalConstraint::Nodes { reported_nodes: 16 },
+    );
+    let before = store.hot_stats();
+    assert_eq!(
+        store.write_retirement_observation_value(&raw, &mut FailedWriter),
+        Err(StoreError::ArchiveIo {
+            stage: "retirement record serialization",
+            kind: std::io::ErrorKind::BrokenPipe
+        })
+    );
+    assert_eq!(store.hot_stats(), before);
+    assert_eq!(store.observations.len(), 0);
+}
+
+#[test]
+fn retirement_closure_keeps_original_consumers_and_checks_unique_pin_bound() {
+    let mut store = PalsStores::new(limits());
+    let position = Position::startpos();
+    let root = store.focus_actual_moves(position.snapshot()).unwrap();
+    let state = store.situations.get(root).unwrap().state;
+    let focus = store.append_cpu_pv(&position, &[mv("e2e4")]).unwrap();
+    let other = store.situations.insert(state, focus).unwrap();
+    let original = TaskConsumer {
+        id: 81,
+        situation: root,
+        revision: 0,
+        generation: store.generation(),
+        deadline_tick: 100,
+    };
+    let TaskAdmission::Start(execution) = store.request_task(key(state), original, 0).unwrap()
+    else {
+        panic!("retirement closure task")
+    };
+    assert!(
+        matches!(store.request_task(key(state), TaskConsumer { id: 82, situation: other, ..original }, 0).unwrap(), TaskAdmission::Join(id) if id == execution)
+    );
+    store.tasks.cancel_consumer(execution, original.id).unwrap();
+    store.tasks.fail(execution).unwrap();
+    let evidence = store.append_observation(observation(state)).unwrap();
+    store.dependencies.add(evidence, other).unwrap();
+    let seed = StorePins {
+        executions: BTreeSet::from([execution]),
+        ..StorePins::default()
+    };
+    let original_seed = seed.clone();
+    let before = store.hot_stats();
+    let closure = store.retirement_dependency_closure(&seed, 32).unwrap();
+    assert_eq!(closure.situations, BTreeSet::from([root, other]));
+    assert!(closure.lines.contains(&focus));
+    assert!(closure.states.contains(&state));
+    assert!(closure.observations.contains(&evidence));
+    assert_eq!(
+        store.retirement_dependency_edges().collect::<Vec<_>>(),
+        vec![(evidence, &BTreeSet::from([other]))]
+    );
+    assert_eq!(
+        store
+            .retirement_dependency_closure(&seed, closure.count())
+            .unwrap(),
+        closure
+    );
+    assert_eq!(
+        store.retirement_dependency_closure(&seed, closure.count() - 1),
+        Err(StoreError::Capacity("retirement dependency closure"))
+    );
+    assert_eq!(
+        store.retirement_dependency_closure(&seed, 0),
+        Err(StoreError::Capacity("retirement dependency closure"))
+    );
+    // Existing archive selection semantics do not start retaining historical
+    // consumers merely because the retirement reader requires their records.
+    let legacy = store.expand_pins(seed.clone()).unwrap();
+    assert!(legacy.situations.is_empty());
+    assert!(!legacy.observations.contains(&evidence));
+    assert_eq!(seed, original_seed);
+    assert_eq!(store.hot_stats(), before);
+}
+
+#[test]
+fn experimental_worklist_visits_situation_task_and_reverse_edges_incrementally() {
+    use super::partial_closure_cursor::Cursor;
+    let mut store = PalsStores::new(limits());
+    let position = Position::startpos();
+    let root = store.focus_actual_moves(position.snapshot()).unwrap();
+    let state = store.situations.get(root).unwrap().state;
+    let line_root = store.situations.get(root).unwrap().focus;
+    let line_first = store.lines.append(line_root, &[mv("e2e4")]).unwrap();
+    let line_repair = store.lines.append(line_first, &[mv("e7e5")]).unwrap();
+    let other = store.situations.insert(state, line_first).unwrap();
+    let unrelated = store.situations.insert(state, line_root).unwrap();
+    let evidence = store.append_observation(observation(state)).unwrap();
+    let reverse = store.append_observation(observation(state)).unwrap();
+    let terminal = store.append_observation(observation(state)).unwrap();
+    let unrelated_observation = store.append_observation(observation(state)).unwrap();
+    store
+        .situations
+        .get_mut(root)
+        .unwrap()
+        .conclusions
+        .continuations
+        .insert(
+            line_first,
+            ContinuationConclusion {
+                status: ContinuationStatus::RepairedBy(line_repair),
+                evidence: Some(evidence),
+                revision: 1,
+            },
+        );
+    store.dependencies.add(reverse, root).unwrap();
+    store
+        .dependencies
+        .add(unrelated_observation, unrelated)
+        .unwrap();
+    let consumer = TaskConsumer {
+        id: 81,
+        situation: root,
+        revision: 0,
+        generation: store.generation(),
+        deadline_tick: 100,
+    };
+    let TaskAdmission::Start(execution) = store.request_task(key(state), consumer, 0).unwrap()
+    else {
+        panic!("fixture task")
+    };
+    assert!(
+        matches!(store.request_task(key(state), TaskConsumer { id: 82, situation: other, ..consumer }, 0).unwrap(), TaskAdmission::Join(id) if id == execution)
+    );
+    // Task-table fixture only; no actual worker or physical-completion claim.
+    store.tasks.complete(execution, terminal).unwrap();
+    let mut seed = StorePins::default();
+    seed.executions.insert(execution);
+    let expected = StorePins {
+        states: BTreeSet::from([state]),
+        lines: BTreeSet::from([line_root, line_first, line_repair]),
+        observations: BTreeSet::from([evidence, reverse, terminal]),
+        situations: BTreeSet::from([root, other]),
+        executions: BTreeSet::from([execution]),
+    };
+    let mut cursor = Cursor::new_complex(seed.clone(), 128, true).unwrap();
+    let mut steps = 0;
+    let mut done = false;
+    for _ in 0..128 {
+        steps += 1;
+        if cursor.step(&store, &mut || Ok(())).unwrap() {
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+    assert!(steps > 10);
+    assert_eq!(cursor.into_completed().unwrap(), expected);
+    assert_eq!(
+        store.retirement_dependency_closure(&seed, 128).unwrap(),
+        expected
+    );
+    let expected_legacy = StorePins {
+        states: BTreeSet::from([state]),
+        observations: BTreeSet::from([terminal]),
+        executions: BTreeSet::from([execution]),
+        ..StorePins::default()
+    };
+    let mut legacy = Cursor::new_complex(seed.clone(), 128, false).unwrap();
+    let mut done = false;
+    for _ in 0..128 {
+        if legacy.step(&store, &mut || Ok(())).unwrap() {
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+    assert_eq!(legacy.into_completed().unwrap(), expected_legacy);
+    assert_eq!(store.expand_pins(seed.clone()).unwrap(), expected_legacy);
+    for interrupt_after in 0..steps - 1 {
+        let mut interrupted = Cursor::new_complex(seed.clone(), 128, true).unwrap();
+        for _ in 0..interrupt_after {
+            assert!(!interrupted.step(&store, &mut || Ok(())).unwrap());
+        }
+        assert!(matches!(
+            interrupted.step(&store, &mut || Err(StoreError::ArchiveDeadline)),
+            Err(super::partial_closure_cursor::Error::Store(
+                StoreError::ArchiveDeadline
+            ))
+        ));
+        assert!(matches!(
+            interrupted.into_completed(),
+            Err(super::partial_closure_cursor::Error::Unsupported)
+        ));
+    }
+}
+
+#[test]
+fn experimental_worklist_retains_resumed_paused_and_retired_pause_sources() {
+    use super::partial_closure_cursor::{Cursor, Error};
+    let mut store = PalsStores::new(limits());
+    let root = store
+        .focus_actual_moves(Position::startpos().snapshot())
+        .unwrap();
+    let state = store.situations.get(root).unwrap().state;
+    let focus = store.situations.get(root).unwrap().focus;
+    let consumer = TaskConsumer {
+        id: 91,
+        situation: root,
+        revision: 0,
+        generation: store.generation(),
+        deadline_tick: 100,
+    };
+    let task_key = key(state);
+    let TaskAdmission::Start(original) = store.request_task(task_key.clone(), consumer, 0).unwrap()
+    else {
+        panic!("fixture task")
+    };
+    let evidence = store.append_observation(observation(state)).unwrap();
+    // Store-only fixture. No CPU worker, checkpoint validity, or completion is asserted.
+    store.tasks.pause(original, 7, Some(evidence)).unwrap();
+    let TaskAdmission::Resume {
+        execution: resumed,
+        previous,
+        checkpoint,
+    } = store
+        .request_task(task_key, TaskConsumer { id: 92, ..consumer }, 1)
+        .unwrap()
+    else {
+        panic!("fixture resume")
+    };
+    assert_eq!((previous, checkpoint), (original, 7));
+    let mut seed = StorePins::default();
+    seed.executions.insert(resumed);
+    let expected = StorePins {
+        states: BTreeSet::from([state]),
+        lines: BTreeSet::from([focus]),
+        observations: BTreeSet::from([evidence]),
+        situations: BTreeSet::from([root]),
+        executions: BTreeSet::from([original, resumed]),
+    };
+    for retired in [false, true] {
+        if retired {
+            assert_eq!(
+                store.tasks.retire_paused_except(&BTreeSet::new()).unwrap(),
+                1
+            );
+            assert_eq!(
+                store.tasks.get(original).unwrap().status,
+                TaskStatus::RetiredPaused {
+                    checkpoint: 7,
+                    evidence: Some(evidence)
+                }
+            );
+        } else {
+            assert_eq!(
+                store.tasks.get(original).unwrap().status,
+                TaskStatus::Paused {
+                    checkpoint: 7,
+                    evidence: Some(evidence)
+                }
+            );
+        }
+        let mut cursor = Cursor::new_complex(seed.clone(), expected.count(), true).unwrap();
+        let mut done = false;
+        for _ in 0..128 {
+            if cursor.step(&store, &mut || Ok(())).unwrap() {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
+        assert_eq!(cursor.into_completed().unwrap(), expected);
+        assert_eq!(
+            store
+                .retirement_dependency_closure(&seed, expected.count())
+                .unwrap(),
+            expected
+        );
+        let mut limited = Cursor::new_complex(seed.clone(), expected.count() - 1, true).unwrap();
+        let result = loop {
+            match limited.step(&store, &mut || Ok(())) {
+                Ok(false) => {}
+                result => break result,
+            }
+        };
+        assert!(matches!(result, Err(Error::Store(StoreError::Capacity(_)))));
+        assert!(matches!(limited.into_completed(), Err(Error::Unsupported)));
+        assert!(matches!(
+            store.retirement_dependency_closure(&seed, expected.count() - 1),
+            Err(StoreError::Capacity(_))
+        ));
+    }
+}
+
+#[test]
+fn experimental_worklist_rejects_old_situation() {
+    use super::partial_closure_cursor::{Cursor, Error};
+    let mut store = PalsStores::new(limits());
+    let root = store
+        .focus_actual_moves(Position::startpos().snapshot())
+        .unwrap();
+    let state = store.situations.get(root).unwrap().state;
+    let focus = store.situations.get(root).unwrap().focus;
+    let old = store.situations.insert(state, focus).unwrap();
+    store.situations.remove(old).unwrap();
+    let replacement = store.situations.insert(state, focus).unwrap();
+    assert_eq!(old.slot, replacement.slot);
+    assert_ne!(old.generation, replacement.generation);
+    let mut old_seed = StorePins::default();
+    old_seed.situations.insert(old);
+    let mut stale = Cursor::new_complex(old_seed.clone(), 128, true).unwrap();
+    assert!(matches!(
+        stale.step(&store, &mut || Ok(())),
+        Err(Error::Store(StoreError::InvalidHandle(_)))
+    ));
+    assert!(matches!(stale.into_completed(), Err(Error::Unsupported)));
+    assert!(matches!(
+        store.retirement_dependency_closure(&old_seed, 128),
+        Err(StoreError::InvalidHandle(_))
+    ));
+}
+
+#[test]
+fn profiled_archive_roundtrip_retains_missing_limits_raw_units_and_question() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let requested = ProfiledExternalConstraint::MoveTime { milliseconds: 100 };
+    let raw = live_profiled_fixture(&mut store, requested);
+    let execution = raw.execution.unwrap();
+    let wire = ObservationWire::encode(&raw).unwrap();
+    let json = serde_json::to_vec(&wire).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<ObservationWire>(&json)
+            .unwrap()
+            .decode()
+            .unwrap(),
+        raw
+    );
+    let task_json = serde_json::to_vec(store.tasks.get(execution).unwrap()).unwrap();
+    let decoded: TaskRecord = serde_json::from_slice(&task_json).unwrap();
+    assert_eq!(decoded.key, store.tasks.get(execution).unwrap().key);
+    let observation = store
+        .append_observation_checked_with_archive_budget(raw.clone(), &mut budget())
+        .unwrap();
+    assert!(store.complete_task(execution, observation).is_err());
+    store.tasks.fail(execution).unwrap();
+    let mut next = Position::startpos();
+    next.make_move(mv("e2e4")).unwrap();
+    store.focus_actual_moves(next.snapshot()).unwrap();
+    let receipt = store.archive_inactive(budget()).unwrap().unwrap();
+    assert!(store.observations.get(observation).is_err());
+    let loaded = store
+        .pin_load(&receipt.observation_handle(observation), budget())
+        .unwrap();
+    assert_eq!(store.observations.get(observation).unwrap(), &raw);
+    assert_eq!(
+        store.tasks.get(execution).unwrap().key.question,
+        TaskQuestion::ProfiledExternal { requested }
+    );
+    assert_eq!(store.tasks.get(execution).unwrap().key.requested_depth, 0);
+    assert_eq!(store.tasks.get(execution).unwrap().key.node_budget, 0);
+    assert_eq!(
+        store.tasks.get(execution).unwrap().status,
+        TaskStatus::Failed
+    );
+    drop(loaded);
+}
+
+#[test]
+fn controlled_retirement_closure_interrupts_clone_and_parent_walk_without_store_mutation() {
+    let mut store = PalsStores::new(StoreLimits {
+        line_chunks: 64,
+        line_plies: 64,
+        ..limits()
+    });
+    let root = store
+        .focus_actual_moves(Position::startpos().snapshot())
+        .unwrap();
+    let mut line = store.situations.get(root).unwrap().focus;
+    let mut all_lines = BTreeSet::from([line]);
+    // A source-authored coordinate-chunk graph exercises parent traversal.
+    // This fixture issues no checked CPU PV, Rules proof or execution receipt.
+    for _ in 0..24 {
+        line = store.lines.append(line, &[mv("e2e4")]).unwrap();
+        all_lines.insert(line);
+    }
+    for seed in [
+        StorePins {
+            lines: BTreeSet::from([line]),
+            ..StorePins::default()
+        },
+        StorePins {
+            lines: all_lines,
+            ..StorePins::default()
+        },
+    ] {
+        let original = seed.clone();
+        let before = store.hot_stats();
+        let expected = store.retirement_dependency_closure(&seed, 64).unwrap();
+        let mut total_checks = 0usize;
+        let completed = store
+            .retirement_dependency_closure_controlled(&seed, 64, &mut || {
+                total_checks += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(completed, expected);
+        assert!(total_checks > 64);
+        for (stop_at, error) in [
+            (1, StoreError::ArchiveCanceled),
+            (3, StoreError::ArchiveDeadline),
+            (27, StoreError::ArchiveCanceled),
+            (total_checks / 2, StoreError::ArchiveDeadline),
+            (total_checks, StoreError::ArchiveCanceled),
+        ] {
+            let mut checks = 0usize;
+            assert_eq!(
+                store.retirement_dependency_closure_controlled(&seed, 64, &mut || {
+                    checks += 1;
+                    if checks == stop_at {
+                        Err(error.clone())
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Err(error.clone())
+            );
+            assert_eq!(checks, stop_at);
+            assert_eq!(seed, original);
+            assert_eq!(store.hot_stats(), before);
+        }
+    }
+}
+
+#[test]
+fn profiled_cold_load_rejects_an_individually_valid_but_replaced_constraint() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let raw = live_profiled_fixture(
+        &mut store,
+        ProfiledExternalConstraint::MoveTime { milliseconds: 100 },
+    );
+    let execution = raw.execution.unwrap();
+    let observation = store
+        .append_observation_checked_with_archive_budget(raw, &mut budget())
+        .unwrap();
+    store.tasks.fail(execution).unwrap();
+    // Corruption fixture bypasses the public writer; the committed segment has
+    // a valid checksum, so its original task/observation relation must be checked.
+    let key = &mut store.tasks.tasks.get_mut(execution.0).unwrap().key;
+    key.question = TaskQuestion::ProfiledExternal {
+        requested: ProfiledExternalConstraint::Nodes { reported_nodes: 16 },
+    };
+    key.node_budget = 16;
+    let mut next = Position::startpos();
+    next.make_move(mv("e2e4")).unwrap();
+    store.focus_actual_moves(next.snapshot()).unwrap();
+    let receipt = store.archive_inactive(budget()).unwrap().unwrap();
+    let before = store.hot_stats();
+    assert_eq!(
+        store
+            .pin_load(&receipt.observation_handle(observation), budget())
+            .unwrap_err(),
+        StoreError::ArchiveIntegrity("profiled observation task constraint")
+    );
+    assert_eq!(store.hot_stats(), before);
+    assert!(store.observations.get(observation).is_err());
 }
 
 #[test]

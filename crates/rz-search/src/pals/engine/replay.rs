@@ -591,7 +591,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         &self.reply_line
     }
     pub fn records(&self) -> &[RoleRecord] {
-        &self.engine.records
+        &self.engine.semantic.records
     }
     pub fn reply_prepared_context(&self) -> Option<&RoleLogicalContext> {
         self.reply_prepared_context.as_ref()
@@ -623,19 +623,19 @@ impl<M: RoleModel> FreshReplayOwner<M> {
     /// Reuses the parent's actual store provenance validator. An unobserved or
     /// invalid endpoint stays explicit; this getter cannot mint completion.
     pub fn repair_endpoint(&self) -> Option<RecheckEndpoint<'_>> {
-        let node = self.engine.nodes.get(self.repair_endpoint_node?)?;
+        let node = self.engine.semantic.nodes.get(self.repair_endpoint_node?)?;
         let snapshot = self.repair_endpoint_snapshot.as_ref()?;
         Some(PalsEngine::<M>::recheck_endpoint(
             node,
-            &self.engine.stores,
+            &self.engine.semantic.stores,
             snapshot,
         ))
     }
     pub fn task(&self, execution: ExecutionId) -> Result<&TaskRecord, StoreError> {
-        self.engine.stores.tasks.get(execution)
+        self.engine.semantic.stores.tasks.get(execution)
     }
     pub fn observation(&self, id: ObservationId) -> Result<&Observation, StoreError> {
-        self.engine.stores.observations.get(id)
+        self.engine.semantic.stores.observations.get(id)
     }
     pub fn strict_query_admission_verified(&self) -> bool {
         false
@@ -694,9 +694,9 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         let started = Instant::now();
         let mut counters = PalsCounters::default();
         let mut result = operation(self, &mut counters);
-        counters.retained_situations = self.engine.nodes.len();
+        counters.retained_situations = self.engine.semantic.nodes.len();
         self.counters = counters;
-        self.engine.last_search_counters = Some(counters);
+        self.engine.semantic.last_search_counters = Some(counters);
         let closure = match &result {
             Err(ReplayError::Search(error)) => match error.as_ref() {
                 PalsError::Role(RoleError::Canceled) => RoleSearchClosure::Canceled,
@@ -709,7 +709,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             Err(_) => RoleSearchClosure::Failed,
             Ok(_) => RoleSearchClosure::Completed,
         };
-        self.engine.model.finish_search(closure);
+        self.engine.semantic.model.finish_search(closure);
         // A secondary accounting callback must not hide a primary failure.
         if result.is_ok()
             && let Err(error) = self.check_control(limits, cancel)
@@ -748,12 +748,13 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         self.engine.start_checker(limits.deadline, cancel)?;
         self.check_control(limits, cancel)?;
         self.engine
+            .semantic
             .stores
             .focus_actual_moves(self.root.snapshot())?;
         let root = self
             .engine
             .intern_checked(self.root.clone(), limits, cancel)?;
-        if let Some((reason, _)) = self.engine.nodes[root].terminal {
+        if let Some((reason, _)) = self.engine.semantic.nodes[root].terminal {
             return Ok(ReplayOutcome::RulesTerminal(reason));
         }
         let ranked = self.engine.ranked(
@@ -809,7 +810,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         }
         let mut target = root;
         for &movement in &self.plan.prefix {
-            target = self.engine.nodes[target]
+            target = self.engine.semantic.nodes[target]
                 .edges
                 .iter()
                 .find(|edge| edge.movement == movement)
@@ -818,7 +819,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
                 ))?
                 .child;
         }
-        if !self.engine.nodes[target]
+        if !self.engine.semantic.nodes[target]
             .position
             .snapshot()
             .same_state(&self.target)
@@ -847,7 +848,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         // allocations briefly coexist; this is not a peak-memory observation.
         // No previous token, report, history table or TT is supplied to `new`.
         let fresh = OwnedCpuChecker::new(CpuEngine::new(self.plan.cpu.clone())?)?;
-        self.engine.cpu = Box::new(fresh);
+        self.engine.researcher.cpu = Box::new(fresh);
         self.engine.start_checker(limits.deadline, cancel)?;
         self.check_control(limits, cancel)?;
         let after = self.stage(
@@ -882,18 +883,25 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         self.candidate_line = line;
         // Recheck actual store/root bindings after insertion and immediately
         // before publication, without fabricating a leaf value or model result.
-        if candidate.generation != self.engine.stores.generation()
-            || self.engine.stores.root() != Some(candidate.root)
-            || self.engine.stores.situations.get(candidate.root)?.revision
+        if candidate.generation != self.engine.semantic.stores.generation()
+            || self.engine.semantic.stores.root() != Some(candidate.root)
+            || self
+                .engine
+                .semantic
+                .stores
+                .situations
+                .get(candidate.root)?
+                .revision
                 != candidate.root_revision
             || self
                 .engine
+                .semantic
                 .stores
                 .observations
                 .get(candidate.observation)?
                 .state
-                != self.engine.nodes[target].state
-            || !self.engine.nodes[target]
+                != self.engine.semantic.nodes[target].state
+            || !self.engine.semantic.nodes[target]
                 .position
                 .snapshot()
                 .same_state(&self.target)
@@ -912,7 +920,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             limits,
             cancel,
         )?;
-        self.publication_revision = Some(self.engine.revision);
+        self.publication_revision = Some(self.engine.semantic.revision);
         let question = RoleQuestion {
             purpose: RoleQueryPurpose::ReplyPolicy,
             prefix: &self.plan.prefix,
@@ -938,7 +946,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             .first()
             .ok_or(RoleError::InvalidOutput)
             .map_err(PalsError::from)?;
-        let mut checked = self.engine.nodes[target].position.clone();
+        let mut checked = self.engine.semantic.nodes[target].position.clone();
         checked.make_move(selected)?;
         self.engine
             .connect_checked(target, selected, checked, counters, limits, cancel)?;
@@ -948,7 +956,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         Ok(ReplayOutcome::ReplyAccepted {
             selected_response: selected,
             after_observation: candidate.observation,
-            publication_revision: self.engine.revision,
+            publication_revision: self.engine.semantic.revision,
         })
     }
 
@@ -1009,35 +1017,42 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             .ok_or(StoreError::InvalidEvidence(
                 "Repair lacks actual accepted Reply context",
             ))?;
-        let root_situation = self.engine.stores.root().ok_or(StoreError::StaleConsumer)?;
+        let root_situation = self
+            .engine
+            .semantic
+            .stores
+            .root()
+            .ok_or(StoreError::StaleConsumer)?;
         let root = self
             .engine
+            .semantic
             .nodes
             .iter()
             .position(|node| node.situation == root_situation)
             .ok_or(StoreError::StaleConsumer)?;
         let target = self
             .engine
+            .semantic
             .nodes
             .iter()
             .position(|node| node.situation == context.situation)
             .ok_or(StoreError::StaleConsumer)?;
         if context.purpose != RoleQueryPurpose::ReplyPolicy
-            || context.search_generation != self.engine.stores.generation()
-            || Some(context.game_generation) != self.engine.game_generation
-            || context.public_revision != self.engine.revision
-            || !self.engine.nodes[root]
+            || context.search_generation != self.engine.semantic.stores.generation()
+            || Some(context.game_generation) != self.engine.semantic.game_generation
+            || context.public_revision != self.engine.semantic.revision
+            || !self.engine.semantic.nodes[root]
                 .position
                 .snapshot()
                 .same_state(&self.root.snapshot())
-            || !self.engine.nodes[target]
+            || !self.engine.semantic.nodes[target]
                 .position
                 .snapshot()
                 .same_state(&self.target)
         {
             return Err(StoreError::StaleConsumer.into());
         }
-        let response = self.engine.nodes[target]
+        let response = self.engine.semantic.nodes[target]
             .edges
             .iter()
             .find(|edge| edge.movement == selected_response)
@@ -1111,16 +1126,17 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             checked.make_move(movement)?;
         }
         let snapshot = checked.snapshot();
-        if !self.engine.nodes[endpoint]
+        if !self.engine.semantic.nodes[endpoint]
             .position
             .snapshot()
             .same_state(&snapshot)
-            || self.engine.nodes[endpoint].position.legal_moves() != checked.legal_moves()
+            || self.engine.semantic.nodes[endpoint].position.legal_moves() != checked.legal_moves()
             || !self
                 .engine
+                .semantic
                 .stores
                 .states
-                .get(self.engine.nodes[endpoint].state)?
+                .get(self.engine.semantic.nodes[endpoint].state)?
                 .same_state(&snapshot)
         {
             return Err(
@@ -1145,13 +1161,13 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             ))?;
         counters.repairs += 1;
         self.repair_line_id = Some(line_id);
-        self.repair_record_revision = Some(self.engine.revision);
+        self.repair_record_revision = Some(self.engine.semantic.revision);
         self.repair_endpoint_node = Some(endpoint);
         self.repair_endpoint_snapshot = Some(snapshot);
         self.check_control(limits, cancel)?;
-        let state = self.engine.nodes[endpoint].state;
-        let situation = self.engine.nodes[endpoint].situation;
-        if let Some((reason, _)) = self.engine.nodes[endpoint].terminal {
+        let state = self.engine.semantic.nodes[endpoint].state;
+        let situation = self.engine.semantic.nodes[endpoint].situation;
+        if let Some((reason, _)) = self.engine.semantic.nodes[endpoint].terminal {
             let facts = self.repair_endpoint().ok_or(StoreError::InvalidEvidence(
                 "Repair terminal snapshot absent",
             ))?;
@@ -1162,7 +1178,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             self.check_control(limits, cancel)?;
             return Ok(ReplayRepairOutcome::RulesTerminalRepairEndpoint {
                 repaired_line: line_id,
-                repair_record_revision: self.engine.revision,
+                repair_record_revision: self.engine.semantic.revision,
                 endpoint_state: state,
                 endpoint_situation: situation,
                 reason,
@@ -1171,7 +1187,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         // Independent third TT/checker with exactly the same registered H1
         // capability. No prior report/token/cache is passed to its constructor.
         let fresh = OwnedCpuChecker::new(CpuEngine::new(self.plan.cpu.clone())?)?;
-        self.engine.cpu = Box::new(fresh);
+        self.engine.researcher.cpu = Box::new(fresh);
         self.engine.start_checker(limits.deadline, cancel)?;
         self.check_control(limits, cancel)?;
         let completed = self.repair_endpoint_stage(
@@ -1220,7 +1236,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         self.check_control(limits, cancel)?;
         Ok(ReplayRepairOutcome::CompletedRepairEndpoint {
             repaired_line: line_id,
-            repair_record_revision: self.engine.revision,
+            repair_record_revision: self.engine.semantic.revision,
             endpoint_state: state,
             endpoint_situation: situation,
             execution,
@@ -1256,11 +1272,13 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         self.engine.validate_checker_namespace()?;
         if phase != kind.phase()
             || depth != self.plan.requested_depth
-            || self.engine.nodes[target].terminal.is_some()
-            || (kind == EndpointKind::Repair && self.engine.nodes[target].evidence.is_some())
-            || self.engine.cpu.last_attempt().is_some()
-            || self.engine.cpu_condition() != self.engine.cpu_registered_condition
-            || self.engine.cpu.identity() != &self.engine.checker_registered_identity
+            || self.engine.semantic.nodes[target].terminal.is_some()
+            || (kind == EndpointKind::Repair
+                && self.engine.semantic.nodes[target].evidence.is_some())
+            || self.engine.researcher.cpu.last_attempt().is_some()
+            || self.engine.cpu_condition() != self.engine.researcher.cpu_registered_condition
+            || self.engine.researcher.cpu.identity()
+                != &self.engine.researcher.checker_registered_identity
             || self.stages.len() != kind.prior_stages()
             || self.stages.capacity() < kind.prior_stages() + 1
         {
@@ -1289,29 +1307,42 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         }
         let profile = stable_id(descriptor.config.profile.identity());
         let condition = stable_id(&task_condition);
-        let generation = self.engine.stores.generation();
-        let active_root = self.engine.stores.root().ok_or(StoreError::StaleConsumer)?;
-        let root_revision = self.engine.stores.situations.get(active_root)?.revision;
-        self.engine.consumer_id = self
+        let generation = self.engine.semantic.stores.generation();
+        let active_root = self
             .engine
+            .semantic
+            .stores
+            .root()
+            .ok_or(StoreError::StaleConsumer)?;
+        let root_revision = self
+            .engine
+            .semantic
+            .stores
+            .situations
+            .get(active_root)?
+            .revision;
+        self.engine.semantic.consumer_id = self
+            .engine
+            .semantic
             .consumer_id
             .checked_add(1)
             .ok_or(PalsError::Capacity)?;
         let consumer = TaskConsumer {
-            id: self.engine.consumer_id,
-            situation: self.engine.nodes[target].situation,
+            id: self.engine.semantic.consumer_id,
+            situation: self.engine.semantic.nodes[target].situation,
             revision: self
                 .engine
+                .semantic
                 .stores
                 .situations
-                .get(self.engine.nodes[target].situation)?
+                .get(self.engine.semantic.nodes[target].situation)?
                 .revision,
             generation,
             deadline_tick: self.engine.tick_at(limits.deadline),
         };
-        let admission = self.engine.stores.request_task(
+        let admission = self.engine.semantic.stores.request_task(
             TaskKey {
-                state: self.engine.nodes[target].state,
+                state: self.engine.semantic.nodes[target].state,
                 line: None,
                 question: TaskQuestion::AnalyzePosition,
                 root_moves: Vec::new(),
@@ -1364,7 +1395,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             kind,
         );
         if result.is_err()
-            && let Err(error) = self.engine.stores.tasks.fail(execution)
+            && let Err(error) = self.engine.semantic.stores.tasks.fail(execution)
         {
             self.stages[index].cleanup_error = Some(Box::new(error));
         }
@@ -1393,14 +1424,15 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             max_nodes: self.plan.nodes_per_check,
             deadline: Some(limits.deadline),
         };
-        self.engine.cpu.preflight_task(cpu_limits)?;
+        self.engine.researcher.cpu.preflight_task(cpu_limits)?;
         self.check_control(limits, cancel)?;
         counters.cpu_tasks_requested += 1;
-        let result =
-            self.engine
-                .cpu
-                .analyze(&self.engine.nodes[target].position, cpu_limits, cancel);
-        self.stages[index].attempt = self.engine.cpu.last_attempt().cloned();
+        let result = self.engine.researcher.cpu.analyze(
+            &self.engine.semantic.nodes[target].position,
+            cpu_limits,
+            cancel,
+        );
+        self.stages[index].attempt = self.engine.researcher.cpu.last_attempt().cloned();
         let report = match result {
             Ok(report) => match PalsEngine::<M>::own_report(report) {
                 Ok(report) => report,
@@ -1423,7 +1455,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         let stage = &self.stages[index];
         let report = stage.report.as_ref().ok_or(PalsError::Capacity)?;
         let validation = self.engine.validate_cpu_report(
-            &self.engine.nodes[target].position,
+            &self.engine.semantic.nodes[target].position,
             report,
             self.engine.owned_identity()?,
             &stage.registered_condition,
@@ -1459,45 +1491,50 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             counters.completed_cpu_tasks -= 1;
         }
         validation?;
-        let observation = self.engine.stores.append_observation(Observation {
-            state: self.engine.nodes[target].state,
-            line: None,
-            source: stable_id(report.score_provenance),
-            epoch: 0,
-            scope: EvidenceScope::DepthLimited {
-                depth: report.completed_depth,
-                profile: stable_id(self.plan.cpu.profile.identity()),
-                condition: stable_id(&stage.task_condition),
-            },
-            value_identity: Some(report.value_identity.clone()),
-            checker_identity: None,
-            checker_work: None,
-            external_report: None,
-            model_value_identity: None,
-            model_value_input: None,
-            cpu_condition: Some(stage.task_condition.clone()),
-            cpu_pv: None,
-            score: if report.score_scope == CpuScoreScope::FrontierOnly {
-                RawScore::Estimate {
-                    value: report.score as f32,
-                    perspective: self.engine.nodes[target].position.side_to_move(),
-                }
-            } else {
-                RawScore::Cpu {
-                    value: report.score,
-                    perspective: self.engine.nodes[target].position.side_to_move(),
-                    bound: BoundKind::ExactWithinSearch,
-                }
-            },
-            budget: report.nodes,
-            kind: ObservationKind::CpuAnalysis,
-            supersedes: None,
-            execution: Some(stage.execution),
-        })?;
+        let observation = self
+            .engine
+            .semantic
+            .stores
+            .append_observation(Observation {
+                state: self.engine.semantic.nodes[target].state,
+                line: None,
+                source: stable_id(report.score_provenance),
+                epoch: 0,
+                scope: EvidenceScope::DepthLimited {
+                    depth: report.completed_depth,
+                    profile: stable_id(self.plan.cpu.profile.identity()),
+                    condition: stable_id(&stage.task_condition),
+                },
+                value_identity: Some(report.value_identity.clone()),
+                checker_identity: None,
+                checker_work: None,
+                external_report: None,
+                model_value_identity: None,
+                model_value_input: None,
+                cpu_condition: Some(stage.task_condition.clone()),
+                cpu_pv: None,
+                score: if report.score_scope == CpuScoreScope::FrontierOnly {
+                    RawScore::Estimate {
+                        value: report.score as f32,
+                        perspective: self.engine.semantic.nodes[target].position.side_to_move(),
+                    }
+                } else {
+                    RawScore::Cpu {
+                        value: report.score,
+                        perspective: self.engine.semantic.nodes[target].position.side_to_move(),
+                        bound: BoundKind::ExactWithinSearch,
+                    }
+                },
+                budget: report.nodes,
+                kind: ObservationKind::CpuAnalysis,
+                supersedes: None,
+                execution: Some(stage.execution),
+            })?;
         self.stages[index].observation = Some(observation);
         self.stages[index].exact_completed = exact;
         if !exact {
             self.engine
+                .semantic
                 .stores
                 .tasks
                 .fail(self.stages[index].execution)?;
@@ -1505,10 +1542,11 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             return Ok(None);
         }
         self.engine
+            .semantic
             .stores
             .complete_task(self.stages[index].execution, observation)?;
         self.check_control(limits, cancel)?;
-        self.engine.stores.consume_task(
+        self.engine.semantic.stores.consume_task(
             self.stages[index].execution,
             consumer.id,
             self.engine.tick_at(Instant::now()),
@@ -1516,18 +1554,27 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         self.check_control(limits, cancel)?;
         counters.consumed_cpu_tasks += 1;
         self.engine
+            .semantic
             .stores
             .dependencies
-            .add(observation, self.engine.nodes[target].situation)?;
+            .add(observation, self.engine.semantic.nodes[target].situation)?;
         self.engine
+            .semantic
             .stores
             .dependencies
-            .add(observation, self.engine.nodes[root].situation)?;
-        if self.engine.stores.generation() != consumer.generation
-            || self.engine.stores.root() != Some(active_root)
-            || self.engine.stores.situations.get(active_root)?.revision != root_revision
+            .add(observation, self.engine.semantic.nodes[root].situation)?;
+        if self.engine.semantic.stores.generation() != consumer.generation
+            || self.engine.semantic.stores.root() != Some(active_root)
+            || self
+                .engine
+                .semantic
+                .stores
+                .situations
+                .get(active_root)?
+                .revision
+                != root_revision
             || self.endpoint_snapshot(kind).is_none_or(|snapshot| {
-                !self.engine.nodes[target]
+                !self.engine.semantic.nodes[target]
                     .position
                     .snapshot()
                     .same_state(snapshot)
@@ -1543,7 +1590,8 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         // Only this completed unrestricted actual observation enters endpoint
         // evidence. Both restricted root observations remain sources only.
         if kind == EndpointKind::Repair {
-            self.engine.nodes[target].evidence = Some(CpuEvidence {
+            self.engine.semantic.nodes[target].evidence = Some(CpuEvidence {
+                context: None,
                 score: report.score,
                 depth: report.completed_depth,
                 scope: report.score_scope,
@@ -1572,9 +1620,10 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         } = request;
         self.check_control(limits, cancel)?;
         self.engine.validate_checker_namespace()?;
-        if self.engine.cpu.last_attempt().is_some()
-            || self.engine.cpu_condition() != self.engine.cpu_registered_condition
-            || self.engine.cpu.identity() != &self.engine.checker_registered_identity
+        if self.engine.researcher.cpu.last_attempt().is_some()
+            || self.engine.cpu_condition() != self.engine.researcher.cpu_registered_condition
+            || self.engine.researcher.cpu.identity()
+                != &self.engine.researcher.checker_registered_identity
         {
             return Err(ReplayError::InvalidPlan(
                 "CPU stage is not a fresh registered checker",
@@ -1611,29 +1660,42 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         }
         let profile = stable_id(descriptor.config.profile.identity());
         let condition = stable_id(&task_condition);
-        let generation = self.engine.stores.generation();
-        let active_root = self.engine.stores.root().ok_or(StoreError::StaleConsumer)?;
-        let root_revision = self.engine.stores.situations.get(active_root)?.revision;
-        self.engine.consumer_id = self
+        let generation = self.engine.semantic.stores.generation();
+        let active_root = self
             .engine
+            .semantic
+            .stores
+            .root()
+            .ok_or(StoreError::StaleConsumer)?;
+        let root_revision = self
+            .engine
+            .semantic
+            .stores
+            .situations
+            .get(active_root)?
+            .revision;
+        self.engine.semantic.consumer_id = self
+            .engine
+            .semantic
             .consumer_id
             .checked_add(1)
             .ok_or(PalsError::Capacity)?;
         let consumer = TaskConsumer {
-            id: self.engine.consumer_id,
-            situation: self.engine.nodes[target].situation,
+            id: self.engine.semantic.consumer_id,
+            situation: self.engine.semantic.nodes[target].situation,
             revision: self
                 .engine
+                .semantic
                 .stores
                 .situations
-                .get(self.engine.nodes[target].situation)?
+                .get(self.engine.semantic.nodes[target].situation)?
                 .revision,
             generation,
             deadline_tick: self.engine.tick_at(limits.deadline),
         };
-        let admission = self.engine.stores.request_task(
+        let admission = self.engine.semantic.stores.request_task(
             TaskKey {
-                state: self.engine.nodes[target].state,
+                state: self.engine.semantic.nodes[target].state,
                 line: None,
                 question: TaskQuestion::AnalyzeRootMoves,
                 root_moves,
@@ -1686,7 +1748,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         );
         // Preserve the primary CPU/Rules/control failure even if fail() fails.
         if result.is_err()
-            && let Err(error) = self.engine.stores.tasks.fail(execution)
+            && let Err(error) = self.engine.semantic.stores.tasks.fail(execution)
         {
             self.stages[index].cleanup_error = Some(Box::new(error));
         }
@@ -1714,17 +1776,17 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             max_nodes: self.stages[index].node_budget,
             deadline: Some(limits.deadline),
         };
-        self.engine.cpu.preflight_task(cpu_limits)?;
+        self.engine.researcher.cpu.preflight_task(cpu_limits)?;
         self.check_control(limits, cancel)?;
         counters.cpu_tasks_requested += 1;
-        let result = self.engine.cpu.analyze_root_moves(
-            &self.engine.nodes[target].position,
+        let result = self.engine.researcher.cpu.analyze_root_moves(
+            &self.engine.semantic.nodes[target].position,
             &self.effective_order,
             cpu_limits,
             cancel,
         );
         // Actual work survives errors and is captured before replacing the CPU.
-        self.stages[index].attempt = self.engine.cpu.last_attempt().cloned();
+        self.stages[index].attempt = self.engine.researcher.cpu.last_attempt().cloned();
         let report = match result {
             Ok(report) => match PalsEngine::<M>::own_report(report) {
                 Ok(report) => report,
@@ -1749,7 +1811,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         let validation = self
             .engine
             .validate_cpu_report(
-                &self.engine.nodes[target].position,
+                &self.engine.semantic.nodes[target].position,
                 report,
                 self.engine.owned_identity()?,
                 &stage.registered_condition,
@@ -1810,47 +1872,53 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         )?;
         let pv_line = self
             .engine
+            .semantic
             .stores
-            .append_cpu_pv(&self.engine.nodes[target].position, &pv)?;
-        let observation = self.engine.stores.append_observation(Observation {
-            state: self.engine.nodes[target].state,
-            line: None,
-            source: stable_id(report.score_provenance),
-            epoch: 0,
-            scope: EvidenceScope::DepthLimited {
-                depth: report.completed_depth,
-                profile: stable_id(self.plan.cpu.profile.identity()),
-                condition: stable_id(&stage.task_condition),
-            },
-            value_identity: Some(report.value_identity.clone()),
-            checker_identity: None,
-            checker_work: None,
-            external_report: None,
-            model_value_identity: None,
-            model_value_input: None,
-            cpu_condition: Some(stage.task_condition.clone()),
-            cpu_pv: Some(pv_line),
-            score: if report.score_scope == CpuScoreScope::FrontierOnly {
-                RawScore::Estimate {
-                    value: report.score as f32,
-                    perspective: self.engine.nodes[target].position.side_to_move(),
-                }
-            } else {
-                RawScore::Cpu {
-                    value: report.score,
-                    perspective: self.engine.nodes[target].position.side_to_move(),
-                    bound: BoundKind::ExactWithinSearch,
-                }
-            },
-            budget: report.nodes,
-            kind: ObservationKind::CpuAnalysis,
-            supersedes: None,
-            execution: Some(stage.execution),
-        })?;
+            .append_cpu_pv(&self.engine.semantic.nodes[target].position, &pv)?;
+        let observation = self
+            .engine
+            .semantic
+            .stores
+            .append_observation(Observation {
+                state: self.engine.semantic.nodes[target].state,
+                line: None,
+                source: stable_id(report.score_provenance),
+                epoch: 0,
+                scope: EvidenceScope::DepthLimited {
+                    depth: report.completed_depth,
+                    profile: stable_id(self.plan.cpu.profile.identity()),
+                    condition: stable_id(&stage.task_condition),
+                },
+                value_identity: Some(report.value_identity.clone()),
+                checker_identity: None,
+                checker_work: None,
+                external_report: None,
+                model_value_identity: None,
+                model_value_input: None,
+                cpu_condition: Some(stage.task_condition.clone()),
+                cpu_pv: Some(pv_line),
+                score: if report.score_scope == CpuScoreScope::FrontierOnly {
+                    RawScore::Estimate {
+                        value: report.score as f32,
+                        perspective: self.engine.semantic.nodes[target].position.side_to_move(),
+                    }
+                } else {
+                    RawScore::Cpu {
+                        value: report.score,
+                        perspective: self.engine.semantic.nodes[target].position.side_to_move(),
+                        bound: BoundKind::ExactWithinSearch,
+                    }
+                },
+                budget: report.nodes,
+                kind: ObservationKind::CpuAnalysis,
+                supersedes: None,
+                execution: Some(stage.execution),
+            })?;
         self.stages[index].observation = Some(observation);
         self.stages[index].exact_completed = exact;
         if !exact {
             self.engine
+                .semantic
                 .stores
                 .tasks
                 .fail(self.stages[index].execution)?;
@@ -1858,10 +1926,11 @@ impl<M: RoleModel> FreshReplayOwner<M> {
             return Ok(None);
         }
         self.engine
+            .semantic
             .stores
             .complete_task(self.stages[index].execution, observation)?;
         self.check_control(limits, cancel)?;
-        self.engine.stores.consume_task(
+        self.engine.semantic.stores.consume_task(
             self.stages[index].execution,
             consumer.id,
             self.engine.tick_at(Instant::now()),
@@ -1869,13 +1938,15 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         self.check_control(limits, cancel)?;
         counters.consumed_cpu_tasks += 1;
         self.engine
+            .semantic
             .stores
             .dependencies
-            .add(observation, self.engine.nodes[target].situation)?;
+            .add(observation, self.engine.semantic.nodes[target].situation)?;
         self.engine
+            .semantic
             .stores
             .dependencies
-            .add(observation, self.engine.nodes[root].situation)?;
+            .add(observation, self.engine.semantic.nodes[root].situation)?;
         Ok(Some(CpuCandidate {
             pv,
             observation,
@@ -2133,16 +2204,19 @@ mod tests {
                 TaskStatus::Completed(stage.observation.unwrap())
             );
         }
-        assert_eq!(owner.engine.model.saw_after, Some(after_observation));
+        assert_eq!(
+            owner.engine.semantic.model.saw_after,
+            Some(after_observation)
+        );
         assert_ne!(Some(after_observation), owner.stages[0].observation);
         let context = owner.reply_accepted_context().unwrap();
         assert_eq!(context.public_revision, publication_revision);
         assert_eq!(context.purpose, RoleQueryPurpose::ReplyPolicy);
         assert_eq!(owner.counters.cpu_tasks_requested, 2);
         assert_eq!(owner.counters.reused_completed_cpu_tasks_consumed, 0);
-        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert_eq!(owner.engine.semantic.model.finish_calls, 1);
         assert_eq!(
-            owner.engine.model.closure,
+            owner.engine.semantic.model.closure,
             Some(RoleSearchClosure::Completed)
         );
         assert!(!owner.strict_query_admission_verified() && !owner.native_freshness_verified());
@@ -2160,7 +2234,7 @@ mod tests {
             Err(ReplayError::AlreadyUsed)
         ));
         assert_eq!(owner.counters, before);
-        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert_eq!(owner.engine.semantic.model.finish_calls, 1);
     }
     #[test]
     fn fixed_two_n_refused_before_roles_and_cpu() {
@@ -2173,8 +2247,11 @@ mod tests {
         ));
         assert_eq!(owner.counters.role_calls, 0);
         assert!(owner.stages.is_empty());
-        assert_eq!(owner.engine.model.finish_calls, 1);
-        assert_eq!(owner.engine.model.closure, Some(RoleSearchClosure::Failed));
+        assert_eq!(owner.engine.semantic.model.finish_calls, 1);
+        assert_eq!(
+            owner.engine.semantic.model.closure,
+            Some(RoleSearchClosure::Failed)
+        );
     }
     #[test]
     fn partial_report_is_retained_without_reply_or_counterexample() {
@@ -2234,23 +2311,23 @@ mod tests {
     #[test]
     fn late_proposer_acceptance_cancellation_prevents_cpu() {
         let mut owner = fixture(100_000, "c7c5");
-        owner.engine.model.cancel_on_accept = Some(1);
+        owner.engine.semantic.model.cancel_on_accept = Some(1);
         let result = owner.run(limits(100_000), &AtomicBool::new(false));
         assert!(
             matches!(result, Err(ReplayError::Search(error)) if matches!(*error, PalsError::Role(RoleError::Canceled)))
         );
         assert_eq!(owner.counters.cpu_tasks_requested, 0);
         assert!(owner.stages.is_empty());
-        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert_eq!(owner.engine.semantic.model.finish_calls, 1);
         assert_eq!(
-            owner.engine.model.closure,
+            owner.engine.semantic.model.closure,
             Some(RoleSearchClosure::Canceled)
         );
     }
     #[test]
     fn late_reply_acceptance_cancellation_preserves_actual_work_but_refuses_success() {
         let mut owner = fixture(100_000, "c7c5");
-        owner.engine.model.cancel_on_accept = Some(4);
+        owner.engine.semantic.model.cancel_on_accept = Some(4);
         let result = owner.run(limits(100_000), &AtomicBool::new(false));
         assert!(
             matches!(result, Err(ReplayError::Search(error)) if matches!(*error, PalsError::Role(RoleError::Canceled)))
@@ -2263,7 +2340,7 @@ mod tests {
     #[test]
     fn primary_reply_failure_and_raw_cpu_work_survive() {
         let mut owner = fixture(100_000, "c7c5");
-        owner.engine.model.fail_reply = true;
+        owner.engine.semantic.model.fail_reply = true;
         let result = owner.run(limits(100_000), &AtomicBool::new(false));
         assert!(
             matches!(result, Err(ReplayError::Search(error)) if matches!(*error, PalsError::Role(RoleError::Backend(_))))
@@ -2277,8 +2354,11 @@ mod tests {
         );
         assert!(owner.reply_prepared_context().is_some());
         assert!(owner.reply_accepted_context().is_none());
-        assert_eq!(owner.engine.model.finish_calls, 1);
-        assert_eq!(owner.engine.model.closure, Some(RoleSearchClosure::Failed));
+        assert_eq!(owner.engine.semantic.model.finish_calls, 1);
+        assert_eq!(
+            owner.engine.semantic.model.closure,
+            Some(RoleSearchClosure::Failed)
+        );
     }
     #[test]
     fn expired_original_deadline_has_no_dispatch() {
@@ -2290,16 +2370,16 @@ mod tests {
         );
         assert_eq!(owner.counters.role_calls, 0);
         assert!(owner.stages.is_empty());
-        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert_eq!(owner.engine.semantic.model.finish_calls, 1);
         assert_eq!(
-            owner.engine.model.closure,
+            owner.engine.semantic.model.closure,
             Some(RoleSearchClosure::Deadline)
         );
     }
     #[test]
     fn actual_proposal_mismatch_keeps_seed_out_of_publication() {
         let mut owner = fixture(100_000, "c7c5");
-        owner.engine.model.proposer_line = vec![mv("d2d4"), mv("d7d5"), mv("c1f4")];
+        owner.engine.semantic.model.proposer_line = vec![mv("d2d4"), mv("d7d5"), mv("c1f4")];
         assert_eq!(
             owner.run(limits(100_000), &AtomicBool::new(false)).unwrap(),
             ReplayOutcome::SeedNotApplied
@@ -2326,17 +2406,19 @@ mod tests {
         owner.run(bound, &cancel).unwrap();
         // Internal guard fixture: replace only the checker, retaining the real
         // completed baseline key. Public callers cannot mutate the owner.
-        owner.engine.cpu = Box::new(
+        owner.engine.researcher.cpu = Box::new(
             OwnedCpuChecker::new(CpuEngine::new(owner.plan.cpu.clone()).unwrap()).unwrap(),
         );
         let root = owner
             .engine
+            .semantic
             .nodes
             .iter()
             .position(|node| node.position.snapshot().same_state(&owner.root.snapshot()))
             .unwrap();
         let target = owner
             .engine
+            .semantic
             .nodes
             .iter()
             .position(|node| node.position.snapshot().same_state(&owner.target))
@@ -2652,9 +2734,10 @@ mod repair_tests {
         assert_eq!(owner.counters.cpu_tasks_requested, 3);
         assert_eq!(owner.counters.supported_repairs, 0);
         assert_eq!(owner.counters.supported_refutations, 0);
-        assert!(owner.engine.nodes.iter().all(|node| {
+        assert!(owner.engine.semantic.nodes.iter().all(|node| {
             owner
                 .engine
+                .semantic
                 .stores
                 .situations
                 .get(node.situation)
@@ -2664,7 +2747,7 @@ mod repair_tests {
                 .next()
                 .is_none()
         }));
-        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert_eq!(owner.engine.semantic.model.finish_calls, 1);
         assert!(!owner.strict_query_admission_verified() && !owner.native_freshness_verified());
         assert!(!owner.whole_cost_verified() && !owner.physical_closure_verified());
         assert!(!owner.utility_authority() && !owner.training_target_created());
@@ -2683,9 +2766,9 @@ mod repair_tests {
             &[mv("e2e4"), mv("e7e6"), mv("d2d4")]
         );
         assert_eq!(owner.repaired_line(), &[mv("e2e4"), mv("e7e6"), mv("d2d3")]);
-        assert!(owner.engine.model.saw_model_counterline);
+        assert!(owner.engine.semantic.model.saw_model_counterline);
         assert_eq!(
-            owner.engine.model.initial_cpu_source,
+            owner.engine.semantic.model.initial_cpu_source,
             owner.stages[1].observation
         );
         assert_eq!(owner.records().len(), 4);
@@ -2709,6 +2792,7 @@ mod repair_tests {
         }
         let target = owner
             .engine
+            .semantic
             .nodes
             .iter()
             .find(|node| node.position.snapshot().same_state(&owner.target))
@@ -2727,7 +2811,7 @@ mod repair_tests {
         ));
         assert_eq!(owner.counters.role_calls, 0);
         assert!(owner.stages.is_empty());
-        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert_eq!(owner.engine.semantic.model.finish_calls, 1);
         let mut owner = fixture(100_000);
         owner.engine.config.max_role_calls = 5; // L+1+2*(L-P-1) is six.
         assert!(matches!(
@@ -2753,22 +2837,22 @@ mod repair_tests {
             owner.run_with_repair(limits(100_000), &cancel),
             Err(ReplayError::AlreadyUsed)
         ));
-        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert_eq!(owner.engine.semantic.model.finish_calls, 1);
         let mut owner = fixture(100_000);
         owner.run_with_repair(limits(100_000), &cancel).unwrap();
         assert!(matches!(
             owner.run(limits(100_000), &cancel),
             Err(ReplayError::AlreadyUsed)
         ));
-        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert_eq!(owner.engine.semantic.model.finish_calls, 1);
     }
 
     #[test]
     fn failed_or_rejected_repair_keeps_h0_h1_and_never_dispatches_endpoint() {
         for reject_acceptance in [false, true] {
             let mut owner = fixture(100_000);
-            owner.engine.model.fail_repair = !reject_acceptance;
-            owner.engine.model.reject_repair_acceptance = reject_acceptance;
+            owner.engine.semantic.model.fail_repair = !reject_acceptance;
+            owner.engine.semantic.model.reject_repair_acceptance = reject_acceptance;
             let error = owner.run_with_repair(limits(100_000), &AtomicBool::new(false));
             assert!(
                 matches!(error, Err(ReplayError::Search(error)) if matches!(*error, PalsError::Role(RoleError::Backend(_))))
@@ -2785,15 +2869,18 @@ mod repair_tests {
                     .any(|record| record.kind == RecordKind::Repair)
             );
             assert_eq!(owner.repair_record_revision(), None);
-            assert_eq!(owner.engine.model.finish_calls, 1);
-            assert_eq!(owner.engine.model.closure, Some(RoleSearchClosure::Failed));
+            assert_eq!(owner.engine.semantic.model.finish_calls, 1);
+            assert_eq!(
+                owner.engine.semantic.model.closure,
+                Some(RoleSearchClosure::Failed)
+            );
         }
     }
 
     #[test]
     fn late_repair_acceptance_cancel_preserves_partial_line_but_no_record_or_endpoint() {
         let mut owner = fixture(100_000);
-        owner.engine.model.cancel_on_accept = Some(6);
+        owner.engine.semantic.model.cancel_on_accept = Some(6);
         let error = owner.run_with_repair(limits(100_000), &AtomicBool::new(false));
         assert!(
             matches!(error, Err(ReplayError::Search(error)) if matches!(*error, PalsError::Role(RoleError::Canceled)))
@@ -2811,6 +2898,7 @@ mod repair_tests {
         assert!(
             !owner
                 .engine
+                .semantic
                 .nodes
                 .iter()
                 .any(|node| node.position.snapshot().same_state(&checked.snapshot()))
@@ -2830,6 +2918,7 @@ mod repair_tests {
             assert_eq!(
                 owner
                     .engine
+                    .semantic
                     .stores
                     .tasks
                     .get(stage.execution())
@@ -2840,6 +2929,7 @@ mod repair_tests {
             assert_eq!(
                 owner
                     .engine
+                    .semantic
                     .stores
                     .observations
                     .get(observation)
@@ -2849,9 +2939,9 @@ mod repair_tests {
             );
         }
         assert_eq!(owner.repair_record_revision(), None);
-        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert_eq!(owner.engine.semantic.model.finish_calls, 1);
         assert_eq!(
-            owner.engine.model.closure,
+            owner.engine.semantic.model.closure,
             Some(RoleSearchClosure::Canceled)
         );
     }
@@ -2894,11 +2984,11 @@ mod repair_tests {
                     RecheckEndpointEvidence::Unobserved
                 ));
                 assert!(
-                    owner.engine.nodes[owner.repair_endpoint_node.unwrap()]
+                    owner.engine.semantic.nodes[owner.repair_endpoint_node.unwrap()]
                         .evidence
                         .is_none()
                 );
-                assert_eq!(owner.engine.model.finish_calls, 1);
+                assert_eq!(owner.engine.semantic.model.finish_calls, 1);
                 break;
             }
         }
@@ -2914,6 +3004,7 @@ mod repair_tests {
         owner.run(limits(100_000), &AtomicBool::new(false)).unwrap();
         let target = owner
             .engine
+            .semantic
             .nodes
             .iter()
             .position(|node| node.position.snapshot().same_state(&owner.target))
@@ -2922,7 +3013,8 @@ mod repair_tests {
         let report = stage.report.as_ref().unwrap();
         // Internal adversarial fixture only: a matching actual raw score/state
         // still has AnalyzeRootMoves/restricted namespace and must be refused.
-        owner.engine.nodes[target].evidence = Some(CpuEvidence {
+        owner.engine.semantic.nodes[target].evidence = Some(CpuEvidence {
+            context: None,
             score: report.score,
             depth: report.completed_depth,
             scope: report.score_scope,
@@ -2930,8 +3022,8 @@ mod repair_tests {
             provenance: Some((stage.observation.unwrap(), stage.execution)),
         });
         let facts = PalsEngine::<RepairRoles>::recheck_endpoint(
-            &owner.engine.nodes[target],
-            &owner.engine.stores,
+            &owner.engine.semantic.nodes[target],
+            &owner.engine.semantic.stores,
             &owner.target,
         );
         assert!(matches!(
@@ -2960,7 +3052,7 @@ mod repair_tests {
             RecheckEndpointEvidence::RulesTerminal { .. }
         ));
         assert_eq!(owner.counters.supported_repairs, 0);
-        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert_eq!(owner.engine.semantic.model.finish_calls, 1);
     }
 
     #[test]
@@ -2973,13 +3065,13 @@ mod repair_tests {
         assert_eq!(owner.counters.accepted_repair_outputs, 0);
         assert_eq!(owner.repair_record_revision(), None);
         assert_eq!(owner.stages.len(), 2);
-        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert_eq!(owner.engine.semantic.model.finish_calls, 1);
     }
 
     #[test]
     fn repair_physical_unknown_keeps_primary_reason_and_stops_before_endpoint() {
         let mut owner = fixture(100_000);
-        owner.engine.model.repair_physical_unknown = true;
+        owner.engine.semantic.model.repair_physical_unknown = true;
         let result = owner.run_with_repair(limits(100_000), &AtomicBool::new(false));
         assert!(
             matches!(result, Err(ReplayError::Search(error)) if matches!(*error, PalsError::Role(RoleError::PhysicalCompletionUnknown)))
@@ -2989,9 +3081,9 @@ mod repair_tests {
         assert_eq!(owner.counters.repair_calls, 1);
         assert_eq!(owner.counters.cpu_tasks_requested, 2);
         assert_eq!(owner.repair_record_revision(), None);
-        assert_eq!(owner.engine.model.finish_calls, 1);
+        assert_eq!(owner.engine.semantic.model.finish_calls, 1);
         assert_eq!(
-            owner.engine.model.closure,
+            owner.engine.semantic.model.closure,
             Some(RoleSearchClosure::PhysicalCompletionUnknown)
         );
     }
@@ -3006,15 +3098,16 @@ mod repair_tests {
         // temporarily detaching only the public stage ledger/Node projection.
         let retained_stage = owner.stages.pop().unwrap();
         let endpoint = owner.repair_endpoint_node.unwrap();
-        let root_situation = owner.engine.stores.root().unwrap();
+        let root_situation = owner.engine.semantic.stores.root().unwrap();
         let root = owner
             .engine
+            .semantic
             .nodes
             .iter()
             .position(|node| node.situation == root_situation)
             .unwrap();
-        owner.engine.nodes[endpoint].evidence = None;
-        owner.engine.cpu = Box::new(
+        owner.engine.semantic.nodes[endpoint].evidence = None;
+        owner.engine.researcher.cpu = Box::new(
             OwnedCpuChecker::new(CpuEngine::new(owner.plan.cpu.clone()).unwrap()).unwrap(),
         );
         let mut counters = owner.counters;

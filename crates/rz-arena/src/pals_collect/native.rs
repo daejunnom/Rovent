@@ -667,6 +667,7 @@ fn search_return_result(
                 PalsError::Role(_) => "Role",
                 PalsError::Store(_) => "Store",
                 PalsError::Review(_) => "Review",
+                PalsError::Rovent(_) => "Rovent",
                 PalsError::Capacity => "Capacity",
                 PalsError::RoleCallLimit => "RoleCallLimit",
             };
@@ -727,6 +728,16 @@ fn recheck_observation_json(observation: &Observation) -> serde_json::Value {
             bound,
         } => {
             serde_json::json!({"kind":"ExternalUci","requested_depth":requested_depth,"reported_depth":reported_depth,"seldepth":seldepth,"bound":format!("{:?}",bound)})
+        }
+        EvidenceScope::ProfiledExternalUci {
+            requested,
+            issued,
+            reported_depth,
+            seldepth,
+            bound,
+        } => {
+            serde_json::json!({"kind":"ProfiledExternalUci","requested":requested,"issued":issued,
+                "reported_depth":reported_depth,"seldepth":seldepth,"bound":format!("{:?}",bound)})
         }
         EvidenceScope::Model {
             model,
@@ -2451,10 +2462,10 @@ impl OwnPalsOnnxCollectionDriver {
         if !(1..=16).contains(&max_rounds) {
             return Err(invalid("native collection max rounds must be 1..=16"));
         }
-        let actual_binary = file_sha(&std::env::current_exe().map_err(io)?, 256 * 1024 * 1024)?;
+        let actual_binary = VerifiedExecutableIdentity::current()?;
         if !checkpoint.is_absolute()
             || file_sha(checkpoint, 256 * 1024 * 1024)? != registry.checkpoint_sha256
-            || actual_binary != registry.collector_binary_sha256
+            || actual_binary.sha256 != registry.collector_binary_sha256
             || hex(pin.binary_digest()) != registry.runtime_sha256
             || hex(
                 rz_uci::pals_native::pals_fresh_encoding_semantic_digest_for_config(
@@ -2529,7 +2540,7 @@ impl OwnPalsOnnxCollectionDriver {
                 model_weights_sha256: registry.checkpoint_sha256.clone(),
             },
             cpu_profile_sha256: cpu_source.cpu_profile_sha256.clone(),
-            implementation_sha256: actual_binary,
+            implementation_sha256: actual_binary.sha256.clone(),
             encoding_sha256: registry.encoding_sha256.clone(),
             encoder_source_sha256: registry.encoder_source_sha256.clone(),
             configuration,
@@ -2546,6 +2557,21 @@ impl OwnPalsOnnxCollectionDriver {
             ),
         };
         checked_source(&description)?;
+        // Split legacy search helpers are a compiled-source observation too.
+        // A reader must still match an independent closed review profile and
+        // the original build/manifest/binary pins; this fact enrolls nothing.
+        if let Some(facts) = description
+            .native
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            facts.insert(
+                "search_implementation_sha256".into(),
+                serde_json::json!(hex(
+                    rz_search::pals::engine::compiled_search_implementation_sha256()
+                )),
+            );
+        }
         let sink = Arc::new(Mutex::new(Sink {
             context: None,
             source: description.clone(),

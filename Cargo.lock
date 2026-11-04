@@ -247,6 +247,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -280,6 +289,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -429,6 +439,7 @@ dependencies = [
  "rz-eval",
  "rz-experiments",
  "rz-native-loader",
+ "rz-platform",
  "rz-position",
  "rz-search",
  "rz-uci",
@@ -471,6 +482,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "libc",
+ "rz-contracts",
  "rz-eval",
  "serde",
  "serde_json",
@@ -489,6 +501,9 @@ dependencies = [
 [[package]]
 name = "rz-platform"
 version = "0.1.0"
+dependencies = [
+ "nix",
+]
 
 [[package]]
 name = "rz-position"
@@ -540,6 +555,7 @@ dependencies = [
  "rz-eval",
  "rz-experiments",
  "rz-native-loader",
+ "rz-platform",
  "rz-position",
  "rz-runtime",
  "rz-search",

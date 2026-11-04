@@ -67,6 +67,42 @@ pub struct VirtualReviewCudaPlacementWitness {
     pub warm_seed_identity_kernels: usize,
     pub category_provenance: String,
 }
+
+/// The system-runtime domain deliberately has no legacy bundle field.  This
+/// proves only the supplied placement profiles and current process mappings;
+/// GPU physical completion remains the native worker owner's responsibility.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SystemVirtualReviewCudaPlacementWitness {
+    pub schema: &'static str,
+    pub inventory_sha256: [u8; 32],
+    pub manifest_sha256: [u8; 32],
+    pub ort_sha256: [u8; 32],
+    pub system_runtime_identity_sha256: [u8; 32],
+    pub declared_device_id: i32,
+    pub mapped_roles: Vec<String>,
+    pub missing_optional_roles: Vec<String>,
+    pub layout: String,
+    pub artifact_kind: String,
+    pub optimization: PalsGraphOptimization,
+    pub initialization: Vec<PalsGraphPlacement>,
+    pub kernels: BTreeMap<String, PalsKernelWitness>,
+    pub validator_private_kernels: usize,
+    pub validator_task_head_kernels: usize,
+    pub warm_seed_identity_kernels: usize,
+    pub physical_completion: &'static str,
+    pub category_provenance: String,
+}
+
+struct VerifiedVirtualProfiles {
+    layout: String,
+    artifact_kind: String,
+    initialization: Vec<PalsGraphPlacement>,
+    kernels: BTreeMap<String, PalsKernelWitness>,
+    validator_private_kernels: usize,
+    validator_task_head_kernels: usize,
+    warm_seed_identity_kernels: usize,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InventoryV3 {
@@ -321,6 +357,94 @@ impl PalsCudaControlPolicy {
         runtime: [u8; 32],
         bundle: [u8; 32],
     ) -> Result<VirtualReviewCudaPlacementWitness, BackendError> {
+        let verified = self.verify_virtual_profiles_common(profiles, placements)?;
+        Ok(VirtualReviewCudaPlacementWitness {
+            schema: WITNESS_SCHEMA.into(),
+            inventory_sha256: self.inventory,
+            manifest_sha256: self.manifest,
+            runtime_sha256: runtime,
+            runtime_bundle_sha256: bundle,
+            layout: verified.layout,
+            artifact_kind: verified.artifact_kind,
+            optimization: PalsGraphOptimization::Disable,
+            initialization: verified.initialization,
+            kernels: verified.kernels,
+            validator_private_kernels: verified.validator_private_kernels,
+            validator_task_head_kernels: verified.validator_task_head_kernels,
+            warm_seed_identity_kernels: verified.warm_seed_identity_kernels,
+            category_provenance: "rc10-category-unavailable-id-location-message-used".into(),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn observe_system_virtual_profiles(
+        &self,
+        profiles: &BTreeMap<String, Vec<u8>>,
+        placements: Vec<PalsGraphPlacement>,
+        runtime: &OrtRuntime,
+        declared_device_id: i32,
+    ) -> Result<super::super::virtual_review::SystemPlacementObservation, BackendError> {
+        if declared_device_id < 0 {
+            return Err(policy_error("system CUDA declared device is invalid"));
+        }
+        let system = runtime
+            .system_runtime()
+            .ok_or_else(|| policy_error("system CUDA placement requires a system runtime owner"))?;
+        // Profile errors must remain errors even when mapping evidence is unavailable.
+        let verified = self.verify_virtual_profiles_common(profiles, placements)?;
+        let observed = match system.verify_mappings() {
+            Ok(observed) => observed,
+            Err(cause) if cause.kind == rz_native_loader::LoadErrorKind::ObservationUnavailable => {
+                return Ok(super::super::virtual_review::SystemPlacementObservation::MappingUnavailable)
+            }
+            Err(cause) if cause.kind == rz_native_loader::LoadErrorKind::ForeignMapping => {
+                return Ok(super::super::virtual_review::SystemPlacementObservation::UnregisteredOrPreexistingMappings)
+            }
+            Err(cause) => {
+                return Err(
+                    policy_error("system CUDA runtime mappings could not be verified")
+                        .with_external_cause(CauseCode::RuntimeLibraryLoad, &cause),
+                )
+            }
+        };
+        if observed.identity_sha256 != system.identity_sha256()
+            || !observed.missing_required_roles.is_empty()
+            || !observed.unregistered_native_mappings.is_empty()
+        {
+            return Err(policy_error("system CUDA mapping identity differs"));
+        }
+        Ok(
+            super::super::virtual_review::SystemPlacementObservation::Verified(Box::new(
+                SystemVirtualReviewCudaPlacementWitness {
+                    schema: "rovezero.pals-virtual-system-cuda-placement.v1",
+                    inventory_sha256: self.inventory,
+                    manifest_sha256: self.manifest,
+                    ort_sha256: runtime.binary_digest(),
+                    system_runtime_identity_sha256: observed.identity_sha256,
+                    declared_device_id,
+                    mapped_roles: observed.mapped_roles,
+                    missing_optional_roles: observed.missing_optional_roles,
+                    layout: verified.layout,
+                    artifact_kind: verified.artifact_kind,
+                    optimization: PalsGraphOptimization::Disable,
+                    initialization: verified.initialization,
+                    kernels: verified.kernels,
+                    validator_private_kernels: verified.validator_private_kernels,
+                    validator_task_head_kernels: verified.validator_task_head_kernels,
+                    warm_seed_identity_kernels: verified.warm_seed_identity_kernels,
+                    physical_completion: "not_inferred",
+                    category_provenance: "rc10-category-unavailable-id-location-message-used"
+                        .into(),
+                },
+            )),
+        )
+    }
+
+    fn verify_virtual_profiles_common(
+        &self,
+        profiles: &BTreeMap<String, Vec<u8>>,
+        placements: Vec<PalsGraphPlacement>,
+    ) -> Result<VerifiedVirtualProfiles, BackendError> {
         let layout = self
             .virtual_layout
             .as_ref()
@@ -354,8 +478,11 @@ impl PalsCudaControlPolicy {
                     .cuda_nodes
                     .checked_add(placement.approved_cpu_control_nodes)
                     != Some(placement.assigned_nodes)
-                || placement.recursive_coverage
-                    != "ort-1.22-finalize-recursive-exact-named-provider-coverage-before-first-run"
+                || (placement.recursive_coverage != NAMED_RECURSIVE_COVERAGE
+                    && !(placement.recursive_coverage == ALL_CUDA_SUMMARY_COVERAGE
+                        && placement.approved_cpu_control_nodes == 0
+                        && graph.required_cuda_dispatch.is_empty()
+                        && placement.approved_transfers.is_empty()))
             {
                 return Err(policy_error(
                     "V3 pre-Run source/provider coverage is invalid",
@@ -376,6 +503,13 @@ impl PalsCudaControlPolicy {
                 &self.graphs[*role],
                 &placement.approved_transfers,
             )?;
+            if placement.recursive_coverage == ALL_CUDA_SUMMARY_COVERAGE
+                && witness.approved_cpu_control_kernels != 0
+            {
+                return Err(policy_error(
+                    "V3 CPU kernel contradicts the recursive all-CUDA summary",
+                ));
+            }
             if witness.neural_kernels == 0 {
                 return Err(policy_error(
                     "V3 role profile has no completed neural kernel",
@@ -422,21 +556,14 @@ impl PalsCudaControlPolicy {
         } else {
             0
         };
-        Ok(VirtualReviewCudaPlacementWitness {
-            schema: WITNESS_SCHEMA.into(),
-            inventory_sha256: self.inventory,
-            manifest_sha256: self.manifest,
-            runtime_sha256: runtime,
-            runtime_bundle_sha256: bundle,
+        Ok(VerifiedVirtualProfiles {
             layout: layout.layout_name().into(),
             artifact_kind: layout.artifact_kind().into(),
-            optimization: PalsGraphOptimization::Disable,
             initialization: placements,
             kernels,
             validator_private_kernels,
             validator_task_head_kernels,
             warm_seed_identity_kernels,
-            category_provenance: "rc10-category-unavailable-id-location-message-used".into(),
         })
     }
     pub(crate) fn finish_virtual_profile(
@@ -1128,6 +1255,115 @@ mod tests {
         ]);
         assert!(value
             .verify_virtual_profiles(&profiles, vec![], [1; 32], [2; 32])
+            .is_err());
+    }
+
+    #[test]
+    fn all_cuda_summary_needs_exact_executed_profiles_and_both_private_roles() {
+        let make_graph = |nodes: &[(&str, &str)]| GraphPolicy {
+            digest: [1; 32],
+            nodes: nodes
+                .iter()
+                .map(|(n, op)| ((*n).into(), (*op).into()))
+                .collect(),
+            controls: BTreeMap::from([("shape".into(), "Shape".into())]),
+            major: nodes
+                .iter()
+                .filter(|(_, op)| *op == "MatMul")
+                .map(|(n, op)| ((*n).into(), (*op).into()))
+                .collect(),
+            proposer_private: BTreeMap::from([("p_nn".into(), "MatMul".into())]),
+            critic_private: BTreeMap::from([("c_nn".into(), "MatMul".into())]),
+            role_transfer: None,
+            required_cuda_dispatch: BTreeSet::new(),
+        };
+        let public = make_graph(&[("nn", "MatMul"), ("shape", "Shape")]);
+        let shared = make_graph(&[("p_nn", "MatMul"), ("c_nn", "MatMul")]);
+        let value = PalsCudaControlPolicy {
+            manifest: [2; 32],
+            inventory: [3; 32],
+            graphs: BTreeMap::from([("public".into(), public), ("shared_pc".into(), shared)]),
+            virtual_layout: Some(VirtualReviewControlLayout {
+                kind: Kind::FreshPc,
+                validator_private: BTreeMap::new(),
+                validator_task_head: BTreeMap::new(),
+                weight_bindings: BTreeMap::new(),
+            }),
+        };
+        let event = |name: &str, op: &str, provider: &str| {
+            json!({
+                "cat":"Node", "name":format!("{name}_kernel_time"),
+                "args":{"provider":provider,"op_name":op,"output_type_shape":[{"int64":[1]}]}
+            })
+        };
+        let profiles = BTreeMap::from([
+            (
+                "public".into(),
+                serde_json::to_vec(&vec![event("nn", "MatMul", CUDA)]).unwrap(),
+            ),
+            (
+                "shared_pc".into(),
+                serde_json::to_vec(&vec![
+                    event("p_nn", "MatMul", CUDA),
+                    event("c_nn", "MatMul", CUDA),
+                ])
+                .unwrap(),
+            ),
+        ]);
+        let placements = ["public", "shared_pc"]
+            .into_iter()
+            .map(|role| PalsGraphPlacement {
+                role: role.into(),
+                graph_sha256: [1; 32],
+                log_sha256: [4; 32],
+                assigned_nodes: 2,
+                cuda_nodes: 2,
+                approved_cpu_control_nodes: 0,
+                optimization: PalsGraphOptimization::Disable,
+                approved_transfers: Vec::new(),
+                recursive_coverage: ALL_CUDA_SUMMARY_COVERAGE.into(),
+            })
+            .collect::<Vec<_>>();
+        assert!(value
+            .verify_virtual_profiles_common(&profiles, placements.clone())
+            .is_ok());
+        let mut cpu = profiles.clone();
+        cpu.insert(
+            "public".into(),
+            serde_json::to_vec(&vec![
+                event("nn", "MatMul", CUDA),
+                event("shape", "Shape", CPU),
+            ])
+            .unwrap(),
+        );
+        assert!(value
+            .verify_virtual_profiles_common(&cpu, placements.clone())
+            .is_err());
+        let mut unknown = profiles.clone();
+        unknown.insert(
+            "public".into(),
+            serde_json::to_vec(&vec![event("unknown", "MatMul", CUDA)]).unwrap(),
+        );
+        assert!(value
+            .verify_virtual_profiles_common(&unknown, placements.clone())
+            .is_err());
+        let mut missing_role = profiles.clone();
+        missing_role.insert(
+            "shared_pc".into(),
+            serde_json::to_vec(&vec![event("p_nn", "MatMul", CUDA)]).unwrap(),
+        );
+        assert!(value
+            .verify_virtual_profiles_common(&missing_role, placements.clone())
+            .is_err());
+        let mut needs_dispatch = value;
+        needs_dispatch
+            .graphs
+            .get_mut("shared_pc")
+            .unwrap()
+            .required_cuda_dispatch
+            .insert("required_role_if".into());
+        assert!(needs_dispatch
+            .verify_virtual_profiles_common(&profiles, placements)
             .is_err());
     }
 }

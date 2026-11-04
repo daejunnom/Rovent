@@ -582,6 +582,13 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(5);
         SearchSessionContext {
             authority,
+            root_moves: None,
+            goal: rz_contracts::rovent::SearchGoal::default(),
+            original_go: None,
+            original_time_budget: None,
+            original_start: None,
+            effective_clock: None,
+            requested_nodes: None,
             control: SearchControl::new(until, 10),
             cancellation: CancelToken::new(),
             shutdown_deadline: until,
@@ -619,6 +626,7 @@ mod tests {
             .finish(
                 &context,
                 &Ok(SearchSessionReport {
+                    mate_strategy: None,
                     best_move: None,
                     work: DriverWork::Pals {
                         rounds: 0,
@@ -878,6 +886,7 @@ mod tests {
             .finish(
                 &context,
                 &Ok(SearchSessionReport {
+                    mate_strategy: None,
                     best_move: None,
                     work: DriverWork::Pals {
                         rounds: 0,
@@ -995,6 +1004,7 @@ mod tests {
         let movement = BoardMove::from_uci("e2e4").unwrap();
         journal.begin().unwrap();
         let report = Ok(SearchSessionReport {
+            mate_strategy: None,
             best_move: Some(movement),
             work: DriverWork::Cpu {
                 nodes: 1,

@@ -105,6 +105,51 @@ fn ledger(envelope: CpuJobEnvelope, clock: InstantClock) -> CpuCreditLedger {
     .unwrap()
 }
 
+fn reciprocal_scope(envelope: CpuJobEnvelope, owner: CpuWorkerId) -> CpuReciprocalScope {
+    use rz_contracts::pals_adaptive::ReviewViewSeal;
+    use rz_contracts::rovent::{
+        ChessPly, QuestionEnvelope, QuestionPurpose, ReciprocalQuestionId, SearchRecipient,
+    };
+    CpuReciprocalScope {
+        job: envelope,
+        owner,
+        parent: QuestionEnvelope {
+            id: ReciprocalQuestionId {
+                authority: envelope.id.authority,
+                sequence: 1,
+            },
+            parent: None,
+            sender: SearchRecipient::Proposer,
+            recipient: SearchRecipient::Researcher,
+            purpose: QuestionPurpose::TacticalReview,
+            anchor: envelope.state_identity,
+            anchor_root_ply: ChessPly(0),
+            original_first_move: None,
+            prefix_digest: Digest([32; 32]),
+            line_digest: None,
+            line_offset: ChessPly(0),
+            question_digest: envelope.question,
+            view: ReviewViewSeal {
+                authority: envelope.id.authority,
+                view_sequence: 1,
+                context_policy: Digest([33; 32]),
+                view_digest: Digest([34; 32]),
+                root_state: envelope.state_identity,
+                actual_tokens: 0,
+                selected_records: 0,
+                anchors: 1,
+                length_bucket: 8,
+            },
+            evidence_revision: 1,
+            root_budget: Digest([35; 32]),
+            original_deadline: envelope.hard_deadline,
+        },
+        recipient: SearchRecipient::Proposer,
+        max_questions: 1,
+        node_interval: 1,
+    }
+}
+
 fn wait_event(worker: &CpuWorker, deadline: Instant) -> CpuWorkerEvent {
     loop {
         // Observe before checking the queue: publication in this gap changes
@@ -169,6 +214,7 @@ fn observed_report(
 ) -> CpuSliceReport {
     CpuSliceReport {
         grant,
+        reciprocal_request: None,
         actual_work: Some(CpuWork {
             nodes,
             quiescence_nodes: 0,
@@ -320,6 +366,83 @@ fn native_private_worker_slices_settle_once_and_match_uninterrupted_work() {
 }
 
 #[test]
+fn settled_slice_receipts_bind_one_ledger_and_never_reissue_work() {
+    let cpu = engine(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+    let clock = clock();
+    let envelope = job(&cpu, Position::startpos(), None, &clock, CpuWorkerId(0), 8).envelope();
+    let mut first_ledger = ledger(envelope, clock);
+    let second_ledger = ledger(envelope, clock);
+    let identity = first_ledger.identity();
+    assert_eq!(identity, first_ledger.identity());
+    assert_ne!(identity, second_ledger.identity());
+    first_ledger.register(envelope).unwrap();
+    let reserved = grant(envelope, CpuWorkerId(0), 1, 4);
+    first_ledger.reserve(reserved).unwrap();
+    let report = observed_report(reserved, 2, 2, false);
+    let receipt = first_ledger.settle_attested(&report).unwrap();
+    assert_eq!(receipt.ledger_identity(), &identity);
+    assert_eq!(receipt.grant(), reserved);
+    assert_eq!(receipt.actual_work().nodes, 2);
+    assert!(!receipt.admission_rejected());
+    assert!(!receipt.terminal());
+    assert_eq!(first_ledger.global_usage().unwrap(), (2, 0));
+    assert!(matches!(
+        first_ledger.settle_attested(&report),
+        Err(CpuWorkerError::Duplicate)
+    ));
+    assert_eq!(first_ledger.global_usage().unwrap(), (2, 0));
+
+    let next = grant(envelope, CpuWorkerId(0), 2, 3);
+    first_ledger.reserve(next).unwrap();
+    let mut unknown = observed_report(next, 1, 3, true);
+    unknown.actual_work = None;
+    assert!(matches!(
+        first_ledger.settle_attested(&unknown),
+        Err(CpuWorkerError::UnknownUsage)
+    ));
+    assert_eq!(first_ledger.usage(envelope.id).unwrap(), (2, 3, true));
+}
+
+#[test]
+fn unqueued_release_and_worker_rejection_have_distinct_accounting_receipts() {
+    let cpu = engine(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+    let clock = clock();
+    let envelope = job(&cpu, Position::startpos(), None, &clock, CpuWorkerId(0), 8).envelope();
+    let mut credits = ledger(envelope, clock);
+    credits.register(envelope).unwrap();
+    let first = grant(envelope, CpuWorkerId(0), 1, 4);
+    credits.reserve(first).unwrap();
+    assert!(matches!(
+        credits.release_unadmitted_attested(&CpuAdmissionRejection {
+            grant: first,
+            verified_unqueued: false,
+        }),
+        Err(CpuWorkerError::UnknownUsage)
+    ));
+    assert_eq!(credits.usage(envelope.id).unwrap(), (0, 4, false));
+    let released = credits
+        .release_unadmitted_attested(&CpuAdmissionRejection {
+            grant: first,
+            verified_unqueued: true,
+        })
+        .unwrap();
+    assert_eq!(released.ledger_identity(), &credits.identity());
+    assert_eq!(released.grant(), first);
+    assert_eq!(credits.global_usage().unwrap(), (0, 0));
+    let second = grant(envelope, CpuWorkerId(0), 2, 4);
+    credits.reserve(second).unwrap();
+    let mut rejected = observed_report(second, 0, 0, false);
+    rejected.admission_rejected = true;
+    rejected.continuation_retained = false;
+    rejected.result = Err(CpuError::Unsupported("authored worker rejection"));
+    let settled = credits.settle_attested(&rejected).unwrap();
+    assert!(settled.admission_rejected());
+    assert_eq!(settled.actual_work(), CpuWork::default());
+    assert_eq!(settled.grant(), second);
+    assert_eq!(credits.global_usage().unwrap(), (0, 0));
+}
+
+#[test]
 fn ledger_rejects_overreservation_duplicate_and_owner_migration_without_refund() {
     let cpu = engine(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
     let clock = clock();
@@ -426,11 +549,40 @@ fn global_credit_covers_all_jobs_and_one_owner_cannot_hold_two_primaries() {
     let mut ledger = ledger(first, clock);
     ledger.register(first).unwrap();
     ledger.register(second).unwrap();
+    assert_eq!(
+        ledger.owner_admission(second.id, CpuWorkerId(0)),
+        Ok(CpuOwnerAdmission::Unstarted)
+    );
     let first_grant = grant(first, CpuWorkerId(0), 1, 6);
     ledger.reserve(first_grant).unwrap();
+    assert_eq!(
+        ledger.owner_admission(first.id, CpuWorkerId(0)),
+        Err(CpuWorkerError::AlreadyReserved)
+    );
     ledger
         .settle(&observed_report(first_grant, 4, 4, false))
         .unwrap();
+    assert_eq!(ledger.global_usage().unwrap(), (4, 0));
+    // A settled Yield frees this invocation's reservation, not its private
+    // primary stack. P/C feedback may run while that exact R owner waits.
+    assert_eq!(
+        ledger.owner_admission(first.id, CpuWorkerId(0)),
+        Ok(CpuOwnerAdmission::SameOwnerResume)
+    );
+    assert_eq!(
+        ledger.owner_admission(second.id, CpuWorkerId(0)),
+        Ok(CpuOwnerAdmission::BlockedBy(first.id))
+    );
+    assert_eq!(
+        ledger.owner_admission(second.id, CpuWorkerId(1)),
+        Ok(CpuOwnerAdmission::Unstarted)
+    );
+    assert!(matches!(
+        ledger.owner_admission(first.id, CpuWorkerId(1)),
+        Err(CpuWorkerError::Invalid(
+            "CPU primary job cannot move between owners"
+        ))
+    ));
     assert_eq!(ledger.global_usage().unwrap(), (4, 0));
     assert!(matches!(
         ledger.reserve(grant(second, CpuWorkerId(0), 2, 1)),
@@ -452,6 +604,121 @@ fn global_credit_covers_all_jobs_and_one_owner_cannot_hold_two_primaries() {
         ledger.reserve(grant(first, CpuWorkerId(0), 3, 1)),
         Err(CpuWorkerError::Invalid(_))
     ));
+}
+
+#[test]
+fn reciprocal_worker_rejects_plain_resume_then_consumes_reply_on_the_same_owner() {
+    use rz_contracts::rovent::{ChessPly, QuestionPurpose, SearchRecipient};
+    let cpu = engine(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+    let clock = clock();
+    let mut original = job(
+        &cpu,
+        Position::from_fen("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1").unwrap(),
+        None,
+        &clock,
+        CpuWorkerId(0),
+        65536,
+    );
+    let envelope = original.envelope();
+    let scope = reciprocal_scope(envelope, CpuWorkerId(0));
+    original.enable_reciprocal_questions(scope.clone()).unwrap();
+    let mut ledger = ledger(envelope, clock);
+    ledger.register(envelope).unwrap();
+    let worker = CpuWorker::spawn(CpuWorkerId(0), cpu).unwrap();
+    let first = grant(envelope, CpuWorkerId(0), 1, 4096);
+    ledger.reserve(first).unwrap();
+    worker.begin(original, first).unwrap();
+    let waiting = wait_report(&worker, clock.origin() + FIXTURE_WINDOW);
+    assert_eq!(
+        waiting.result.as_ref().unwrap().report.completion,
+        CpuCompletion::AwaitReciprocal
+    );
+    assert!(waiting.continuation_retained && !waiting.terminal);
+    assert!(waiting.result.as_ref().unwrap().report.resume.is_none());
+    let request = waiting
+        .reciprocal_request
+        .clone()
+        .expect("real private owner question");
+    assert_eq!(request.scope().job, envelope);
+    assert_eq!(request.scope().owner, CpuWorkerId(0));
+    ledger.settle(&waiting).unwrap();
+    let before_rejection = ledger.global_usage().unwrap();
+
+    let plain = grant(envelope, CpuWorkerId(0), 2, 4096);
+    ledger.reserve(plain).unwrap();
+    worker.resume_attested(plain).unwrap();
+    let rejected = wait_report(&worker, clock.origin() + FIXTURE_WINDOW);
+    assert!(rejected.admission_rejected && !rejected.terminal);
+    assert!(matches!(&rejected.result, Err(CpuError::ResumeMismatch(_))));
+    assert_eq!(rejected.actual_work, Some(CpuWork::default()));
+    ledger.settle(&rejected).unwrap();
+    assert_eq!(ledger.global_usage().unwrap(), before_rejection);
+    assert_eq!(
+        ledger.owner_admission(envelope.id, CpuWorkerId(0)),
+        Ok(CpuOwnerAdmission::SameOwnerResume)
+    );
+
+    let anchor = ContractPosition::new(OwnerId(72), request.position().clone())
+        .export()
+        .unwrap();
+    let mut child = scope.parent;
+    child.id.sequence = 2;
+    child.parent = Some(scope.parent.id);
+    child.sender = SearchRecipient::Researcher;
+    child.recipient = SearchRecipient::Proposer;
+    child.purpose = QuestionPurpose::Propose;
+    child.anchor = anchor.snapshot().identity();
+    child.anchor_root_ply = ChessPly(request.ply());
+    child.question_digest = Digest([36; 32]);
+    child.view.view_sequence = 2;
+    child.view.view_digest = Digest([37; 32]);
+    // Authored legal ordering feedback tests the owner boundary. It is not a
+    // neural result or evidence of an actual P/C model call.
+    let reply = CpuReciprocalReply::new(
+        &request,
+        child,
+        &anchor,
+        request.candidates().iter().rev().copied().collect(),
+    )
+    .unwrap();
+    let next = grant(envelope, CpuWorkerId(0), 3, 4096);
+    ledger.reserve(next).unwrap();
+    worker.resume_with_reply_attested(next, reply).unwrap();
+    let mut completed = None;
+    for sequence in 4..=64 {
+        let report = wait_report(&worker, clock.origin() + FIXTURE_WINDOW);
+        assert_eq!(report.grant.owner, CpuWorkerId(0));
+        assert_eq!(report.grant.job, envelope.id);
+        assert!(!report.admission_rejected);
+        assert!(report.reciprocal_request.is_none());
+        ledger.settle(&report).unwrap();
+        if report.terminal {
+            completed = Some(report);
+            break;
+        }
+        assert!(report.continuation_retained);
+        let remaining = envelope.total_native_node_credit - ledger.global_usage().unwrap().0;
+        assert!(
+            remaining > 0,
+            "original credit exhausted before native completion"
+        );
+        let next = grant(envelope, CpuWorkerId(0), sequence, remaining.min(4096));
+        ledger.reserve(next).unwrap();
+        worker.resume_attested(next).unwrap();
+    }
+    let completed = completed.expect("bounded same-owner traversal must terminate");
+    let result = completed.result.as_ref().unwrap();
+    assert_eq!(result.report.completion, CpuCompletion::DepthLimit);
+    assert_eq!(result.report.completed_depth, 2);
+    assert!(completed.cumulative_nodes > before_rejection.0);
+    assert_eq!(
+        ledger.global_usage().unwrap(),
+        (completed.cumulative_nodes, 0)
+    );
+    let shutdown = worker.shutdown().unwrap();
+    assert!(shutdown.thread_joined && !shutdown.thread_panicked);
+    assert!(shutdown.events.is_empty());
+    assert_eq!(shutdown.mailbox.reliable_reserved, 0);
 }
 
 #[test]

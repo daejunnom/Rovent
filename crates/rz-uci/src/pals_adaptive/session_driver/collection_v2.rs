@@ -1,0 +1,376 @@
+//! Board-backed PCR collection uses the original loaded /2 owner and frontier.
+//! These hooks are admission/coordination only; they are not a teacher fence.
+
+use super::*;
+use crate::pals_adaptive::{
+    AdaptiveCollectionError, AdaptiveCollectionObserverBoxV2, AdaptiveCollectionV2ObserverStatus,
+    RoventCollectionRootAdmissionV2, RoventNativeCollectionOriginV2,
+    RoventTeacherScopePhysicalAckV2,
+};
+use crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2;
+use std::any::Any;
+
+/// The collection owner must not perform blocking teacher or filesystem work
+/// from these callbacks, which run while the actual session manager is held.
+pub trait RoventBoardCollectionHooksV2<B>: Send + Sync
+where
+    B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
+    B::Output: ProposerRankingOutput,
+{
+    /// Bind the exact startup control without spawning or waiting.
+    fn register_startup_control(
+        &self,
+        control: &crate::rovent_bootstrap::RoventStartupControl,
+    ) -> Result<(), AdaptiveManagerError>;
+    fn admit(
+        &self,
+        port: &mut RoventBoardCollectionAdmissionPortV2<'_, B>,
+        admission: RoventCollectionRootAdmissionV2,
+    ) -> Result<(), RoventBoardCollectionAdmissionFailureV2>;
+    fn pump(&self) -> Result<(), AdaptiveManagerError>;
+    fn revoke(&self);
+    fn handoff_sender(
+        &self,
+    ) -> std::sync::mpsc::SyncSender<Arc<Mutex<RoventBoardCollectionHandoffV2<B::Output>>>>;
+}
+
+/// Native root completion and the original observer; this does not attest
+/// retirement of any separate teacher process.
+pub struct RoventBoardCollectionHandoffV2<O> {
+    pub(super) admission: RoventCollectionRootAdmissionV2,
+    pub(super) observer: AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, O>,
+    pub(super) settlement: Result<(), AdaptiveCollectionError>,
+    pub(super) native_fence: AdaptiveShutdownReceipt,
+    pub(super) teacher_physical_ack: Option<RoventTeacherScopePhysicalAckV2>,
+    pub(super) teacher_aggregate_ack: Option<RoventTeacherScopeAggregateAckV2>,
+}
+
+/// Delivery never certifies teacher or physical completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventBoardCollectionDeliveryV2 {
+    Delivered,
+    Full,
+    Disconnected,
+}
+
+impl<O> RoventBoardCollectionHandoffV2<O> {
+    /// Accept only a unique, original teacher scope acknowledgment for this
+    /// exact admission. It conveys physical retirement, not semantic success.
+    pub fn submit_teacher_physical_ack(
+        &mut self,
+        ack: RoventTeacherScopePhysicalAckV2,
+    ) -> Result<(), RoventTeacherScopePhysicalAckV2> {
+        if self.teacher_physical_ack.is_some()
+            || self.teacher_aggregate_ack.is_some()
+            || !ack.matches_admission(&self.admission)
+        {
+            return Err(ack);
+        }
+        self.teacher_physical_ack = Some(ack);
+        Ok(())
+    }
+
+    /// Reclaim the same non-clone acknowledgment; removing it does not itself
+    /// certify that the session or its native owner has stopped.
+    pub fn take_teacher_physical_ack(&mut self) -> Option<RoventTeacherScopePhysicalAckV2> {
+        self.teacher_physical_ack.take()
+    }
+
+    /// Aggregate retirement remains separate from collection semantic success
+    /// and cannot replace the original observer or publication custody.
+    pub fn submit_teacher_aggregate_ack(
+        &mut self,
+        ack: RoventTeacherScopeAggregateAckV2,
+    ) -> Result<(), RoventTeacherScopeAggregateAckV2> {
+        if self.teacher_physical_ack.is_some()
+            || self.teacher_aggregate_ack.is_some()
+            || !ack.matches_admission(&self.admission)
+        {
+            return Err(ack);
+        }
+        self.teacher_aggregate_ack = Some(ack);
+        Ok(())
+    }
+
+    pub fn teacher_aggregate_ack(&self) -> Option<&RoventTeacherScopeAggregateAckV2> {
+        self.teacher_aggregate_ack.as_ref()
+    }
+
+    pub fn take_teacher_aggregate_ack(&mut self) -> Option<RoventTeacherScopeAggregateAckV2> {
+        self.teacher_aggregate_ack.take()
+    }
+    pub fn parts_mut(
+        &mut self,
+    ) -> (
+        &RoventCollectionRootAdmissionV2,
+        &mut AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, O>,
+        &Result<(), AdaptiveCollectionError>,
+        &AdaptiveShutdownReceipt,
+    ) {
+        (
+            &self.admission,
+            &mut self.observer,
+            &self.settlement,
+            &self.native_fence,
+        )
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        RoventCollectionRootAdmissionV2,
+        AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, O>,
+        Result<(), AdaptiveCollectionError>,
+        AdaptiveShutdownReceipt,
+        Option<RoventTeacherScopePhysicalAckV2>,
+        Option<RoventTeacherScopeAggregateAckV2>,
+    ) {
+        (
+            self.admission,
+            self.observer,
+            self.settlement,
+            self.native_fence,
+            self.teacher_physical_ack,
+            self.teacher_aggregate_ack,
+        )
+    }
+}
+
+/// Preserve the original admission and every acquired owner on a failed hook.
+pub struct RoventBoardCollectionAdmissionFailureV2 {
+    pub error: AdaptiveManagerError,
+    pub admission: RoventCollectionRootAdmissionV2,
+    pub owners: Box<dyn Any + Send>,
+}
+
+pub struct RoventBoardCollectionObserverRejectionV2<O> {
+    pub error: AdaptiveManagerError,
+    pub admission: RoventCollectionRootAdmissionV2,
+    pub observer: AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, O>,
+    pub observer_status: AdaptiveCollectionV2ObserverStatus,
+    pub panic_payload: Option<Box<dyn Any + Send>>,
+}
+
+pub struct RoventBoardCollectionAdmissionPortV2<'a, B>
+where
+    B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
+    B::Output: ProposerRankingOutput,
+{
+    pub(super) manager: &'a mut AdaptiveSessionManager<B>,
+}
+
+impl<B> RoventBoardCollectionAdmissionPortV2<'_, B>
+where
+    B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
+    B::Output: ProposerRankingOutput,
+{
+    pub fn install(
+        &mut self,
+        admission: RoventCollectionRootAdmissionV2,
+        observer: AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, B::Output>,
+    ) -> Result<(), RoventBoardCollectionObserverRejectionV2<B::Output>> {
+        self.manager
+            .install_collection_observer_v2(admission, observer)
+            .map_err(|failure| RoventBoardCollectionObserverRejectionV2 {
+                error: failure.error,
+                admission: failure.admission,
+                observer: failure.observer,
+                observer_status: failure.observer_status,
+                panic_payload: failure.panic_payload,
+            })
+    }
+}
+
+/// Registration returns both original owners on rejection, rather than
+/// dropping a hook that may itself own a teacher worker.
+pub struct RoventBoardCollectionRegistrationRejectionV2<B>
+where
+    B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
+    B::Output: ProposerRankingOutput,
+{
+    pub error: SearchSessionFailure,
+    pub origin: RoventNativeCollectionOriginV2,
+    pub hooks: Arc<dyn RoventBoardCollectionHooksV2<B>>,
+    pub panic_payload: Option<Box<dyn Any + Send>>,
+}
+
+impl<B> AdaptiveSessionDriver<B>
+where
+    B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
+    B::Output: ProposerRankingOutput,
+{
+    pub fn board_collection_delivery_v2(
+        &self,
+    ) -> Result<Option<RoventBoardCollectionDeliveryV2>, SearchSessionFailure> {
+        self.rovent_collection_delivery_v2
+            .lock()
+            .map(|status| *status)
+            .map_err(|_| failure("RoventBoardCollectionDeliveryV2", "delivery state poisoned"))
+    }
+
+    /// Transfer this session's original handoff to a caller that will retain
+    /// its observer and unpublished corpus data. This is also the recovery
+    /// path when the worker channel was full or disconnected. It cannot
+    /// fabricate a teacher acknowledgment or establish corpus acceptance.
+    /// Repeated calls never create a second copy of this custody transfer.
+    pub fn take_board_collection_handoff_v2(
+        &self,
+    ) -> Result<Option<Arc<Mutex<RoventBoardCollectionHandoffV2<B::Output>>>>, SearchSessionFailure>
+    {
+        let mut transferred = self
+            .rovent_collection_handoff_transferred_v2
+            .try_lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+        let mut retained = self
+            .rovent_collection_handoff_v2
+            .try_lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+        if transferred.is_some() {
+            if retained.is_some() {
+                return Err(SearchSessionFailure::physical_completion_unknown());
+            }
+            return Ok(None);
+        }
+        let Some(original) = retained.take() else {
+            return Ok(None);
+        };
+        *transferred = Some(Arc::downgrade(&original));
+        Ok(Some(original))
+    }
+    /// Installs only the actual loaded /2 owner on the still-idle session.
+    /// A copied digest or a separately loaded model cannot stand in for it.
+    pub fn register_rovent_collection_v2(
+        &mut self,
+        origin: RoventNativeCollectionOriginV2,
+        hooks: Arc<dyn RoventBoardCollectionHooksV2<B>>,
+        control: &crate::rovent_bootstrap::RoventStartupControl,
+    ) -> Result<(), Box<RoventBoardCollectionRegistrationRejectionV2<B>>> {
+        let valid = origin.sources().matches_startup_control(control)
+            && self.rovent_root_policy_v2.as_ref().is_some_and(|policy| {
+                policy.owner.v2().is_some_and(|lock| {
+                    Arc::ptr_eq(lock, origin.sources().lock_owner())
+                        && matches!(
+                            lock.manifest.engine.researcher.as_ref(),
+                            Some(rz_experiments::RoventResearcher::Own { .. })
+                        )
+                })
+            })
+            && self.rovent_collection_origin.is_none()
+            && self.rovent_collection_origin_v2.is_none()
+            && self.rovent_collection_hooks_v2.is_none()
+            && !self.closed.load(Ordering::Acquire)
+            && self.state.try_lock().is_ok_and(|state| match &*state {
+                SessionState::Idle(owners)
+                    if owners.continuation.is_none()
+                        && owners.native_finished.is_none()
+                        && !owners.native.is_quarantined() =>
+                {
+                    match (
+                        owners.native.native_acceptance_verifier(),
+                        owners.native.ready_clock(),
+                    ) {
+                        (Some(verifier), Some(clock)) => {
+                            origin.matches_native_owner(&verifier, &clock)
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            });
+        if !valid {
+            return Err(Box::new(RoventBoardCollectionRegistrationRejectionV2 {
+                error: failure(
+                    "RoventBoardCollectionRegistrationV2",
+                    "original /2 lock or idle owner differs",
+                ),
+                origin,
+                hooks,
+                panic_payload: None,
+            }));
+        }
+        match catch_unwind(AssertUnwindSafe(|| hooks.register_startup_control(control))) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(Box::new(RoventBoardCollectionRegistrationRejectionV2 {
+                    error: SearchSessionFailure::debug("RoventBoardCollectionControlV2", &error)
+                        .unknown_if_unclosed(),
+                    origin,
+                    hooks,
+                    panic_payload: None,
+                }));
+            }
+            Err(payload) => {
+                return Err(Box::new(RoventBoardCollectionRegistrationRejectionV2 {
+                    error: SearchSessionFailure::physical_completion_unknown(),
+                    origin,
+                    hooks,
+                    panic_payload: Some(payload),
+                }));
+            }
+        }
+        self.rovent_collection_origin_v2 = Some(origin);
+        self.rovent_collection_hooks_v2 = Some(hooks);
+        Ok(())
+    }
+
+    pub(super) fn admit_board_collection_v2(
+        &self,
+        manager: &mut AdaptiveSessionManager<B>,
+        root: &RoventPcrRootAdmission,
+        profile: &RoventPcrSessionProfile,
+    ) -> Result<bool, AdaptiveManagerError> {
+        let Some(origin) = &self.rovent_collection_origin_v2 else {
+            return Ok(false);
+        };
+        let hooks =
+            self.rovent_collection_hooks_v2
+                .as_ref()
+                .ok_or(AdaptiveManagerError::Invalid(
+                    "V2 board collection hook owner is absent",
+                ))?;
+        let original = root
+            .original_v2
+            .as_ref()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "V2 board collection requires the original root admission",
+            ))?;
+        let frontier = manager
+            .driver()
+            .port()
+            .and_then(|port| port.rovent_frontier())
+            .ok_or(AdaptiveManagerError::Invalid(
+                "actual V2 board collection frontier absent",
+            ))?;
+        let admission = RoventCollectionRootAdmissionV2::from_attached_frontier(
+            origin,
+            frontier,
+            Arc::clone(original),
+            root.budget,
+            profile.selective_policy,
+        )?;
+        let expected = admission.clone();
+        let mut port = RoventBoardCollectionAdmissionPortV2 { manager };
+        if let Err(rejected) = hooks.admit(&mut port, admission) {
+            let error = if rejected.admission.same_original_admission(&expected) {
+                rejected.error.clone()
+            } else {
+                AdaptiveManagerError::Invalid("V2 board rejected a different root owner")
+            };
+            *self
+                .rovent_collection_failure_v2
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(rejected);
+            return Err(error);
+        }
+        if !port
+            .manager
+            .collection_root_admission_v2()
+            .is_some_and(|installed| installed.same_original_admission(&expected))
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "V2 board hook did not install the original collection admission",
+            ));
+        }
+        Ok(true)
+    }
+}

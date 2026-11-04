@@ -147,6 +147,7 @@ enum OutputKind {
     Coordinator,
     Termination,
     FailedTermination,
+    SessionReleaseObservation,
     StartupResources,
     FinalResources,
 }
@@ -160,6 +161,7 @@ impl OutputKind {
             Self::Coordinator => "pals-coordinator-observation.v5.json",
             Self::Termination => "pals-native-termination.v5.json",
             Self::FailedTermination => "pals-native-failed-termination-observation.v5.json",
+            Self::SessionReleaseObservation => "pals-session-release-observation.v1.json",
             Self::StartupResources => "pals-startup-resource-readback.v5.json",
             Self::FinalResources => "pals-final-resource-readback.v5.json",
         }
@@ -798,6 +800,56 @@ impl PalsAdaptiveObservationBridgeV5 {
             training_executed: false,
         };
         writer.write_json(OutputKind::Termination, &record)
+    }
+
+    /// A separate, non-acceptance observation written after required receipts.
+    /// No value here proves placement, GPU completion, input count or strength.
+    pub(crate) fn publish_session_release_observation(
+        &self,
+        finish: Option<&AdaptiveSessionProcessReceipt>,
+    ) -> Result<ArtifactRef, ManifestError> {
+        if let Some(receipt) = finish {
+            need(
+                receipt.epoch().0 == self.snapshot.process_epoch(),
+                "session release observation belongs to another process epoch",
+            )?;
+        }
+        let provider = match self.pinned.config.endpoint.model.backend {
+            PalsModelBackendV3::OrtCpu => "CPUExecutionProvider",
+            PalsModelBackendV3::OrtCuda => "CUDAExecutionProvider",
+            PalsModelBackendV3::RustCpu | PalsModelBackendV3::DeterministicMock => "unknown",
+        };
+        let release = finish.and_then(|receipt| receipt.native_session_release());
+        let session = match release {
+            Some(observation) => serde_json::json!({
+                "status":"released", "completed_synchronous_runs":observation.release().completed_synchronous_runs,
+                "zero_run":observation.release().completed_synchronous_runs == 0,
+                "observation_source":format!("{:?}", observation.source()),
+            }),
+            None => {
+                serde_json::json!({"status":"unknown", "completed_synchronous_runs":null, "zero_run":null, "observation_source":null})
+            }
+        };
+        let record = serde_json::json!({
+            "domain":"rz-pals-session-release-observation/1",
+            "process_id":self.identity.process_id,
+            "process_epoch":self.snapshot.process_epoch(),
+            "process_run_id":self.identity.process_run_id,
+            "lock_sha256":self.pinned.lock.canonical_sha256,
+            "startup_config_sha256":self.pinned.config_sha256,
+            "configured_provider":provider,
+            "actual_execution_provider":{"status":"unknown"},
+            "actual_device_placement":{"status":"unknown"},
+            "native_owner_joined":finish.map(|receipt| receipt.native_owner_joined()),
+            "session_release":session,
+            "gpu_fence_or_nn_acceptance":false,
+            "completed_nn_inputs":"unknown",
+            "scope":"original process-local owner observation; not external device identity or performance evidence"
+        });
+        self.writer
+            .lock()
+            .map_err(|_| fail("evidence writer poisoned"))?
+            .write_json(OutputKind::SessionReleaseObservation, &record)
     }
 
     /// Preserve already observed root totals and the actual retained-owner

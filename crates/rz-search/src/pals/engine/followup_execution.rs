@@ -258,14 +258,14 @@ impl<M: RoleModel> PalsEngine<M> {
     pub fn followup_owner_snapshot(&self) -> PalsFollowupOwnerSnapshot {
         PalsFollowupOwnerSnapshot {
             version: PALS_FOLLOWUP_EXECUTION_VERSION,
-            game_generation: self.game_generation,
+            game_generation: self.semantic.game_generation,
             search_attempt_sequence: self.followup_execution.sequence,
-            store_root_generation: self.stores.generation(),
-            root: self.stores.root(),
+            store_root_generation: self.semantic.stores.generation(),
+            root: self.semantic.stores.root(),
             archive: self.engine_archive_owner_snapshot(),
-            previous_closed_archive_owner: self.archive_state.previous_closed_owner,
-            paused_stack: self.cpu.paused_stack_snapshot(),
-            new_game_error: self.new_game_transition_error.clone(),
+            previous_closed_archive_owner: self.semantic.archive_state.previous_closed_owner,
+            paused_stack: self.researcher.cpu.paused_stack_snapshot(),
+            new_game_error: self.semantic.new_game_transition_error.clone(),
         }
     }
 
@@ -277,16 +277,16 @@ impl<M: RoleModel> PalsEngine<M> {
         self.followup_execution.value_bindings.clear();
         self.followup_execution.accepted_repair_question = None;
         let archive = self.engine_archive_owner_snapshot();
-        let paused = self.cpu.paused_stack_snapshot();
+        let paused = self.researcher.cpu.paused_stack_snapshot();
         self.followup_execution.snapshot = Some(PalsFollowupExecutionSnapshot {
             version: PALS_FOLLOWUP_EXECUTION_VERSION,
-            game_generation: self.game_generation,
+            game_generation: self.semantic.game_generation,
             search_attempt_sequence: self.followup_execution.sequence,
             requested_position: position.snapshot(),
             scope: None,
             selected_recheck: self.post_repair_recheck,
             selected_resolver: self.resolver,
-            model_identity: self.model_registered_value.clone(),
+            model_identity: self.semantic.model_registered_value.clone(),
             // An entered search really observes the empty queue/admission table.
             pending_questions_peak: Some(0),
             repair_admissions_peak: Some(0),
@@ -299,7 +299,7 @@ impl<M: RoleModel> PalsEngine<M> {
             original_error: None,
             archive_start: archive.clone(),
             archive_end: archive,
-            previous_closed_archive_owner: self.archive_state.previous_closed_owner,
+            previous_closed_archive_owner: self.semantic.archive_state.previous_closed_owner,
             paused_stack_start: paused,
             paused_stack_end: paused,
         });
@@ -310,8 +310,10 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 
     pub(super) fn observe_followup_root(&mut self, root: usize) {
-        let Some((game_generation, search_attempt_sequence)) =
-            self.game_generation.zip(self.followup_execution.sequence)
+        let Some((game_generation, search_attempt_sequence)) = self
+            .semantic
+            .game_generation
+            .zip(self.followup_execution.sequence)
         else {
             return;
         };
@@ -319,9 +321,9 @@ impl<M: RoleModel> PalsEngine<M> {
             snapshot.scope = Some(PalsFollowupExecutionScope {
                 game_generation,
                 search_attempt_sequence,
-                store_root_generation: self.stores.generation(),
-                root: self.nodes[root].situation,
-                root_state: self.nodes[root].state,
+                store_root_generation: self.semantic.stores.generation(),
+                root: self.semantic.nodes[root].situation,
+                root_state: self.semantic.nodes[root].state,
             });
         }
     }
@@ -341,7 +343,7 @@ impl<M: RoleModel> PalsEngine<M> {
         counters: PalsCounters,
     ) {
         let archive = self.engine_archive_owner_snapshot();
-        let paused = self.cpu.paused_stack_snapshot();
+        let paused = self.researcher.cpu.paused_stack_snapshot();
         if let Some(snapshot) = &mut self.followup_execution.snapshot {
             snapshot.closure = Some(closure);
             snapshot.original_error = error.cloned();
@@ -349,7 +351,8 @@ impl<M: RoleModel> PalsEngine<M> {
             snapshot.paused_stack_end = paused;
             snapshot.pending_questions_peak = u32::try_from(counters.repair_queue_peak).ok();
             snapshot.repair_admissions_peak = Some(
-                self.repair_counts
+                self.semantic
+                    .repair_counts
                     .values()
                     .copied()
                     .max()
@@ -470,10 +473,10 @@ impl<M: RoleModel> PalsEngine<M> {
                 .issue(PalsFollowupObservationIssue::TraceAuthorityMismatch);
             return;
         };
-        let Some(record) = self.records.iter().find(|record| {
+        let Some(record) = self.semantic.records.iter().find(|record| {
             record.revision == record_revision
                 && record.kind == RecordKind::Repair
-                && record.origin_state == self.nodes[root].state
+                && record.origin_state == self.semantic.nodes[root].state
                 && record.line.first() == Some(&first_move)
         }) else {
             self.followup_execution
@@ -522,7 +525,7 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 
     fn execution_endpoint(&self, node: usize) -> PalsExecutionEndpointSnapshot {
-        let node = &self.nodes[node];
+        let node = &self.semantic.nodes[node];
         let value = if let Some((reason, value)) = node.terminal {
             PalsExecutionEndpointValue::RulesTerminal {
                 reason,
@@ -534,7 +537,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 .as_ref()
                 .zip(node.model_observation.zip(node.model_value_revision))
                 .and_then(|(output, (observation, revision))| {
-                    let raw = self.stores.observations.get(observation).ok()?;
+                    let raw = self.semantic.stores.observations.get(observation).ok()?;
                     if raw.state != node.state
                         || raw.model_value_identity.as_ref() != Some(&output.identity)
                         || raw.model_value_input != Some(output.input_sha256)
@@ -842,6 +845,7 @@ mod tests {
         let position = Position::startpos();
         engine.begin_followup_execution(&position);
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -888,7 +892,10 @@ mod tests {
             (2, 2)
         );
         assert_eq!(counters.cpu_tasks, 0);
-        assert_eq!(engine.nodes[root].model_observation, Some(b.observation));
+        assert_eq!(
+            engine.semantic.nodes[root].model_observation,
+            Some(b.observation)
+        );
     }
 
     #[test]
@@ -906,10 +913,10 @@ mod tests {
             .unwrap();
         assert!(matches!(engine.execution_endpoint(root).value,
             PalsExecutionEndpointValue::FrozenWdl(ref value) if value.execution.is_some()));
-        let generation = engine.game_generation;
+        let generation = engine.semantic.game_generation;
         engine.begin_followup_execution(&Position::startpos());
         let stale = engine.execution_endpoint(root);
-        assert_eq!(engine.game_generation, generation);
+        assert_eq!(engine.semantic.game_generation, generation);
         assert_eq!(
             engine
                 .last_followup_execution_snapshot()
@@ -936,12 +943,12 @@ mod tests {
     fn mismatched_observer_binding_keeps_valid_value_and_marks_actual_receipt_incomplete() {
         let mut engine = engine(PostRepairRecheckPolicy::FrozenModelWdlV2);
         let root = entered_root(&mut engine);
-        engine.model.mismatch_context = true;
+        engine.semantic.model.mismatch_context = true;
         let mut counters = PalsCounters::default();
         engine
             .evaluate_model_value(root, &[], limits(), &AtomicBool::new(false), &mut counters)
             .unwrap();
-        assert!(engine.nodes[root].model_value.is_some());
+        assert!(engine.semantic.nodes[root].model_value.is_some());
         assert_eq!(counters.accepted_value_outputs, 1);
         assert!(matches!(engine.execution_endpoint(root).value,
             PalsExecutionEndpointValue::FrozenWdl(ref value) if value.execution.is_none()));
@@ -972,7 +979,7 @@ mod tests {
             execution_pair(&first, Some(&first)).3,
             Some(PalsFollowupObservationIssue::DuplicateValueExecution)
         );
-        engine.model.inputs = None;
+        engine.semantic.model.inputs = None;
         engine
             .evaluate_model_value(
                 root,
@@ -1015,7 +1022,7 @@ mod tests {
         engine
             .record(RecordKind::Counterexample, &line, None, 0, None, None)
             .unwrap();
-        let parent = engine.revision;
+        let parent = engine.semantic.revision;
         let mut previous = None;
         for ordinal in 1..=65 {
             let question = engine
@@ -1035,7 +1042,7 @@ mod tests {
                 .record(RecordKind::Repair, &line, None, 0, None, None)
                 .unwrap()
                 .unwrap();
-            engine.observe_accepted_repair(root, line[0], id, engine.revision);
+            engine.observe_accepted_repair(root, line[0], id, engine.semantic.revision);
             if ordinal <= 64 {
                 let snapshot = engine.last_followup_execution_snapshot().unwrap();
                 let trace = snapshot.repair_traces.last().unwrap();
@@ -1044,7 +1051,7 @@ mod tests {
                 assert_eq!(trace.repair_ordinal, ordinal);
                 assert_eq!(trace.lineage_root_record, parent + 1);
             }
-            previous = Some(engine.revision);
+            previous = Some(engine.semantic.revision);
         }
         let snapshot = engine.last_followup_execution_snapshot().unwrap();
         assert_eq!(
@@ -1057,8 +1064,8 @@ mod tests {
                 .issues
                 .contains(&PalsFollowupObservationIssue::TraceOverflow)
         );
-        assert_eq!(engine.records.len(), 66);
-        assert_eq!(engine.revision, parent + 65);
+        assert_eq!(engine.semantic.records.len(), 66);
+        assert_eq!(engine.semantic.revision, parent + 65);
     }
 
     #[test]

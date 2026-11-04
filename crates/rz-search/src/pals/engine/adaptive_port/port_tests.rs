@@ -21,6 +21,14 @@ pub(super) fn setup_with_resolver(
     line_plies: usize,
     resolver: ResolverPolicy,
 ) -> Port {
+    setup_with_model(position, line_plies, resolver, LegalOrderRoleMock)
+}
+pub(super) fn setup_with_model<M: RoleModel>(
+    position: Position,
+    line_plies: usize,
+    resolver: ResolverPolicy,
+    model: M,
+) -> AdaptiveEnginePort<M> {
     let cpu = CpuEngine::new(crate::cpu::CpuConfig {
         tt_entries: 16,
         max_depth: 8,
@@ -33,10 +41,10 @@ pub(super) fn setup_with_resolver(
     };
     let engine = match resolver {
         // Keep the original fixture's legacy followup-lane/default identity.
-        ResolverPolicy::OwnRawRestricted => PalsEngine::new(config, LegalOrderRoleMock, cpu),
+        ResolverPolicy::OwnRawRestricted => PalsEngine::new(config, model, cpu),
         ResolverPolicy::ModelWdlRestricted => PalsEngine::new_with_boxed_checker_and_policies(
             config,
-            LegalOrderRoleMock,
+            model,
             Box::new(OwnedCpuChecker::new(Box::new(cpu)).unwrap()),
             resolver,
             PostRepairRecheckPolicy::Disabled,
@@ -57,7 +65,7 @@ pub(super) fn setup_with_resolver(
     let next = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let issuer: AdaptiveRulesOwnerIssuer =
         Arc::new(move || Ok(OwnerId(next.fetch_add(1, Ordering::Relaxed))));
-    Port::new(
+    AdaptiveEnginePort::new(
         engine,
         position,
         authority,
@@ -171,11 +179,22 @@ pub(super) fn output(work: &Work, id: u64) -> (RoleTicketEnvelope, RoleOutput) {
 
 /// This CPU/mock owner crosses the real linear registry acceptance boundary.
 /// Its authored output is not native neural execution or GPU acceptance proof.
-fn accepted_root_ranking(
-    port: &mut Port,
+pub(in crate::pals::engine::adaptive_port) fn accepted_root_ranking<M: RoleModel>(
+    port: &mut AdaptiveEnginePort<M>,
 ) -> (
     ProposerRankingPublished,
     RoleTicketRegistry<ReviewView, RoleOutput>,
+) {
+    let (ranking, registry, _) = accepted_root_ranking_with_input(port);
+    (ranking, registry)
+}
+
+fn accepted_root_ranking_with_input<M: RoleModel>(
+    port: &mut AdaptiveEnginePort<M>,
+) -> (
+    ProposerRankingPublished,
+    RoleTicketRegistry<ReviewView, RoleOutput>,
+    FrameInput<ReviewView, AdaptivePortQuestion>,
 ) {
     let input = port.root_input().unwrap();
     assert_eq!(input.stage, RefinementStage::ProposerRanking);
@@ -185,7 +204,7 @@ fn accepted_root_ranking(
             rz_contracts::pals::Move16::encode(rz_contracts::Move::try_from(*movement).unwrap());
         ordered_candidates.update(encoded.bits().to_le_bytes());
     }
-    let identity = port.engine.model.value_identity().unwrap();
+    let identity = port.engine.semantic.model.value_identity().unwrap();
     let key = RepresentationKey {
         input: ContractDigest(input.view.digest()),
         history: input.view_seal.root_state.semantic,
@@ -266,7 +285,269 @@ fn accepted_root_ranking(
         .unwrap();
     assert_eq!(ranking.source().ticket.representation, key);
     assert_eq!(ranking.source().ordered_candidate_digest, key.candidates);
-    (ranking, registry)
+    (ranking, registry, input)
+}
+
+#[test]
+fn root_ranking_initial_fanout_keeps_consumed_scope_when_protection_reorders_selection() {
+    for legacy_full in [false, true] {
+        let mut port = setup(Position::startpos(), 3);
+        port.engine.semantic.legacy_full_native_context = legacy_full;
+        let proposal = vec![
+            BoardMove::from_uci("e2e4").unwrap(),
+            BoardMove::from_uci("e7e5").unwrap(),
+        ];
+        let counter = vec![proposal[0], BoardMove::from_uci("c7c5").unwrap()];
+        port.record_hot(RecordKind::Proposal, &proposal, None)
+            .unwrap();
+        port.record_hot(RecordKind::Counterexample, &counter, None)
+            .unwrap();
+        let bundle = port
+            .engine
+            .semantic
+            .review_index
+            .as_ref()
+            .unwrap()
+            .bundle_for_revision(port.engine.semantic.revision)
+            .unwrap();
+        let input = port
+            .input(
+                port.root,
+                RefinementStage::CriticDivergence,
+                Some(proposal[0]),
+                Vec::new(),
+                proposal,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let prior = Work {
+            frame: FrameId {
+                authority: port.authority,
+                sequence: 100,
+            },
+            original_first_move: rz_contracts::pals::Move16::encode(
+                rz_contracts::Move::try_from(counter[0]).unwrap(),
+            ),
+            original_deadline: port.deadline,
+            budget: FrameBudget {
+                original_cpu_credit: port.limits.max_cpu_nodes,
+                role_submissions_remaining: port.engine.config.max_role_calls,
+                original_store_byte_limit: 8 * 1024 * 1024,
+            },
+            input,
+        };
+        let (ticket, value) = output(&prior, 100);
+        port.commit_role(&prior, &ticket, &value, None).unwrap();
+        port.role_consumed(&ticket, &prior.input.view).unwrap();
+        let protected = |port: &Port| {
+            port.engine
+                .semantic
+                .review_index
+                .as_ref()
+                .unwrap()
+                .bundle(bundle)
+                .unwrap()
+                .protected_consumptions()
+        };
+        assert_eq!(protected(&port), 1);
+        // This newer unprotected bundle follows the protected old bundle in
+        // the root input. The actual ranking consume expires that protection.
+        port.record_hot(
+            RecordKind::Proposal,
+            &[BoardMove::from_uci("d2d4").unwrap()],
+            None,
+        )
+        .unwrap();
+        let consumed_before = port.counters.consumed_role_outputs;
+        let calls_before = port.counters.role_calls;
+        let (ranking, mut registry, ranking_input) = accepted_root_ranking_with_input(&mut port);
+        let source_scope = ContractDigest(ranking.view().record_scope_digest());
+        let source_metadata = ranking.view().records_metadata().to_vec();
+        let source_lines: Vec<_> = ranking
+            .view()
+            .records()
+            .iter()
+            .map(|record| (record.revision, record.line.clone()))
+            .collect();
+        let candidates = port.ranking_published(&ranking).unwrap();
+        assert!(!candidates.is_empty());
+        assert_eq!(protected(&port), 0);
+        let first_input = &candidates[0].input;
+        let query = first_input.view.query();
+        let selected_again = port
+            .engine
+            .prepare_review_view(
+                first_input.question.node,
+                RoleQuestion {
+                    purpose: query.purpose,
+                    prefix: &query.prefix,
+                    proposal: &query.proposal,
+                    refutation: query.counterexample.as_deref(),
+                    divergences: &query.divergences,
+                },
+                &query.legal,
+            )
+            .unwrap()
+            .unwrap();
+        let changed_scope = ContractDigest(selected_again.record_scope_digest());
+        assert_ne!(
+            changed_scope, source_scope,
+            "fixture must cross actual selector ordering"
+        );
+        let mut machine = RefinementMachine::new(port.authority, port.deadline, 512).unwrap();
+        let candidate_count = candidates.len();
+        for candidate in candidates {
+            assert_eq!(candidate.input.public_context, source_scope);
+            assert_eq!(candidate.input.view.record_scope_digest(), source_scope.0);
+            assert_eq!(candidate.input.view.records_metadata(), source_metadata);
+            assert_eq!(
+                candidate
+                    .input
+                    .view
+                    .records()
+                    .iter()
+                    .map(|record| (record.revision, record.line.clone()))
+                    .collect::<Vec<_>>(),
+                source_lines,
+            );
+            assert!(candidate.input.view.validates(&port.engine.semantic.stores));
+            assert_eq!(
+                candidate.input.view.generation(),
+                ranking.view().generation()
+            );
+            assert_eq!(
+                candidate.input.view.root_state(),
+                ranking.view().root_state()
+            );
+            assert_ne!(
+                candidate.input.question_digest,
+                ranking_input.question_digest
+            );
+            assert_ne!(candidate.input.view.digest(), ranking.view().digest());
+            assert_eq!(candidate.input.view.query().prefix.len(), 1);
+            assert_eq!(
+                candidate.budget.role_submissions_remaining,
+                port.engine.config.max_role_calls - port.counters.role_calls
+            );
+            match (
+                &ranking_input.question.legacy_full_records,
+                &candidate.input.question.legacy_full_records,
+            ) {
+                (Some(original), Some(current)) => {
+                    assert!(Arc::ptr_eq(original, current));
+                    assert!(current.validates(&port.engine.semantic.stores));
+                }
+                (None, None) => assert!(!legacy_full),
+                _ => panic!("initial query changed the independent legacy raw namespace"),
+            }
+            let mut wrong_scope = candidate.input.clone();
+            wrong_scope.public_context = changed_scope;
+            let before = machine.history_usage();
+            assert_eq!(
+                machine.admit_candidate(
+                    &ranking,
+                    candidate.first_move,
+                    wrong_scope,
+                    candidate.budget,
+                    port.deadline.clock,
+                    MonotonicTick(4),
+                ),
+                Err(CoordinatorError::IdentityMismatch(
+                    "published root ranking/candidate question scope",
+                )),
+            );
+            assert_eq!(machine.history_usage(), before);
+            let frame = machine
+                .admit_candidate(
+                    &ranking,
+                    candidate.first_move,
+                    candidate.input.clone(),
+                    candidate.budget,
+                    port.deadline.clock,
+                    MonotonicTick(4),
+                )
+                .unwrap();
+            port.root_candidate_admitted(frame, candidate.first_move, &candidate.input)
+                .unwrap();
+            assert_eq!(
+                machine.frame(frame).unwrap().ranking_source(),
+                Some(ranking.source())
+            );
+        }
+        assert_eq!(machine.history_usage().ranking_fanouts, candidate_count);
+        assert_eq!(machine.history_usage().role_requests, 1);
+        assert_eq!(port.counters.role_calls, calls_before + 1);
+        assert_eq!(port.counters.consumed_role_outputs, consumed_before + 1);
+        assert_eq!(registry.next_request_sequence(), 2);
+        assert!(
+            registry.take_dispatch().is_none(),
+            "forking invented a forward"
+        );
+    }
+}
+
+#[test]
+fn root_ranking_full_frozen_scope_rejects_extra_query_tokens_without_reselection() {
+    let mut port = setup(Position::startpos(), 4);
+    port.engine
+        .semantic
+        .review_policy
+        .as_mut()
+        .unwrap()
+        .token_budget = 128;
+    let proposal = [
+        BoardMove::from_uci("e2e4").unwrap(),
+        BoardMove::from_uci("e7e5").unwrap(),
+        BoardMove::from_uci("g1f3").unwrap(),
+        BoardMove::from_uci("b8c6").unwrap(),
+    ];
+    // Fill one original coherent bundle with actual Rules-checked revisions.
+    // No raw evidence is truncated to make the candidate's extra token fit.
+    for _ in 0..32 {
+        port.record_hot(RecordKind::Proposal, &proposal, None)
+            .unwrap();
+    }
+    let revisions: Vec<_> = port
+        .engine
+        .semantic
+        .records
+        .iter()
+        .map(|record| record.revision)
+        .collect();
+    let (ranking, mut registry, _input) = accepted_root_ranking_with_input(&mut port);
+    assert_eq!(ranking.view().records().len(), 32);
+    assert_eq!(ranking.view().token_count(), 128);
+    let source_scope = ranking.view().record_scope_digest();
+    assert!(matches!(
+        port.ranking_published(&ranking),
+        Err(PalsError::Review(ReviewError::ViewCapacity))
+    ));
+    assert_eq!(port.counters.role_calls, 1);
+    assert_eq!(port.counters.consumed_role_outputs, 1);
+    assert!(
+        port.role_consumption_recorded(&ranking.source().ticket, ranking.view())
+            .unwrap()
+    );
+    assert!(port.round_candidates.is_empty());
+    assert!(port.lazy_frontier.is_empty());
+    assert_eq!(
+        port.engine
+            .semantic
+            .records
+            .iter()
+            .map(|record| record.revision)
+            .collect::<Vec<_>>(),
+        revisions
+    );
+    assert_eq!(ranking.view().record_scope_digest(), source_scope);
+    assert!(ranking.view().validates(&port.engine.semantic.stores));
+    assert_eq!(registry.next_request_sequence(), 2);
+    assert!(registry.take_dispatch().is_none());
 }
 
 #[test]
@@ -450,7 +731,7 @@ fn independently_pending_roles_keep_their_original_view_after_publication() {
     let (b, out_b) = output(&second, 2);
     port.commit_role(&first, &a, &out_a, None).unwrap();
     port.role_consumed(&a, &first.input.view).unwrap();
-    assert!(port.engine.revision > second_revision);
+    assert!(port.engine.semantic.revision > second_revision);
     port.validate_role(&second, &b, &out_b).unwrap();
     port.commit_role(&second, &b, &out_b, None).unwrap();
     port.role_consumed(&b, &second.input.view).unwrap();
@@ -475,9 +756,10 @@ fn recorded_role_consumption_is_read_only_and_survives_later_progress_or_deadlin
         .unwrap();
     port.record_hot(RecordKind::Counterexample, &counter, None)
         .unwrap();
-    let witness_revision = port.engine.revision;
+    let witness_revision = port.engine.semantic.revision;
     let bundle = port
         .engine
+        .semantic
         .review_index
         .as_ref()
         .unwrap()
@@ -485,6 +767,7 @@ fn recorded_role_consumption_is_read_only_and_survives_later_progress_or_deadlin
         .unwrap();
     let protected = |port: &Port| {
         port.engine
+            .semantic
             .review_index
             .as_ref()
             .unwrap()
@@ -554,13 +837,13 @@ fn recorded_role_consumption_is_read_only_and_survives_later_progress_or_deadlin
         port.role_consumption_recorded(&ticket, &other.input.view),
         Err(PalsError::Role(RoleError::InvalidOutput))
     ));
-    let revision_before = port.engine.revision;
+    let revision_before = port.engine.semantic.revision;
     let (other_ticket, other_out) = output(&other, 2);
     port.commit_role(&other, &other_ticket, &other_out, None)
         .unwrap();
     port.role_consumed(&other_ticket, &other.input.view)
         .unwrap();
-    assert!(port.engine.revision > revision_before);
+    assert!(port.engine.semantic.revision > revision_before);
     assert!(
         port.role_consumption_recorded(&ticket, &original.input.view)
             .unwrap()
@@ -574,10 +857,10 @@ fn recorded_role_consumption_is_read_only_and_survives_later_progress_or_deadlin
         Err(PalsError::Role(RoleError::Deadline))
     ));
     let counters = port.counters;
-    let observations = port.engine.stores.observations.len();
-    let pins = port.engine.stores.review_pin_count().unwrap();
+    let observations = port.engine.semantic.stores.observations.len();
+    let pins = port.engine.semantic.stores.review_pin_count().unwrap();
     let remaining = protected(&port);
-    let revision = port.engine.revision;
+    let revision = port.engine.semantic.revision;
     for _ in 0..3 {
         assert!(
             port.role_consumption_recorded(&ticket, &original.input.view)
@@ -585,9 +868,12 @@ fn recorded_role_consumption_is_read_only_and_survives_later_progress_or_deadlin
         );
         assert_eq!(protected(&port), remaining);
         assert_eq!(port.counters, counters);
-        assert_eq!(port.engine.stores.observations.len(), observations);
-        assert_eq!(port.engine.stores.review_pin_count().unwrap(), pins);
-        assert_eq!(port.engine.revision, revision);
+        assert_eq!(port.engine.semantic.stores.observations.len(), observations);
+        assert_eq!(
+            port.engine.semantic.stores.review_pin_count().unwrap(),
+            pins
+        );
+        assert_eq!(port.engine.semantic.revision, revision);
     }
 }
 #[test]
@@ -619,7 +905,10 @@ fn fresh_counter_rejects_changed_namespace_before_any_hot_publication() {
     let original = FreshPairSeal::from_ticket(
         &ticket,
         pending.input.public_context,
-        port.engine.nodes[port.root].position.side_to_move().into(),
+        port.engine.semantic.nodes[port.root]
+            .position
+            .side_to_move()
+            .into(),
     );
     let query = Arc::make_mut(&mut pending.input.question);
     query.paired_fresh_seal = Some(original);
@@ -627,7 +916,7 @@ fn fresh_counter_rejects_changed_namespace_before_any_hot_publication() {
     // existence of a comparison source observation.
     query.paired_repaired = Some(ObservationId(0));
     port.validate_role(&pending, &ticket, &out).unwrap();
-    let observations = port.engine.stores.observations.len();
+    let observations = port.engine.semantic.stores.observations.len();
     for changed in ["model", "encoding", "epoch", "revision"] {
         ticket.representation = out.key;
         match changed {
@@ -644,7 +933,7 @@ fn fresh_counter_rejects_changed_namespace_before_any_hot_publication() {
         );
         out.key = saved;
     }
-    assert_eq!(port.engine.stores.observations.len(), observations);
+    assert_eq!(port.engine.semantic.stores.observations.len(), observations);
     assert_eq!(port.counters.consumed_role_outputs, 0);
 }
 #[test]
@@ -914,15 +1203,15 @@ fn immediate_rules_terminal_scan_precedes_every_model_beam() {
     port.prepare_root_rules().unwrap();
     for movement in mates {
         assert!(
-            port.engine.nodes[port.root]
+            port.engine.semantic.nodes[port.root]
                 .edges
                 .iter()
                 .any(|edge| edge.movement == movement
-                    && port.engine.nodes[edge.child].terminal.is_some())
+                    && port.engine.semantic.nodes[edge.child].terminal.is_some())
         );
     }
     let result = port.result(PalsCompletion::RoundLimit).unwrap();
-    let mut child = port.engine.nodes[port.root].position.clone();
+    let mut child = port.engine.semantic.nodes[port.root].position.clone();
     child.make_move(result.best_move.unwrap()).unwrap();
     assert!(matches!(
         child.classify_position().unwrap().play_status,
@@ -1039,7 +1328,7 @@ fn role_consumption_observation_preserves_rejections_and_refuses_late_enable() {
         event.outcome,
         AdaptiveRoleConsumptionOutcome::Rejected(AdaptiveRoleConsumptionRejection::InvalidOutput)
     );
-    port.engine.game_generation = Some(port.authority.game.0 + 1);
+    port.engine.semantic.game_generation = Some(port.authority.game.0 + 1);
     assert!(matches!(
         port.commit_role(&original, &ticket, &out, None),
         Err(PalsError::Store(StoreError::StaleConsumer))
@@ -1048,7 +1337,7 @@ fn role_consumption_observation_preserves_rejections_and_refuses_late_enable() {
         port.role_consumption_observation().unwrap().events()[1].outcome,
         AdaptiveRoleConsumptionOutcome::Rejected(AdaptiveRoleConsumptionRejection::StaleConsumer)
     );
-    port.engine.game_generation = Some(port.authority.game.0);
+    port.engine.semantic.game_generation = Some(port.authority.game.0);
     port.limits.deadline = Instant::now();
     assert!(matches!(
         port.commit_role(&original, &ticket, &out, None),
@@ -1087,8 +1376,8 @@ fn role_consumption_observation_overflow_cannot_change_idempotent_search_behavio
     port.commit_role(&original, &ticket, &out, None).unwrap();
     port.role_consumed(&ticket, &original.input.view).unwrap();
     let counters = port.counters;
-    let revision = port.engine.revision;
-    let observations = port.engine.stores.observations.len();
+    let revision = port.engine.semantic.revision;
+    let observations = port.engine.semantic.stores.observations.len();
     for _ in 0..MAX_ROLE_CONSUMPTION_EVENTS + 3 {
         port.role_consumed(&ticket, &original.input.view).unwrap();
     }
@@ -1107,8 +1396,8 @@ fn role_consumption_observation_overflow_cannot_change_idempotent_search_behavio
         1
     );
     assert_eq!(port.counters, counters);
-    assert_eq!(port.engine.revision, revision);
-    assert_eq!(port.engine.stores.observations.len(), observations);
+    assert_eq!(port.engine.semantic.revision, revision);
+    assert_eq!(port.engine.semantic.stores.observations.len(), observations);
     assert!(
         port.role_consumption_recorded(&ticket, &original.input.view)
             .unwrap()
@@ -1171,10 +1460,10 @@ fn repair_publication_metadata_is_original_and_does_not_change_semantic_result()
     let mut results = Vec::new();
     for observe in [false, true] {
         let (mut port, work) = repair_publication_work(3, observe);
-        let prior_revision = port.engine.revision;
+        let prior_revision = port.engine.semantic.revision;
         let (ticket, out) = output(&work, 1);
         let step = port.commit_role(&work, &ticket, &out, None).unwrap();
-        let record = port.engine.records.last().unwrap();
+        let record = port.engine.semantic.records.last().unwrap();
         assert_eq!(record.kind, RecordKind::Repair);
         assert_eq!(record.parent_revision, Some(prior_revision));
         assert_eq!(record.line.len(), 3);
@@ -1204,6 +1493,7 @@ fn repair_publication_metadata_is_original_and_does_not_change_semantic_result()
             assert_eq!(published.first_move, record.line.first().copied());
             let original_observation = port
                 .engine
+                .semantic
                 .stores
                 .observations
                 .get(published.observation)
@@ -1211,7 +1501,12 @@ fn repair_publication_metadata_is_original_and_does_not_change_semantic_result()
             assert_eq!(original_observation.line, Some(published.line));
             assert_eq!(original_observation.kind, ObservationKind::Repair);
             assert_eq!(
-                port.engine.stores.lines.moves(published.line).unwrap(),
+                port.engine
+                    .semantic
+                    .stores
+                    .lines
+                    .moves(published.line)
+                    .unwrap(),
                 record.line
             );
             port.role_consumed(&ticket, &work.input.view).unwrap();
@@ -1257,6 +1552,7 @@ fn unfinished_repair_semantic_result_is_not_a_published_repair_line() {
     assert!(
         !port
             .engine
+            .semantic
             .records
             .iter()
             .any(|r| r.kind == RecordKind::Repair)
@@ -1390,6 +1686,7 @@ fn repair_provenance_reaches_original_critic_query_and_first_consume_without_han
         let repaired_moves = repaired.input.question.repaired.as_ref().unwrap().clone();
         assert_eq!(
             port.engine
+                .semantic
                 .stores
                 .lines
                 .moves(original.published_line.line)
@@ -1463,6 +1760,121 @@ fn repair_provenance_reaches_original_critic_query_and_first_consume_without_han
     );
     assert_ne!(observed[0].0.producer_frame, observed[1].0.producer_frame);
 }
+#[test]
+fn original_critic_recheck_opens_native_cpu_question_but_closed_frame_stays_rejected() {
+    // Reuse the original accepted-output/Rules producer fixture. No worker,
+    // physical NN receipt or completed-depth claim is authored by this test.
+    let (mut port, repaired) = repair_provenance_source_fixture(false, 1);
+    let next = port
+        .critic_recheck_after_repaired_fresh(&repaired.input.question)
+        .unwrap();
+    let critic = materialize_authored_source_transition(&mut port, &repaired, next);
+    assert_eq!(critic.input.stage, RefinementStage::CriticRecheck);
+    let (evaluation_namespace, search_conditions) = port.cpu_namespace_digests().unwrap();
+    let profile = crate::cpu_worker::CpuWorkerProfile {
+        owner: rz_contracts::pals_adaptive::CpuWorkerId(1),
+        max_depth: port.engine.owned_descriptor().unwrap().config.max_depth,
+        evaluation_namespace,
+        search_conditions,
+    };
+    assert!(matches!(
+        port.prepare_cpu_question(&critic, &[profile], false),
+        Err(PalsError::Store(StoreError::InvalidConditions(
+            "not an open CPU frame"
+        )))
+    ));
+    assert!(port.cpu_admissions.is_empty());
+
+    let (ticket, mut output) = output(&critic, 3);
+    let chosen = BoardMove::from_uci("c7c5").unwrap();
+    let index = critic
+        .input
+        .view
+        .query()
+        .legal
+        .iter()
+        .position(|movement| *movement == chosen)
+        .expect("original repaired endpoint has the legal C alternative");
+    let RolePayload::Counterexample {
+        candidate_logits, ..
+    } = &mut output.payload
+    else {
+        panic!("the original CriticRecheck must consume C output");
+    };
+    candidate_logits[index] = 1.0;
+    let step = port.commit_role(&critic, &ticket, &output, None).unwrap();
+    port.role_consumed(&ticket, &critic.input.view).unwrap();
+    let next = port.materialize_step(step).unwrap();
+    let FrameTransition::Continue(input) = next.transition else {
+        panic!("the actual C reply must issue its native recheck validation");
+    };
+    let validation = Work { input, ..critic };
+    assert_eq!(
+        validation.input.stage,
+        RefinementStage::RecheckCounterValidation
+    );
+    assert_eq!(
+        validation.input.question.context.prefix.last(),
+        Some(&chosen)
+    );
+    assert_eq!(
+        validation.input.question.counter.as_deref(),
+        Some(validation.input.question.context.prefix.as_slice())
+    );
+    assert!(!port.closed.contains(&validation.frame));
+    let before = port.counters();
+    let prepared = port
+        .prepare_cpu_question(&validation, &[profile], false)
+        .unwrap()
+        .expect("the actual open C recheck has its original native CPU credit");
+    assert_eq!(prepared.target_depth, port.limits.cpu_depth);
+    assert_eq!(
+        prepared.total_native_node_credit,
+        port.limits
+            .max_cpu_nodes
+            .min(port.engine.config.cpu_nodes_per_task)
+    );
+    assert!(prepared.root_moves.is_none());
+    let admission = port
+        .cpu_admissions
+        .get(&validation.input.question_digest)
+        .unwrap();
+    assert_eq!(admission.frame, validation.frame);
+    assert_eq!(admission.stage, RefinementStage::RecheckCounterValidation);
+    assert_eq!(admission.first_move, validation.original_first_move);
+    assert!(
+        admission
+            .position
+            .snapshot()
+            .same_state(&validation.input.question.position.snapshot())
+    );
+    assert_eq!(
+        prepared.position.export().unwrap().snapshot().identity(),
+        admission.rules_identity
+    );
+    assert_eq!(port.counters(), before);
+    assert_eq!(port.cpu_admissions.len(), 1);
+
+    // Only logical closure is authored here. This does not claim a worker
+    // report, fence, root goal completion or original Store evidence deletion.
+    port.publish_closed(&ClosedFrame {
+        id: validation.frame,
+        original_first_move: validation.original_first_move,
+        evidence: vec![validation.input.question_digest],
+        unknown: Some("authored closed-frame admission guard"),
+        completion_scope: None,
+    })
+    .unwrap();
+    // The common sealed-work check rejects the closed frame before the CPU
+    // stage-specific check. Preserve that original typed rejection.
+    assert!(matches!(
+        port.prepare_cpu_question(&validation, &[profile], false),
+        Err(PalsError::Role(RoleError::InvalidOutput))
+    ));
+    assert_eq!(port.cpu_admissions.len(), 1);
+    assert_eq!(port.counters(), before);
+}
+
 #[test]
 fn zero_step_repair_does_not_inherit_an_earlier_p_line_identity() {
     let (mut port, prior) = repair_provenance_source_fixture(false, 1);

@@ -13,12 +13,49 @@ permissions:
 
 concurrency:
   group: workspace-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: true
+  # Preserve bounded in-flight validation and its artifacts when a follow-up
+  # source fix is pushed. The same goal still has only one active run.
+  cancel-in-progress: false
 
 jobs:
+  runtime-loader-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      CARGO_BUILD_JOBS: '2'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12.3'
+      - uses: dtolnay/rust-toolchain@3db9de313aa3e84732d075f6fd8938cc0d6d4b58
+        with:
+          toolchain: 1.96.0
+      - name: Build one same-HEAD model-free runtime loader diagnostic (CPU2 only)
+        id: loader
+        shell: bash
+        env:
+          RZ_EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python -I -S -B scripts/ci_native_bundle.py --profile runtime-loader-only --expected-head "$RZ_EXPECTED_HEAD" --timeout 3600 --output-root "$RUNNER_TEMP/RoveZero/runtime-loader-diagnostic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - name: Preserve loader-only ELF, source provenance and closed command logs
+        if: always() && steps.loader.outputs.artifact_ready == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runtime-loader-diagnostic-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/RoveZero/runtime-loader-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}/artifact/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
   native-validation-bundle:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 190
     env:
       CARGO_BUILD_JOBS: '2'
       PYTHONDONTWRITEBYTECODE: '1'
@@ -39,7 +76,7 @@ jobs:
         env:
           RZ_EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          python -I -S -B scripts/ci_native_bundle.py --expected-head "$RZ_EXPECTED_HEAD" --timeout 2700 --output-root "$RUNNER_TEMP/RoveZero/native-validation-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python -I -S -B scripts/ci_native_bundle.py --expected-head "$RZ_EXPECTED_HEAD" --timeout 10800 --output-root "$RUNNER_TEMP/RoveZero/native-validation-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
       - name: Preserve bounded binaries and source metadata for local validation
         if: always() && steps.bundle.outputs.artifact_ready == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -128,6 +165,10 @@ jobs:
     env:
       CARGO_BUILD_JOBS: '2'
       PYTHONDONTWRITEBYTECODE: '1'
+      # The all-feature test image exceeded the production identity byte bound.
+      # Reduce CI debug data; keep the guard and the test selection intact.
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -136,11 +177,14 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.12'
+      - name: Register exact Python executable for metadata-only wire checks
+        run: python -I -S -c "import os,sys; f=open(os.environ['GITHUB_ENV'],'a',encoding='utf-8'); f.write('RZ_ROVENT_METADATA_PYTHON='+sys.executable+'\n'); f.close()"
       - uses: dtolnay/rust-toolchain@3db9de313aa3e84732d075f6fd8938cc0d6d4b58
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
+      - run: python scripts/run_managed.py -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: python scripts/run_managed.py -- cargo test --workspace --all-targets --all-features --locked
       - name: Check current-thread affinity owner cannot cross threads
         run: python scripts/run_managed.py -- cargo test -p rz-platform --doc --locked
@@ -163,4 +207,3 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: '1'
       - run: python scripts/run_managed.py -- python -m unittest discover -s scripts/tests -q
-      - run: python scripts/run_managed.py -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

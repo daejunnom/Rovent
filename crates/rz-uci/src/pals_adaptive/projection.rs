@@ -5,7 +5,8 @@
 //! neither reads a newer Search question nor regenerates an input on the manager.
 
 use crate::pals_native::ticketed::{
-    NativeTicketQuestion, TicketExecutionEvidence, TicketNativeBackend, TicketPhysicalResult,
+    NativeTicketQuestion, TicketExecutionEvidence, TicketNativeBackend,
+    TicketNativeObservationFailure, TicketOwnerDispatchContext, TicketPhysicalResult,
     TicketPreparation,
 };
 use rz_contracts::pals::RepresentationKey;
@@ -191,6 +192,34 @@ where
             .run(ticket, &prepared.question, &prepared.prepared, canceled)
     }
 
+    fn run_owned(
+        &mut self,
+        context: TicketOwnerDispatchContext<'_, ReviewView, Q, Self::Prepared>,
+        canceled: &AtomicBool,
+    ) -> TicketPhysicalResult<Self::Output> {
+        self.last_executed = None;
+        let ticket = context.ticket();
+        let source = context.question();
+        let prepared = context.prepared();
+        if !matches_original(ticket, source, prepared) {
+            return TicketPhysicalResult {
+                physical: PhysicalRoleCompletion::Confirmed,
+                output: Err(RoleFailure::InvalidOutput),
+            };
+        }
+        let projected = match context.project(&prepared.question, &prepared.prepared) {
+            Ok(projected) => projected,
+            Err(error) => {
+                return TicketPhysicalResult {
+                    physical: PhysicalRoleCompletion::Confirmed,
+                    output: Err(error),
+                };
+            }
+        };
+        self.last_executed = Some(*ticket);
+        self.backend.run_owned(projected, canceled)
+    }
+
     fn output_host_bytes(&self, output: &Self::Output) -> u64 {
         self.backend.output_host_bytes(output)
     }
@@ -208,6 +237,10 @@ where
         } else {
             None
         }
+    }
+
+    fn take_observation_failure(&mut self) -> Option<TicketNativeObservationFailure> {
+        self.backend.take_observation_failure()
     }
 
     fn accept(
@@ -233,6 +266,31 @@ where
     }
     fn finish(&mut self, until: Instant) -> bool {
         self.backend.finish(until)
+    }
+    fn finish_report(
+        &mut self,
+        until: Instant,
+    ) -> crate::pals_native::ticketed::TicketNativeFinishReport {
+        self.backend.finish_report(until)
+    }
+    fn recovery_owner(&self) -> Option<rz_eval::worker::PhysicalRecoveryKey> {
+        self.backend.recovery_owner()
+    }
+    fn recovery_work_scope(&self) -> Option<rz_eval::worker::PhysicalWorkScope> {
+        self.backend.recovery_work_scope()
+    }
+    fn reobserve_quarantined(
+        &mut self,
+        until: Instant,
+    ) -> Result<crate::pals_native::ticketed::TicketNativeRecoveryProbe, RoleFailure> {
+        self.backend.reobserve_quarantined(until)
+    }
+    fn release_quarantined(
+        &mut self,
+        proof: &rz_eval::worker::PhysicalRecoveryConfirmation,
+        until: Instant,
+    ) -> Result<crate::pals_native::ticketed::TicketNativeRelease, RoleFailure> {
+        self.backend.release_quarantined(proof, until)
     }
 }
 

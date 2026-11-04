@@ -99,3 +99,57 @@ fn exclusive_storage_lease_covers_reservation_and_failed_owner_lifetime() {
     std::fs::remove_file(root.join("pals-owned-storage.v5.json")).unwrap();
     std::fs::remove_dir(&root).unwrap();
 }
+
+/// A historical sparse logical file must not prevent a new advisory run from
+/// acquiring its genuine marker lease. Strict V5 retains its registered cap.
+#[cfg(target_os = "linux")]
+#[test]
+fn advisory_storage_preserves_owner_when_historical_bytes_exceed_v5_limit() {
+    use std::io::Write;
+    use std::path::PathBuf;
+    struct OwnedFixture(PathBuf);
+    impl Drop for OwnedFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0.join("retained-sparse"));
+            let _ = std::fs::remove_file(self.0.join("pals-owned-storage.v5.json"));
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+    let root = OwnedFixture(std::env::temp_dir().join(format!(
+        "rz-advisory-owner-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    )));
+    std::fs::create_dir(&root.0).unwrap();
+    let marker = br#"{"domain":"rz-pals-owned-storage-v5/1","owner_id":"fixture-owner","purpose":"staging_and_cache"}"#;
+    std::fs::File::create(root.0.join("pals-owned-storage.v5.json"))
+        .unwrap()
+        .write_all(marker)
+        .unwrap();
+    let retained = std::fs::File::create(root.0.join("retained-sparse")).unwrap();
+    retained.set_len(PALS_STAGING_BYTES_V5 + 1).unwrap();
+    drop(retained);
+    let p = PalsOwnedStoragePlanV5 {
+        owner_id: "fixture-owner".into(),
+        marker: asset(marker),
+        byte_limit: PALS_STAGING_BYTES_V5,
+        external_serialization_required: true,
+        automatic_eviction: false,
+    };
+    assert!(acquire_pals_owned_storage_v5(&p, &root.0, 1024).is_err());
+    let (audit, lease) = storage::acquire_pals_owned_storage_advisory(&p, &root.0).unwrap();
+    assert_eq!(audit.observation_status, "not_measured");
+    assert!(audit.measured_root_bytes.is_none() && audit.threshold_exceeded.is_none());
+    assert!(audit.external_serialization_observed);
+    assert!(storage::acquire_pals_owned_storage_advisory(&p, &root.0).is_err());
+    let continued = storage::readmit_pals_owned_storage_advisory(&p, &root.0, &lease).unwrap();
+    assert_eq!(continued.observation_status, "not_measured");
+    assert!(continued.measured_root_bytes.is_none() && continued.threshold_exceeded.is_none());
+    assert_eq!(
+        std::fs::metadata(root.0.join("retained-sparse"))
+            .unwrap()
+            .len(),
+        PALS_STAGING_BYTES_V5 + 1
+    );
+    drop(lease);
+}

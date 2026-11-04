@@ -9,6 +9,12 @@ pub struct PalsAdaptiveAdmissionV5 {
     pub numerical_by_endpoint: BTreeMap<String, PalsNumericalAdmissionV5>,
     pub artifact_domain_by_endpoint: BTreeMap<String, PalsArtifactDomainAdmissionV5>,
 }
+#[derive(Clone, Debug)]
+pub(super) struct PalsAdaptiveInputAdmission {
+    pub source_verification: PalsSourceVerificationV5,
+    pub numerical_by_endpoint: BTreeMap<String, PalsNumericalAdmissionV5>,
+    pub artifact_domain_by_endpoint: BTreeMap<String, PalsArtifactDomainAdmissionV5>,
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct PalsAdaptiveSessionAuditV5 {
     pub endpoint_id: String,
@@ -112,9 +118,9 @@ fn read_pin(
 }
 
 #[cfg(target_os = "linux")]
-pub fn validate_prepared_pals_launch_v5(
+fn validate_prepared_pals_launch(
     owner: &NativeLaunchOwner<LockedPalsArenaLaunchV5>,
-) -> Result<PalsAdaptiveAdmissionV5, ArenaError> {
+) -> Result<(storage::PalsStorageAdmission, PalsAdaptiveInputAdmission), ArenaError> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
     use cap_std::fs::{OpenOptions, OpenOptionsExt};
     use std::io::Write;
@@ -123,18 +129,28 @@ pub fn validate_prepared_pals_launch_v5(
         .spec
         .storage_admission
         .lock()
-        .map_err(|_| invalid("V5 storage admission state poisoned"))?
+        .map_err(|_| invalid("storage admission state poisoned"))?
         .clone()
-        .ok_or_else(|| {
-            invalid("owned 18GiB storage admission was not observed before snapshot creation")
-        })?;
+        .ok_or_else(|| invalid("owned storage admission missing"))?;
     require(
-        storage.reserved_attempt_bytes == owner.spec.input.budget.max_artifact_bytes
-            && storage.no_follow_byte_scan_completed
-            && storage.external_serialization_observed
-            && owner.spec.storage_lease.is_some(),
-        "owned storage observation and exclusive lease are not bound to this attempt reservation",
+        owner.spec.storage_lease.is_some(),
+        "original storage lease missing",
     )?;
+    match (&storage, owner.spec.storage_policy) {
+        (storage::PalsStorageAdmission::Strict(a), PalsOwnedStoragePolicy::StrictV5) => require(
+            a.reserved_attempt_bytes == owner.spec.input.budget.max_artifact_bytes
+                && a.no_follow_byte_scan_completed
+                && a.external_serialization_observed,
+            "V5 strict storage admission differs from the attempt reservation",
+        )?,
+        (storage::PalsStorageAdmission::Advisory(a), PalsOwnedStoragePolicy::AdvisoryV1) => {
+            require(
+                a.external_serialization_observed,
+                "advisory storage lease missing",
+            )?
+        }
+        _ => return Err(invalid("storage policy and admission domain differ")),
+    }
     let lockbytes = read_pin(owner, &owner.spec.input.semantic_lock_artifact, 2 << 20)?;
     owner.spec.validate_additional_manifest(&lockbytes)?;
     let mut actual = BTreeMap::new();
@@ -228,6 +244,10 @@ pub fn validate_prepared_pals_launch_v5(
             "endpoint binary actual hash missing",
         )?;
     }
+    let source_filename = match owner.spec.storage_policy {
+        PalsOwnedStoragePolicy::StrictV5 => "source-verification.v5.json",
+        PalsOwnedStoragePolicy::AdvisoryV1 => "source-verification.storage-advisory-v1.json",
+    };
     let mut source = PalsSourceVerificationV5 {
         components,
         binary_sha256_by_endpoint: owner
@@ -241,17 +261,29 @@ pub fn validate_prepared_pals_launch_v5(
             .collect(),
         content_verified: true,
         evidence: ArtifactRef {
-            path: format!(
-                "{}/source-verification.v5.json",
-                owner.snapshot.output_directory
-            ),
+            path: format!("{}/{}", owner.snapshot.output_directory, source_filename),
             sha256: "0".repeat(64),
             bytes: 0,
             source: "https://github.com/daejunnom/RoveZero".into(),
             license: "MIT".into(),
         },
     };
-    let payload = serde_json::json!({"domain":"rz-pals-source-verification-v5/1","launch_sha256":owner.spec.sha256,"lock_sha256":owner.spec.input.semantic_lock.canonical_sha256,"components":source.components,"binary_sha256_by_endpoint":source.binary_sha256_by_endpoint,"content_verified":true,"inputs_verified":actual.len(),"storage":storage,"independent_numerical":numerical_by_endpoint,"artifact_domains":artifact_domain_by_endpoint});
+    let (source_domain, storage_json) = match &storage {
+        storage::PalsStorageAdmission::Strict(a) => {
+            ("rz-pals-source-verification-v5/1", serde_json::to_value(a))
+        }
+        storage::PalsStorageAdmission::Advisory(a) => (
+            "rz-pals-source-verification-storage-advisory-v1/1",
+            serde_json::to_value(a),
+        ),
+    };
+    let storage_json =
+        storage_json.map_err(|_| invalid("storage admission serialization failed"))?;
+    let mut payload = serde_json::json!({"domain":source_domain,"launch_sha256":owner.spec.input_sha256(),"lock_sha256":owner.spec.input.semantic_lock.canonical_sha256,"components":source.components,"binary_sha256_by_endpoint":source.binary_sha256_by_endpoint,"content_verified":true,"inputs_verified":actual.len(),"storage":storage_json,"independent_numerical":numerical_by_endpoint,"artifact_domains":artifact_domain_by_endpoint});
+    if owner.spec.storage_policy == PalsOwnedStoragePolicy::AdvisoryV1 {
+        payload["base_v5_launch_sha256"] = owner.spec.sha256.clone().into();
+        payload["policy_domain"] = "rz-pals-preparation-storage-advisory-v1/1".into();
+    }
     let bytes = serde_json::to_vec(&payload)
         .map_err(|_| invalid("source admission evidence encode failed"))?;
     require(
@@ -267,7 +299,7 @@ pub fn validate_prepared_pals_launch_v5(
     let mut out = owner
         .snapshot
         .directory
-        .open_with("source-verification.v5.json", &opt)
+        .open_with(source_filename, &opt)
         .map_err(|_| invalid("source admission evidence already exists or cannot be created"))?;
     out.write_all(&bytes)
         .and_then(|()| out.sync_all())
@@ -275,8 +307,7 @@ pub fn validate_prepared_pals_launch_v5(
     source.evidence.sha256 = format!("{:x}", Sha256::digest(&bytes));
     source.evidence.bytes = bytes.len() as u64;
     source.evidence.validate()?;
-    let result = PalsAdaptiveAdmissionV5 {
-        storage,
+    let result = PalsAdaptiveInputAdmission {
         source_verification: source,
         numerical_by_endpoint,
         artifact_domain_by_endpoint,
@@ -285,9 +316,55 @@ pub fn validate_prepared_pals_launch_v5(
         .spec
         .admission
         .lock()
-        .map_err(|_| invalid("V5 admission state poisoned"))? = Some(result.clone());
-    Ok(result)
+        .map_err(|_| invalid("admission state poisoned"))? = Some(result.clone());
+    Ok((storage, result))
 }
+
+#[cfg(target_os = "linux")]
+pub fn validate_prepared_pals_launch_v5(
+    owner: &NativeLaunchOwner<LockedPalsArenaLaunchV5>,
+) -> Result<PalsAdaptiveAdmissionV5, ArenaError> {
+    require(
+        owner.spec.storage_policy == PalsOwnedStoragePolicy::StrictV5,
+        "V5 admission requires strict storage",
+    )?;
+    let (storage, input) = validate_prepared_pals_launch(owner)?;
+    let storage::PalsStorageAdmission::Strict(storage) = storage else {
+        return Err(invalid("V5 strict storage admission missing"));
+    };
+    Ok(PalsAdaptiveAdmissionV5 {
+        storage,
+        source_verification: input.source_verification,
+        numerical_by_endpoint: input.numerical_by_endpoint,
+        artifact_domain_by_endpoint: input.artifact_domain_by_endpoint,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn validate_prepared_pals_launch_advisory(
+    owner: &NativeLaunchOwner<LockedPalsArenaLaunchV5>,
+) -> Result<(), ArenaError> {
+    require(
+        owner.spec.storage_policy == PalsOwnedStoragePolicy::AdvisoryV1,
+        "advisory storage policy missing",
+    )?;
+    let (storage, _input) = validate_prepared_pals_launch(owner)?;
+    let storage::PalsStorageAdmission::Advisory(audit) = storage else {
+        return Err(invalid("advisory storage admission missing"));
+    };
+    // The mandatory source-verification artifact already records the policy,
+    // audit and execution identity. Do not create a second optional sidecar.
+    let _ = audit;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn validate_prepared_pals_launch_advisory(
+    _owner: &NativeLaunchOwner<LockedPalsArenaLaunchV5>,
+) -> Result<(), ArenaError> {
+    Err(invalid("advisory input FD validation requires Linux"))
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn validate_prepared_pals_launch_v5(
     _owner: &NativeLaunchOwner<LockedPalsArenaLaunchV5>,
@@ -423,13 +500,26 @@ impl NativeProviderDeclaration for LockedPalsArenaLaunchV5 {
     }
     type Audit = PalsAdaptiveSessionAuditV5;
     fn scope(&self) -> &'static str {
-        "pals_v5_adaptive_exact_source_native_lifecycle_rules_clock"
+        match self.storage_policy {
+            PalsOwnedStoragePolicy::StrictV5 => {
+                "pals_v5_adaptive_exact_source_native_lifecycle_rules_clock"
+            }
+            PalsOwnedStoragePolicy::AdvisoryV1 => {
+                "pals_v5_semantics_storage_advisory_v1_native_lifecycle_rules_clock"
+            }
+        }
     }
     fn receipt_filename(&self) -> &'static str {
-        "pals-arena-receipt.v5.json"
+        match self.storage_policy {
+            PalsOwnedStoragePolicy::StrictV5 => "pals-arena-receipt.v5.json",
+            PalsOwnedStoragePolicy::AdvisoryV1 => "pals-arena-receipt.storage-advisory-v1.json",
+        }
     }
     fn receipt_version(&self) -> u32 {
-        5
+        match self.storage_policy {
+            PalsOwnedStoragePolicy::StrictV5 => 5,
+            PalsOwnedStoragePolicy::AdvisoryV1 => 6,
+        }
     }
     fn startup_filename(&self) -> &'static str {
         "pals-native-startup.v5.json"
@@ -655,7 +745,12 @@ impl NativeProviderDeclaration for LockedPalsArenaLaunchV5 {
             .source_verification
             .evidence
             .path
-            .strip_suffix("/source-verification.v5.json")
+            .strip_suffix(match self.storage_policy {
+                PalsOwnedStoragePolicy::StrictV5 => "/source-verification.v5.json",
+                PalsOwnedStoragePolicy::AdvisoryV1 => {
+                    "/source-verification.storage-advisory-v1.json"
+                }
+            })
             .ok_or_else(|| invalid("parent source artifact topology differs"))?;
         let endpoint = &self.endpoint(role).configuration;
         let expected = format!(

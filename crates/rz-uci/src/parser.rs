@@ -1,4 +1,5 @@
 use std::fmt;
+use std::num::NonZeroU16;
 
 /// Line size is checked before allocating fields; command-specific bounds
 /// are checked before copying an option or move trace.
@@ -6,7 +7,8 @@ use std::fmt;
 pub struct ParserLimits {
     pub max_line_bytes: usize,
     pub max_moves: usize,
-    /// Finite Rules view bound, checked by the session rather than text parser.
+    /// Root-list cardinality bound, checked before copying `searchmoves` and
+    /// again against the complete Rules view by the session.
     pub max_legal_moves: usize,
     pub max_option_name_bytes: usize,
     pub max_option_value_bytes: usize,
@@ -50,6 +52,13 @@ impl Default for PositionSpec {
 /// the real side-to-move clock and accounts for output/drain reserves.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GoLimits {
+    /// An explicit nonempty root restriction, in the received order. Rules
+    /// checks legality and selects its canonical legal-move order later.
+    pub searchmoves: Option<Vec<String>>,
+    /// Root-relative selective chess-ply horizon, not NN calls or R depth.
+    pub depth_plies: Option<NonZeroU16>,
+    /// Forced-mate objective in chess moves; proof is a search responsibility.
+    pub mate_moves: Option<NonZeroU16>,
     pub movetime_ms: Option<u64>,
     pub white_time_ms: Option<u64>,
     pub black_time_ms: Option<u64>,
@@ -59,6 +68,21 @@ pub struct GoLimits {
     pub nodes: Option<u64>,
     pub infinite: bool,
     pub ponder: bool,
+}
+
+impl GoLimits {
+    /// No UCI stop criterion was supplied; the configured resource profile
+    /// remains a finite execution boundary and must be reported to the GUI.
+    pub(crate) fn uses_default_resource_limits(&self) -> bool {
+        !self.infinite
+            && !self.ponder
+            && self.movetime_ms.is_none()
+            && self.white_time_ms.is_none()
+            && self.black_time_ms.is_none()
+            && self.nodes.is_none()
+            && self.depth_plies.is_none()
+            && self.mate_moves.is_none()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +129,22 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 pub fn parse(line: &str, limits: ParserLimits) -> Result<Command, ParseError> {
+    parse_with_zero_node_limit(line, limits, ZeroNodeLimit::Reject)
+}
+
+/// Syntax selection for an explicitly registered node domain. This does not
+/// grant search capability or turn a zero-node request into completed work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ZeroNodeLimit {
+    Reject,
+    Allow,
+}
+
+pub(crate) fn parse_with_zero_node_limit(
+    line: &str,
+    limits: ParserLimits,
+    zero_nodes: ZeroNodeLimit,
+) -> Result<Command, ParseError> {
     if line.len() > limits.max_line_bytes {
         return Err(ParseError::LineTooLong);
     }
@@ -127,7 +167,7 @@ pub fn parse(line: &str, limits: ParserLimits) -> Result<Command, ParseError> {
         "ucinewgame" => no_args(tail, Command::NewGame),
         "setoption" => parse_option(line, limits),
         "position" => parse_position(tail, limits),
-        "go" => parse_go(tail),
+        "go" => parse_go(tail, limits, zero_nodes),
         "ponderhit" => no_args(tail, Command::PonderHit),
         _ => Ok(Command::Unknown(head.to_owned())),
     }
@@ -299,11 +339,65 @@ fn decimal<T: std::str::FromStr>(s: &str) -> Result<T, ParseError> {
         .map_err(|_| ParseError::Malformed("integer overflow"))
 }
 
-fn parse_go(fields: &[&str]) -> Result<Command, ParseError> {
+fn is_go_keyword(field: &str) -> bool {
+    matches!(
+        field,
+        "searchmoves"
+            | "depth"
+            | "mate"
+            | "movetime"
+            | "wtime"
+            | "btime"
+            | "winc"
+            | "binc"
+            | "movestogo"
+            | "nodes"
+            | "infinite"
+            | "ponder"
+    )
+}
+
+fn parse_go(
+    fields: &[&str],
+    parser_limits: ParserLimits,
+    zero_nodes: ZeroNodeLimit,
+) -> Result<Command, ParseError> {
     let mut limits = GoLimits::default();
     let mut i = 0;
     while i < fields.len() {
         let field = fields[i];
+        if field == "searchmoves" {
+            if limits.searchmoves.is_some() {
+                return Err(ParseError::Malformed("duplicate go field"));
+            }
+            let start = i + 1;
+            let end = fields[start..]
+                .iter()
+                .position(|field| is_go_keyword(field))
+                .map_or(fields.len(), |offset| start + offset);
+            let moves = &fields[start..end];
+            if moves.is_empty() {
+                return Err(ParseError::Malformed(
+                    "searchmoves requires a nonempty list",
+                ));
+            }
+            if moves.len() > parser_limits.max_legal_moves {
+                return Err(ParseError::Limit("searchmoves"));
+            }
+            if moves.iter().any(|movement| !is_move_text(movement)) {
+                return Err(ParseError::Malformed(
+                    "searchmoves requires from/to and optional q/r/b/n promotion",
+                ));
+            }
+            limits.searchmoves = Some(
+                moves
+                    .iter()
+                    .map(|movement| (*movement).to_owned())
+                    .collect(),
+            );
+            i = end;
+            continue;
+        }
         if field == "ponder" {
             if limits.ponder {
                 return Err(ParseError::Malformed("duplicate go field"));
@@ -322,7 +416,15 @@ fn parse_go(fields: &[&str]) -> Result<Command, ParseError> {
         }
         if !matches!(
             field,
-            "movetime" | "wtime" | "btime" | "winc" | "binc" | "movestogo" | "nodes"
+            "depth"
+                | "mate"
+                | "movetime"
+                | "wtime"
+                | "btime"
+                | "winc"
+                | "binc"
+                | "movestogo"
+                | "nodes"
         ) {
             return Err(ParseError::Unsupported(field.to_owned()));
         }
@@ -331,12 +433,34 @@ fn parse_go(fields: &[&str]) -> Result<Command, ParseError> {
             .ok_or(ParseError::Malformed("go field lacks value"))?;
         let number: u64 = decimal(value)?;
         match field {
+            "depth" => {
+                let value =
+                    u16::try_from(number).map_err(|_| ParseError::Malformed("depth overflow"))?;
+                let value = NonZeroU16::new(value)
+                    .ok_or(ParseError::Malformed("depth must be positive"))?;
+                set_once(&mut limits.depth_plies, value)?;
+            }
+            "mate" => {
+                let value =
+                    u16::try_from(number).map_err(|_| ParseError::Malformed("mate overflow"))?;
+                let value =
+                    NonZeroU16::new(value).ok_or(ParseError::Malformed("mate must be positive"))?;
+                // Both forced wins (2*N-1) and forced losses (2*N) use the
+                // shared u16 chess-ply domain. Never silently wrap or clamp.
+                value
+                    .get()
+                    .checked_mul(2)
+                    .ok_or(ParseError::Malformed("mate ply horizon overflow"))?;
+                set_once(&mut limits.mate_moves, value)?;
+            }
             "movetime" => set_once(&mut limits.movetime_ms, number)?,
             "wtime" => set_once(&mut limits.white_time_ms, number)?,
             "btime" => set_once(&mut limits.black_time_ms, number)?,
             "winc" => set_once(&mut limits.white_increment_ms, number)?,
             "binc" => set_once(&mut limits.black_increment_ms, number)?,
-            "nodes" if number > 0 => set_once(&mut limits.nodes, number)?,
+            "nodes" if number > 0 || zero_nodes == ZeroNodeLimit::Allow => {
+                set_once(&mut limits.nodes, number)?
+            }
             "nodes" => return Err(ParseError::Malformed("nodes must be positive")),
             "movestogo" => {
                 let value = u32::try_from(number)
@@ -366,21 +490,11 @@ fn parse_go(fields: &[&str]) -> Result<Command, ParseError> {
             "movetime and clock modes are distinct",
         ));
     }
-    if limits.infinite
-        && (limits.ponder || limits.movetime_ms.is_some() || has_clock || limits.nodes.is_some())
-    {
+    // Infinite owns bestmove output until stop even if a finite work objective
+    // has completed. Its time/ponder conflicts retain the existing policy.
+    if limits.infinite && (limits.ponder || limits.movetime_ms.is_some() || has_clock) {
         return Err(ParseError::Malformed(
-            "infinite cannot be combined with finite limits",
-        ));
-    }
-    if !limits.infinite
-        && !limits.ponder
-        && limits.movetime_ms.is_none()
-        && !has_clock
-        && limits.nodes.is_none()
-    {
-        return Err(ParseError::Malformed(
-            "go requires a finite limit or infinite",
+            "infinite cannot be combined with ponder or time limits",
         ));
     }
     Ok(Command::Go(limits))

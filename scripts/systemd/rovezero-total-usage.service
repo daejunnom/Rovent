@@ -1,0 +1,22 @@
+[Unit]
+Description=RoveZero bounded aggregate storage observation
+
+[Service]
+Type=oneshot
+User=root
+# This advisory observer must yield CPU and block-I/O priority to the engine.
+Nice=19
+IOSchedulingClass=idle
+# Optional root-owned configuration may set RZ_USAGE_MIRROR_DIR. If a mirror
+# is enabled, add a systemd drop-in granting that exact directory write access.
+Environment=RZ_USAGE_THRESHOLD_BYTES=19327352832
+EnvironmentFile=-/etc/rovezero/total-usage.conf
+# Install only the two reviewed Python source files in this root-owned path.
+# The nonblocking lock prevents concurrent scans even after manual starts.
+ExecStart=/usr/bin/flock -n -E 75 /run/lock/rovezero-total-usage.lock /usr/bin/python3 -I -S -B /usr/local/lib/rovezero/storage/rovezero_usage_snapshot.py --threshold-bytes=${RZ_USAGE_THRESHOLD_BYTES}
+SuccessExitStatus=75
+TimeoutStartSec=180
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/rovezero/total-usage /run/lock

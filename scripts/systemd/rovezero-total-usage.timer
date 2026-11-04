@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodic RoveZero aggregate storage observation
+
+[Timer]
+OnBootSec=5min
+# A drop-in that resets any monotonic timer (e.g. OnBootSec=) clears all
+# monotonic timers, so it must also restore this recurring trigger.
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+Unit=rovezero-total-usage.service
+
+[Install]
+WantedBy=timers.target

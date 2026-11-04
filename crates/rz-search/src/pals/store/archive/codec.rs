@@ -2,6 +2,28 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
+/// Stream the unchanged archive DTO into the caller's already-bounded writer.
+/// This function opens no files and does not grant a cold read or write scope.
+pub(super) fn write_retirement_wire<W: Write + ?Sized, T: Serialize + ?Sized>(
+    writer: &mut W,
+    wire: &T,
+) -> Result<(), StoreError> {
+    serde_json::to_writer(writer, wire).map_err(|error| match error.io_error_kind() {
+        Some(kind) => StoreError::ArchiveIo {
+            stage: "retirement record serialization",
+            kind,
+        },
+        None => StoreError::ArchiveIntegrity("retirement record serialization"),
+    })
+}
+
+pub(super) fn write_retirement_external_report<W: Write + ?Sized>(
+    report: &ExternalCheckerReport,
+    writer: &mut W,
+) -> Result<(), StoreError> {
+    write_retirement_wire(writer, &ReportWire::encode(report)?)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Bundle {
@@ -222,6 +244,13 @@ enum ScopeWire {
     Depth(u16, u64, u64),
     External(u16, Option<u16>, Option<u16>, u8),
     Model(u64, u64, u64),
+    ProfiledExternal(
+        ProfiledExternalConstraint,
+        ProfiledExternalConstraint,
+        Option<u16>,
+        Option<u16>,
+        u8,
+    ),
 }
 impl ScopeWire {
     fn encode(value: EvidenceScope) -> Self {
@@ -243,6 +272,13 @@ impl ScopeWire {
                 encoding,
                 input,
             } => Self::Model(model, encoding, input),
+            EvidenceScope::ProfiledExternalUci {
+                requested,
+                issued,
+                reported_depth,
+                seldepth,
+                bound,
+            } => Self::ProfiledExternal(requested, issued, reported_depth, seldepth, b(bound)),
         }
     }
     fn decode(&self) -> Result<EvidenceScope, StoreError> {
@@ -266,7 +302,143 @@ impl ScopeWire {
                 encoding,
                 input,
             },
+            Self::ProfiledExternal(requested, issued, reported_depth, seldepth, b) => {
+                requested.validate_issued(issued)?;
+                EvidenceScope::ProfiledExternalUci {
+                    requested,
+                    issued,
+                    reported_depth,
+                    seldepth,
+                    bound: bound(b)?,
+                }
+            }
         })
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_scope_wire_tags_and_bytes_stay_unchanged() {
+        for (scope, bytes) in [
+            (EvidenceScope::RulesTerminal, "\"Rules\""),
+            (
+                EvidenceScope::DepthLimited {
+                    depth: 4,
+                    profile: 7,
+                    condition: 9,
+                },
+                "{\"Depth\":[4,7,9]}",
+            ),
+            (
+                EvidenceScope::ExternalUci {
+                    requested_depth: 4,
+                    reported_depth: Some(1),
+                    seldepth: Some(3),
+                    bound: ExternalBound::Lower,
+                },
+                "{\"External\":[4,1,3,1]}",
+            ),
+            (
+                EvidenceScope::Model {
+                    model: 7,
+                    encoding: 8,
+                    input: 9,
+                },
+                "{\"Model\":[7,8,9]}",
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&ScopeWire::encode(scope)).unwrap(),
+                bytes
+            );
+            assert_eq!(
+                serde_json::from_str::<ScopeWire>(bytes)
+                    .unwrap()
+                    .decode()
+                    .unwrap(),
+                scope
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&TaskQuestion::AnalyzePosition).unwrap(),
+            "\"AnalyzePosition\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskQuestion::FindAlternative { divergence_ply: 3 }).unwrap(),
+            "{\"FindAlternative\":{\"divergence_ply\":3}}"
+        );
+    }
+
+    #[test]
+    fn profiled_scope_has_an_explicit_tag_and_rejects_invalid_issued_limits() {
+        for requested in [
+            ProfiledExternalConstraint::Combined {
+                depth: 4,
+                reported_nodes: 16,
+            },
+            ProfiledExternalConstraint::Nodes { reported_nodes: 16 },
+            ProfiledExternalConstraint::Depth { depth: 4 },
+            ProfiledExternalConstraint::MoveTime { milliseconds: 100 },
+        ] {
+            let issued = match requested {
+                ProfiledExternalConstraint::MoveTime { .. } => {
+                    ProfiledExternalConstraint::MoveTime { milliseconds: 50 }
+                }
+                other => other,
+            };
+            let scope = EvidenceScope::ProfiledExternalUci {
+                requested,
+                issued,
+                reported_depth: Some(2),
+                seldepth: None,
+                bound: ExternalBound::Unknown,
+            };
+            let json = serde_json::to_string(&ScopeWire::encode(scope)).unwrap();
+            assert!(json.starts_with("{\"ProfiledExternal\":"));
+            assert_eq!(
+                serde_json::from_str::<ScopeWire>(&json)
+                    .unwrap()
+                    .decode()
+                    .unwrap(),
+                scope
+            );
+        }
+        for wire in [
+            ScopeWire::ProfiledExternal(
+                ProfiledExternalConstraint::Nodes { reported_nodes: 0 },
+                ProfiledExternalConstraint::Nodes { reported_nodes: 0 },
+                None,
+                None,
+                0,
+            ),
+            ScopeWire::ProfiledExternal(
+                ProfiledExternalConstraint::MoveTime { milliseconds: 50 },
+                ProfiledExternalConstraint::MoveTime { milliseconds: 51 },
+                None,
+                None,
+                0,
+            ),
+            ScopeWire::ProfiledExternal(
+                ProfiledExternalConstraint::Depth { depth: 4 },
+                ProfiledExternalConstraint::Nodes { reported_nodes: 16 },
+                None,
+                None,
+                0,
+            ),
+            ScopeWire::ProfiledExternal(
+                ProfiledExternalConstraint::Depth { depth: 4 },
+                ProfiledExternalConstraint::Depth { depth: 4 },
+                None,
+                None,
+                9,
+            ),
+        ] {
+            assert!(wire.decode().is_err());
+        }
+        assert!(serde_json::from_str::<ScopeWire>("{\"UnknownProfiledTag\":[]}").is_err());
     }
 }
 #[derive(Debug, Serialize, Deserialize)]

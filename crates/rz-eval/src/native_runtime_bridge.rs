@@ -57,6 +57,26 @@ pub struct NativeCudaMetadata {
     pub executed_cuda_nodes: usize,
 }
 
+/// Evidence from the system CUDA runtime domain. The identity is deliberately
+/// separate from `runtime_bundle_digest`: it does not identify a copied bundle.
+/// The completed warm probe does not attest completion of any later request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeSystemCudaMetadata {
+    pub device_id: i32,
+    pub arena_bytes: u64,
+    pub system_runtime_identity: Digest,
+    pub placement_profile_digest: Digest,
+    pub executed_cuda_nodes: usize,
+    pub warm_probe_synchronous_run_returned: bool,
+}
+
+#[cfg(feature = "onnx")]
+#[derive(Clone, Copy)]
+enum CudaRuntimeSource {
+    LegacyBundle,
+    System,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeDiagnosticKind {
     DispatchRefused,
@@ -130,6 +150,7 @@ struct OwnerInner<A: ModelAdapter> {
     origin: NativeWorkerOrigin,
     admission_policy: AdapterAdmission,
     cuda_metadata: Option<NativeCudaMetadata>,
+    system_cuda_metadata: Option<NativeSystemCudaMetadata>,
     source_trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
     state: Mutex<OwnerState<A>>,
 }
@@ -260,6 +281,23 @@ impl<A: ModelAdapter> NativeWorkerOwner<A> {
         admission_policy: AdapterAdmission,
         max_batch: usize,
     ) -> Result<Self, PhysicalFailure> {
+        let diagnostics = Self::prepare_worker(&projection, diagnostic_capacity, max_batch)?;
+        Ok(Self::from_prepared_worker(
+            worker,
+            projection,
+            admission_policy,
+            max_batch,
+            diagnostics,
+        ))
+    }
+
+    // Complete all fallible owner validation and allocation before a retained
+    // native worker can take the original backend.
+    fn prepare_worker(
+        projection: &A,
+        diagnostic_capacity: usize,
+        max_batch: usize,
+    ) -> Result<Vec<DiagnosticSlot>, PhysicalFailure> {
         if diagnostic_capacity == 0 || diagnostic_capacity > MAX_DIAGNOSTICS {
             return Err(failure(
                 ErrorCode::ResourceExhausted,
@@ -284,7 +322,17 @@ impl<A: ModelAdapter> NativeWorkerOwner<A> {
             .try_reserve_exact(diagnostic_capacity)
             .map_err(allocation_failure)?;
         diagnostics.resize_with(diagnostic_capacity, || DiagnosticSlot::Free);
-        Ok(Self(Arc::new(OwnerInner {
+        Ok(diagnostics)
+    }
+
+    fn from_prepared_worker(
+        worker: NativePhysicalWorker<A>,
+        projection: A,
+        admission_policy: AdapterAdmission,
+        max_batch: usize,
+        diagnostics: Vec<DiagnosticSlot>,
+    ) -> Self {
+        Self(Arc::new(OwnerInner {
             max_batch,
             #[cfg(feature = "experimental-notify")]
             signal: worker.completion_signal(),
@@ -292,6 +340,7 @@ impl<A: ModelAdapter> NativeWorkerOwner<A> {
             origin: NativeWorkerOrigin::Injected,
             admission_policy,
             cuda_metadata: None,
+            system_cuda_metadata: None,
             source_trace: None,
             state: Mutex::new(OwnerState {
                 #[cfg(feature = "experimental-batch")]
@@ -311,7 +360,7 @@ impl<A: ModelAdapter> NativeWorkerOwner<A> {
                 poison_error: None,
                 poison_observed: false,
             }),
-        })))
+        }))
     }
 
     pub fn origin(&self) -> NativeWorkerOrigin {
@@ -324,6 +373,12 @@ impl<A: ModelAdapter> NativeWorkerOwner<A> {
 
     pub fn cuda_metadata(&self) -> Option<&NativeCudaMetadata> {
         self.0.cuda_metadata.as_ref()
+    }
+
+    /// Actual system-domain observation after warm placement and mapping
+    /// checks, not a legacy CUDA bundle receipt or a later-run fence.
+    pub fn system_cuda_metadata(&self) -> Option<&NativeSystemCudaMetadata> {
+        self.0.system_cuda_metadata.as_ref()
     }
 
     #[cfg(feature = "experimental-notify")]
@@ -459,6 +514,27 @@ impl<A: ModelAdapter> NativeWorkerOwner<A> {
             .worker
             .try_shutdown()
             .map(|result| result.map_err(PhysicalFailure::from))
+    }
+
+    /// Nonblocking observation of this worker's same-owner session release.
+    /// `None` is not a physical completion or device-wide fence; the caller
+    /// must also drive and check `try_shutdown` and preserve unknown failures.
+    pub fn try_session_release(
+        &self,
+    ) -> Poll<Result<Option<crate::worker::SessionReleased>, PhysicalFailure>> {
+        let state = match self.0.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Poll::Pending,
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let mut state = poisoned.into_inner();
+                Self::mark_poison(&mut state);
+                return Poll::Ready(Err(owner_poison_error().into()));
+            }
+        };
+        if state.poison_observed {
+            return Poll::Ready(Err(owner_poison_error().into()));
+        }
+        Poll::Ready(Ok(state.worker.session_release()))
     }
 
     fn take_from(
@@ -1091,7 +1167,14 @@ impl NativeWorkerOwner<Lc0ModelAdapter> {
         diagnostic_capacity: usize,
         trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
     ) -> Result<Self, PhysicalFailure> {
-        Self::from_cuda_onnx_limit(backend, projection, diagnostic_capacity, 1, trace)
+        Self::from_cuda_onnx_limit(
+            backend,
+            projection,
+            diagnostic_capacity,
+            1,
+            trace,
+            CudaRuntimeSource::LegacyBundle,
+        )
     }
     #[cfg(all(feature = "onnx", feature = "experimental-batch"))]
     pub fn from_cuda_onnx_batched(
@@ -1100,8 +1183,100 @@ impl NativeWorkerOwner<Lc0ModelAdapter> {
         diagnostic_capacity: usize,
     ) -> Result<Self, PhysicalFailure> {
         let max_batch = backend.config().max_batch;
-        Self::from_cuda_onnx_limit(backend, projection, diagnostic_capacity, max_batch, None)
+        Self::from_cuda_onnx_limit(
+            backend,
+            projection,
+            diagnostic_capacity,
+            max_batch,
+            None,
+            CudaRuntimeSource::LegacyBundle,
+        )
     }
+
+    /// The system-runtime owner is explicit and cannot issue a historical
+    /// bundle witness. The same physical worker and failure handling apply.
+    #[cfg(feature = "onnx")]
+    pub fn from_system_cuda_onnx(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+    ) -> Result<Self, PhysicalFailure> {
+        Self::from_system_cuda_onnx_profiled(backend, projection, diagnostic_capacity, None)
+    }
+
+    #[cfg(feature = "onnx")]
+    pub fn from_system_cuda_onnx_profiled(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
+    ) -> Result<Self, PhysicalFailure> {
+        Self::from_cuda_onnx_limit(
+            backend,
+            projection,
+            diagnostic_capacity,
+            1,
+            trace,
+            CudaRuntimeSource::System,
+        )
+    }
+
+    /// Install the original verified system CUDA backend into a retained
+    /// worker. The reservation must be acquired before native entry. On any
+    /// recoverable admission or worker-start error the caller retains the
+    /// original backend and reservation, and must also retain its startup scope.
+    /// A normal session release is a same-owner observation, not a device fence.
+    #[cfg(feature = "onnx")]
+    pub fn from_system_cuda_onnx_retained_profiled(
+        original: &mut Option<crate::onnx::OnnxBackend>,
+        reservation: &mut crate::worker::PhysicalRecoveryReservation,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
+    ) -> Result<Self, PhysicalFailure> {
+        let backend = original.as_ref().ok_or_else(|| {
+            failure(
+                ErrorCode::InvalidInput,
+                Stage::Admission,
+                "missing original system CUDA backend",
+            )
+        })?;
+        let (admission, metadata, system_metadata) =
+            Self::inspect_cuda_onnx(backend, &projection, 1, CudaRuntimeSource::System)?;
+        let diagnostics = Self::prepare_worker(&projection, diagnostic_capacity, 1)?;
+        let worker = crate::contracts::spawn_onnx_worker_retained_profiled(
+            original,
+            reservation,
+            trace.clone(),
+        )?;
+        let mut owner = Self::from_prepared_worker(worker, projection, admission, 1, diagnostics);
+        // No clone or reference has escaped, and no fallible step follows the
+        // transfer of the retained worker into this owner.
+        let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");
+        inner.origin = NativeWorkerOrigin::CudaOnnx;
+        inner.cuda_metadata = metadata;
+        inner.system_cuda_metadata = system_metadata;
+        inner.source_trace = trace;
+        Ok(owner)
+    }
+
+    #[cfg(all(feature = "onnx", feature = "experimental-batch"))]
+    pub fn from_system_cuda_onnx_batched(
+        backend: crate::onnx::OnnxBackend,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+    ) -> Result<Self, PhysicalFailure> {
+        let max_batch = backend.config().max_batch;
+        Self::from_cuda_onnx_limit(
+            backend,
+            projection,
+            diagnostic_capacity,
+            max_batch,
+            None,
+            CudaRuntimeSource::System,
+        )
+    }
+
     #[cfg(feature = "onnx")]
     fn from_cuda_onnx_limit(
         backend: crate::onnx::OnnxBackend,
@@ -1109,7 +1284,40 @@ impl NativeWorkerOwner<Lc0ModelAdapter> {
         diagnostic_capacity: usize,
         max_batch: usize,
         trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
+        runtime_source: CudaRuntimeSource,
     ) -> Result<Self, PhysicalFailure> {
+        let (admission, metadata, system_metadata) =
+            Self::inspect_cuda_onnx(&backend, &projection, max_batch, runtime_source)?;
+        let worker = crate::contracts::spawn_onnx_worker_profiled(backend, trace.clone())?;
+        let mut owner = Self::from_worker_limit(
+            worker,
+            projection,
+            diagnostic_capacity,
+            admission,
+            max_batch,
+        )?;
+        let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");
+        inner.origin = NativeWorkerOrigin::CudaOnnx;
+        inner.cuda_metadata = metadata;
+        inner.system_cuda_metadata = system_metadata;
+        inner.source_trace = trace;
+        Ok(owner)
+    }
+
+    #[cfg(feature = "onnx")]
+    fn inspect_cuda_onnx(
+        backend: &crate::onnx::OnnxBackend,
+        projection: &ClassicalProjection,
+        max_batch: usize,
+        runtime_source: CudaRuntimeSource,
+    ) -> Result<
+        (
+            AdapterAdmission,
+            Option<NativeCudaMetadata>,
+            Option<NativeSystemCudaMetadata>,
+        ),
+        PhysicalFailure,
+    > {
         // Preserve the actual native cause of an earlier uncertain Run before
         // reporting a generic profile mismatch. Drop retains its session/input.
         if let Some(cause) = backend.physical_quarantine_cause() {
@@ -1152,37 +1360,63 @@ impl NativeWorkerOwner<Lc0ModelAdapter> {
                     "native CUDA owner requires actual warm CUDA kernel placement",
                 )
             })?;
-        let runtime_bundle_digest = backend.runtime_bundle_digest().ok_or_else(|| {
-            failure(
-                ErrorCode::IdentityMismatch,
-                Stage::Contract,
-                "native CUDA owner requires the complete pinned runtime bundle",
-            )
-        })?;
-        let metadata = NativeCudaMetadata {
-            device_id,
-            arena_bytes: arena_bytes as u64,
-            runtime_bundle_digest: Digest(runtime_bundle_digest),
-            placement_profile_digest: Digest(evidence.profile_sha256),
-            executed_cuda_nodes: evidence.executed_cuda_nodes,
+        let (metadata, system_metadata) = match runtime_source {
+            CudaRuntimeSource::LegacyBundle => {
+                let digest = backend.runtime_bundle_digest().ok_or_else(|| {
+                    failure(
+                        ErrorCode::IdentityMismatch,
+                        Stage::Contract,
+                        "native CUDA owner requires the complete pinned runtime bundle",
+                    )
+                })?;
+                (
+                    Some(NativeCudaMetadata {
+                        device_id,
+                        arena_bytes: arena_bytes as u64,
+                        runtime_bundle_digest: Digest(digest),
+                        placement_profile_digest: Digest(evidence.profile_sha256),
+                        executed_cuda_nodes: evidence.executed_cuda_nodes,
+                    }),
+                    None,
+                )
+            }
+            CudaRuntimeSource::System => {
+                let digest = backend.system_cuda_runtime_identity().ok_or_else(|| {
+                    failure(
+                        ErrorCode::IdentityMismatch,
+                        Stage::Contract,
+                        "native CUDA owner requires an observed system runtime",
+                    )
+                })?;
+                (
+                    None,
+                    Some(NativeSystemCudaMetadata {
+                        device_id,
+                        arena_bytes: arena_bytes as u64,
+                        system_runtime_identity: Digest(digest),
+                        placement_profile_digest: Digest(evidence.profile_sha256),
+                        executed_cuda_nodes: evidence.executed_cuda_nodes,
+                        // `cuda_evidence` is assigned only after a successful
+                        // synchronous warm Run and placement-profile validation.
+                        warm_probe_synchronous_run_returned: true,
+                    }),
+                )
+            }
         };
         // A successful historical probe alone does not authorize current maps.
         // Loader failure stays typed and latched, with all native pins retained.
-        backend.verify_cuda_runtime_mappings()?;
-        let admission = backend.asset_profile().admission_policy();
-        let worker = crate::contracts::spawn_onnx_worker_profiled(backend, trace.clone())?;
-        let mut owner = Self::from_worker_limit(
-            worker,
-            projection,
-            diagnostic_capacity,
-            admission.into(),
-            max_batch,
-        )?;
-        let inner = Arc::get_mut(&mut owner.0).expect("new native owner is exclusively owned");
-        inner.origin = NativeWorkerOrigin::CudaOnnx;
-        inner.cuda_metadata = Some(metadata);
-        inner.source_trace = trace;
-        Ok(owner)
+        if backend.system_cuda_runtime_identity().is_some() {
+            // Actual conflicts still fail and physical lifetime is checked;
+            // an incomplete mapping observation is not a strict witness.
+            backend.observe_cuda_runtime_mappings()?;
+        } else {
+            backend.verify_cuda_runtime_mappings()?;
+        }
+        Ok((
+            backend.asset_profile().admission_policy().into(),
+            metadata,
+            system_metadata,
+        ))
     }
 }
 
@@ -1222,6 +1456,24 @@ mod tests {
         .unwrap();
         let worker = SingleWorker::spawn(|_: &PreparedBatch<RulesState>| Ok(Vec::new())).unwrap();
         NativeWorkerOwner::from_worker(worker, ClassicalProjection::new(binding), 2).unwrap()
+    }
+
+    #[test]
+    fn injected_worker_does_not_issue_session_release_proof() {
+        let owner = owner();
+        assert!(matches!(owner.try_session_release(), Poll::Ready(Ok(None))));
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match owner.try_shutdown() {
+                Poll::Ready(result) => {
+                    result.unwrap();
+                    break;
+                }
+                Poll::Pending if std::time::Instant::now() < until => std::thread::yield_now(),
+                Poll::Pending => panic!("injected worker shutdown timed out"),
+            }
+        }
+        assert!(matches!(owner.try_session_release(), Poll::Ready(Ok(None))));
     }
 
     fn occupied(owner: &NativeWorkerOwner) -> NativeDiagnosticReceipt {

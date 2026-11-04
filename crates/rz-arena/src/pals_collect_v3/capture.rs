@@ -8,6 +8,30 @@ use rz_search::cpu::CpuScoreScope;
 use rz_search::pals::engine::RecordKind;
 use rz_search::pals::review_context::ReviewView;
 
+/// 원 Rules repetition identity의 기존 generation grouping domain이다.
+/// 모델/평가 캐시 또는 Rules semantic state digest와 혼용하지 않는다.
+pub(crate) fn generation_transposition_sha256(position: &Position) -> String {
+    use sha2::{Digest, Sha256};
+    use std::hash::{Hash, Hasher};
+
+    struct IdentityHash(Sha256);
+    impl Hasher for IdentityHash {
+        fn finish(&self) -> u64 {
+            u64::from_le_bytes(self.0.clone().finalize()[..8].try_into().unwrap())
+        }
+        fn write(&mut self, b: &[u8]) {
+            self.0.update(b);
+        }
+    }
+    let mut transposition = IdentityHash(Sha256::new());
+    transposition.write(b"rz-pals-generation-transposition/1\0");
+    position
+        .snapshot()
+        .repetition_identity()
+        .hash(&mut transposition);
+    format!("{:x}", transposition.0.finalize())
+}
+
 #[derive(Clone, Debug)]
 enum CaptureWorkScope {
     Native(rz_contracts::RequestId),
@@ -197,8 +221,34 @@ pub fn capture_submitted_review_v3(
     input: &PalsVirtualReviewInput,
     context: &GenerationCaptureContextV3,
 ) -> Result<GenerationInputV3, ArenaError> {
-    use sha2::{Digest, Sha256};
-    use std::hash::{Hash, Hasher};
+    let mut captured = capture_submitted_review_common_fields(ticket, view, input, context)?;
+    captured.divergence_record_ids = view
+        .query()
+        .divergences
+        .iter()
+        .map(|slot| {
+            captured
+                .selected_view
+                .records
+                .get(*slot)
+                .filter(|r| r.kind == GenerationRecordKindV3::Counter)
+                .map(|r| r.record_id.clone())
+                .ok_or_else(|| invalid("submitted divergence index absent/noncounter"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    captured.validate()?;
+    Ok(captured)
+}
+
+/// 공통 실제 Rules/query/tensor capture 계산이다. 이 중간 projection은
+/// legacy V3나 새 Rovent 입력으로 발행하지 않는다. 각 명시 wrapper가 자기
+/// divergence 의미를 추가하고 전체 형식 검증을 완료해야 한다.
+pub(crate) fn capture_submitted_review_common_fields(
+    ticket: &RoleTicketEnvelope,
+    view: &ReviewView,
+    input: &PalsVirtualReviewInput,
+    context: &GenerationCaptureContextV3,
+) -> Result<GenerationInputV3, ArenaError> {
     check(
         ticket.view.view_digest.0 == view.seal_digest()
             && ticket.view.view_sequence == view.sequence()
@@ -379,42 +429,12 @@ pub fn capture_submitted_review_v3(
         token_budget: input.token_budget,
         length_bucket: view.length_bucket(),
     };
-    // Same Rules-owned repetition identity as the historical leakage grouping,
-    // in a new hash domain; this is not an evaluation cache key.
-    struct IdentityHash(Sha256);
-    impl Hasher for IdentityHash {
-        fn finish(&self) -> u64 {
-            u64::from_le_bytes(self.0.clone().finalize()[..8].try_into().unwrap())
-        }
-        fn write(&mut self, b: &[u8]) {
-            self.0.update(b);
-        }
-    }
-    let mut transposition = IdentityHash(Sha256::new());
-    transposition.write(b"rz-pals-generation-transposition/1\0");
-    query_position
-        .snapshot()
-        .repetition_identity()
-        .hash(&mut transposition);
-    let divergence_record_ids = view
-        .query()
-        .divergences
-        .iter()
-        .map(|slot| {
-            selected_view
-                .records
-                .get(*slot)
-                .filter(|r| r.kind == GenerationRecordKindV3::Counter)
-                .map(|r| r.record_id.clone())
-                .ok_or_else(|| invalid("submitted divergence index absent/noncounter"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let (worker_id, job_id, slice_id) = context.work_scope.identifiers(ticket)?;
     let captured = GenerationInputV3 {
         game_id: context.game_id.clone(),
         opening_id: context.opening_id.clone(),
         line_genealogy_id: context.line_genealogy_id.clone(),
-        transposition_sha256: format!("{:x}", transposition.0.finalize()),
+        transposition_sha256: generation_transposition_sha256(&query_position),
         role,
         model_epoch: context.model_epoch,
         context_epoch: context.context_epoch,
@@ -430,9 +450,8 @@ pub fn capture_submitted_review_v3(
         legal_moves: input.candidates.iter().map(component_bits).collect(),
         action_support_mask: context.action_support.for_ticket(ticket)?,
         encoded_model_input: virtual_review_json_v3(input)?,
-        divergence_record_ids,
+        divergence_record_ids: Vec::new(),
     };
-    captured.validate()?;
     Ok(captured)
 }
 

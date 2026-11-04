@@ -404,8 +404,15 @@ fn root_position(plan: &Plan) -> Result<Position> {
     }
     Ok(root)
 }
+#[cfg(feature = "native-validation-diagnostics")]
+#[path = "virtual_review_warm_numeric_capture/gpu_inflight_validation.rs"]
+pub mod gpu_inflight_validation;
+
 fn validate_plan(plan: &Plan) -> Result<()> {
-    if plan.domain != DOMAIN || plan.game_moves.len() > 4096 || plan.groups.len() != 12 {
+    validate_plan_domain(plan, DOMAIN)
+}
+fn validate_plan_domain(plan: &Plan, domain: &str) -> Result<()> {
+    if plan.domain != domain || plan.game_moves.len() > 4096 || plan.groups.len() != 12 {
         return Err(
             "separate bounded V3 Warm plan with exactly twelve P/C bucket groups required".into(),
         );
@@ -440,9 +447,26 @@ fn validate_plan(plan: &Plan) -> Result<()> {
 }
 
 fn load(config: &Config, profiles: &Path) -> Result<PalsVirtualReviewOnnxBackend> {
+    load_kind(config, profiles, VirtualReviewArtifactKind::ApproxWarm)
+}
+fn load_kind(
+    config: &Config,
+    profiles: &Path,
+    kind: VirtualReviewArtifactKind,
+) -> Result<PalsVirtualReviewOnnxBackend> {
+    load_kind_from_sources(config, profiles, kind, None, None)
+}
+
+fn load_kind_from_sources(
+    config: &Config,
+    profiles: &Path,
+    kind: VirtualReviewArtifactKind,
+    owned_sources: Option<Arc<dyn rz_eval::pals_onnx::virtual_review::VirtualReviewOwnedSources>>,
+    source_metadata: Option<(Vec<u8>, Vec<u8>)>,
+) -> Result<PalsVirtualReviewOnnxBackend> {
     let mut selected = PalsOnnxConfig::cpu();
     selected.intra_threads = 1;
-    selected.cache_public_memory = true;
+    selected.cache_public_memory = kind == VirtualReviewArtifactKind::ApproxWarm;
     selected.cudnn_conv_search = match config.cudnn_conv_search.as_str() {
         "legacy_implicit_exhaustive" => PalsCuDnnConvSearch::LegacyImplicitExhaustive,
         "experimental_default" => PalsCuDnnConvSearch::ExperimentalDefault,
@@ -472,7 +496,11 @@ fn load(config: &Config, profiles: &Path) -> Result<PalsVirtualReviewOnnxBackend
                 return Err("explicit CUDA0 FP32/TF32-off finite arena required".into());
             }
             let bundle = config.cuda_bundle.as_ref().ok_or("CUDA bundle absent")?;
-            let bytes = asset::read_bounded(bundle, 64 * 1024)?;
+            let bytes = if let Some((bundle_bytes, _)) = source_metadata.as_ref() {
+                bundle_bytes.clone()
+            } else {
+                asset::read_bounded(bundle, 64 * 1024)?
+            };
             if Some(sha(&bytes)) != config.cuda_bundle_sha256 {
                 return Err("CUDA bundle byte pin differs".into());
             }
@@ -495,16 +523,26 @@ fn load(config: &Config, profiles: &Path) -> Result<PalsVirtualReviewOnnxBackend
                 device_id: config.gpu_device_id,
                 arena_bytes: config.gpu_arena_bytes,
             };
-            let policy = PalsCudaControlPolicy::from_virtual_review_inventory(
-                config
-                    .cuda_inventory
-                    .as_ref()
-                    .ok_or("Warm V3 inventory absent")?,
-                config
-                    .cuda_inventory_sha256
-                    .as_deref()
-                    .ok_or("Warm inventory pin absent")?,
-            )?;
+            let policy = if let Some((_, inventory_bytes)) = source_metadata.as_ref() {
+                PalsCudaControlPolicy::from_virtual_review_inventory_bytes(
+                    inventory_bytes,
+                    config
+                        .cuda_inventory_sha256
+                        .as_deref()
+                        .ok_or("Warm inventory pin absent")?,
+                )?
+            } else {
+                PalsCudaControlPolicy::from_virtual_review_inventory(
+                    config
+                        .cuda_inventory
+                        .as_ref()
+                        .ok_or("Warm V3 inventory absent")?,
+                    config
+                        .cuda_inventory_sha256
+                        .as_deref()
+                        .ok_or("Warm inventory pin absent")?,
+                )?
+            };
             (
                 cache.cuda_bundle(
                     config
@@ -527,24 +565,56 @@ fn load(config: &Config, profiles: &Path) -> Result<PalsVirtualReviewOnnxBackend
         return Err("actual ORT pin differs".into());
     }
     selected.validate_execution_selection(runtime.native_loading_profile(), policy.is_some())?;
-    let backend = match policy {
-        Some(policy) => PalsVirtualReviewOnnxBackend::load_warm_with_cuda_control_policy(
-            &config.export_manifest,
+    let backend = if let Some(sources) = owned_sources {
+        PalsVirtualReviewOnnxBackend::load_owned_sources(
+            sources,
             &config.export_manifest_sha256,
             runtime,
             selected,
-            policy,
-            profiles,
-        )?,
-        None => PalsVirtualReviewOnnxBackend::load_approx_warm(
-            &config.export_manifest,
-            &config.export_manifest_sha256,
-            runtime,
-            selected,
-        )?,
+            VirtualReviewExecutionMode::Deployment,
+            kind,
+            policy.map(|policy| (policy, profiles.to_path_buf())),
+        )?
+    } else {
+        match (policy, kind) {
+            (Some(policy), VirtualReviewArtifactKind::Fresh) => {
+                PalsVirtualReviewOnnxBackend::load_with_cuda_control_policy(
+                    &config.export_manifest,
+                    &config.export_manifest_sha256,
+                    runtime,
+                    selected,
+                    policy,
+                    profiles,
+                )?
+            }
+            (None, VirtualReviewArtifactKind::Fresh) => PalsVirtualReviewOnnxBackend::load(
+                &config.export_manifest,
+                &config.export_manifest_sha256,
+                runtime,
+                selected,
+            )?,
+            (Some(policy), VirtualReviewArtifactKind::ApproxWarm) => {
+                PalsVirtualReviewOnnxBackend::load_warm_with_cuda_control_policy(
+                    &config.export_manifest,
+                    &config.export_manifest_sha256,
+                    runtime,
+                    selected,
+                    policy,
+                    profiles,
+                )?
+            }
+            (None, VirtualReviewArtifactKind::ApproxWarm) => {
+                PalsVirtualReviewOnnxBackend::load_approx_warm(
+                    &config.export_manifest,
+                    &config.export_manifest_sha256,
+                    runtime,
+                    selected,
+                )?
+            }
+        }
     };
     if backend.validator_present()
-        || !backend.approximate_warm_capable()
+        || backend.approximate_warm_capable() != (kind == VirtualReviewArtifactKind::ApproxWarm)
         || hex(backend.model_epoch()) != config.checkpoint_sha256
     {
         return Err("actual V-free Warm owner/checkpoint differs".into());
@@ -762,7 +832,7 @@ fn run_cases(
             }
             checked(service.execute(id, ticket))?;
             let mut started = false;
-            let (completion, evidence) = loop {
+            let (completion, evidence, observation_failures) = loop {
                 match next(service, until)? {
                     TicketNativeEvent::Started(t) if t == ticket => {
                         checked(registry.physical_started(&t))?;
@@ -772,8 +842,11 @@ fn run_cases(
                     TicketNativeEvent::Completed {
                         completion,
                         evidence,
+                        observation_failures,
                         ..
-                    } if completion.ticket == ticket && started => break (completion, evidence),
+                    } if completion.ticket == ticket && started => {
+                        break (completion, evidence, observation_failures);
+                    }
                     event => return Err(unexpected(&event).into()),
                 }
             };
@@ -783,6 +856,11 @@ fn run_cases(
                 }
                 std::mem::forget(registry);
                 return Err("physical completion unknown; original owners retained".into());
+            }
+            if !observation_failures.is_empty() {
+                let error = format!("native observation failure: {:?}", observation_failures);
+                std::mem::forget(registry);
+                return Err(error.into());
             }
             if ticket.role == Role::Proposer {
                 registry
@@ -895,7 +973,21 @@ fn run_cases(
                     result: Ok(()),
                     native_receipt,
                     rejected_permit: None,
+                    observation_failures,
                 } if t == ticket => {
+                    if !observation_failures.is_empty() {
+                        let error = format!(
+                            "native retirement observation failure: {:?}",
+                            observation_failures
+                        );
+                        // Preserve the exact receipt and registry until the
+                        // process is gone; do not promote it to logical accept.
+                        if let Some(receipt) = native_receipt {
+                            std::mem::forget(receipt);
+                        }
+                        std::mem::forget(registry);
+                        return Err(error.into());
+                    }
                     if let Some(receipt) = native_receipt {
                         registry
                             .confirm_native_acceptance(receipt, clock.domain(), clock.now())

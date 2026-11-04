@@ -765,6 +765,12 @@ fn raw_report(
             ));
         }
         CpuCompletion::QuiescenceLimit => "quiescence_limit",
+        CpuCompletion::AwaitReciprocal => {
+            return Err(CpuTaskError::new(
+                "unsupported_completion",
+                "reciprocal CPU wait requires the Rovent question receipt",
+            ));
+        }
         CpuCompletion::Terminal(_) => "rules_terminal",
     };
     if report.score_provenance

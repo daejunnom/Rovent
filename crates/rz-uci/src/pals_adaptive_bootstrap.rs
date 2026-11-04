@@ -6,11 +6,12 @@ pub mod diagnostic;
 pub mod external;
 mod native_backend;
 mod observations;
-mod protocol;
+pub(crate) mod protocol;
 mod resource_plan;
 mod resource_readback;
 pub mod runtime_assets;
 mod startup_snapshot;
+mod system_v6;
 
 use crate::EngineIdentity;
 use crate::engine::{EngineSettings, OwnerRegistry, ProcessClock};
@@ -115,10 +116,29 @@ struct DeploymentDiagnosticHooksV5 {
 pub struct AdaptiveBootstrapError {
     pub stage: &'static str,
     pub detail: String,
+    // Cleanup reports contain diagnostic vectors, not a live worker owner.
+    // Allocate their container only when a failure actually produced them.
+    pub cleanup_failures: Option<Box<NativeCleanupFailures>>,
+}
+/// Distinct errors observed while draining the original rejected native owner.
+#[derive(Debug, Default)]
+pub struct NativeCleanupFailures {
+    pub physical: Vec<rz_search::pals::coordinator::RoleFailure>,
+    pub semantic: Vec<rz_search::pals::coordinator::RoleFailure>,
+    /// Event and original report disagreed, in that order.
+    pub physical_mismatches: Vec<(bool, bool)>,
+    /// Original single-take reports, distinct from sticky diagnostic copies.
+    pub finish_reports: Vec<crate::pals_native::ticketed::TicketNativeFinishReport>,
+    pub missing_required_snapshots: usize,
+    pub missing_original_reports: usize,
 }
 impl fmt::Display for AdaptiveBootstrapError {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(out, "PALS V5 {}: {}", self.stage, self.detail)
+        write!(out, "PALS V5 {}: {}", self.stage, self.detail)?;
+        if let Some(failures) = &self.cleanup_failures {
+            write!(out, "; cleanup failures: {failures:?}")?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for AdaptiveBootstrapError {}
@@ -126,6 +146,7 @@ fn failure(stage: &'static str, cause: &dyn fmt::Debug) -> AdaptiveBootstrapErro
     AdaptiveBootstrapError {
         stage,
         detail: SearchSessionFailure::debug(stage, cause).detail,
+        cleanup_failures: None,
     }
 }
 fn boundary(stage: &'static str) -> AdaptiveBootstrapError {
@@ -304,14 +325,18 @@ impl Drop for StartupNativeGuard {
                 while let Some(event) = native.poll() {
                     if let TicketNativeEvent::Finished {
                         physical_shutdown_confirmed,
+                        ..
                     } = event
                     {
                         physically_closed = physical_shutdown_confirmed;
+                        // Do not take the recoverable report in Drop: service
+                        // teardown hands the original shared receiver to its
+                        // registry owner for a later explicit single take.
                     }
                 }
                 if native.try_join() == Ok(true) {
                     eprintln!(
-                        "pals_v5_bootstrap_cleanup owner_joined=true physical_shutdown_confirmed={physically_closed}"
+                        "pals_v5_bootstrap_cleanup owner_joined=true event_physical_shutdown_confirmed={physically_closed}"
                     );
                     return;
                 }
@@ -325,6 +350,58 @@ impl Drop for StartupNativeGuard {
 }
 
 pub fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapError> {
+    run_cli_inner(arguments, None)
+}
+
+/// The executable passes its local main-entry observation for the explicitly
+/// selected proxy-entry functional smoke. This is not an OS spawn timestamp.
+/// Existing library callers retain `run_cli` and its established behavior.
+pub fn run_cli_from_main_entry(
+    arguments: Vec<String>,
+    main_entry: Instant,
+) -> Result<(), AdaptiveBootstrapError> {
+    run_cli_inner(arguments, Some(main_entry))
+}
+
+fn run_cli_inner(
+    arguments: Vec<String>,
+    main_entry: Option<Instant>,
+) -> Result<(), AdaptiveBootstrapError> {
+    if arguments
+        .iter()
+        .any(|arg| arg == "--pals-proxy-entry-functional-smoke=true")
+    {
+        #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+        {
+            let entry = main_entry.ok_or_else(|| boundary("ProxyEntrySmokeRequiresMainEntry"))?;
+            return crate::pals_system_proxy::run_entry_smoke_guarded(&arguments, entry)
+                .map_err(|error| failure("ProxyEntryFunctionalSmoke", &error));
+        }
+        #[cfg(not(all(target_os = "linux", feature = "onnx-cuda")))]
+        {
+            let _ = main_entry;
+            return Err(boundary("ProxyEntrySmokeRequiresLinuxCuda"));
+        }
+    }
+    if arguments
+        .iter()
+        .any(|arg| arg.starts_with("--pals-system-proxy="))
+    {
+        #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+        return crate::pals_system_proxy::run_guarded_cli(&arguments)
+            .map_err(|error| failure("SystemV6Proxy", &error));
+        #[cfg(not(all(target_os = "linux", feature = "onnx-cuda")))]
+        return Err(boundary("SystemV6ProxyRequiresLinuxCuda"));
+    }
+    if arguments == ["--pals-system-source-inventory"] {
+        return system_v6::source_inventory();
+    }
+    if arguments
+        .iter()
+        .any(|arg| arg.starts_with("--pals-system-startup-"))
+    {
+        return system_v6::run_cli(arguments);
+    }
     if arguments == ["--source-inventory"] {
         let pins = compiled_source_components_v5().map_err(|e| failure("SourceInventory", &e))?;
         let output = serde_json::json!({"domain":"rz-pals-compiled-source-registration-v5/1",
@@ -428,10 +505,21 @@ pub fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapError> {
     let completion = prepared.driver.completion_diagnostic().ok();
     match &finish {
         Ok(receipt) => {
-            prepared
+            let termination = prepared
                 .observations
-                .publish_termination(receipt, completion.as_ref())
-                .map_err(|e| failure("TerminationReceipt", &e))?;
+                .publish_termination(receipt, completion.as_ref());
+            if let Err(error) = prepared
+                .observations
+                .publish_session_release_observation(Some(receipt))
+            {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "pals_v5_session_release_observation_warning {}",
+                    failure("SessionReleaseObservation", &error)
+                );
+            }
+            termination.map_err(|e| failure("TerminationReceipt", &e))?;
         }
         Err(error) => {
             let retained = prepared.driver.retained_owner_status().ok();
@@ -444,6 +532,17 @@ pub fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapError> {
                 eprintln!(
                     "pals_v5_failure_record {}",
                     failure("FailureReceipt", &record_error)
+                );
+            }
+            if let Err(record_error) = prepared
+                .observations
+                .publish_session_release_observation(None)
+            {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "pals_v5_session_release_observation_warning {}",
+                    failure("SessionReleaseObservation", &record_error)
                 );
             }
             return Err(failure("ProcessDrain", error));
@@ -539,6 +638,13 @@ impl PreparedAdaptiveProcessV5 {
         };
         let context = SearchSessionContext {
             authority,
+            root_moves: None,
+            goal: rz_contracts::rovent::SearchGoal::default(),
+            original_go: None,
+            original_time_budget: None,
+            original_start: None,
+            effective_clock: None,
+            requested_nodes: None,
             control: rz_search::driver::SearchControl::new(hard_deadline, self.cpu_nodes_limit),
             cancellation: CancelToken::new(),
             shutdown_deadline,
@@ -770,7 +876,13 @@ fn prepare_actual(
                     AdaptiveSessionCollectionHooks {
                         root_admission: Some(hooks.root_admission),
                         root_closure: Some(hooks.root_closure),
+                        utility_route_completed: None,
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        utility_trial_retired: None,
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        utility_intervention_trial_retired: None,
                         external_teacher: Some(hooks.teacher_observer),
+                        cooperative: None,
                     },
                 )
             }
@@ -1151,8 +1263,17 @@ fn prepare_actual(
         collection_hooks,
     )
     .map_err(|rejected| {
-        let error = failure("SessionAdmission", &rejected.failure);
-        cleanup_rejected_sources(rejected.sources, startup_until);
+        let mut error = failure("SessionAdmission", &rejected.failure);
+        let cleanup = cleanup_rejected_sources(rejected.sources, startup_until);
+        if !cleanup.physical.is_empty()
+            || !cleanup.semantic.is_empty()
+            || !cleanup.physical_mismatches.is_empty()
+            || !cleanup.finish_reports.is_empty()
+            || cleanup.missing_required_snapshots != 0
+            || cleanup.missing_original_reports != 0
+        {
+            error.cleanup_failures = Some(Box::new(cleanup));
+        }
         error
     })?;
     let initial_scope = crate::contracts::SessionScope::Search(SearchAuthority {
@@ -1213,7 +1334,10 @@ fn finish_rejected_legacy_factory(
 
 /// Rejected declarations never re-enter session admission. These are the same
 /// owners created at startup, with no accepted jobs and no synthetic work ledger.
-fn cleanup_rejected_sources(mut sources: AdaptiveSessionSources<ActualBackend>, until: Instant) {
+fn cleanup_rejected_sources(
+    mut sources: AdaptiveSessionSources<ActualBackend>,
+    until: Instant,
+) -> NativeCleanupFailures {
     sources.native.begin_shutdown(until);
     if let Some(external) = &sources.external {
         external.worker.request_shutdown(until);
@@ -1223,15 +1347,38 @@ fn cleanup_rejected_sources(mut sources: AdaptiveSessionSources<ActualBackend>, 
     let mut joined = false;
     let mut external_joined = sources.external.is_none();
     let mut failed = false;
+    let mut failures = NativeCleanupFailures::default();
     while Instant::now() < until && !failed {
         let version = signal.version();
         while let Some(event) = sources.native.poll() {
             match event {
                 TicketNativeEvent::Finished {
                     physical_shutdown_confirmed,
-                } => {
-                    physical = Some(physical_shutdown_confirmed);
-                }
+                    ..
+                } => match sources.native.finish_report_snapshot() {
+                    Some(snapshot) => {
+                        if physical_shutdown_confirmed != snapshot.physical_shutdown_confirmed {
+                            failures.physical_mismatches.push((
+                                physical_shutdown_confirmed,
+                                snapshot.physical_shutdown_confirmed,
+                            ));
+                        }
+                        physical = Some(
+                            physical_shutdown_confirmed && snapshot.physical_shutdown_confirmed,
+                        );
+                        failures.physical.extend(snapshot.physical_failure);
+                        failures.semantic.extend(snapshot.semantic_failure);
+                        match sources.native.take_finish_report() {
+                            Some(original) => failures.finish_reports.push(original),
+                            None => failures.missing_original_reports += 1,
+                        }
+                    }
+                    None if sources.native.requires_finish_report() => {
+                        failures.missing_required_snapshots += 1;
+                        physical = Some(false);
+                    }
+                    None => physical = Some(physical_shutdown_confirmed),
+                },
                 TicketNativeEvent::Ready { .. } => {}
                 _ => failed = true,
             }
@@ -1266,7 +1413,7 @@ fn cleanup_rejected_sources(mut sources: AdaptiveSessionSources<ActualBackend>, 
                 eprintln!(
                     "pals_v5_rejected_startup_cleanup physical=confirmed native_joined=true external_joined=true archive_closed=true"
                 );
-                return;
+                return failures;
             }
             failed = true;
         }
@@ -1281,6 +1428,7 @@ fn cleanup_rejected_sources(mut sources: AdaptiveSessionSources<ActualBackend>, 
     // quarantine is never labelled successful, refunded, or reused.
     let _quarantined = Box::leak(Box::new(sources));
     eprintln!("pals_v5_rejected_startup_cleanup physical=unknown owners_quarantined=true");
+    failures
 }
 
 #[cfg(test)]

@@ -581,6 +581,27 @@ pub fn run_pals_evaluation_series_v5(
     attempt_prefix: &str,
     cancel: &AtomicBool,
 ) -> PalsEvaluationSeriesV5 {
+    run_pals_evaluation_series_with_storage_policy_v5(
+        pipeline,
+        launches,
+        source_root,
+        output_root,
+        attempt_prefix,
+        cancel,
+        PalsOwnedStoragePolicy::StrictV5,
+    )
+}
+
+#[cfg(feature = "pals-collection-onnx")]
+pub fn run_pals_evaluation_series_with_storage_policy_v5(
+    pipeline: Arc<crate::pals_collect_v3::VerifiedGenerationPipelineV3>,
+    launches: Vec<LockedPalsArenaLaunchV5>,
+    source_root: &Path,
+    output_root: &Path,
+    attempt_prefix: &str,
+    cancel: &AtomicBool,
+    storage_policy: PalsOwnedStoragePolicy,
+) -> PalsEvaluationSeriesV5 {
     let registration = Arc::clone(pipeline.evaluation_openings());
     let mut series = PalsEvaluationSeriesV5 {
         pipeline, registration: Arc::clone(&registration), launches, pairs: Vec::with_capacity(32), failure: None,
@@ -597,6 +618,10 @@ pub fn run_pals_evaluation_series_v5(
                 "Full cohort effect compares G0/G1 weights of the same compact V-free own-CPU_R engine; no Elo or promotion is implied".into()],
         },
     };
+    if storage_policy == PalsOwnedStoragePolicy::AdvisoryV1 {
+        series.report.domain = "rz-pals-final-evaluation-series-storage-advisory-v1/1".into();
+        series.report.notes.push("Explicit storage advisory policy; each native pair records its advisory-v1 policy in its source-verification artifact. Output-root usage is not measured by the pair; global storage observation is independent.".into());
+    }
     let admission = (|| -> Result<String, ArenaError> {
         require(
             series_identifier(attempt_prefix),
@@ -649,18 +674,20 @@ pub fn run_pals_evaluation_series_v5(
         let attempt = format!("{attempt_prefix}-pair-{index:02}");
         series.report.preparation_attempts += 1;
         let prepared = match series.pairs.last() {
-            Some(previous) => prepare_pals_pair_launch_after_closed_v5(
+            Some(previous) => prepare_pals_pair_launch_after_closed_with_storage_policy(
                 &series.launches[index],
                 &previous.native,
                 source_root,
                 output_root,
                 &attempt,
+                storage_policy,
             ),
-            None => prepare_pals_pair_launch_v5(
+            None => prepare_pals_pair_launch_with_storage_policy(
                 &series.launches[index],
                 source_root,
                 output_root,
                 &attempt,
+                storage_policy,
             ),
         };
         let owner = match prepared {
@@ -676,7 +703,7 @@ pub fn run_pals_evaluation_series_v5(
             }
         };
         series.report.native_dispatch_attempts += 1;
-        let output = match run_pals_pair_v5(owner, Some(cancel)) {
+        let output = match run_pals_pair_with_storage_policy(owner, Some(cancel)) {
             Ok(output) => output,
             Err(original) => {
                 preserve_unscored_attempt(

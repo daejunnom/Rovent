@@ -379,3 +379,87 @@ fn both_component_pins_and_the_declared_inventory_must_match_compiled_sources() 
         assert!(verify_component_sources(&search, &own, &wrong).is_err());
     }
 }
+
+#[test]
+fn v6_reuses_search_semantics_and_keeps_source_observation_independent() {
+    let (search_options, own_options) = declarations();
+    let compiled = compiled_source_components_v5().unwrap();
+    let search = PalsComponentV3 {
+        semantic_id: "v6-search".into(),
+        implementation_sha256: compiled["coordinator"].clone(),
+        options: search_options,
+    };
+    let own = PalsComponentV3 {
+        semantic_id: "v6-own".into(),
+        implementation_sha256: compiled["cpu_search"].clone(),
+        options: own_options,
+    };
+    let deadline = Instant::now() + Duration::from_secs(17);
+    let parse_v6 =
+        |policy, declared: &BTreeMap<String, String>, actual: Option<&BTreeMap<String, String>>| {
+            parse_v6_components(
+                &search,
+                &own,
+                PalsCpuSelectionV5::Own,
+                policy,
+                declared,
+                actual,
+                deadline,
+            )
+        };
+    let strict = parse_v6(PalsSystemSourcePolicyV6::Strict, &compiled, Some(&compiled)).unwrap();
+    assert_eq!(strict.settings.limits.deadline, deadline);
+    assert_eq!(strict.settings.config.beam_width, 3);
+    assert_eq!(strict.settings.own_cpu.max_depth, 11);
+    assert_eq!(
+        strict.coordinator_source.observation,
+        PalsSystemSourceObservationV6::Verified
+    );
+    assert_eq!(
+        strict.own_cpu_source.observation,
+        PalsSystemSourceObservationV6::Verified
+    );
+
+    let mut missing = compiled.clone();
+    missing.remove("coordinator");
+    assert!(matches!(
+        parse_v6(PalsSystemSourcePolicyV6::Strict, &missing, Some(&compiled)),
+        Err(PalsSearchSettingsErrorV6::SourceMismatch {
+            component: "coordinator"
+        })
+    ));
+    let observed = parse_v6(PalsSystemSourcePolicyV6::Observe, &missing, Some(&compiled)).unwrap();
+    assert_eq!(
+        observed.coordinator_source.observation,
+        PalsSystemSourceObservationV6::Missing
+    );
+    assert_eq!(observed.settings.limits.deadline, deadline);
+
+    let unknown = parse_v6(PalsSystemSourcePolicyV6::Observe, &compiled, None).unwrap();
+    assert_eq!(
+        unknown.coordinator_source.observation,
+        PalsSystemSourceObservationV6::Missing
+    );
+    assert!(
+        unknown
+            .coordinator_source
+            .compiled_component_sha256
+            .is_none()
+    );
+    let mut changed = compiled.clone();
+    let mut wrong_cpu = compiled["cpu_search"].clone();
+    let replacement = if wrong_cpu.starts_with('0') { "1" } else { "0" };
+    wrong_cpu.replace_range(..1, replacement);
+    changed.insert("cpu_search".into(), wrong_cpu);
+    let mismatch = parse_v6(PalsSystemSourcePolicyV6::Observe, &changed, Some(&compiled)).unwrap();
+    assert_eq!(
+        mismatch.own_cpu_source.observation,
+        PalsSystemSourceObservationV6::Mismatch
+    );
+    assert!(matches!(
+        parse_v6(PalsSystemSourcePolicyV6::Strict, &changed, Some(&compiled)),
+        Err(PalsSearchSettingsErrorV6::SourceMismatch {
+            component: "cpu_search"
+        })
+    ));
+}

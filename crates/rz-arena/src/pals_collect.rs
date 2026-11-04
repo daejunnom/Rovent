@@ -442,7 +442,15 @@ struct VerifiedExecutableIdentity {
 }
 impl VerifiedExecutableIdentity {
     fn current() -> Result<Self, ArenaError> {
-        Self::open(&std::env::current_exe().map_err(io)?, 256 * 1024 * 1024)
+        let path = std::env::current_exe().map_err(io)?;
+        let observed = std::fs::symlink_metadata(&path).map_err(io)?;
+        // Bound this hash by the actual executable's observed length, rather
+        // than rejecting valid builds based on an unrelated fixed size.
+        let verified = Self::open(&path, observed.len())?;
+        if !Self::same_metadata(&observed, &verified.metadata)? {
+            return Err(invalid("current executable changed before verification"));
+        }
+        Ok(verified)
     }
 
     fn open(path: &Path, max_bytes: u64) -> Result<Self, ArenaError> {
@@ -2909,7 +2917,8 @@ pub fn own_collection_registry(
             "automatic source enrollment is only available for verified weightless CPU; NN assets need an independent verified registry",
         ));
     }
-    let actual = file_sha(&std::env::current_exe().map_err(io)?, 256 * 1024 * 1024)?;
+    let executable = VerifiedExecutableIdentity::current()?;
+    let actual = executable.sha256.clone();
     if actual != description.implementation_sha256 {
         return Err(invalid("loaded source implementation hash mismatch"));
     }
@@ -2926,6 +2935,21 @@ mod tests {
     use super::*;
     std::thread_local! {pub(super) static FAIL_ARTIFACT:std::cell::Cell<Option<(&'static str,usize)>>=const {std::cell::Cell::new(None)};}
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+    static EXECUTABLE_FIXTURE_ADMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn admit_executable_fixture() -> std::sync::MutexGuard<'static, ()> {
+        // These tests independently hash the actual debug test executable at
+        // the driver, registry and collection boundaries. Admit one such
+        // fixture before any of its clocks start, rather than letting the
+        // test harness turn every 10-second collection into a competing
+        // executable-hashing workload. This changes neither production
+        // admission/deadlines nor any explicit timeout/cancellation case.
+        // The mutex owns no source state, so a failed test may release its
+        // admission without suppressing the next test's independent checks.
+        EXECUTABLE_FIXTURE_ADMISSION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
     struct OwnedTemp(PathBuf);
     impl OwnedTemp {
         fn new() -> Self {
@@ -2961,7 +2985,10 @@ mod tests {
             cpu_depth: 1,
             nodes_per_job: 256,
             max_total_nodes: 1024,
-            max_wall_time_ms: 10_000,
+            // These exercise result/ownership semantics rather than executable
+            // hashing speed. Keep the same finite window already used by the
+            // strict owner fixtures when the test binary grows or CI is busy.
+            max_wall_time_ms: 120_000,
             max_output_bytes: 1024 * 1024,
             exploration_plies: 0,
             collect_conditional_repair: false,
@@ -3583,6 +3610,7 @@ mod tests {
     }
     #[test]
     fn collection_rejects_a_consistently_forged_driver_and_registry_binary_digest() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let path = output.0.join("unregistered-fixture-executable");
         std::fs::write(&path, b"not the actual collector executable").unwrap();
@@ -3624,6 +3652,7 @@ mod tests {
     }
     #[test]
     fn actual_cpu_collection_seals_native_inputs_and_masks_ply_limit() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let mut cpu = driver();
         let registry = own_collection_registry(&cpu).unwrap();
@@ -3696,6 +3725,7 @@ mod tests {
     }
     #[test]
     fn exact_terminal_and_stalemate_are_rules_labels_without_cpu_jobs() {
+        let _admission = admit_executable_fixture();
         for (fen, outcome) in [
             ("7k/6Q1/5K2/8/8/8/8/8 b - - 0 1", PalsOutcome::WhiteWin),
             ("8/8/8/8/8/5k2/6q1/7K w - - 0 1", PalsOutcome::BlackWin),
@@ -3748,6 +3778,7 @@ mod tests {
     }
     #[test]
     fn failure_preserves_seal_and_unknown_partial_pgn() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let mut cpu = BrokenDriver(driver());
         let registry = own_collection_registry(&cpu).unwrap();
@@ -3772,6 +3803,7 @@ mod tests {
     }
     #[test]
     fn source_mismatch_and_existing_directory_are_rejected_without_overwrite() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let mut cpu = driver();
         let mut registry = own_collection_registry(&cpu).unwrap();
@@ -3819,6 +3851,7 @@ mod tests {
     }
     #[test]
     fn overlapping_declared_splits_fail_audit_and_preserve_games() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let mut cpu = driver();
         let registry = own_collection_registry(&cpu).unwrap();
@@ -3845,6 +3878,7 @@ mod tests {
     }
     #[test]
     fn conditional_repair_inputs_keep_actual_history_separate_and_no_game_outcome() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let source = driver().description().clone();
         let config = small_config();
@@ -3864,7 +3898,6 @@ mod tests {
         };
         let root = Position::startpos();
         let opening = PalsCollectionOpening::default();
-        let deadline = Instant::now() + Duration::from_secs(10);
         let cancel = AtomicBool::new(false);
         let proposal = [
             BoardMove::from_uci("e2e4").unwrap(),
@@ -3882,6 +3915,9 @@ mod tests {
             serde_json::Value::Null,
         )
         .unwrap();
+        // All source preparation, including executable verification, precedes
+        // this conditional operation's own finite admission window.
+        let deadline = Instant::now() + Duration::from_secs(10);
         conditional(
             &config,
             &mut state,
@@ -3950,6 +3986,7 @@ mod tests {
     }
     #[test]
     fn one_actual_ply_budget_keeps_capacity_for_deeper_virtual_cpu_lines() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let mut cpu = VirtualDepthProbe(driver());
         let registry = own_collection_registry(&cpu).unwrap();
@@ -3966,6 +4003,7 @@ mod tests {
     }
     #[test]
     fn output_failure_after_rules_result_never_rewrites_outcome_to_unknown() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let mut cpu = driver();
         let registry = own_collection_registry(&cpu).unwrap();
@@ -3998,6 +4036,7 @@ mod tests {
     }
     #[test]
     fn partial_opening_failure_keeps_every_successfully_played_move() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let mut cpu = driver();
         let registry = own_collection_registry(&cpu).unwrap();
@@ -4019,6 +4058,7 @@ mod tests {
     }
     #[test]
     fn foreign_git_checkout_and_terminal_continuations_are_rejected() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let foreign = output.0.join("another-repository");
         std::fs::create_dir(&foreign).unwrap();
@@ -4068,6 +4108,7 @@ mod tests {
     }
     #[test]
     fn cancellation_before_actual_consumption_preserves_observation_without_moving() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let mut cpu = CancelAfterAnalysis(driver());
         let registry = own_collection_registry(&cpu).unwrap();
@@ -4108,6 +4149,7 @@ mod tests {
     }
     #[test]
     fn partial_result_and_pgn_writes_preserve_raw_prefix_and_valid_separate_recovery() {
+        let _admission = admit_executable_fixture();
         for (artifact, recovery) in [
             ("game-results.jsonl", "recovered-game-results.jsonl"),
             ("games.pgn", "recovered-games.pgn"),
@@ -4145,6 +4187,7 @@ mod tests {
     }
     #[test]
     fn admitted_compact_source_config_fits_compact_receipt_reserve() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let mut description = driver().description().clone();
         description
@@ -4207,6 +4250,7 @@ mod tests {
     }
     #[test]
     fn strict_cpu_producer_pins_actual_bytes_and_preserves_raw_label_history() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let mut cpu = driver();
         let registration = producer_config(&mut cpu);
@@ -4417,6 +4461,7 @@ mod tests {
     }
     #[test]
     fn strict_registration_mismatch_and_unchecked_mock_never_fall_back() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let mut registered = driver();
         let registration = producer_config(&mut registered);
@@ -4456,6 +4501,7 @@ mod tests {
     }
     #[test]
     fn producer_close_credit_is_reserved_before_first_capture() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let mut cpu = driver();
         let bytes = serde_json::to_vec(
@@ -4485,6 +4531,7 @@ mod tests {
     }
     #[test]
     fn prior_registration_requires_actual_pin_unique_keys_and_integer_epoch() {
+        let _admission = admit_executable_fixture();
         let mut cpu = driver();
         let description =
             pals_producer_registration_description(&mut cpu, "primary-owner").unwrap();
@@ -4563,6 +4610,7 @@ mod tests {
     }
     #[test]
     fn opaque_owner_rejects_declaration_and_routes_delegated_proof_to_actual_dispatcher() {
+        let _admission = admit_executable_fixture();
         let output = OwnedTemp::new();
         let mut wrapper = CustomOwnerWrapper {
             inner: driver(),

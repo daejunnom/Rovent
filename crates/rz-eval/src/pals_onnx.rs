@@ -6,7 +6,10 @@
 //! buffers. Public memory is exact and role-neutral; role latents start fresh.
 use crate::asset::{self, parse_sha256};
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
-use crate::onnx::{NativeLoadingProfile, NativeMappingObservation, OrtRuntime, Provider};
+use crate::onnx::{
+    CudaRuntimeMappingEvidence, NativeLoadingProfile, NativeMappingObservation, OrtRuntime,
+    Provider,
+};
 use crate::pals_model::{
     PalsModelConfig, PalsModelInput, PalsModelProfile, PalsRawOutput, PalsRole,
     PreparedPalsFullLineTensors, PreparedPalsTensors, MAX_LINE_PLY, PALS_ENCODING_SCHEMA,
@@ -39,6 +42,8 @@ mod device_pages_plan;
 mod public_pages;
 pub mod virtual_review;
 mod warm;
+#[cfg(target_os = "linux")]
+pub use cuda_control::SystemVirtualReviewCudaPlacementWitness;
 pub use cuda_control::{
     PalsControlTransfer, PalsControlTransferKind, PalsCudaControlPolicy, PalsCudaPlacementWitness,
     PalsGraphOptimization, PalsGraphPlacement, PalsKernelWitness, VirtualReviewControlLayout,
@@ -453,6 +458,7 @@ pub enum PalsStartupStageBoundary {
     ReturnedOk,
     ReturnedError,
     Observed,
+    ObservationUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -918,6 +924,10 @@ impl PalsOnnxConfig {
         }
     }
     fn validate(&self) -> Result<(), BackendError> {
+        self.validate_with_system_cuda(false)
+    }
+
+    fn validate_with_system_cuda(&self, system_cuda: bool) -> Result<(), BackendError> {
         if !(1..=2).contains(&self.intra_threads) {
             return Err(fail(
                 K::InvalidInput,
@@ -930,7 +940,10 @@ impl PalsOnnxConfig {
             arena_bytes,
         } = self.provider
         {
-            if device_id < 0 || arena_bytes == 0 || arena_bytes > 6 * 1024 * 1024 * 1024 {
+            if device_id < 0
+                || arena_bytes == 0
+                || (!system_cuda && arena_bytes > 6 * 1024 * 1024 * 1024)
+            {
                 return Err(fail(
                     K::InvalidInput,
                     S::Admission,
@@ -969,6 +982,41 @@ impl PalsOnnxConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Validate an explicitly selected system-CUDA configuration. The arena
+    /// limit is still the caller's registered positive `usize`; unlike the
+    /// historical local profile it is not capped to one GPU's 6 GiB VRAM.
+    /// This preflight does not inspect the device or establish availability.
+    pub fn validate_system_execution_selection(self) -> Result<(), BackendError> {
+        self.validate_with_system_cuda(true)?;
+        if !matches!(self.provider, Provider::Cuda { .. }) {
+            return Err(fail(
+                K::InvalidInput,
+                S::Admission,
+                "system CUDA selection requires an explicit CUDA provider",
+            ));
+        }
+        if self.cudnn_conv_search != PalsCuDnnConvSearch::LegacyImplicitExhaustive {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Admission,
+                "system CUDA does not support experimental cuDNN control profiles",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_for_runtime(
+        self,
+        runtime: &OrtRuntime,
+        explicit_control: bool,
+    ) -> Result<(), BackendError> {
+        if runtime.is_system_cuda() {
+            self.validate_system_execution_selection()
+        } else {
+            self.validate_execution_selection(runtime.native_loading_profile(), explicit_control)
+        }
     }
     /// Pure preflight for callers before runtime/model I/O. The loader repeats
     /// this with the actual retained runtime profile before reading the model.
@@ -1342,6 +1390,9 @@ fn validate_role_tag(shape: &[i64], values: &[bool], critic: bool) -> Result<(),
 enum CudaMappingAudit {
     #[default]
     AwaitingFirstRun,
+    /// A Run physically completed, but native mapping provenance was not
+    /// observable. This is neither a failure nor an acceptance witness.
+    ObservationUnknown,
     Confirmed,
     Rejected(BackendError),
 }
@@ -1352,18 +1403,32 @@ impl CudaMappingAudit {
             _ => Ok(()),
         }
     }
+    #[cfg(test)]
     fn after_run(
         &mut self,
         completed: bool,
         full_audit: impl FnOnce() -> Result<(), BackendError>,
     ) -> Result<(), BackendError> {
+        self.after_run_observed(completed, || {
+            full_audit().map(|()| CudaRuntimeMappingEvidence::Observed)
+        })
+    }
+    fn after_run_observed(
+        &mut self,
+        completed: bool,
+        full_audit: impl FnOnce() -> Result<CudaRuntimeMappingEvidence, BackendError>,
+    ) -> Result<(), BackendError> {
         self.allow_run()?;
-        if !completed || matches!(self, Self::Confirmed) {
+        if !completed || matches!(self, Self::Confirmed | Self::ObservationUnknown) {
             return Ok(());
         }
         match full_audit() {
-            Ok(()) => {
+            Ok(CudaRuntimeMappingEvidence::Observed) => {
                 *self = Self::Confirmed;
+                Ok(())
+            }
+            Ok(CudaRuntimeMappingEvidence::Unknown) => {
+                *self = Self::ObservationUnknown;
                 Ok(())
             }
             Err(mut failure) => {
@@ -1378,6 +1443,13 @@ impl CudaMappingAudit {
         full_audit: impl FnOnce() -> Result<(), BackendError>,
     ) -> Result<(), BackendError> {
         self.allow_run()?;
+        if matches!(self, Self::ObservationUnknown) {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "PALS CUDA mapping observation is unavailable",
+            ));
+        }
         if !matches!(self, Self::Confirmed) {
             return Err(fail(
                 K::BackendUnavailable,
@@ -1387,6 +1459,58 @@ impl CudaMappingAudit {
         }
         match full_audit() {
             Ok(()) => Ok(()),
+            Err(mut failure) => {
+                failure.detail =
+                    "PALS CUDA final full mapping audit failed after completed native Run";
+                *self = Self::Rejected(failure.clone());
+                Err(failure)
+            }
+        }
+    }
+
+    /// A strict caller can retry an unavailable observation without poisoning
+    /// the live backend. Only an actual conflicting observation is latched.
+    fn final_audit_observed(
+        &mut self,
+        full_audit: impl FnOnce() -> Result<CudaRuntimeMappingEvidence, BackendError>,
+    ) -> Result<(), BackendError> {
+        self.allow_run()?;
+        if matches!(self, Self::AwaitingFirstRun) {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "PALS full CUDA audit requires a completed native Run",
+            ));
+        }
+        match self.observe_final_audit(full_audit)? {
+            CudaRuntimeMappingEvidence::Observed => Ok(()),
+            CudaRuntimeMappingEvidence::Unknown => Err(fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "PALS CUDA mapping observation is unavailable",
+            )),
+        }
+    }
+
+    /// Production shutdown can retain an unavailable observation without
+    /// calling it a successful strict audit or a physical completion fence.
+    fn observe_final_audit(
+        &mut self,
+        full_audit: impl FnOnce() -> Result<CudaRuntimeMappingEvidence, BackendError>,
+    ) -> Result<CudaRuntimeMappingEvidence, BackendError> {
+        self.allow_run()?;
+        if matches!(self, Self::AwaitingFirstRun) {
+            return Ok(CudaRuntimeMappingEvidence::Unknown);
+        }
+        match full_audit() {
+            Ok(CudaRuntimeMappingEvidence::Observed) => {
+                *self = Self::Confirmed;
+                Ok(CudaRuntimeMappingEvidence::Observed)
+            }
+            Ok(CudaRuntimeMappingEvidence::Unknown) => {
+                *self = Self::ObservationUnknown;
+                Ok(CudaRuntimeMappingEvidence::Unknown)
+            }
             Err(mut failure) => {
                 failure.detail =
                     "PALS CUDA final full mapping audit failed after completed native Run";
@@ -1899,6 +2023,81 @@ impl PalsAppliedSessionSettings {
         "setters_execution_provider_registration_and_session_commit_success"
     }
 }
+/// Failure from one session constructor. This describes provider setup in
+/// this function only: an earlier ORT runtime load may itself have entered
+/// native code. A returned session stays in the caller-owned slot; the failure
+/// only records whether that slot contains the returned session.
+enum SessionLoadFailure {
+    BeforeProvider(BackendError),
+    ProviderEntered {
+        error: BackendError,
+        /// The actual session, when present, remains in the caller-owned slot.
+        returned_session: bool,
+    },
+}
+impl From<BackendError> for SessionLoadFailure {
+    fn from(error: BackendError) -> Self {
+        Self::BeforeProvider(error)
+    }
+}
+impl SessionLoadFailure {
+    /// Historical call sites preserve their existing error contract. This is
+    /// not a physical-completion claim and must not be used by the new owner.
+    fn into_error(self) -> BackendError {
+        match self {
+            Self::BeforeProvider(error) | Self::ProviderEntered { error, .. } => error,
+        }
+    }
+}
+
+/// Validate only the caller-owned slots before invoking either callback. This
+/// boundary is deliberately generic so its ordering can be tested without
+/// loading ORT or touching a GPU.
+#[cfg(test)]
+fn begin_session_native<T>(
+    session_occupied: bool,
+    serialized_present: bool,
+    before_native: impl FnOnce(),
+    builder: impl FnOnce() -> T,
+) -> Result<T, SessionLoadFailure> {
+    begin_session_native_checked(
+        session_occupied,
+        serialized_present,
+        || {
+            before_native();
+            Ok(())
+        },
+        builder,
+    )
+}
+
+/// The fallible check runs at the same final pre-native boundary. A rejected
+/// call leaves the original serialized and session slots with their owner and
+/// neither marks this constructor entered nor invokes the native builder.
+fn begin_session_native_checked<T>(
+    session_occupied: bool,
+    serialized_present: bool,
+    before_native: impl FnOnce() -> Result<(), BackendError>,
+    builder: impl FnOnce() -> T,
+) -> Result<T, SessionLoadFailure> {
+    if session_occupied {
+        return Err(SessionLoadFailure::BeforeProvider(fail(
+            K::InvalidInput,
+            S::Admission,
+            "PALS session custody slot is already occupied",
+        )));
+    }
+    if !serialized_present {
+        return Err(SessionLoadFailure::BeforeProvider(fail(
+            K::InvalidInput,
+            S::Admission,
+            "PALS serialized model custody slot is empty",
+        )));
+    }
+    before_native().map_err(SessionLoadFailure::BeforeProvider)?;
+    Ok(builder())
+}
+
 fn load_session(
     bytes: Vec<u8>,
     config: PalsOnnxConfig,
@@ -1912,6 +2111,43 @@ fn load_session(
     ),
     BackendError,
 > {
+    let mut serialized_bytes = Some(bytes);
+    let mut session = None;
+    let (placement, settings) = load_session_retaining_failure(
+        &mut serialized_bytes,
+        config,
+        role,
+        audit,
+        &mut session,
+        false,
+        || Ok(()),
+    )
+    .map_err(SessionLoadFailure::into_error)?;
+    Ok((
+        session.expect("successful session load owns session"),
+        placement,
+        settings,
+    ))
+}
+
+/// `returned_session` is the original owner's slot, not a temporary inside
+/// this function. ORT success is moved there before any placement/log callback
+/// can fail or unwind. `serialized_bytes` is likewise an original owner slot:
+/// V3 callers request preservation on unsuccessful or unwinding commits;
+/// the legacy wrapper releases failed-commit bytes at its original time.
+/// Successful native-copy commits release bytes immediately after the
+/// returned Session is installed.
+/// The owner must itself survive unwinding and unknown physical completion;
+/// this function does not create that owner or a fence.
+fn load_session_retaining_failure(
+    serialized_bytes: &mut Option<Vec<u8>>,
+    config: PalsOnnxConfig,
+    role: &str,
+    audit: Option<(&PalsCudaControlPolicy, &Path)>,
+    returned_session: &mut Option<Session>,
+    preserve_failed_input: bool,
+    before_native: impl FnOnce() -> Result<(), BackendError>,
+) -> Result<(Option<PalsGraphPlacement>, PalsAppliedSessionSettings), SessionLoadFailure> {
     let configure = |e| {
         native(
             CauseCode::SessionConfiguration,
@@ -1919,30 +2155,46 @@ fn load_session(
             e,
         )
     };
-    let mut builder = Session::builder()
-        .map_err(configure)?
-        .with_no_environment_execution_providers()
-        .map_err(configure)?
-        .with_intra_threads(config.intra_threads)
-        .map_err(configure)?
-        .with_inter_threads(1)
-        .map_err(configure)?
-        .with_parallel_execution(false)
-        .map_err(configure)?
-        .with_intra_op_spinning(false)
-        .map_err(configure)?
-        .with_inter_op_spinning(false)
-        .map_err(configure)?
-        .with_memory_pattern(false)
-        .map_err(configure)?
-        // Explicit control v2 is separately attested. Disabling graph rewrites
-        // keeps named source metadata chains; strict CUDA and CPU retain L1.
-        .with_optimization_level(match session_optimization(config, audit.is_some()) {
-            PalsGraphOptimization::Disable => GraphOptimizationLevel::Disable,
-            PalsGraphOptimization::Level1 => GraphOptimizationLevel::Level1,
-        })
-        .map_err(configure)?;
+    // Even when the ORT runtime latch already exists, constructing a fresh
+    // session enters native code. Pure slot failures never call either closure.
+    let mut builder = begin_session_native_checked(
+        returned_session.is_some(),
+        serialized_bytes.is_some(),
+        before_native,
+        Session::builder,
+    )?
+    .map_err(configure)?
+    .with_no_environment_execution_providers()
+    .map_err(configure)?
+    .with_intra_threads(config.intra_threads)
+    .map_err(configure)?
+    .with_inter_threads(1)
+    .map_err(configure)?
+    .with_parallel_execution(false)
+    .map_err(configure)?
+    .with_intra_op_spinning(false)
+    .map_err(configure)?
+    .with_inter_op_spinning(false)
+    .map_err(configure)?
+    .with_memory_pattern(false)
+    .map_err(configure)?
+    // Explicit control v2 is separately attested. Disabling graph rewrites
+    // keeps named source metadata chains; strict CUDA and CPU retain L1.
+    .with_optimization_level(match session_optimization(config, audit.is_some()) {
+        PalsGraphOptimization::Disable => GraphOptimizationLevel::Disable,
+        PalsGraphOptimization::Level1 => GraphOptimizationLevel::Level1,
+    })
+    .map_err(configure)?;
     let mut cuda_provider_available = None;
+    // CPU and CUDA keep separate accounting. The caller must mark the broader
+    // ORT runtime/provider boundary *before* invoking native runtime loading.
+    let provider_entered = |error| match config.provider {
+        Provider::Cpu => SessionLoadFailure::BeforeProvider(error),
+        Provider::Cuda { .. } => SessionLoadFailure::ProviderEntered {
+            error,
+            returned_session: false,
+        },
+    };
     builder = match config.provider {
         Provider::Cpu => builder
             .with_execution_providers([CPUExecutionProvider::default()
@@ -1962,12 +2214,16 @@ fn load_session(
                         .with_conv_algorithm_search(CuDNNConvAlgorithmSearch::Default)
                 }
             };
-            if !cuda.is_available().map_err(configure)? {
-                return Err(fail(
+            if !cuda
+                .is_available()
+                .map_err(configure)
+                .map_err(provider_entered)?
+            {
+                return Err(provider_entered(fail(
                     K::BackendUnavailable,
                     S::Backend,
                     "PALS CUDA provider unavailable; CPU fallback forbidden",
-                ));
+                )));
             }
             cuda_provider_available = Some(true);
             builder
@@ -1977,7 +2233,8 @@ fn load_session(
                     "session.disable_cpu_ep_fallback",
                     if audit.is_some() { "0" } else { "1" },
                 )
-                .map_err(configure)?
+                .map_err(configure)
+                .map_err(provider_entered)?
                 .with_execution_providers([cuda
                     .with_device_id(device_id)
                     .with_memory_limit(arena_bytes)
@@ -1986,24 +2243,49 @@ fn load_session(
                     .with_cuda_graph(false)
                     .build()
                     .error_on_failure()])
-                .map_err(configure)?
+                .map_err(configure)
+                .map_err(provider_entered)?
         }
     };
     let placement_log = if let Some((policy, root)) = audit {
-        let (configured, log) =
-            policy.configure(builder, role, &root.join(format!("pals-{role}-kernels")))?;
+        let (configured, log) = policy
+            .configure(builder, role, &root.join(format!("pals-{role}-kernels")))
+            .map_err(provider_entered)?;
         builder = configured;
         Some(log)
     } else {
         None
     };
     // Default native copying; no direct-reference initializer option is enabled.
-    // Serialized owned bytes are freed immediately after successful/failed load.
-    let loaded = builder.commit_from_memory(&bytes);
+    // Successful commits release serialized bytes after Session ownership is
+    // secured. The original V3 owner preserves its bytes on failed commits.
+    let loaded = builder.commit_from_memory(
+        serialized_bytes
+            .as_deref()
+            .expect("serialized slot checked before commit"),
+    );
+    let loaded_ok = loaded.is_ok();
+    // Move the actual Session into original custody before policy/log calls.
+    // On Err ORT does not return a Session: the caller must retain unknown.
+    let load_error = match loaded {
+        Ok(session) => {
+            *returned_session = Some(session);
+            // This builder uses ORT's native-copy model path, with no direct
+            // reference to the source buffer. Preserve the existing successful
+            // commit's early release while retaining failed/unknown inputs.
+            drop(serialized_bytes.take());
+            None
+        }
+        Err(error) => {
+            if !preserve_failed_input {
+                // Preserve the legacy wrapper's original pre-log release.
+                drop(serialized_bytes.take());
+            }
+            Some(error)
+        }
+    };
     let placement = if let (Some((policy, _)), Some(log)) = (audit, &placement_log) {
-        loaded
-            .is_ok()
-            .then(|| policy.verify_initialization(role, log))
+        loaded_ok.then(|| policy.verify_initialization(role, log))
     } else {
         None
     };
@@ -2013,7 +2295,7 @@ fn load_session(
                 log,
                 &root.join(format!("{role}-initial-placement.json")),
                 role,
-                loaded.is_ok(),
+                loaded_ok,
                 placement.as_ref(),
             )
         } else {
@@ -2021,7 +2303,7 @@ fn load_session(
                 log,
                 &root.join(format!("{role}-initial-placement.json")),
                 role,
-                loaded.is_ok(),
+                loaded_ok,
                 placement.as_ref(),
             )
         }
@@ -2030,12 +2312,30 @@ fn load_session(
     };
     // Preserve the primary native initialization failure; successful sessions
     // require both a saved bounded log and the independent pre-Run gate.
-    let session =
-        loaded.map_err(|e| native(CauseCode::ModelLoad, "PALS ONNX loading failed", e))?;
+    if let Some(error) = load_error {
+        return Err(provider_entered(native(
+            CauseCode::ModelLoad,
+            "PALS ONNX loading failed",
+            error,
+        )));
+    }
     // Recording is attempted even for a rejected native/policy initialization.
     // Preserve that primary error; a successful gate cannot bypass failed IO.
-    let placement = placement.transpose()?;
-    recorded?;
+    let placement = match placement.transpose() {
+        Ok(placement) => placement,
+        Err(error) => {
+            return Err(SessionLoadFailure::ProviderEntered {
+                error,
+                returned_session: true,
+            });
+        }
+    };
+    if let Err(error) = recorded {
+        return Err(SessionLoadFailure::ProviderEntered {
+            error,
+            returned_session: true,
+        });
+    }
     // 위 setter/EP 등록/commit과 모든 기존 초기화 검사가 성공한 뒤에만 발급한다.
     let applied = PalsAppliedSessionSettings {
         role: role.to_owned(),
@@ -2047,7 +2347,7 @@ fn load_session(
         parallel_execution: false,
         cuda_provider_available,
     };
-    Ok((session, placement, applied))
+    Ok((placement, applied))
 }
 
 struct ActiveInputs {
@@ -2809,7 +3109,7 @@ impl PalsOnnxBackend {
         profile: &virtual_review::VirtualReviewProfileDirectory,
     ) -> Result<Self, BackendError> {
         if config.cudnn_conv_search != PalsCuDnnConvSearch::LegacyImplicitExhaustive {
-            config.validate_execution_selection(runtime.native_loading_profile(), true)?;
+            config.validate_for_runtime(&runtime, true)?;
         }
         if !matches!(config.provider, Provider::Cuda { .. }) || config.device_public_memory {
             return Err(fail(
@@ -2848,7 +3148,7 @@ impl PalsOnnxBackend {
         profile_root: &Path,
     ) -> Result<Self, BackendError> {
         if config.cudnn_conv_search != PalsCuDnnConvSearch::LegacyImplicitExhaustive {
-            config.validate_execution_selection(runtime.native_loading_profile(), true)?;
+            config.validate_for_runtime(&runtime, true)?;
         }
         if !matches!(config.provider, Provider::Cuda { .. }) || config.device_public_memory {
             return Err(fail(
@@ -2873,7 +3173,7 @@ impl PalsOnnxBackend {
         config: PalsOnnxConfig,
         audit: Option<(PalsCudaControlPolicy, std::path::PathBuf)>,
     ) -> Result<Self, BackendError> {
-        config.validate_execution_selection(runtime.native_loading_profile(), audit.is_some())?;
+        config.validate_for_runtime(&runtime, audit.is_some())?;
         if !path.is_absolute() {
             return Err(fail(
                 K::InvalidInput,
@@ -2891,7 +3191,7 @@ impl PalsOnnxBackend {
         config: PalsOnnxConfig,
         audit: Option<(PalsCudaControlPolicy, std::path::PathBuf)>,
     ) -> Result<Self, BackendError> {
-        config.validate_execution_selection(runtime.native_loading_profile(), audit.is_some())?;
+        config.validate_for_runtime(&runtime, audit.is_some())?;
         let bytes = sources.read_manifest(MAX_MANIFEST_BYTES)?;
         if bytes.len() > MAX_MANIFEST_BYTES {
             return Err(fail(
@@ -2923,12 +3223,12 @@ impl PalsOnnxBackend {
             .as_deref()
             .map(parse_sha256)
             .transpose()?;
-        match (config.provider, runtime.bundle_digest()) {
+        match (config.provider, runtime.cuda_runtime_identity()) {
             (Provider::Cpu, Some(_)) | (Provider::Cuda { .. }, None) => {
                 return Err(fail(
                     K::IdentityMismatch,
                     S::Backend,
-                    "PALS provider and verified native runtime bundle differ",
+                    "PALS provider and verified native runtime identity differ",
                 ));
             }
             (Provider::Cuda { .. }, Some(_)) => {
@@ -3174,11 +3474,11 @@ impl PalsOnnxBackend {
             game_generation: self.game_generation,
             domain: DevicePageDomain::Cuda {
                 device_id,
-                runtime_sha256: self.runtime.bundle_digest().ok_or_else(|| {
+                runtime_sha256: self.runtime.cuda_runtime_identity().ok_or_else(|| {
                     fail(
                         K::IdentityMismatch,
                         S::Admission,
-                        "resident PALS pages require the actual CUDA runtime bundle identity",
+                        "resident PALS pages require the actual CUDA runtime identity",
                     )
                 })?,
             },
@@ -3545,7 +3845,7 @@ impl PalsOnnxBackend {
         if matches!(self.config.provider, Provider::Cuda { .. }) {
             self.cuda_mapping_audit
                 .borrow_mut()
-                .final_audit(|| self.runtime.verify_cuda_runtime_mappings())?;
+                .final_audit_observed(|| self.runtime.observe_cuda_runtime_mappings())?;
         }
         Ok(())
     }
@@ -3991,18 +4291,29 @@ impl PalsOnnxBackend {
             // `run_active`'s synchronous Run or `run_device`'s output sync has
             // physically completed. ORT provider images can now be required;
             // this one-time audit must never preempt session creation, and is
-            // not a per-node mapping scan. A failed origin audit is latched but
-            // does not mislabel this already-fenced execution as unknown.
+            // not a per-node mapping scan. An observed conflict is latched;
+            // unavailable mapping evidence remains unknown and does not
+            // mislabel this already-fenced execution as physically incomplete.
             self.cuda_mapping_audit
                 .borrow_mut()
-                .after_run(result.is_ok(), || {
+                .after_run_observed(result.is_ok(), || {
                     startup_enter(trace, PalsStartupBackendStage::FirstRuntimeOriginAudit);
-                    let verified = self.runtime.verify_cuda_runtime_mappings();
-                    startup_return(
-                        trace,
-                        PalsStartupBackendStage::FirstRuntimeOriginAudit,
-                        verified.is_ok(),
-                    );
+                    let verified = self.runtime.observe_cuda_runtime_mappings();
+                    match &verified {
+                        Ok(CudaRuntimeMappingEvidence::Unknown) => {
+                            if let Some(trace) = trace {
+                                trace.record(
+                                    PalsStartupBackendStage::FirstRuntimeOriginAudit,
+                                    PalsStartupStageBoundary::ObservationUnavailable,
+                                );
+                            }
+                        }
+                        result => startup_return(
+                            trace,
+                            PalsStartupBackendStage::FirstRuntimeOriginAudit,
+                            result.is_ok(),
+                        ),
+                    }
                     verified
                 })?;
         }
@@ -4952,6 +5263,62 @@ mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_native_boundary_rejects_invalid_slots_before_callbacks() {
+        for (occupied, present) in [(true, true), (false, false), (true, false)] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let result = begin_session_native(
+                occupied,
+                present,
+                || calls.borrow_mut().push("native-entry"),
+                || calls.borrow_mut().push("builder"),
+            );
+            assert!(matches!(result, Err(SessionLoadFailure::BeforeProvider(_))));
+            assert!(calls.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn session_native_boundary_marks_entry_before_mock_builder() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = begin_session_native(
+            false,
+            true,
+            || calls.borrow_mut().push("native-entry"),
+            || {
+                calls.borrow_mut().push("builder");
+                7
+            },
+        );
+        assert!(matches!(result, Ok(7)));
+        assert_eq!(*calls.borrow(), ["native-entry", "builder"]);
+    }
+
+    #[test]
+    fn fallible_session_admission_preserves_primary_error_and_never_enters_builder() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let expected = fail(
+            K::BackendUnavailable,
+            S::Admission,
+            "original parent unavailable",
+        );
+        let result = begin_session_native_checked(
+            false,
+            true,
+            || {
+                calls.borrow_mut().push("admission");
+                Err(expected.clone())
+            },
+            || calls.borrow_mut().push("builder"),
+        );
+        match result {
+            Err(SessionLoadFailure::BeforeProvider(actual)) => assert_eq!(actual, expected),
+            _ => panic!("rejected admission must preserve its original error"),
+        }
+        assert_eq!(*calls.borrow(), ["admission"]);
+    }
+
     fn host_page_observation_fixture() -> HostRecordPageSnapshot {
         HostRecordPageSnapshot {
             policy: HostRecordPagePolicy::for_registered_graph([4; 32]),
@@ -5319,6 +5686,48 @@ mod tests {
         validate_native_loading_path(shim, cuda, true).unwrap();
         cuda.device_public_memory = true;
         assert!(validate_native_loading_path(shim, cuda, true).is_err());
+    }
+
+    #[test]
+    fn system_cuda_selection_preserves_legacy_limits_and_rejects_unsupported_modes() {
+        let mut config = PalsOnnxConfig::cpu();
+        assert!(config.validate_system_execution_selection().is_err());
+        config.provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: 256 * 1024 * 1024,
+        };
+        config.validate_system_execution_selection().unwrap();
+        config.intra_threads = 0;
+        assert!(config.validate_system_execution_selection().is_err());
+        config.intra_threads = 2;
+        config.provider = Provider::Cuda {
+            device_id: -1,
+            arena_bytes: 1,
+        };
+        assert!(config.validate_system_execution_selection().is_err());
+        config.provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: 0,
+        };
+        assert!(config.validate_system_execution_selection().is_err());
+        config.provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: 256 * 1024 * 1024,
+        };
+        config.cudnn_conv_search = PalsCuDnnConvSearch::ExperimentalDefault;
+        assert!(config.validate_system_execution_selection().is_err());
+        config.cudnn_conv_search = PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm;
+        assert!(config.validate_system_execution_selection().is_err());
+        #[cfg(target_pointer_width = "64")]
+        {
+            config.cudnn_conv_search = PalsCuDnnConvSearch::LegacyImplicitExhaustive;
+            config.provider = Provider::Cuda {
+                device_id: 0,
+                arena_bytes: 7 * 1024 * 1024 * 1024,
+            };
+            config.validate_system_execution_selection().unwrap();
+            assert!(config.validate_execution_selection(None, false).is_err());
+        }
     }
 
     #[test]
@@ -6112,5 +6521,82 @@ mod tests {
                 .unwrap_err(),
             failure
         );
+    }
+
+    #[test]
+    fn shutdown_mapping_observation_keeps_unknown_distinct_from_conflict() {
+        let mut phase = CudaMappingAudit::default();
+        assert_eq!(
+            phase
+                .observe_final_audit(|| panic!("no run must not claim a fresh audit"))
+                .unwrap(),
+            CudaRuntimeMappingEvidence::Unknown
+        );
+        phase
+            .after_run_observed(true, || Ok(CudaRuntimeMappingEvidence::Unknown))
+            .unwrap();
+        assert_eq!(
+            phase
+                .observe_final_audit(|| Ok(CudaRuntimeMappingEvidence::Unknown))
+                .unwrap(),
+            CudaRuntimeMappingEvidence::Unknown
+        );
+        assert!(phase
+            .final_audit_observed(|| Ok(CudaRuntimeMappingEvidence::Unknown))
+            .is_err());
+        phase.allow_run().unwrap();
+        assert_eq!(
+            phase
+                .observe_final_audit(|| Ok(CudaRuntimeMappingEvidence::Observed))
+                .unwrap(),
+            CudaRuntimeMappingEvidence::Observed
+        );
+        let failure = phase
+            .observe_final_audit(|| Err(fail(K::IdentityMismatch, S::Backend, "conflict")))
+            .unwrap_err();
+        assert_eq!(failure.kind, K::IdentityMismatch);
+        assert!(phase.allow_run().is_err());
+    }
+
+    #[test]
+    fn unavailable_mapping_observation_keeps_runs_enabled_but_not_a_witness() {
+        let mut phase = CudaMappingAudit::default();
+        phase
+            .after_run_observed(true, || Ok(CudaRuntimeMappingEvidence::Unknown))
+            .unwrap();
+        assert!(matches!(phase, CudaMappingAudit::ObservationUnknown));
+        phase.allow_run().unwrap();
+        phase
+            .after_run_observed(true, || panic!("unknown is not a per-node rescan"))
+            .unwrap();
+        let error = phase
+            .final_audit(|| panic!("unknown cannot become acceptance evidence"))
+            .unwrap_err();
+        assert_eq!(error.kind, K::BackendUnavailable);
+        assert!(matches!(phase, CudaMappingAudit::ObservationUnknown));
+        phase.allow_run().unwrap();
+        assert!(phase
+            .final_audit_observed(|| Ok(CudaRuntimeMappingEvidence::Unknown))
+            .is_err());
+        assert!(matches!(phase, CudaMappingAudit::ObservationUnknown));
+        phase.allow_run().unwrap();
+        phase
+            .final_audit_observed(|| Ok(CudaRuntimeMappingEvidence::Observed))
+            .unwrap();
+        assert!(matches!(phase, CudaMappingAudit::Confirmed));
+
+        let mut conflict = CudaMappingAudit::default();
+        conflict
+            .after_run_observed(true, || Ok(CudaRuntimeMappingEvidence::Unknown))
+            .unwrap();
+        assert!(conflict
+            .final_audit_observed(|| Err(fail(
+                K::IdentityMismatch,
+                S::Backend,
+                "actual foreign mapping"
+            )))
+            .is_err());
+        assert!(matches!(conflict, CudaMappingAudit::Rejected(_)));
+        assert!(conflict.allow_run().is_err());
     }
 }

@@ -5,6 +5,24 @@ use rz_contracts::{
     RootGeneration, StateIdentity, StateRevision,
 };
 
+// Retry only transient registry/custody contention under the original fixed
+// deadline. A poisoned lock or an unexpected owner error remains visible.
+fn retry_recovery_busy<T>(
+    until: Instant,
+    mut operation: impl FnMut() -> Result<T, super::super::recovery::TicketRecoveryError>,
+) -> Result<T, super::super::recovery::TicketRecoveryError> {
+    use super::super::recovery::TicketRecoveryError;
+    loop {
+        if Instant::now() >= until {
+            return Err(TicketRecoveryError::TimedOut);
+        }
+        match operation() {
+            Err(TicketRecoveryError::Busy) => thread::yield_now(),
+            result => return result,
+        }
+    }
+}
+
 struct View {
     value: u64,
     drops: Arc<std::sync::atomic::AtomicUsize>,
@@ -24,6 +42,19 @@ struct Facts {
     quiesced: AtomicUsize,
     fixture_evidence_produced: Mutex<Vec<(RequestId, TicketExecutionEvidence)>>,
     fixture_evidence_taken: Mutex<Vec<RequestId>>,
+    expected_dispatch: Mutex<
+        Option<(
+            NativeAcceptanceVerifier,
+            NativeAcceptanceVerifier,
+            Arc<View>,
+        )>,
+    >,
+    owned_dispatch: Mutex<Vec<(RoleTicketEnvelope, u64, u64, bool, bool, bool)>>,
+    run_observation: Mutex<Option<(TicketNativeObservationDisposition, RoleFailure)>>,
+    accept_observation: Mutex<Option<(TicketNativeObservationDisposition, RoleFailure)>>,
+    accept_failure: Mutex<Option<RoleFailure>>,
+    finish_semantic_failure: Mutex<Option<RoleFailure>>,
+    pending_observations: Mutex<std::collections::VecDeque<TicketNativeObservationFailure>>,
 }
 struct Fake {
     clock: ContractSystemClock,
@@ -68,6 +99,16 @@ impl TicketNativeBackend<View, u64> for Fake {
         // These are deterministic fake-backend observations, never evidence of
         // actual ORT/NN execution. Only this fixture's run produces them.
         let evidence = fixture_execution_evidence(ticket, *prepared);
+        if let Some((disposition, cause)) = self.facts.run_observation.lock().unwrap().take() {
+            self.facts.pending_observations.lock().unwrap().push_back(
+                TicketNativeObservationFailure {
+                    ticket: *ticket,
+                    stage: TicketNativeObservationStage::Completed,
+                    disposition,
+                    cause,
+                },
+            );
+        }
         self.fixture_evidence = Some((ticket.id, evidence));
         self.facts
             .fixture_evidence_produced
@@ -82,6 +123,29 @@ impl TicketNativeBackend<View, u64> for Fake {
             },
             output: Ok((*prepared, question.view.value)),
         }
+    }
+    fn run_owned(
+        &mut self,
+        context: TicketOwnerDispatchContext<'_, View, u64, u64>,
+        canceled: &AtomicBool,
+    ) -> TicketPhysicalResult<(u64, u64)> {
+        if let Some((expected, other, view)) = self.facts.expected_dispatch.lock().unwrap().as_ref()
+        {
+            self.facts.owned_dispatch.lock().unwrap().push((
+                *context.ticket(),
+                context.question().query,
+                *context.prepared(),
+                context.same_owner(expected),
+                context.same_owner(other),
+                Arc::ptr_eq(&context.question().view, view),
+            ));
+        }
+        self.run(
+            context.ticket(),
+            context.question(),
+            context.prepared(),
+            canceled,
+        )
     }
     fn output_host_bytes(&self, _: &(u64, u64)) -> u64 {
         16
@@ -107,6 +171,9 @@ impl TicketNativeBackend<View, u64> for Fake {
         self.facts.fixture_evidence_taken.lock().unwrap().push(id);
         Some(evidence)
     }
+    fn take_observation_failure(&mut self) -> Option<TicketNativeObservationFailure> {
+        self.facts.pending_observations.lock().unwrap().pop_front()
+    }
     fn accept(
         &mut self,
         ticket: &RoleTicketEnvelope,
@@ -115,6 +182,19 @@ impl TicketNativeBackend<View, u64> for Fake {
         _: &(u64, u64),
     ) -> Result<(), RoleFailure> {
         self.facts.accepted.lock().unwrap().push(ticket.id.sequence);
+        if let Some((disposition, cause)) = self.facts.accept_observation.lock().unwrap().take() {
+            self.facts.pending_observations.lock().unwrap().push_back(
+                TicketNativeObservationFailure {
+                    ticket: *ticket,
+                    stage: TicketNativeObservationStage::Retired,
+                    disposition,
+                    cause,
+                },
+            );
+        }
+        if let Some(failure) = self.facts.accept_failure.lock().unwrap().take() {
+            return Err(failure);
+        }
         if self.facts.fail_accept.load(Ordering::Acquire) {
             Err(RoleFailure::Backend(
                 "fixture observer failed after a partial acknowledgement".into(),
@@ -133,6 +213,17 @@ impl TicketNativeBackend<View, u64> for Fake {
     fn finish(&mut self, _: Instant) -> bool {
         self.facts.shutdown.store(true, Ordering::Release);
         true
+    }
+    fn finish_report(&mut self, until: Instant) -> TicketNativeFinishReport {
+        let physical_shutdown_confirmed = self.finish(until);
+        TicketNativeFinishReport {
+            physical_shutdown_confirmed,
+            physical_failure: None,
+            session_release: None,
+            semantic_failure: self.facts.finish_semantic_failure.lock().unwrap().take(),
+            runtime_mapping_status: TicketRuntimeMappingStatus::NotObserved,
+            system_placement_status: TicketSystemPlacementStatus::NotObserved,
+        }
     }
 }
 fn fixture_execution_evidence(ticket: &RoleTicketEnvelope, value: u64) -> TicketExecutionEvidence {
@@ -178,6 +269,13 @@ fn fixture_facts(gate: bool) -> Arc<Facts> {
         quiesced: AtomicUsize::new(0),
         fixture_evidence_produced: Mutex::new(Vec::new()),
         fixture_evidence_taken: Mutex::new(Vec::new()),
+        expected_dispatch: Mutex::new(None),
+        owned_dispatch: Mutex::new(Vec::new()),
+        run_observation: Mutex::new(None),
+        accept_observation: Mutex::new(None),
+        accept_failure: Mutex::new(None),
+        finish_semantic_failure: Mutex::new(None),
+        pending_observations: Mutex::new(std::collections::VecDeque::new()),
     })
 }
 fn authority(root: u64) -> SearchAuthority {
@@ -358,6 +456,181 @@ fn native_owner_receipt_confirms_only_after_the_original_output_acknowledgement(
 }
 
 #[test]
+fn required_retirement_observation_does_not_rewrite_original_owner_acceptance() {
+    let (mut service, facts, clock) = spawn(true);
+    let (id, original, permit, mut registry) = issued_acceptance(&mut service, &clock, true);
+    let cause = RoleFailure::Backend("required retirement observation failed".into());
+    *facts.accept_observation.lock().unwrap() = Some((
+        TicketNativeObservationDisposition::RequiredAfterPhysical,
+        cause.clone(),
+    ));
+    service.accept_with_permit(id, original, permit).unwrap();
+    let receipt = match next(&service) {
+        TicketNativeEvent::Retired {
+            ticket,
+            accepted,
+            result,
+            native_receipt,
+            rejected_permit,
+            observation_failures,
+        } => {
+            assert_eq!(ticket, original);
+            assert!(accepted);
+            assert_eq!(result, Ok(()));
+            assert!(rejected_permit.is_none());
+            let reports: Vec<_> = observation_failures.iter().collect();
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].ticket, original);
+            assert_eq!(reports[0].stage, TicketNativeObservationStage::Retired);
+            assert_eq!(
+                reports[0].disposition,
+                TicketNativeObservationDisposition::RequiredAfterPhysical
+            );
+            assert_eq!(reports[0].cause, cause);
+            native_receipt.expect("actual successful acceptance retains original receipt")
+        }
+        _ => panic!("expected original retirement with observation"),
+    };
+    registry
+        .confirm_native_acceptance(receipt, clock.domain(), clock.now())
+        .unwrap();
+    service.accept(id, original).unwrap();
+    assert!(matches!(next(&service), TicketNativeEvent::Rejected {
+        preparation, error: TicketServiceError::UnknownPreparation
+    } if preparation == id));
+    assert_eq!(facts.accepted.lock().unwrap().as_slice(), &[1]);
+    finish(service);
+}
+
+#[test]
+fn unknown_acceptance_preserves_failure_and_original_permit_without_replay() {
+    let (mut service, facts, clock) = spawn(true);
+    let (id, original, permit, _registry) = issued_acceptance(&mut service, &clock, true);
+    *facts.accept_failure.lock().unwrap() = Some(RoleFailure::PhysicalUnknown);
+    let cause = RoleFailure::Backend("retirement observation failed".into());
+    *facts.accept_observation.lock().unwrap() = Some((
+        TicketNativeObservationDisposition::RequiredAfterPhysical,
+        cause.clone(),
+    ));
+    service.accept_with_permit(id, original, permit).unwrap();
+    let permit = match next(&service) {
+        TicketNativeEvent::Retired {
+            ticket,
+            accepted,
+            result,
+            native_receipt,
+            rejected_permit,
+            observation_failures,
+        } => {
+            assert_eq!(ticket, original);
+            assert!(!accepted);
+            assert_eq!(result, Err(RoleFailure::PhysicalUnknown));
+            assert!(native_receipt.is_none());
+            let reports: Vec<_> = observation_failures.iter().collect();
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].ticket, original);
+            assert_eq!(reports[0].stage, TicketNativeObservationStage::Retired);
+            assert_eq!(reports[0].cause, cause);
+            let permit = rejected_permit.expect("unconfirmed acceptance returns original permit");
+            assert_eq!(permit.ticket(), &original);
+            permit
+        }
+        _ => panic!("expected physical-unknown retirement"),
+    };
+    service.accept_with_permit(id, original, permit).unwrap();
+    match next(&service) {
+        TicketNativeEvent::AcceptanceRejected {
+            preparation,
+            ticket,
+            error,
+            permit,
+        } => {
+            assert_eq!(preparation, id);
+            assert_eq!(ticket, original);
+            assert_eq!(error, TicketServiceError::Duplicate);
+            assert_eq!(permit.ticket(), &original);
+        }
+        _ => panic!("expected duplicate rejection retaining permit"),
+    }
+    assert_eq!(facts.accepted.lock().unwrap().as_slice(), &[1]);
+    // This fake has no device-backed resources. Real PhysicalUnknown is not
+    // resolved by this fixture's explicit discard or fake finish callback.
+    service.discard(id, original).unwrap();
+    assert!(matches!(
+        next(&service),
+        TicketNativeEvent::Retired { result: Ok(()), .. }
+    ));
+    finish(service);
+}
+
+#[test]
+fn completed_observation_is_one_terminal_and_preserves_actual_physical_result() {
+    for physical_unknown in [false, true] {
+        let (mut service, facts, clock) = spawn(true);
+        let value = if physical_unknown { 99 } else { 2 };
+        let seal = prepare(
+            &mut service,
+            value,
+            4,
+            &clock,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let original = ticket(seal, 1);
+        let cause = RoleFailure::Backend("completed observation failed".into());
+        *facts.run_observation.lock().unwrap() = Some((
+            TicketNativeObservationDisposition::RequiredAfterPhysical,
+            cause.clone(),
+        ));
+        service.execute(seal.preparation, original).unwrap();
+        let (completion, reports) = loop {
+            if let TicketNativeEvent::Completed {
+                completion,
+                observation_failures,
+                ..
+            } = next(&service)
+            {
+                break (completion, observation_failures);
+            }
+        };
+        assert_eq!(completion.ticket, original);
+        let entries: Vec<_> = reports.iter().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ticket, original);
+        assert_eq!(entries[0].stage, TicketNativeObservationStage::Completed);
+        assert_eq!(
+            entries[0].disposition,
+            TicketNativeObservationDisposition::RequiredAfterPhysical
+        );
+        assert_eq!(entries[0].cause, cause);
+        if physical_unknown {
+            assert_eq!(completion.physical, PhysicalRoleCompletion::Unknown);
+            assert!(matches!(
+                completion.result,
+                Err(RoleFailure::PhysicalUnknown)
+            ));
+            assert!(matches!(
+                next(&service),
+                TicketNativeEvent::Finished {
+                    physical_shutdown_confirmed: false,
+                    ..
+                }
+            ));
+            assert!(service.is_quarantined());
+            drop(service);
+        } else {
+            assert_eq!(completion.physical, PhysicalRoleCompletion::Confirmed);
+            assert_eq!(*completion.result.unwrap(), (2, 102));
+            service.discard(seal.preparation, original).unwrap();
+            assert!(matches!(
+                next(&service),
+                TicketNativeEvent::Retired { result: Ok(()), .. }
+            ));
+            finish(service);
+        }
+    }
+}
+
+#[test]
 fn substituted_output_head_cannot_obtain_an_owner_receipt_or_accept_callback() {
     let (mut service, facts, clock) = spawn(true);
     let (id, ticket, permit, _) = issued_acceptance(&mut service, &clock, false);
@@ -446,6 +719,592 @@ fn spawn_limited(
     )
     .unwrap();
     (service, facts, clock)
+}
+
+#[test]
+fn recoverable_factory_before_native_returns_original_owner() {
+    struct Owner(Arc<AtomicUsize>);
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    impl FactoryStartupRecovery for Owner {}
+    let drops = Arc::new(AtomicUsize::new(0));
+    let service: TicketedNativeService<View, u64, Fake> =
+        TicketedNativeService::spawn_with_startup_custody(
+            Owner(Arc::clone(&drops)),
+            |_| Err(RoleFailure::Backend("fixture pre-native failure".into())),
+            TicketServiceLimits::default(),
+            1,
+            1,
+        )
+        .unwrap();
+    let key = service.recovery_key().unwrap();
+    assert!(matches!(
+        next(&service),
+        TicketNativeEvent::StartupFailed(_)
+    ));
+    assert_eq!(
+        service.startup_status(),
+        NativeFactoryStartupStatus::BeforeNative
+    );
+    drop(service);
+    let until = Instant::now() + Duration::from_secs(2);
+    let owner = retry_recovery_busy(until, || key.take_before_native::<Owner>(until)).unwrap();
+    assert_eq!(drops.load(Ordering::Acquire), 0);
+    drop(owner);
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        retry_recovery_busy(until, || key.status()),
+        Err(super::super::recovery::TicketRecoveryError::InvalidKey)
+    ));
+}
+
+#[test]
+fn repeated_before_native_failure_returns_event_owner_and_keeps_admission() {
+    struct Owner {
+        sequence: usize,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    impl FactoryStartupRecovery for Owner {}
+    let drops = Arc::new(AtomicUsize::new(0));
+    for sequence in 0..17 {
+        let expected = format!("pre-native failure {sequence}");
+        let failure = expected.clone();
+        let mut service: TicketedNativeService<View, u64, Fake> =
+            TicketedNativeService::spawn_with_startup_custody(
+                Owner {
+                    sequence,
+                    drops: Arc::clone(&drops),
+                },
+                move |_| Err(RoleFailure::Backend(failure)),
+                TicketServiceLimits::default(),
+                1,
+                1,
+            )
+            .unwrap();
+        let key = service.recovery_key().unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            if service.try_join() == Ok(true) {
+                break;
+            }
+            assert!(Instant::now() < until);
+            thread::yield_now();
+        }
+        assert_eq!(
+            service.startup_status(),
+            NativeFactoryStartupStatus::BeforeNative
+        );
+        drop(service);
+        let event = retry_recovery_busy(until, || key.take_event(until))
+            .unwrap()
+            .expect("original startup failure");
+        assert!(
+            matches!(retry_recovery_busy(until, || event.take::<TicketNativeEvent<(u64, u64)>>()).unwrap(),
+            Some(TicketNativeEvent::StartupFailed(RoleFailure::Backend(cause))) if cause == expected)
+        );
+        assert!(
+            retry_recovery_busy(until, || key.take_event(until))
+                .unwrap()
+                .is_none()
+        );
+        let owner = retry_recovery_busy(until, || key.take_before_native::<Owner>(until)).unwrap();
+        assert_eq!(owner.sequence, sequence);
+        assert_eq!(drops.load(Ordering::Acquire), sequence);
+        drop(owner);
+        assert_eq!(drops.load(Ordering::Acquire), sequence + 1);
+        assert!(matches!(
+            retry_recovery_busy(until, || key.status()),
+            Err(super::super::recovery::TicketRecoveryError::InvalidKey)
+        ));
+    }
+    let (extra, _) = super::super::recovery::TicketNativeRecoveryReservation::reserve().unwrap();
+    extra.cancel_unstarted().unwrap();
+}
+
+#[test]
+fn not_started_owner_join_is_nonblocking_and_recoverable() {
+    let (service, _, _) = spawn(true);
+    assert!(matches!(next(&service), TicketNativeEvent::Ready { .. }));
+    let (reservation, key) =
+        super::super::recovery::TicketNativeRecoveryReservation::reserve().unwrap();
+    let join = Arc::new(super::super::recovery::TicketOwnerJoin::new());
+    reservation.attach(Arc::clone(&join)).unwrap();
+    let (release, blocked) = mpsc::sync_channel::<()>(1);
+    let worker = thread::spawn(move || {
+        let _ = blocked.recv();
+    });
+    join.install(worker).unwrap();
+    reservation.mark_start_not_delivered();
+    let (sender, receiver) = mpsc::sync_channel::<TicketNativeEvent<(u64, u64)>>(1);
+    drop(sender);
+    key.handover_receiver(receiver, Arc::clone(&service.shared))
+        .unwrap();
+    assert_eq!(key.try_retire_not_started(), Ok(false));
+    release.send(()).unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    while !key.try_retire_not_started().unwrap() {
+        assert!(Instant::now() < until);
+        thread::yield_now();
+    }
+    finish(service);
+}
+
+#[test]
+fn recoverable_spawn_rejection_returns_exact_original_owner() {
+    struct Owner(Arc<AtomicUsize>);
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    impl FactoryStartupRecovery for Owner {}
+    let drops = Arc::new(AtomicUsize::new(0));
+    let result: Result<TicketedNativeService<View, u64, Fake>, _> =
+        TicketedNativeService::spawn_with_startup_custody(
+            Owner(Arc::clone(&drops)),
+            |_| Err(RoleFailure::Canceled),
+            TicketServiceLimits::default(),
+            0,
+            1,
+        );
+    let rejection = match result {
+        Ok(_) => panic!("capacity must reject"),
+        Err(rejection) => rejection,
+    };
+    assert!(matches!(rejection.error, TicketServiceError::Capacity));
+    assert!(rejection.recovery_key.is_none());
+    assert_eq!(drops.load(Ordering::Acquire), 0);
+    drop(rejection);
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn recovery_scope_binds_original_inner_owner_and_ticket_once() {
+    use rz_eval::worker::{PhysicalRecoveryReservation, PhysicalWorkScope};
+    let (_inner_reservation, inner_key) = PhysicalRecoveryReservation::reserve().unwrap();
+    let (_other_reservation, other_key) = PhysicalRecoveryReservation::reserve().unwrap();
+    let (reservation, _) =
+        super::super::recovery::TicketNativeRecoveryReservation::reserve().unwrap();
+    reservation.bind_inner(&inner_key, 17).unwrap();
+    let join = Arc::new(super::super::recovery::TicketOwnerJoin::new());
+    reservation.attach(join).unwrap();
+    let clock = ContractSystemClock::new(ProcessEpoch(17));
+    let q = question(2, 7, &clock, Arc::new(AtomicUsize::new(0)));
+    let seal = PreparedTicketSeal {
+        preparation: PreparationId(1),
+        question: q.question,
+        view: q.seal,
+        representation: key(2),
+        role: q.role,
+        original_deadline: q.deadline,
+    };
+    let original = ticket(seal, 1);
+    let work = PhysicalWorkScope::Ticket {
+        ticket: original,
+        execution: ExecutionId::new(ProcessEpoch(17), 5),
+    };
+    assert!(reservation.bind_active_work(&other_key, work).is_err());
+    assert!(
+        reservation
+            .bind_active_work(
+                &inner_key,
+                PhysicalWorkScope::Startup {
+                    epoch: ProcessEpoch(17)
+                }
+            )
+            .is_err()
+    );
+    assert!(reservation.bind_active_work(&inner_key, work).is_ok());
+    let other_work = PhysicalWorkScope::Ticket {
+        ticket: original,
+        execution: ExecutionId::new(ProcessEpoch(17), 6),
+    };
+    assert!(
+        reservation
+            .bind_active_work(&inner_key, other_work)
+            .is_err()
+    );
+    reservation.cancel_spawn_failure().unwrap();
+}
+
+#[test]
+fn recoverable_finished_owner_and_empty_queue_retire_slot() {
+    struct Owner(Arc<AtomicUsize>);
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    impl FactoryStartupRecovery for Owner {}
+    let drops = Arc::new(AtomicUsize::new(0));
+    let clock = ContractSystemClock::new(ProcessEpoch(17));
+    let facts = fixture_facts(true);
+    let service: TicketedNativeService<View, u64, Fake> =
+        TicketedNativeService::spawn_with_startup_custody(
+            Owner(Arc::clone(&drops)),
+            move |_| {
+                Ok(Fake {
+                    clock,
+                    facts,
+                    fixture_evidence: None,
+                })
+            },
+            TicketServiceLimits::default(),
+            1,
+            1,
+        )
+        .unwrap();
+    let key = service.recovery_key().unwrap();
+    assert!(matches!(next(&service), TicketNativeEvent::Ready { .. }));
+    assert_eq!(drops.load(Ordering::Acquire), 0);
+    finish(service);
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    let until = Instant::now() + Duration::from_secs(2);
+    assert!(matches!(
+        retry_recovery_busy(until, || key.status()),
+        Err(super::super::recovery::TicketRecoveryError::InvalidKey)
+    ));
+}
+
+#[test]
+fn recoverable_finish_reports_semantic_failure_after_physical_completion() {
+    struct Owner;
+    impl FactoryStartupRecovery for Owner {}
+    let clock = ContractSystemClock::new(ProcessEpoch(17));
+    let facts = fixture_facts(true);
+    let expected = RoleFailure::Backend("fixture shutdown audit failure".into());
+    *facts.finish_semantic_failure.lock().unwrap() = Some(expected.clone());
+    let mut service: TicketedNativeService<View, u64, Fake> =
+        TicketedNativeService::spawn_with_startup_custody(
+            Owner,
+            move |_| {
+                Ok(Fake {
+                    clock,
+                    facts,
+                    fixture_evidence: None,
+                })
+            },
+            TicketServiceLimits::default(),
+            1,
+            1,
+        )
+        .unwrap();
+    assert!(service.requires_finish_report());
+    assert!(service.finish_report_snapshot().is_none());
+    assert!(matches!(next(&service), TicketNativeEvent::Ready { .. }));
+    let until = Instant::now() + Duration::from_secs(2);
+    service.begin_shutdown(until);
+    match next(&service) {
+        TicketNativeEvent::Finished {
+            physical_shutdown_confirmed,
+        } => {
+            assert!(physical_shutdown_confirmed);
+            let report = service
+                .take_finish_report()
+                .expect("original finish report");
+            assert!(report.physical_shutdown_confirmed);
+            assert_eq!(report.physical_failure, None);
+            assert_eq!(report.semantic_failure, Some(expected));
+            assert!(service.take_finish_report().is_none());
+            assert_eq!(service.finish_report_snapshot(), Some(report));
+        }
+        _ => panic!("expected original finish report"),
+    }
+    while !service.try_join().unwrap() {
+        assert!(Instant::now() < until);
+        thread::yield_now();
+    }
+}
+
+#[test]
+fn finish_report_survives_service_drop_and_is_taken_once_from_same_key() {
+    use super::super::recovery::TicketRecoveryError;
+    struct Owner;
+    impl FactoryStartupRecovery for Owner {}
+    let clock = ContractSystemClock::new(ProcessEpoch(17));
+    let facts = fixture_facts(true);
+    let expected = RoleFailure::Backend("fixture retained shutdown failure".into());
+    *facts.finish_semantic_failure.lock().unwrap() = Some(expected.clone());
+    let mut service: TicketedNativeService<View, u64, Fake> =
+        TicketedNativeService::spawn_with_startup_custody(
+            Owner,
+            move |_| {
+                Ok(Fake {
+                    clock,
+                    facts,
+                    fixture_evidence: None,
+                })
+            },
+            TicketServiceLimits::default(),
+            1,
+            1,
+        )
+        .unwrap();
+    let key = service.recovery_key().unwrap();
+    assert!(matches!(
+        key.take_finish_report(),
+        Err(TicketRecoveryError::WrongState)
+    ));
+    assert!(matches!(next(&service), TicketNativeEvent::Ready { .. }));
+    let until = Instant::now() + Duration::from_secs(2);
+    service.begin_shutdown(until);
+    assert!(matches!(
+        next(&service),
+        TicketNativeEvent::Finished {
+            physical_shutdown_confirmed: true
+        }
+    ));
+    while !service.try_join().unwrap() {
+        assert!(Instant::now() < until);
+        thread::yield_now();
+    }
+    drop(service);
+    key.try_retire_clean();
+    let report = key
+        .take_finish_report()
+        .unwrap()
+        .expect("report must keep slot alive");
+    assert!(report.physical_shutdown_confirmed);
+    assert_eq!(report.semantic_failure, Some(expected));
+    assert!(key.take_finish_report().unwrap().is_none());
+    key.try_retire_clean();
+    assert!(matches!(
+        retry_recovery_busy(until, || key.status()),
+        Err(TicketRecoveryError::InvalidKey)
+    ));
+}
+
+#[test]
+fn shutdown_waits_for_admitted_original_permit_before_sealing() {
+    struct Owner;
+    impl FactoryStartupRecovery for Owner {}
+    let clock = ContractSystemClock::new(ProcessEpoch(17));
+    let factory_clock = clock.clone();
+    let facts = fixture_facts(true);
+    let mut service: TicketedNativeService<View, u64, Fake> =
+        TicketedNativeService::spawn_with_startup_custody(
+            Owner,
+            move |_| {
+                Ok(Fake {
+                    clock: factory_clock,
+                    facts,
+                    fixture_evidence: None,
+                })
+            },
+            TicketServiceLimits::default(),
+            2,
+            2,
+        )
+        .unwrap();
+    assert!(matches!(next(&service), TicketNativeEvent::Ready { .. }));
+    let recovery_key = service.recovery_key().unwrap();
+    let (id, ticket, permit, _registry) = issued_acceptance(&mut service, &clock, false);
+    let expected_digest = permit.output_digest();
+    let shared = Arc::clone(&service.shared);
+    let (entered_send, entered_receive) = mpsc::sync_channel(1);
+    let (release_send, release_receive) = mpsc::sync_channel(1);
+    *shared.admission_test.lock().unwrap() = Some(AdmissionTestGate {
+        entered: entered_send,
+        release: release_receive,
+        until: Instant::now() + Duration::from_secs(2),
+    });
+    let producer = thread::spawn(move || {
+        let result = service.accept_with_permit(id, ticket, permit);
+        (service, result)
+    });
+    entered_receive
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    let (starting_send, starting_receive) = mpsc::sync_channel(1);
+    let (sealed_send, sealed_receive) = mpsc::sync_channel(1);
+    let closer_shared = Arc::clone(&shared);
+    let closer = thread::spawn(move || {
+        starting_send.send(()).unwrap();
+        closer_shared.seal_admission();
+        sealed_send.send(()).unwrap();
+    });
+    starting_receive
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert!(matches!(
+        sealed_receive.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    release_send.send(()).unwrap();
+    let (service, result) = producer.join().unwrap();
+    assert!(result.is_ok());
+    sealed_receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    closer.join().unwrap();
+    assert!(shared.closed.load(Ordering::Acquire));
+    let original = loop {
+        if let TicketNativeEvent::Retired {
+            rejected_permit, ..
+        } = next(&service)
+        {
+            let original = rejected_permit.expect("original unaccepted permit returned");
+            assert_eq!(original.ticket(), &ticket);
+            assert_eq!(original.output_digest(), expected_digest);
+            break original;
+        }
+    };
+    let (error, original) = service
+        .accept_with_permit(id, ticket, original)
+        .unwrap_err();
+    assert_eq!(error, TicketServiceError::Closed);
+    assert_eq!(original.output_digest(), expected_digest);
+    service.begin_shutdown(Instant::now() + Duration::from_secs(2));
+    loop {
+        if let TicketNativeEvent::Finished {
+            physical_shutdown_confirmed,
+            ..
+        } = next(&service)
+        {
+            assert!(physical_shutdown_confirmed);
+            if let Some(report) = service.take_finish_report() {
+                assert!(report.physical_shutdown_confirmed);
+                assert_eq!(report.physical_failure, None);
+                assert_eq!(report.semantic_failure, None);
+            }
+            break;
+        }
+    }
+    drop(service);
+    let until = Instant::now() + Duration::from_secs(2);
+    while retry_recovery_busy(until, || recovery_key.status()).unwrap()
+        != super::super::recovery::TicketRecoveryStatus::Confirmed
+    {
+        assert!(Instant::now() < until);
+        thread::yield_now();
+    }
+    let retained = retry_recovery_busy(until, || recovery_key.take_confirmed_state(until))
+        .unwrap()
+        .expect("original state retained");
+    let mut retained = retry_recovery_busy(until, || {
+        retained.take::<TicketRetainedOwnerState<View, u64, u64, (u64, u64)>>()
+    })
+    .unwrap()
+    .expect("original state transferred");
+    assert_eq!(retained.pop_preparation().unwrap().0, id);
+    drop(retained);
+    let proof = recovery_key
+        .latest_confirmation()
+        .expect("local finish evidence");
+    retry_recovery_busy(until, || recovery_key.release_confirmed(&proof, until)).unwrap();
+}
+
+#[test]
+fn reserve_reaps_only_finished_joined_owner_without_unreceived_event() {
+    use super::super::recovery::{
+        TicketNativeRecoveryReservation, TicketOwnerJoin, TicketRecoveryError, TicketRecoveryStatus,
+    };
+    let (service, _, _) = spawn(true);
+    assert!(matches!(next(&service), TicketNativeEvent::Ready { .. }));
+    let shared = Arc::clone(&service.shared);
+
+    // A real fixture thread publishes the local-finish state. Its original
+    // join and event receiver are installed in the same recovery slot.
+    let finished_slot = |has_event: bool| {
+        let (reservation, key) = TicketNativeRecoveryReservation::reserve().unwrap();
+        let join = Arc::new(TicketOwnerJoin::new());
+        reservation.attach(Arc::clone(&join)).unwrap();
+        let (start, receive_start) = mpsc::sync_channel::<()>(1);
+        let worker = thread::spawn(move || {
+            receive_start.recv().unwrap();
+            reservation.finish_clean().unwrap();
+        });
+        join.install(worker).unwrap();
+        let (sender, receiver) = mpsc::sync_channel::<TicketNativeEvent<(u64, u64)>>(1);
+        if has_event {
+            // The ordinary EventPublisher increments this same counter before
+            // queueing; this direct fixture reproduces that ownership count.
+            shared.pending_reports.fetch_add(1, Ordering::AcqRel);
+            assert!(
+                sender
+                    .send(TicketNativeEvent::StartupFailed(RoleFailure::Canceled))
+                    .is_ok()
+            );
+        }
+        drop(sender);
+        key.handover_receiver(receiver, Arc::clone(&shared))
+            .unwrap();
+        start.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        while retry_recovery_busy(until, || key.status()).unwrap() != TicketRecoveryStatus::Released
+        {
+            assert!(Instant::now() < until);
+            thread::yield_now();
+        }
+        key
+    };
+
+    let empty = finished_slot(false);
+    let pending = finished_slot(true);
+
+    // Test-only empty slot transition: no worker, native owner, or GPU is
+    // created. The exact reservation is restored and canceled at the end.
+    let (unknown_owner, unknown) = TicketNativeRecoveryReservation::reserve().unwrap();
+    unknown_owner.test_set_unstarted_unknown().unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    assert_eq!(
+        retry_recovery_busy(until, || unknown.status()),
+        Ok(TicketRecoveryStatus::Unknown)
+    );
+
+    // A fresh reservation invokes the bounded reaper. It may first observe
+    // the finished thread just before its join becomes ready, so retry only
+    // until the fixed local deadline and cancel each unused reservation.
+    loop {
+        let (probe, _) = TicketNativeRecoveryReservation::reserve().unwrap();
+        probe.cancel_unstarted().unwrap();
+        match retry_recovery_busy(until, || empty.status()) {
+            Err(TicketRecoveryError::InvalidKey) => break,
+            Ok(_) => {}
+            Err(error) => panic!("unexpected recovery status error: {error:?}"),
+        }
+        assert!(Instant::now() < until);
+        thread::yield_now();
+    }
+    assert_eq!(
+        retry_recovery_busy(until, || pending.status()),
+        Ok(TicketRecoveryStatus::Released)
+    );
+    assert_eq!(
+        retry_recovery_busy(until, || unknown.status()),
+        Ok(TicketRecoveryStatus::Unknown)
+    );
+    let event = retry_recovery_busy(until, || pending.take_event(until))
+        .unwrap()
+        .expect("original event retained");
+    assert!(matches!(
+        retry_recovery_busy(until, || event.take::<TicketNativeEvent<(u64, u64)>>()).unwrap(),
+        Some(TicketNativeEvent::StartupFailed(RoleFailure::Canceled))
+    ));
+    loop {
+        let (probe, _) = TicketNativeRecoveryReservation::reserve().unwrap();
+        probe.cancel_unstarted().unwrap();
+        match retry_recovery_busy(until, || pending.status()) {
+            Err(TicketRecoveryError::InvalidKey) => break,
+            Ok(_) => {}
+            Err(error) => panic!("unexpected recovery status error: {error:?}"),
+        }
+        assert!(Instant::now() < until);
+        thread::yield_now();
+    }
+    assert_eq!(
+        retry_recovery_busy(until, || unknown.status()),
+        Ok(TicketRecoveryStatus::Unknown)
+    );
+    unknown_owner.test_clear_unstarted_unknown().unwrap();
+    unknown_owner.cancel_unstarted().unwrap();
+    finish(service);
 }
 
 #[test]
@@ -603,13 +1462,22 @@ fn completed_with_owner_witness(
     }
 }
 fn finish(mut service: TicketedNativeService<View, u64, Fake>) {
+    if !service.requires_finish_report() {
+        assert!(service.finish_report_snapshot().is_none());
+    }
     service.begin_shutdown(Instant::now() + Duration::from_secs(1));
     loop {
         if let TicketNativeEvent::Finished {
             physical_shutdown_confirmed,
+            ..
         } = next(&service)
         {
             assert!(physical_shutdown_confirmed);
+            if let Some(report) = service.take_finish_report() {
+                assert!(report.physical_shutdown_confirmed);
+                assert_eq!(report.physical_failure, None);
+                assert_eq!(report.semantic_failure, None);
+            }
             break;
         }
     }
@@ -618,6 +1486,123 @@ fn finish(mut service: TicketedNativeService<View, u64, Fake>) {
         assert!(Instant::now() < until);
         thread::sleep(Duration::from_millis(1));
     }
+}
+
+#[test]
+fn real_worker_dispatch_preserves_original_owner_ticket_and_prepared_input() {
+    let (mut service, facts, clock) = spawn(true);
+    let q = question(23, 7, &clock, Arc::new(AtomicUsize::new(0)));
+    let original_view = Arc::clone(&q.view);
+    let preparation = service.prepare(q).map_err(|error| error.0).unwrap();
+    let seal = loop {
+        if let TicketNativeEvent::Prepared(seal) = next(&service) {
+            assert_eq!(seal.preparation, preparation);
+            break seal;
+        }
+    };
+    let expected = service.native_acceptance_verifier().unwrap();
+    let (_other_issuer, other) = NativeAcceptanceIssuer::new_pair();
+    *facts.expected_dispatch.lock().unwrap() = Some((expected, other, original_view));
+    let original = ticket(seal, 1);
+    service.execute(preparation, original).unwrap();
+    let completion = completed(&service);
+    assert_eq!(completion.ticket, original);
+    assert_eq!(*completion.result.unwrap(), (23, 123));
+    assert_eq!(
+        facts.owned_dispatch.lock().unwrap().as_slice(),
+        &[(original, 23, 23, true, false, true)]
+    );
+    service.discard(preparation, original).unwrap();
+    assert!(matches!(
+        next(&service),
+        TicketNativeEvent::Retired { result: Ok(()), .. }
+    ));
+    finish(service);
+}
+
+#[test]
+fn owner_context_projection_requires_the_original_view_and_question_contract() {
+    let clock = ContractSystemClock::new(ProcessEpoch(17));
+    let source = question(5, 7, &clock, Arc::new(AtomicUsize::new(0)));
+    let seal = PreparedTicketSeal {
+        preparation: PreparationId(1),
+        question: source.question,
+        view: source.seal,
+        representation: key(5),
+        role: source.role,
+        original_deadline: source.deadline,
+    };
+    let original = ticket(seal, 1);
+    let (_issuer, owner) = NativeAcceptanceIssuer::new_pair();
+    let (_other_issuer, other) = NativeAcceptanceIssuer::new_pair();
+    let original_prepared = 5_u64;
+    let projected_prepared = 9_u64;
+    let original_cancellation = Arc::new(AtomicBool::new(false));
+    let projected = || TicketPreparation {
+        question: source.question,
+        seal: source.seal,
+        role: source.role,
+        deadline: source.deadline,
+        view: Arc::clone(&source.view),
+        query: 9_u64,
+    };
+    let context = || TicketOwnerDispatchContext {
+        verifier: &owner,
+        ticket: &original,
+        question: &source,
+        prepared: &original_prepared,
+        canceled: &original_cancellation,
+    };
+
+    let matching = projected();
+    let result = context().project(&matching, &projected_prepared).unwrap();
+    assert!(result.same_owner(&owner));
+    assert!(!result.same_owner(&other));
+    assert_eq!(result.ticket(), &original);
+    assert_eq!(*result.prepared(), projected_prepared);
+    assert!(Arc::ptr_eq(&result.question().view, &source.view));
+    // Projection must retain the real preparation's cancellation word, not
+    // a new flag or acceptance/fence authority.
+    let original_cancel = context().original_cancellation();
+    let projected_cancel = result.original_cancellation();
+    assert!(original_cancel.try_claim_submission());
+    original_cancellation.store(true, Ordering::Release);
+    assert!(projected_cancel.is_canceled());
+    assert!(!projected_cancel.try_claim_submission());
+
+    let mut changed = projected();
+    changed.question = Digest([42; 32]);
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
+    let mut changed = projected();
+    changed.seal.view_sequence += 1;
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
+    let mut changed = projected();
+    changed.role = Role::Critic;
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
+    let mut changed = projected();
+    changed.deadline.at = MonotonicTick(changed.deadline.at.0 + 1);
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
+    let mut changed = projected();
+    changed.view = Arc::new(View {
+        value: source.view.value,
+        drops: Arc::clone(&source.view.drops),
+    });
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
 }
 
 #[test]
@@ -801,7 +1786,8 @@ fn physical_unknown_quarantines_backend_input_output_and_view_without_acceptance
     assert!(matches!(
         next(&service),
         TicketNativeEvent::Finished {
-            physical_shutdown_confirmed: false
+            physical_shutdown_confirmed: false,
+            ..
         }
     ));
     assert!(service.is_quarantined());
@@ -847,6 +1833,7 @@ fn report_backpressure_reserves_terminal_space_and_shutdown_joins_without_pollin
     while let Some(event) = service.poll() {
         if let TicketNativeEvent::Finished {
             physical_shutdown_confirmed,
+            ..
         } = event
         {
             assert!(physical_shutdown_confirmed);

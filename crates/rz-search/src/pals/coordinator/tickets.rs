@@ -91,6 +91,7 @@ pub(super) struct HeldRole<V, O> {
     pub(super) validator_ranking: Option<HeldValidatorRanking>,
     pub(super) native_acceptance_issued: Option<super::native_acceptance::NativeAcceptanceSeal>,
     pub(super) native_acceptance_confirmed: bool,
+    pub(super) reciprocal_output_digest: Option<Digest>,
 }
 
 /// Bounded independent questions, with one fixed authority for the whole root.
@@ -252,6 +253,7 @@ impl<V, O> RoleTicketRegistry<V, O> {
             validator_ranking: None,
             native_acceptance_issued: None,
             native_acceptance_confirmed: false,
+            reciprocal_output_digest: None,
         });
         self.next_sequence = next;
         self.cumulative

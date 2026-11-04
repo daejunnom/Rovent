@@ -1,7 +1,26 @@
 //! Concrete Rules → UCI → search → common evaluation assembly.
 //! Model loading and physical execution remain the injected factory's responsibility.
 
+#[cfg(feature = "pals-adaptive")]
+pub mod async_engine;
 pub mod diagnostics;
+#[cfg(feature = "pals-adaptive")]
+mod priority_cancel;
+#[cfg(feature = "pals-adaptive")]
+mod priority_close;
+#[cfg(feature = "pals-adaptive")]
+pub use priority_cancel::{
+    PriorityCancelAcknowledgment, PriorityCancelApplicationFailure, PriorityCancelHandle,
+    PriorityCancelObservation, PriorityCancelPanicAccessError, PriorityCancelRequest,
+};
+#[cfg(feature = "pals-adaptive")]
+pub use priority_close::{PriorityCloseHandle, PriorityCloseObservation};
+mod driver_output;
+use driver_output::DriverOutputEnvelope;
+mod driver_start;
+pub(crate) use driver_start::DriverStartSource;
+#[cfg(test)]
+pub(crate) use driver_start::fixture as driver_start_fixture;
 
 use crate::{bridge::BuildSearchSettings, *};
 use rz_contracts as contract;
@@ -28,6 +47,101 @@ use std::{
 
 fn failure(code: contract::ErrorCode, detail: &'static str) -> contract::ContractError {
     contract::ContractError::new(code, contract::Stage::Admission, detail)
+}
+
+/// An actual driver pre-ticket rejection, separate from search or GPU results.
+/// The sequence counts parsed `go` commands after the observer is attached.
+/// This is an instantaneous owner observation, not a physical-completion proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PriorSearchObservation {
+    NoOwnerSearchOrDrainObserved,
+    SearchDrainOrFailurePending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GoAdmissionRejection {
+    pub go_sequence: u64,
+    pub epoch: contract::ProcessEpoch,
+    pub game: contract::GameGeneration,
+    pub root: contract::RootGeneration,
+    pub prior_search: PriorSearchObservation,
+    pub stage: contract::Stage,
+    pub code: contract::ErrorCode,
+}
+
+/// Optional bounded observation only: a full or closed receiver never changes
+/// command handling. A supervisor must bind events to its own process/lock and
+/// authenticate any external transport; this queue grants no stop authority.
+#[derive(Clone)]
+pub struct GoAdmissionObserver {
+    sink: Arc<dyn GoAdmissionSink>,
+    missed: Arc<AtomicU64>,
+}
+
+/// Implementations must return promptly without blocking the UCI owner.
+/// False records observation failure and never changes the go result.
+pub(crate) trait GoAdmissionSink: Send + Sync {
+    fn try_publish(&self, event: GoAdmissionRejection) -> bool;
+}
+
+struct GoAdmissionChannel(SyncSender<GoAdmissionRejection>);
+impl GoAdmissionSink for GoAdmissionChannel {
+    fn try_publish(&self, event: GoAdmissionRejection) -> bool {
+        self.0.try_send(event).is_ok()
+    }
+}
+
+impl GoAdmissionObserver {
+    pub fn channel() -> (Self, Receiver<GoAdmissionRejection>) {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        (
+            Self::from_sink(Arc::new(GoAdmissionChannel(sender))),
+            receiver,
+        )
+    }
+    pub(crate) fn from_sink(sink: Arc<dyn GoAdmissionSink>) -> Self {
+        Self {
+            sink,
+            missed: Arc::new(AtomicU64::new(0)),
+        }
+    }
+    pub fn missed(&self) -> u64 {
+        self.missed.load(Ordering::Relaxed)
+    }
+    fn record_missed(&self) {
+        let _ = self
+            .missed
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_add(1)
+            });
+    }
+    fn rejected(
+        &self,
+        go_sequence: u64,
+        scope: crate::contracts::SessionScope,
+        epoch: contract::ProcessEpoch,
+        prior_search: PriorSearchObservation,
+        error: contract::ContractError,
+    ) {
+        let event = GoAdmissionRejection {
+            go_sequence,
+            epoch,
+            game: scope.game(),
+            root: scope.root(),
+            prior_search,
+            stage: error.stage,
+            code: error.code,
+        };
+        // Observer code is auxiliary; an unwind must not reject or cancel the
+        // already-existing search. Process abort/OOM is not catchable here.
+        if !std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.sink.try_publish(event)
+        }))
+        .unwrap_or(false)
+        {
+            self.record_missed();
+        }
+    }
 }
 
 /// All position forks obtain a checked fresh owner. Clone shares immutable state.
@@ -245,6 +359,14 @@ impl ProcessClock {
         &self,
         instant: Instant,
     ) -> Result<contract::MonotonicTick, contract::ContractError> {
+        // Windows QPC duration conversion may round a tiny negative delta to
+        // zero. Compare the actual Instants before converting that delta.
+        if instant < self.origin {
+            return Err(failure(
+                contract::ErrorCode::InvalidInput,
+                "tick predates process clock origin",
+            ));
+        }
         let elapsed = instant.checked_duration_since(self.origin).ok_or_else(|| {
             failure(
                 contract::ErrorCode::InvalidInput,
@@ -388,6 +510,11 @@ pub struct EngineProcess {
     owners: Arc<OwnerRegistry>,
     clock: ProcessClock,
     identity: EngineIdentity,
+    go_admission_observer: Option<GoAdmissionObserver>,
+    #[cfg(feature = "pals-adaptive")]
+    priority_cancel: Option<priority_cancel::PriorityCancelOwner>,
+    #[cfg(feature = "pals-adaptive")]
+    priority_close: Option<priority_close::PriorityCloseOwner>,
 }
 impl EngineProcess {
     /// CPU/PALS evidence is distinct from the legacy evaluator's native
@@ -415,6 +542,11 @@ impl EngineProcess {
                 name: "RoveZero CPU mock integration".into(),
                 author: "RoveZero contributors".into(),
             },
+            go_admission_observer: None,
+            #[cfg(feature = "pals-adaptive")]
+            priority_cancel: None,
+            #[cfg(feature = "pals-adaptive")]
+            priority_close: None,
         }
     }
     /// Search-only startup. No neural descriptor or evaluator is constructed.
@@ -430,12 +562,61 @@ impl EngineProcess {
             owners,
             clock,
             identity,
+            go_admission_observer: None,
+            #[cfg(feature = "pals-adaptive")]
+            priority_cancel: None,
+            #[cfg(feature = "pals-adaptive")]
+            priority_close: None,
         }
     }
     /// Session validates the declared identity before starting protocol service.
     pub fn with_identity(mut self, identity: EngineIdentity) -> Self {
         self.identity = identity;
         self
+    }
+
+    /// Attach an optional, nonblocking in-process observer. This does not
+    /// authorize an external peer or change ordinary UCI behavior.
+    pub fn with_go_admission_observer(mut self, observer: GoAdmissionObserver) -> Self {
+        self.go_admission_observer = Some(observer);
+        self
+    }
+
+    /// Install one optional mailbox owned by this exact process. The request
+    /// cancels whichever search is active when the original Owner observes it;
+    /// it does not close future admission, stop UCI, or prove physical drain.
+    #[cfg(feature = "pals-adaptive")]
+    pub fn install_priority_cancel(
+        &mut self,
+    ) -> Result<PriorityCancelHandle, contract::ContractError> {
+        if self.priority_cancel.is_some() || self.priority_close.is_some() {
+            return Err(failure(
+                contract::ErrorCode::InvalidInput,
+                "a priority control is already installed",
+            ));
+        }
+        let (owner, handle) = priority_cancel::PriorityCancelOwner::new(self.clock.epoch());
+        self.priority_cancel = Some(owner);
+        Ok(handle)
+    }
+
+    /// Install an independent session-level admission close request. A
+    /// recorded request is not a close ACK or physical completion. Until the
+    /// two controls share a recovery protocol they are mutually exclusive,
+    /// avoiding an implicit retry after the other control's cancellation panic.
+    #[cfg(feature = "pals-adaptive")]
+    pub fn install_priority_close(
+        &mut self,
+    ) -> Result<PriorityCloseHandle, contract::ContractError> {
+        if self.priority_close.is_some() || self.priority_cancel.is_some() {
+            return Err(failure(
+                contract::ErrorCode::InvalidInput,
+                "a priority control is already installed",
+            ));
+        }
+        let (owner, handle) = priority_close::PriorityCloseOwner::new(self.clock.epoch());
+        self.priority_close = Some(owner);
+        Ok(handle)
     }
 }
 
@@ -592,6 +773,11 @@ pub enum WorkerFailureSource {
     Authority(contract::ContractError),
     Search(Box<rz_search::contracts::ContractSearchFailure>),
     Driver(crate::search_driver::SearchSessionFailure),
+    RejectedDriverReport {
+        error: contract::ContractError,
+        report: Arc<crate::search_driver::SearchSessionReport>,
+        diagnostic_failure: Option<(contract::ContractError, Box<WorkerDiagnosticReceipt>)>,
+    },
     DiagnosticRetention {
         error: contract::ContractError,
         receipt: Box<WorkerDiagnosticReceipt>,
@@ -633,6 +819,19 @@ impl WorkerCompletion {
                 code: error.code.into(),
                 message: error.detail.clone(),
             },
+            WorkerFailureSource::RejectedDriverReport {
+                error,
+                diagnostic_failure,
+                ..
+            } => SearchCompletion::Failed {
+                code: "DriverFinalReport".into(),
+                message: match diagnostic_failure {
+                    Some((diagnostic_error, _)) => {
+                        format!("{error}; original work retention failed: {diagnostic_error}")
+                    }
+                    None => error.to_string(),
+                },
+            },
             WorkerFailureSource::DiagnosticRetention { error, receipt } => {
                 SearchCompletion::Failed {
                     code: "DiagnosticRetentionFailure".into(),
@@ -647,9 +846,11 @@ impl WorkerCompletion {
 #[derive(Debug)]
 pub enum EngineError {
     Contract(contract::ContractError),
+    SearchDriverClose(crate::search_driver::SearchSessionFailure),
     Session(SessionError),
     Transport(Box<ServeError<EngineError>>),
     WorkerPanic,
+    TimerSpawn(std::io::Error),
     DrainTimeout,
     UndeliveredDiagnostics(Vec<(WorkerDiagnosticReceipt, u64)>),
     UndeliveredWorkerFailure(Box<UndeliveredWorkerFailure>),
@@ -673,6 +874,10 @@ struct ActiveBinding {
     ticket: SearchTicket,
     control: SearchControl,
     authority: Option<SearchAuthority>,
+    driver_output: Option<Arc<DriverOutputEnvelope>>,
+    driver_output_until: Option<Instant>,
+    driver_start: Option<Arc<DriverStartSource>>,
+    ponder_clock: Option<crate::rovent_ponder::RoventPonderClockOwner>,
 }
 type FailedPublication = Arc<Mutex<Option<Box<UndeliveredWorkerFailure>>>>;
 struct Worker {
@@ -700,25 +905,37 @@ struct Owner {
     ponder: Option<(crate::contracts::SessionScope, Option<u64>)>,
     held_ponder_bestmove: Option<HeldPonderBestMove>,
     admitted_ponder_report: Option<AdmittedPonderReport>,
+    pending_original_go: Option<(SearchTicket, Arc<crate::parser::GoLimits>)>,
     pending_close: Option<Event>,
     fence_failure: Option<EngineError>,
     diagnostics: Arc<Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>>,
+    go_admission_observer: Option<GoAdmissionObserver>,
+    go_sequence: u64,
 }
 struct PendingBestMove {
     scope: crate::contracts::SessionScope,
     line: String,
     until: Instant,
     from_driver_report: bool,
+    driver_output: Option<DriverOutputPublication>,
 }
 struct HeldPonderBestMove {
     scope: crate::contracts::SessionScope,
     line: String,
     from_driver_report: bool,
+    driver_output: Option<DriverOutputPublication>,
 }
 struct AdmittedPonderReport {
     ticket: SearchTicket,
     scope: crate::contracts::SessionScope,
     bestmove: String,
+    driver_output: Option<DriverOutputPublication>,
+}
+#[derive(Clone)]
+struct DriverOutputPublication {
+    envelope: Arc<DriverOutputEnvelope>,
+    report: Option<Arc<crate::search_driver::SearchSessionReport>>,
+    until: Instant,
 }
 impl PendingBestMove {
     fn matches_scope(&self, scope: crate::contracts::SessionScope) -> bool {
@@ -726,21 +943,184 @@ impl PendingBestMove {
     }
 }
 impl Owner {
+    #[cfg(test)]
+    fn admitted_ponder_output_for_tests(
+        &self,
+    ) -> Option<(
+        &Arc<DriverOutputEnvelope>,
+        &Arc<crate::search_driver::SearchSessionReport>,
+    )> {
+        let publication = self
+            .admitted_ponder_report
+            .as_ref()
+            .and_then(|report| report.driver_output.as_ref())
+            .or_else(|| {
+                self.held_ponder_bestmove
+                    .as_ref()
+                    .and_then(|held| held.driver_output.as_ref())
+            })?;
+        Some((&publication.envelope, publication.report.as_ref()?))
+    }
+    fn driver_publication_for(
+        &self,
+        ticket: Option<&SearchTicket>,
+    ) -> Result<Option<DriverOutputPublication>, contract::ContractError> {
+        let Some(active) = &self.active else {
+            return Ok(None);
+        };
+        if ticket.is_some_and(|ticket| ticket != &active.ticket) {
+            return Ok(None);
+        }
+        let Some(envelope) = &active.driver_output else {
+            return Ok(None);
+        };
+        let scope = self.session_owner.lifecycle_scope();
+        if envelope.scope() != scope {
+            return Ok(None);
+        }
+        let report = envelope.report_for(&active.ticket, scope)?;
+        let until = active.driver_output_until.ok_or_else(|| {
+            failure(
+                contract::ErrorCode::IdentityMismatch,
+                "actual driver Start has no original output cleanup boundary",
+            )
+        })?;
+        Ok(Some(DriverOutputPublication {
+            envelope: Arc::clone(envelope),
+            report,
+            until,
+        }))
+    }
     fn command_line(
         &mut self,
         session: &mut Session<RulesUciPort>,
         line: &str,
-    ) -> (SessionResult<RulesSearchPosition>, bool) {
-        let parsed = parse(line, session.parser_limits());
+    ) -> (
+        SessionResult<RulesSearchPosition>,
+        bool,
+        Option<DriverOutputPublication>,
+    ) {
+        let dispatched_at = Instant::now();
+        let parsed = crate::parser::parse_with_zero_node_limit(
+            line,
+            session.parser_limits(),
+            match session.node_budget_semantics() {
+                crate::bridge::NodeBudgetSemantics::LegacySimulations => {
+                    crate::parser::ZeroNodeLimit::Reject
+                }
+                crate::bridge::NodeBudgetSemantics::RoventPositionVisits => {
+                    crate::parser::ZeroNodeLimit::Allow
+                }
+            },
+        );
+        // Capture once, before ponder normalization and Rules canonicalization.
+        let original_go = match &parsed {
+            Ok(Command::Go(limits)) => Some(Arc::new(limits.clone())),
+            _ => None,
+        };
+        let go_sequence = if original_go.is_some() && self.go_admission_observer.is_some() {
+            match self.go_sequence.checked_add(1) {
+                Some(sequence) => {
+                    self.go_sequence = sequence;
+                    Some(sequence)
+                }
+                None => {
+                    if let Some(observer) = &self.go_admission_observer {
+                        observer.record_missed();
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let (Some(driver), Some(original_go)) = (&self.driver, &original_go) {
+            if let Err(error) = driver.validate_go(session.snapshot().rules_position(), original_go)
+            {
+                if let (Some(observer), Some(sequence)) = (&self.go_admission_observer, go_sequence)
+                {
+                    // Report the owner's existing state at rejection; a rejected
+                    // go does not cancel an earlier accepted search. Empty worker
+                    // bookkeeping is not evidence of a GPU/device-wide fence.
+                    let prior_search = if session.active_ticket().is_none()
+                        && self.active.is_none()
+                        && self.workers.is_empty()
+                        && self.pending_failures.is_empty()
+                        && self.pending_bestmove.is_none()
+                        && self.ponder.is_none()
+                        && self.held_ponder_bestmove.is_none()
+                        && self.admitted_ponder_report.is_none()
+                        && self.pending_original_go.is_none()
+                        && self.pending_close.is_none()
+                        && self.fence_failure.is_none()
+                    {
+                        PriorSearchObservation::NoOwnerSearchOrDrainObserved
+                    } else {
+                        PriorSearchObservation::SearchDrainOrFailurePending
+                    };
+                    observer.rejected(
+                        sequence,
+                        self.session_owner.lifecycle_scope(),
+                        self.clock.epoch(),
+                        prior_search,
+                        error,
+                    );
+                }
+                let mut rejected = SessionResult {
+                    accepted: false,
+                    ..SessionResult::default()
+                };
+                rejected.diagnostics.push(Diagnostic {
+                    code: "DriverGoRejected",
+                    message: error.to_string(),
+                });
+                return (rejected, false, None);
+            }
+            if original_go.ponder && driver.supports_ponder_clock() {
+                let mut normal = original_go.as_ref().clone();
+                normal.ponder = false;
+                normal.infinite = false;
+                let side = match session.snapshot().rules_position().side_to_move() {
+                    rz_position::Color::White => crate::bridge::SideToMove::White,
+                    rz_position::Color::Black => crate::bridge::SideToMove::Black,
+                };
+                // The allocation's duration is fixed by the received go. A
+                // future hit cannot make an oversized clock legal; reject it
+                // before the old search is canceled or a new ticket exists.
+                if let Err(error) = crate::bridge::PreparedSearchBinding::prepare(
+                    &normal,
+                    side,
+                    dispatched_at,
+                    self.settings.search,
+                    driver.search_goal_capability(),
+                    crate::bridge::NodeBudgetSemantics::RoventPositionVisits,
+                ) {
+                    let mut rejected = SessionResult {
+                        accepted: false,
+                        ..SessionResult::default()
+                    };
+                    rejected.diagnostics.push(Diagnostic {
+                        code: "PonderClockRejected",
+                        message: error.to_string(),
+                    });
+                    return (rejected, false, None);
+                }
+            }
+        }
         let enabled = matches!(
             session.option_values().get("Ponder"),
             Some(OptionValue::Check(true))
         );
         let mut out = SessionResult::default();
         let mut from_driver_report = false;
+        let mut released_output = None;
         match &parsed {
             Ok(Command::Go(limits)) if limits.ponder => {
-                if !enabled || limits.nodes.is_some_and(|n| n > 4096) {
+                if !enabled
+                    || session.node_budget_semantics()
+                        == crate::bridge::NodeBudgetSemantics::LegacySimulations
+                        && limits.nodes.is_some_and(|n| n > 4096)
+                {
                     out.accepted = false;
                     out.diagnostics.push(Diagnostic {
                         code: "PonderRejected",
@@ -748,21 +1128,39 @@ impl Owner {
                             "Ponder must be enabled and the node limit must fit the engine envelope"
                                 .into(),
                     });
-                    return (out, false);
+                    return (out, false, None);
                 }
                 // The opponent's elapsed time is never debited from the supplied own clock.
                 // A finite resource wall and simulation ceiling still bound speculative work.
+                let mut normalized = limits.clone();
+                normalized.ponder = false;
+                normalized.infinite = true;
+                normalized.movetime_ms = None;
+                normalized.white_time_ms = None;
+                normalized.black_time_ms = None;
+                normalized.white_increment_ms = None;
+                normalized.black_increment_ms = None;
+                normalized.moves_to_go = None;
                 append_contract_result(
                     &mut out,
-                    self.session_owner.handle_line(session, "go infinite", |s| {
-                        Ok(s.state.snapshot().side_to_move())
-                    }),
+                    self.session_owner
+                        .handle_normalized_go(session, normalized, |s| {
+                            Ok(s.state.snapshot().side_to_move())
+                        }),
                 );
                 if out.accepted {
                     self.held_ponder_bestmove = None;
                     self.admitted_ponder_report = None;
                     self.ponder = Some((self.session_owner.lifecycle_scope(), limits.nodes));
                 }
+            }
+            Ok(Command::PonderHit)
+                if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.ponder_clock.is_some()) =>
+            {
+                return self.hit_rovent_ponder(session, dispatched_at);
             }
             Ok(Command::PonderHit) => {
                 if !self
@@ -775,7 +1173,7 @@ impl Owner {
                         code: "StalePonderHit",
                         message: "no current predicted-root search".into(),
                     });
-                    return (out, false);
+                    return (out, false, None);
                 }
                 self.ponder = None;
                 let ticket = session.active_ticket();
@@ -786,7 +1184,8 @@ impl Owner {
                     self.session_owner
                         .handle_line(session, "stop", |s| Ok(s.state.snapshot().side_to_move())),
                 );
-                from_driver_report = self.release_ponder_output(ticket.as_ref(), &mut out);
+                (from_driver_report, released_output) =
+                    self.release_ponder_output(ticket.as_ref(), &mut out);
             }
             Ok(Command::SetOption { name, .. })
                 if name.eq_ignore_ascii_case("Ponder")
@@ -806,7 +1205,8 @@ impl Owner {
                         .handle_line(session, line, |s| Ok(s.state.snapshot().side_to_move())),
                 );
                 if out.accepted && matches!(parsed, Ok(Command::Stop)) {
-                    from_driver_report = self.release_ponder_output(ticket.as_ref(), &mut out);
+                    (from_driver_report, released_output) =
+                        self.release_ponder_output(ticket.as_ref(), &mut out);
                 }
                 if out.accepted
                     && matches!(
@@ -824,17 +1224,136 @@ impl Owner {
                 }
             }
         }
-        (out, from_driver_report)
+        if out.accepted {
+            if let Some(original_go) = original_go {
+                self.pending_original_go = out.effects.iter().find_map(|effect| match effect {
+                    Effect::Start { ticket, .. } => Some((ticket.clone(), original_go.clone())),
+                    _ => None,
+                });
+            }
+        }
+        (out, from_driver_report, released_output)
+    }
+
+    fn hit_rovent_ponder(
+        &mut self,
+        session: &mut Session<RulesUciPort>,
+        hit_at: Instant,
+    ) -> (
+        SessionResult<RulesSearchPosition>,
+        bool,
+        Option<DriverOutputPublication>,
+    ) {
+        let mut out = SessionResult::default();
+        let current_scope = self.session_owner.lifecycle_scope();
+        let hit = (|| {
+            if !self
+                .ponder
+                .as_ref()
+                .is_some_and(|(scope, _)| *scope == current_scope)
+            {
+                return Err(failure(
+                    contract::ErrorCode::Stale,
+                    "no current actual ponder Start",
+                ));
+            }
+            let active = self.active.as_mut().ok_or_else(|| {
+                failure(contract::ErrorCode::Stale, "actual ponder Start is absent")
+            })?;
+            let original = active.driver_start.as_ref().ok_or_else(|| {
+                failure(
+                    contract::ErrorCode::IdentityMismatch,
+                    "actual ponder source is absent",
+                )
+            })?;
+            let mut normal = original.original_go().as_ref().clone();
+            normal.ponder = false;
+            normal.infinite = false;
+            let side = match session.snapshot().rules_position().side_to_move() {
+                rz_position::Color::White => crate::bridge::SideToMove::White,
+                rz_position::Color::Black => crate::bridge::SideToMove::Black,
+            };
+            let prepared = crate::bridge::PreparedSearchBinding::prepare(
+                &normal,
+                side,
+                hit_at,
+                self.settings.search,
+                self.driver
+                    .as_ref()
+                    .and_then(|driver| driver.search_goal_capability()),
+                crate::bridge::NodeBudgetSemantics::RoventPositionVisits,
+            )
+            .map_err(|_| {
+                failure(
+                    contract::ErrorCode::InvalidInput,
+                    "normal ponder-hit time allocation is invalid",
+                )
+            })?;
+            let disposition = active
+                .ponder_clock
+                .as_mut()
+                .ok_or_else(|| {
+                    failure(
+                        contract::ErrorCode::IdentityMismatch,
+                        "actual ponder clock owner is absent",
+                    )
+                })?
+                .hit(
+                    &active.ticket,
+                    current_scope,
+                    hit_at,
+                    &prepared,
+                    Instant::now(),
+                )?;
+            Ok((active.ticket.clone(), disposition))
+        })();
+        let (ticket, disposition) = match hit {
+            Ok(value) => value,
+            Err(error) => {
+                out.accepted = false;
+                out.diagnostics.push(Diagnostic {
+                    code: "PonderHitRejected",
+                    message: error.to_string(),
+                });
+                return (out, false, None);
+            }
+        };
+        self.ponder = None;
+        if session.active_ticket().as_ref() == Some(&ticket) {
+            append_contract_result(
+                &mut out,
+                self.session_owner.release_ponder_hit(session, &ticket),
+            );
+            // A hit cannot reopen the expired original resource wall. Only
+            // this terminal case follows the same ticket's normal stop path.
+            if disposition == crate::rovent_ponder::HitDisposition::NoLiveWork
+                && session.active_ticket().as_ref() == Some(&ticket)
+            {
+                append_contract_result(
+                    &mut out,
+                    self.session_owner
+                        .handle_line(session, "stop", |s| Ok(s.state.snapshot().side_to_move())),
+                );
+            }
+        } else if self.held_ponder_bestmove.is_none() {
+            out.accepted = false;
+            out.diagnostics.push(Diagnostic {
+                code: "StalePonderHit",
+                message: "the original Start has neither live work nor a held result".into(),
+            });
+        }
+        let (reported, publication) = self.release_ponder_output(Some(&ticket), &mut out);
+        (out, reported, publication)
     }
     fn release_ponder_output(
         &mut self,
         ticket: Option<&SearchTicket>,
         out: &mut SessionResult<RulesSearchPosition>,
-    ) -> bool {
+    ) -> (bool, Option<DriverOutputPublication>) {
         // Successful infinite work stays in Session until stop/hit. Only its
         // exact admitted ticket, scope and move can acknowledge that report;
         // a coincident fallback after an earlier stop is not report consumption.
-        let from_passive_report = self.admitted_ponder_report.take().is_some_and(|report| {
+        let passive = self.admitted_ponder_report.take().filter(|report| {
             ticket == Some(&report.ticket)
                 && report.scope == self.session_owner.lifecycle_scope()
                 && out.protocol.iter().any(|line| {
@@ -843,18 +1362,23 @@ impl Owner {
                         == Some(report.bestmove.as_str())
                 })
         });
+        let from_passive_report = passive.is_some();
+        let passive_output = passive.and_then(|report| report.driver_output);
         let Some(held) = self.held_ponder_bestmove.take() else {
-            return from_passive_report;
+            return (from_passive_report, passive_output);
         };
         if held.scope != self.session_owner.lifecycle_scope() {
             out.diagnostics.push(Diagnostic {
                 code: "StalePonderOutput",
                 message: "held predicted-root move has lost its publication authority".into(),
             });
-            return from_passive_report;
+            return (from_passive_report, passive_output);
         }
         out.protocol.push(held.line);
-        held.from_driver_report || from_passive_report
+        (
+            held.from_driver_report || from_passive_report,
+            held.driver_output.or(passive_output),
+        )
     }
     fn annotate_ponder(
         &self,
@@ -907,6 +1431,7 @@ impl Owner {
         session: &Session<RulesUciPort>,
         out: &mut SessionResult<RulesSearchPosition>,
         from_driver_report: bool,
+        driver_output: Option<&DriverOutputPublication>,
     ) {
         if session.is_closed() {
             self.ponder = None;
@@ -932,6 +1457,7 @@ impl Owner {
                     scope: self.session_owner.lifecycle_scope(),
                     line,
                     from_driver_report,
+                    driver_output: driver_output.cloned(),
                 });
             }
         }
@@ -1064,20 +1590,30 @@ impl Owner {
                     .handle_event(session, Event::Complete { ticket, completion }),
             );
             self.annotate_ponder(session, &mut failed);
-            self.hold_ponder_output(session, &mut failed, false);
-            self.defer_bestmove(session, &mut failed, false);
+            self.hold_ponder_output(session, &mut failed, false, None);
+            self.defer_bestmove(session, &mut failed, false, None);
             append_result(&mut out, failed);
         }
-        let (mut next, held_driver_report) = match event {
+        let completed_output = match passive_report.as_ref() {
+            Some((ticket, _)) => match self.driver_publication_for(Some(ticket)) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    self.close_physical_fence(session, &mut out, error.into());
+                    return out;
+                }
+            },
+            None => None,
+        };
+        let (mut next, held_driver_report, held_output) = match event {
             Event::RejectedInput {
                 code: "OwnerWake", ..
-            } => (SessionResult::default(), false),
+            } => (SessionResult::default(), false, None),
             Event::Line(line) => self.command_line(session, &line),
             event => {
                 let next = self.session_owner.handle_event(session, event);
                 let mut out = SessionResult::default();
                 append_contract_result(&mut out, next);
-                (out, false)
+                (out, false, None)
             }
         };
         // Enqueueing is not consumption. A typed failed publication stays with
@@ -1143,6 +1679,7 @@ impl Owner {
         // and replaced with a frozen fallback. Only the actual admitted
         // completion outcome may acknowledge consumption of a CPU report.
         let admitted_driver_report = (from_driver_report && next.accepted) || held_driver_report;
+        let driver_output = held_output.or(completed_output);
         if from_driver_report
             && next.accepted
             && let Some((ticket, bestmove)) = passive_report
@@ -1156,11 +1693,17 @@ impl Owner {
                 ticket,
                 scope: self.session_owner.lifecycle_scope(),
                 bestmove,
+                driver_output: driver_output.clone(),
             });
         }
         self.annotate_ponder(session, &mut next);
-        self.hold_ponder_output(session, &mut next, admitted_driver_report);
-        self.defer_bestmove(session, &mut next, admitted_driver_report);
+        self.hold_ponder_output(
+            session,
+            &mut next,
+            admitted_driver_report,
+            driver_output.as_ref(),
+        );
+        self.defer_bestmove(session, &mut next, admitted_driver_report, driver_output);
         append_result(&mut out, next);
         self.finish_physical_output(session, &mut out);
         if !session.is_closed()
@@ -1184,6 +1727,7 @@ impl Owner {
         session: &mut Session<RulesUciPort>,
         out: &mut SessionResult<RulesSearchPosition>,
         from_driver_report: bool,
+        driver_output: Option<DriverOutputPublication>,
     ) {
         let scope = self.session_owner.lifecycle_scope();
         if session.is_closed()
@@ -1194,7 +1738,22 @@ impl Owner {
         {
             self.pending_bestmove = None;
         }
-        if session.is_closed() || self.workers.is_empty() {
+        if session.is_closed() {
+            return;
+        }
+        let driver_output = match driver_output {
+            Some(publication) => Some(publication),
+            None => match self.driver_publication_for(None) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    self.close_physical_fence(session, out, error.into());
+                    return;
+                }
+            },
+        };
+        // A Rules-only bestmove has no actual Start or driver report. Every
+        // actual driver Start uses this publisher even if it was already reaped.
+        if self.workers.is_empty() && driver_output.is_none() {
             return;
         }
         for line in std::mem::take(&mut out.protocol) {
@@ -1214,7 +1773,11 @@ impl Owner {
                 );
                 return;
             }
-            let Some(until) = Instant::now().checked_add(self.settings.shutdown_limit) else {
+            let until = driver_output
+                .as_ref()
+                .map(|output| output.until)
+                .or_else(|| Instant::now().checked_add(self.settings.shutdown_limit));
+            let Some(until) = until else {
                 self.close_physical_fence(
                     session,
                     out,
@@ -1231,6 +1794,7 @@ impl Owner {
                 line,
                 until,
                 from_driver_report,
+                driver_output: driver_output.clone(),
             });
         }
     }
@@ -1253,19 +1817,87 @@ impl Owner {
         }
         if self.workers.is_empty() {
             let pending = self.pending_bestmove.take().unwrap();
+            if pending.scope != self.session_owner.lifecycle_scope() {
+                self.close_physical_fence(
+                    session,
+                    out,
+                    failure(
+                        contract::ErrorCode::Stale,
+                        "actual Start output lost its original lifecycle scope",
+                    )
+                    .into(),
+                );
+                return;
+            }
+            let bestmove = pending
+                .line
+                .strip_prefix("bestmove ")
+                .and_then(|text| text.split_ascii_whitespace().next())
+                .unwrap_or("");
+            let strategy = if let Some(publication) = &pending.driver_output {
+                match (&publication.report, pending.from_driver_report) {
+                    (Some(report), _) => publication.envelope.mate_for(
+                        report,
+                        pending.scope,
+                        bestmove,
+                        pending.from_driver_report,
+                    ),
+                    (None, false) => Ok(None),
+                    (None, true) => Err(failure(
+                        contract::ErrorCode::IdentityMismatch,
+                        "reported driver output has no actual Start final report",
+                    )),
+                }
+            } else {
+                Ok(None)
+            };
+            let strategy = match strategy {
+                Ok(strategy) => strategy,
+                Err(error) => {
+                    self.close_physical_fence(session, out, error.into());
+                    return;
+                }
+            };
+            let horizon = match &pending.driver_output {
+                Some(publication) if pending.from_driver_report => match &publication.report {
+                    Some(report) => {
+                        publication
+                            .envelope
+                            .horizon_for(report, pending.scope, bestmove, true)
+                    }
+                    None => Err(failure(
+                        contract::ErrorCode::IdentityMismatch,
+                        "reported driver output has no actual Start final report",
+                    )),
+                },
+                _ => Ok(None),
+            };
+            let horizon = match horizon {
+                Ok(horizon) => horizon,
+                Err(error) => {
+                    self.close_physical_fence(session, out, error.into());
+                    return;
+                }
+            };
             if let (Some(driver), crate::contracts::SessionScope::Search(authority)) =
                 (&self.driver, pending.scope)
             {
-                let bestmove = pending
-                    .line
-                    .strip_prefix("bestmove ")
-                    .and_then(|text| text.split_ascii_whitespace().next())
-                    .unwrap_or("");
                 if let Err(error) =
                     driver.accept_uci_output(authority, bestmove, pending.from_driver_report)
                 {
                     self.close_physical_fence(session, out, error.into());
                     return;
+                }
+            }
+            if let Some((depth, seldepth)) = horizon {
+                let depth = depth.map_or_else(String::new, |value| format!(" depth {value}"));
+                out.protocol
+                    .push(format!("info{depth} seldepth {seldepth} pv {bestmove}"));
+            }
+            if let Some(strategy) = strategy {
+                if let Some(mate) = strategy.conclusion().exact_uci_mate() {
+                    out.protocol
+                        .push(format!("info score mate {mate} pv {bestmove}"));
                 }
             }
             out.protocol.push(pending.line);
@@ -1295,7 +1927,15 @@ impl Owner {
     }
     fn cancel(&self) {
         if let Some(active) = &self.active {
+            // The original Start's optional Collection gate closes before
+            // signaling its physical search cancellation; neither waits.
+            if let Some(start) = &active.driver_start {
+                start.abort_collection();
+            }
             active.control.cancel();
+            if let Some(clock) = &active.ponder_clock {
+                clock.close();
+            }
             if let Some(authority) = &active.authority {
                 authority.cancel();
             }
@@ -1394,8 +2034,15 @@ impl Owner {
             }
             Effect::Shutdown => self.cancel(),
             Effect::Start {
-                ticket, snapshot, ..
+                ticket,
+                snapshot,
+                limits,
+                ..
             } => {
+                let original_go = self
+                    .pending_original_go
+                    .take()
+                    .and_then(|(original_ticket, go)| (original_ticket == ticket).then_some(go));
                 self.reap()?;
                 if self.workers.len() >= self.settings.max_workers {
                     self.pending_failure(
@@ -1415,7 +2062,12 @@ impl Owner {
                     )
                 })?;
                 if let Some((_, Some(nodes))) = self.ponder {
-                    control.max_simulations = control.max_simulations.min(nodes);
+                    if self.driver.as_ref().is_none_or(|driver| {
+                        driver.node_budget_semantics()
+                            == crate::bridge::NodeBudgetSemantics::LegacySimulations
+                    }) {
+                        control.max_simulations = control.max_simulations.min(nodes);
+                    }
                 }
                 let token = self
                     .session_owner
@@ -1457,17 +2109,100 @@ impl Owner {
                                 "search driver shutdown deadline overflow",
                             )
                         })?;
-                    let context = crate::search_driver::SearchSessionContext {
+                    let mut context = crate::search_driver::SearchSessionContext {
                         authority: search_authority,
+                        original_go,
+                        original_start: None,
+                        effective_clock: None,
+                        original_time_budget: self
+                            .session_owner
+                            .active_binding()
+                            .map(|binding| *binding.budget()),
+                        root_moves: limits
+                            .searchmoves
+                            .as_ref()
+                            .map(|moves| {
+                                moves
+                                    .iter()
+                                    .map(|movement| {
+                                        movement.parse::<BoardMove>().map_err(|_| {
+                                            failure(
+                                                contract::ErrorCode::IdentityMismatch,
+                                                "sealed root move could not be decoded",
+                                            )
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()
+                                    .map(Arc::from)
+                            })
+                            .transpose()?,
+                        goal: contract::rovent::SearchGoal {
+                            depth_plies: limits.depth_plies,
+                            mate_moves: limits.mate_moves,
+                        },
+                        requested_nodes: limits.nodes,
                         control: control.clone(),
                         cancellation: token,
                         shutdown_deadline,
                         current: Arc::clone(&self.scope),
                     };
+                    let ponder_clock = if driver.supports_ponder_clock()
+                        && context.original_go.as_ref().is_some_and(|go| go.ponder)
+                    {
+                        let original_budget = context.original_time_budget.ok_or_else(|| {
+                            failure(
+                                contract::ErrorCode::IdentityMismatch,
+                                "actual ponder Start has no original TimeBudget",
+                            )
+                        })?;
+                        let (owner, handle) = crate::rovent_ponder::RoventPonderClockOwner::new(
+                            ticket.clone(),
+                            search_authority,
+                            original_budget,
+                            shutdown_deadline,
+                            &self.clock,
+                        )?;
+                        context.effective_clock = Some(handle);
+                        Some(owner)
+                    } else {
+                        None
+                    };
+                    let original_start = DriverStartSource::from_start(
+                        &ticket,
+                        snapshot.rules_position(),
+                        self.session_owner.active_binding().ok_or_else(|| {
+                            failure(
+                                contract::ErrorCode::IdentityMismatch,
+                                "actual driver Start has no original binding",
+                            )
+                        })?,
+                        &context,
+                        &self.clock,
+                    )?;
+                    context.original_start = Some(Arc::clone(&original_start));
+                    if let Err(error) = self
+                        .session_owner
+                        .bind_original_start(&ticket, Arc::clone(&original_start))
+                    {
+                        // This optional Collection association is not part of
+                        // driver admission; retain the failure for its later
+                        // binding and leave the existing search path intact.
+                        original_start.mark_collection_owner_binding_failed(error);
+                    }
+                    let driver_output = Arc::new(DriverOutputEnvelope::new(
+                        original_start.ticket().clone(),
+                        search_authority,
+                        snapshot.rules_position(),
+                        context.root_moves.as_deref(),
+                    )?);
                     self.active = Some(ActiveBinding {
                         ticket: ticket.clone(),
                         control,
                         authority: None,
+                        driver_output: Some(Arc::clone(&driver_output)),
+                        driver_output_until: Some(shutdown_deadline),
+                        driver_start: Some(original_start),
+                        ponder_clock,
                     });
                     let driver = Arc::clone(driver);
                     let events = sender.clone();
@@ -1487,13 +2222,42 @@ impl Owner {
                         let completion =
                             match driver.run(snapshot.rules_position(), &context, &mut progress) {
                                 Ok(report) => {
-                                    match retain_diagnostic(
+                                    // Charge/preserve the actual returned work before deciding
+                                    // whether its final move/proof is publishable.
+                                    let work_retention = retain_diagnostic(
                                         &diagnostics,
                                         WorkerDiagnosticReceipt::DriverWork {
                                             kind: driver.kind(),
-                                            work: report.work,
+                                            work: report.work.clone(),
                                         },
-                                    ) {
+                                    );
+                                    let report = match driver_output.record_retaining(report) {
+                                        Ok(report) => report,
+                                        Err((report, error)) => {
+                                            return finish_worker(
+                                                &events,
+                                                ticket,
+                                                WorkerCompletion::failed(
+                                                    WorkerFailureSource::RejectedDriverReport {
+                                                        error,
+                                                        report,
+                                                        diagnostic_failure: work_retention
+                                                            .err()
+                                                            .map(|failure| {
+                                                                (
+                                                                    failure.error,
+                                                                    Box::new(failure.receipt),
+                                                                )
+                                                            }),
+                                                    },
+                                                ),
+                                                &worker_publication,
+                                                None,
+                                                shutdown_limit,
+                                            );
+                                        }
+                                    };
+                                    match work_retention {
                                         Ok(()) => {
                                             let _ = events.try_send(Event::RejectedInput {
                                                 code: "OwnerWake",
@@ -1559,6 +2323,10 @@ impl Owner {
                     ticket: ticket.clone(),
                     control: control.clone(),
                     authority: Some(authority.clone()),
+                    driver_output: None,
+                    driver_output_until: None,
+                    driver_start: None,
+                    ponder_clock: None,
                 });
                 let profile = factory.profile();
                 let config = rz_search::contracts::ContractSearchConfig {
@@ -1576,6 +2344,24 @@ impl Owner {
                     tree_limits: self.settings.tree,
                 };
                 let factory = Arc::clone(factory);
+                let restricted_root_moves = limits
+                    .searchmoves
+                    .as_ref()
+                    .map(|moves| {
+                        moves
+                            .iter()
+                            .map(|movement| {
+                                let movement = movement.parse::<BoardMove>().map_err(|_| {
+                                    failure(
+                                        contract::ErrorCode::IdentityMismatch,
+                                        "sealed PUCT root move could not be decoded",
+                                    )
+                                })?;
+                                contract::Move::try_from(movement)
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?;
                 let clock = self.clock.clone();
                 let shutdown_limit = self.settings.shutdown_limit;
                 let self_final_move_policy = self.settings.final_move_policy;
@@ -1613,6 +2399,20 @@ impl Owner {
                                 );
                             }
                         };
+                    if let Some(root_moves) = &restricted_root_moves {
+                        if let Err(error) = search.set_root_moves(root_moves) {
+                            return finish_worker(
+                                &events,
+                                ticket,
+                                WorkerCompletion::failed(WorkerFailureSource::SearchConstructor(
+                                    error,
+                                )),
+                                &worker_publication,
+                                Some(runtime.as_mut()),
+                                shutdown_limit,
+                            );
+                        }
+                    }
                     #[cfg(feature = "experimental-batch")]
                     if let Err(error) = search.set_parallelism(factory.parallelism()) {
                         return finish_worker(
@@ -1987,6 +2787,9 @@ fn append_result<S>(out: &mut SessionResult<S>, next: SessionResult<S>) {
     out.accepted &= next.accepted;
 }
 
+// Preserve the exact rejected receipt on bounded retention failure without a
+// new allocation on that failure path.
+#[allow(clippy::result_large_err)]
 fn consume_pump_diagnostic(
     event: &rz_search::contracts::ContractPumpEvent,
     receipts: &Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>,
@@ -2038,6 +2841,9 @@ fn consume_pump_diagnostic(
     retained
 }
 
+// The 32-class owner returns an overflow/poisoned receipt intact; allocating a
+// replacement error must not become a prerequisite for preserving that receipt.
+#[allow(clippy::result_large_err)]
 fn retain_diagnostic(
     receipts: &Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>,
     receipt: WorkerDiagnosticReceipt,
@@ -2083,62 +2889,143 @@ fn retain_diagnostic(
     }
     Ok(())
 }
-/// Independent input, timer, search and physical evaluator owners have bounded
-/// event/worker counts. CPU/mock success does not assert NN/GPU support.
-pub fn serve<O: Write, D: Write>(
+// Shared startup owner; async integration must retain these same fields rather
+// than reconstructing a Session or stopping the timer after a yielded output.
+struct PreparedEngine {
+    owner: Arc<Mutex<Owner>>,
+    session: Session<RulesUciPort>,
     events: Receiver<Event>,
     sender: SyncSender<Event>,
-    protocol: &mut O,
-    diagnostics: &mut D,
+    settings: EngineSettings,
+    timer_stop: Arc<std::sync::atomic::AtomicBool>,
+    timer: JoinHandle<()>,
+    #[cfg(feature = "pals-adaptive")]
+    priority_owner: Option<priority_cancel::PriorityCancelOwner>,
+    #[cfg(feature = "pals-adaptive")]
+    priority_close_owner: Option<priority_close::PriorityCloseOwner>,
+    #[cfg(feature = "pals-adaptive")]
+    dispatch_close_observer: Option<priority_close::PriorityCloseObserver>,
+}
+
+struct PrepareEngineFailure {
+    error: EngineError,
+    process: EngineProcess,
+    events: Receiver<Event>,
+    sender: SyncSender<Event>,
+}
+
+fn prepare_engine(
+    events: Receiver<Event>,
+    sender: SyncSender<Event>,
     process: EngineProcess,
     settings: EngineSettings,
-) -> Result<(), EngineError> {
+) -> Result<PreparedEngine, PrepareEngineFailure> {
+    // No original process fields are moved until every fallible, pre-worker
+    // setup succeeds. On rejection the caller receives the same process and
+    // event endpoints; this does not attest native or output completion.
+    let setup = (|| -> Result<_, EngineError> {
+        if settings.max_workers == 0
+            || settings.shutdown_limit.is_zero()
+            || settings.search.max_simulations == 0
+            || (process.factory.is_some() && settings.search.max_simulations > 4096)
+            || process.factory.is_some() == process.driver.is_some()
+        {
+            return Err(failure(
+                contract::ErrorCode::InvalidInput,
+                "finite workers/drain/work and exactly one search startup required",
+            )
+            .into());
+        }
+        let scope = if let Some(factory) = &process.factory {
+            let profile = factory.profile();
+            crate::contracts::SessionScope::Evaluation(contract::AcceptanceScope {
+                game: contract::GameGeneration(1),
+                root: contract::RootGeneration(0),
+                model: profile.model.handle(),
+                encoding: profile.model.encoding().handle,
+                backend: profile.backend,
+            })
+        } else {
+            crate::contracts::SessionScope::Search(contract::pals::SearchAuthority {
+                epoch: process.clock.epoch(),
+                game: contract::GameGeneration(1),
+                root: contract::RootGeneration(0),
+                implementation: process
+                    .driver
+                    .as_ref()
+                    .expect("validated driver startup")
+                    .implementation(),
+            })
+        };
+        let session_owner = crate::contracts::ContractSessionOwner::new_scope_with_cancel_history(
+            scope,
+            process.clock.epoch(),
+            process.clock.b_clock(),
+            settings.search,
+            settings.max_workers,
+        )?;
+        let goal = process
+            .driver
+            .as_ref()
+            .and_then(|driver| driver.search_goal_capability());
+        let semantics = process.driver.as_ref().map_or(
+            crate::bridge::NodeBudgetSemantics::LegacySimulations,
+            |driver| driver.node_budget_semantics(),
+        );
+        let mut session = Session::new(
+            RulesUciPort::new(Arc::clone(&process.owners), settings.position),
+            process.identity.clone(),
+            vec![OptionSpec {
+                name: "Ponder".into(),
+                kind: OptionKind::Check { default: false },
+            }],
+            settings.parser,
+        )
+        .map_err(EngineError::Session)?;
+        session
+            .set_search_goal_capability(goal)
+            .map_err(EngineError::Session)?;
+        session
+            .set_node_budget_semantics(semantics)
+            .map_err(EngineError::Session)?;
+        Ok((scope, session_owner, session))
+    })();
+    let (scope, session_owner, session) = match setup {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return Err(PrepareEngineFailure {
+                error,
+                process,
+                events,
+                sender,
+            });
+        }
+    };
+    // These Arc/identity copies identify the same pre-worker resources; the
+    // sole priority owner remains unique. They are only used if timer thread
+    // creation fails before any engine work can begin.
+    let recovery_factory = process.factory.clone();
+    let recovery_driver = process.driver.clone();
+    let recovery_owners = Arc::clone(&process.owners);
+    let recovery_clock = process.clock.clone();
+    let recovery_identity = process.identity.clone();
+    let recovery_go_observer = process.go_admission_observer.clone();
     let EngineProcess {
         factory,
         driver,
-        owners,
+        owners: _,
         clock,
-        identity,
+        identity: _,
+        go_admission_observer,
+        #[cfg(feature = "pals-adaptive")]
+        priority_cancel,
+        #[cfg(feature = "pals-adaptive")]
+        priority_close,
     } = process;
-    if settings.max_workers == 0
-        || settings.shutdown_limit.is_zero()
-        || settings.search.max_simulations == 0
-        || (factory.is_some() && settings.search.max_simulations > 4096)
-        || factory.is_some() == driver.is_some()
-    {
-        return Err(failure(
-            contract::ErrorCode::InvalidInput,
-            "finite workers/drain/work and exactly one search startup required",
-        )
-        .into());
-    }
-    let scope = if let Some(factory) = &factory {
-        let profile = factory.profile();
-        crate::contracts::SessionScope::Evaluation(contract::AcceptanceScope {
-            game: contract::GameGeneration(1),
-            root: contract::RootGeneration(0),
-            model: profile.model.handle(),
-            encoding: profile.model.encoding().handle,
-            backend: profile.backend,
-        })
-    } else {
-        crate::contracts::SessionScope::Search(contract::pals::SearchAuthority {
-            epoch: clock.epoch(),
-            game: contract::GameGeneration(1),
-            root: contract::RootGeneration(0),
-            implementation: driver
-                .as_ref()
-                .expect("validated driver startup")
-                .implementation(),
-        })
-    };
-    let session_owner = crate::contracts::ContractSessionOwner::new_scope_with_cancel_history(
-        scope,
-        clock.epoch(),
-        clock.b_clock(),
-        settings.search,
-        settings.max_workers,
-    )?;
+    #[cfg(feature = "pals-adaptive")]
+    let _priority_owner = priority_cancel;
+    #[cfg(feature = "pals-adaptive")]
+    let _priority_close_owner = priority_close;
     let owner = Arc::new(Mutex::new(Owner {
         session_owner,
         active: None,
@@ -2155,28 +3042,43 @@ pub fn serve<O: Write, D: Write>(
         ponder: None,
         held_ponder_bestmove: None,
         admitted_ponder_report: None,
+        pending_original_go: None,
         pending_close: None,
         fence_failure: None,
         diagnostics: Arc::new(Mutex::new(Vec::new())),
+        go_admission_observer,
+        go_sequence: 0,
     }));
-    let mut session = Session::new(
-        RulesUciPort::new(owners, settings.position),
-        identity,
-        vec![OptionSpec {
-            name: "Ponder".into(),
-            kind: OptionKind::Check { default: false },
-        }],
-        settings.parser,
-    )
-    .map_err(EngineError::Session)?;
     let timer_owner = Arc::clone(&owner);
     let timer_events = sender.clone();
     let timer_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let timer_flag = Arc::clone(&timer_stop);
-    let timer = thread::spawn(move || {
+    #[cfg(feature = "pals-adaptive")]
+    let priority_observer = _priority_owner.as_ref().map(|owner| owner.observer());
+    #[cfg(feature = "pals-adaptive")]
+    let close_observer = _priority_close_owner.as_ref().map(|owner| owner.observer());
+    #[cfg(feature = "pals-adaptive")]
+    let dispatch_close_observer = close_observer.clone();
+    let timer = thread::Builder::new().spawn(move || {
         let mut delivered = None;
         while !timer_flag.load(Ordering::Acquire) {
             if let Ok(owner) = timer_owner.lock() {
+                #[cfg(feature = "pals-adaptive")]
+                if let Some(priority) = &priority_observer {
+                    priority.apply(&owner);
+                }
+                #[cfg(feature = "pals-adaptive")]
+                if let Some(close) = &close_observer {
+                    if close.apply_under_owner_lock(&owner) {
+                        // A sleeping event consumer can re-check its own
+                        // close policy. A full queue already has events; no
+                        // wake is an ACK or permission to drop output.
+                        let _ = timer_events.try_send(Event::RejectedInput {
+                            code: "OwnerWake",
+                            message: String::new(),
+                        });
+                    }
+                }
                 if owner.pending_bestmove.as_ref().is_some_and(|pending| {
                     Instant::now() >= pending.until || owner.workers.iter().any(Worker::is_finished)
                 }) {
@@ -2192,10 +3094,84 @@ pub fn serve<O: Write, D: Write>(
                 {
                     delivered = Some(ticket);
                 }
+            } else {
+                #[cfg(feature = "pals-adaptive")]
+                if let Some(priority) = &priority_observer {
+                    priority.owner_poisoned();
+                }
+                #[cfg(feature = "pals-adaptive")]
+                if let Some(close) = &close_observer {
+                    close.owner_poisoned();
+                }
             }
             thread::sleep(Duration::from_millis(1));
         }
     });
+    let timer = match timer {
+        Ok(timer) => timer,
+        Err(error) => {
+            let process = EngineProcess {
+                factory: recovery_factory,
+                driver: recovery_driver,
+                owners: recovery_owners,
+                clock: recovery_clock,
+                identity: recovery_identity,
+                go_admission_observer: recovery_go_observer,
+                #[cfg(feature = "pals-adaptive")]
+                priority_cancel: _priority_owner,
+                #[cfg(feature = "pals-adaptive")]
+                priority_close: _priority_close_owner,
+            };
+            return Err(PrepareEngineFailure {
+                error: EngineError::TimerSpawn(error),
+                process,
+                events,
+                sender,
+            });
+        }
+    };
+    Ok(PreparedEngine {
+        owner,
+        session,
+        events,
+        sender,
+        settings,
+        timer_stop,
+        timer,
+        #[cfg(feature = "pals-adaptive")]
+        priority_owner: _priority_owner,
+        #[cfg(feature = "pals-adaptive")]
+        priority_close_owner: _priority_close_owner,
+        #[cfg(feature = "pals-adaptive")]
+        dispatch_close_observer,
+    })
+}
+
+/// Independent input, timer, search and physical evaluator owners have bounded
+/// event/worker counts. CPU/mock success does not assert NN/GPU support.
+pub fn serve<O: Write, D: Write>(
+    events: Receiver<Event>,
+    sender: SyncSender<Event>,
+    protocol: &mut O,
+    diagnostics: &mut D,
+    process: EngineProcess,
+    settings: EngineSettings,
+) -> Result<(), EngineError> {
+    let PreparedEngine {
+        owner,
+        mut session,
+        events,
+        sender,
+        settings,
+        timer_stop,
+        timer,
+        #[cfg(feature = "pals-adaptive")]
+            priority_owner: _priority_owner,
+        #[cfg(feature = "pals-adaptive")]
+            priority_close_owner: _priority_close_owner,
+        #[cfg(feature = "pals-adaptive")]
+        dispatch_close_observer,
+    } = prepare_engine(events, sender, process, settings).map_err(|failure| failure.error)?;
     let handler_owner = Arc::clone(&owner);
     let dispatch_owner = Arc::clone(&owner);
     let result = serve_events_with_handler(
@@ -2210,10 +3186,22 @@ pub fn serve<O: Write, D: Write>(
                 .handle(session, event)
         },
         move |effect| {
-            dispatch_owner
+            let mut owner = dispatch_owner
                 .lock()
-                .map_err(|_| failure(contract::ErrorCode::BackendFailure, "UCI owner poisoned"))?
-                .dispatch(effect, &sender)
+                .map_err(|_| failure(contract::ErrorCode::BackendFailure, "UCI owner poisoned"))?;
+            #[cfg(feature = "pals-adaptive")]
+            if matches!(&effect, Effect::Start { .. })
+                && dispatch_close_observer
+                    .as_ref()
+                    .is_some_and(|close| close.closed_under_owner_lock())
+            {
+                return Err(failure(
+                    contract::ErrorCode::Canceled,
+                    "priority admission is closed",
+                )
+                .into());
+            }
+            owner.dispatch(effect, &sender)
         },
     );
     timer_stop.store(true, Ordering::Release);
@@ -2225,7 +3213,8 @@ pub fn serve<O: Write, D: Write>(
     if timer.join().is_err() {
         cleanup.push(EngineError::WorkerPanic);
     }
-    if let Some(until) = Instant::now().checked_add(settings.shutdown_limit) {
+    let cleanup_deadline = Instant::now().checked_add(settings.shutdown_limit);
+    if let Some(until) = cleanup_deadline {
         loop {
             let mut owner = match owner.lock() {
                 Ok(owner) => owner,
@@ -2259,8 +3248,12 @@ pub fn serve<O: Write, D: Write>(
             .into(),
         );
     }
+    let mut joined_driver = None;
     match owner.lock() {
         Ok(mut owner) => {
+            if owner.workers.is_empty() {
+                joined_driver = owner.driver.clone();
+            }
             if let Some(error) = owner.fence_failure.take() {
                 cleanup.push(error);
             }
@@ -2283,6 +3276,23 @@ pub fn serve<O: Write, D: Write>(
         }
         Err(_) => {
             cleanup.push(failure(contract::ErrorCode::BackendFailure, "UCI owner poisoned").into())
+        }
+    }
+    // The search thread is joined before its persistent model/search owners
+    // close. Keep the same cleanup deadline; expiry grants no fresh window.
+    // No hook means no additional lifecycle observation for legacy drivers.
+    if let (Some(driver), Some(until)) = (joined_driver, cleanup_deadline) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            driver.finish_session(until)
+        })) {
+            Ok(Ok(Some(crate::search_driver::DriverPhysicalCompletion::Unknown))) => {
+                cleanup.push(EngineError::SearchDriverClose(
+                    crate::search_driver::SearchSessionFailure::physical_completion_unknown(),
+                ));
+            }
+            Ok(Err(error)) => cleanup.push(EngineError::SearchDriverClose(error)),
+            Err(_) => cleanup.push(EngineError::WorkerPanic),
+            Ok(Ok(_)) => {}
         }
     }
     finish_errors(primary, cleanup)
@@ -2312,6 +3322,576 @@ pub fn event_channel() -> (SyncSender<Event>, Receiver<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_clock_rejects_actual_instants_before_origin_even_for_tiny_deltas() {
+        let clock = ProcessClock::new(contract::ProcessEpoch(8123));
+        for delta in [Duration::from_nanos(1), Duration::from_millis(1)] {
+            let before = clock.origin.checked_sub(delta).unwrap();
+            assert!(before < clock.origin);
+            assert_eq!(
+                clock.tick_at(before).unwrap_err().code,
+                contract::ErrorCode::InvalidInput
+            );
+            assert_eq!(
+                clock.deadline(before).unwrap_err().code,
+                contract::ErrorCode::InvalidInput
+            );
+        }
+        assert_eq!(
+            clock.tick_at(clock.origin).unwrap(),
+            contract::MonotonicTick(0)
+        );
+    }
+
+    struct CloseObservedDriver {
+        state: crate::search_driver::DriverPhysicalCompletion,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::search_driver::SearchSessionDriver for CloseObservedDriver {
+        fn kind(&self) -> crate::search_driver::SearchKind {
+            crate::search_driver::SearchKind::Cpu
+        }
+        fn implementation(&self) -> contract::Digest {
+            contract::Digest([77; 32])
+        }
+        fn identity(&self) -> EngineIdentity {
+            EngineIdentity {
+                name: "persistent owner close fixture".into(),
+                author: "test".into(),
+            }
+        }
+        fn finish_session(
+            &self,
+            _: Instant,
+        ) -> Result<
+            Option<crate::search_driver::DriverPhysicalCompletion>,
+            crate::search_driver::SearchSessionFailure,
+        > {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Ok(Some(self.state))
+        }
+        fn run(
+            &self,
+            _: &Position,
+            _: &crate::search_driver::SearchSessionContext,
+            _: &mut dyn FnMut(BoardMove),
+        ) -> Result<
+            crate::search_driver::SearchSessionReport,
+            crate::search_driver::SearchSessionFailure,
+        > {
+            unreachable!("quit without go must not invoke a search")
+        }
+    }
+
+    #[cfg(feature = "pals-adaptive")]
+    #[test]
+    fn priority_cancel_closes_if_original_process_is_dropped_before_serve() {
+        let mut process = EngineProcess::with_search_driver(
+            Arc::new(CloseObservedDriver {
+                state: crate::search_driver::DriverPhysicalCompletion::Confirmed,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            Arc::new(OwnerRegistry::default()),
+            ProcessClock::new(contract::ProcessEpoch(81)),
+        );
+        let control = process.install_priority_cancel().unwrap();
+        assert!(process.install_priority_cancel().is_err());
+        assert!(process.install_priority_close().is_err());
+        drop(process);
+        assert!(control.observe().owner_closed);
+        assert_eq!(control.request(), PriorityCancelRequest::OwnerClosed);
+        assert_eq!(control.observe().acknowledgment, None);
+        assert!(!control.observe().physical_completion_observed);
+    }
+
+    #[cfg(feature = "pals-adaptive")]
+    #[test]
+    fn priority_close_prevents_queued_start_after_owner_ack() {
+        use std::io;
+        use std::sync::mpsc;
+
+        struct BlockFirstWrite {
+            entered: Option<mpsc::SyncSender<()>>,
+            release: mpsc::Receiver<()>,
+        }
+        impl io::Write for BlockFirstWrite {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                    self.release
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "fixture release"))?;
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        struct CountStarts(Arc<std::sync::atomic::AtomicUsize>);
+        impl crate::search_driver::SearchSessionDriver for CountStarts {
+            fn kind(&self) -> crate::search_driver::SearchKind {
+                crate::search_driver::SearchKind::Cpu
+            }
+            fn implementation(&self) -> contract::Digest {
+                contract::Digest([14; 32])
+            }
+            fn identity(&self) -> EngineIdentity {
+                EngineIdentity {
+                    name: "close fixture".into(),
+                    author: "test".into(),
+                }
+            }
+            fn run(
+                &self,
+                _: &Position,
+                _: &crate::search_driver::SearchSessionContext,
+                _: &mut dyn FnMut(BoardMove),
+            ) -> Result<
+                crate::search_driver::SearchSessionReport,
+                crate::search_driver::SearchSessionFailure,
+            > {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                Err(crate::search_driver::SearchSessionFailure {
+                    physical_completion: crate::search_driver::DriverPhysicalCompletion::Confirmed,
+                    code: "UnexpectedStartFixture",
+                    detail: "fixture started".into(),
+                })
+            }
+        }
+
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut process = EngineProcess::with_search_driver(
+            Arc::new(CountStarts(Arc::clone(&starts))),
+            Arc::new(OwnerRegistry::default()),
+            ProcessClock::new(contract::ProcessEpoch(84)),
+        );
+        let close = process.install_priority_close().unwrap();
+        assert!(process.install_priority_cancel().is_err());
+        let (sender, events) = mpsc::sync_channel(4);
+        let child_sender = sender.clone();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let child = thread::spawn(move || {
+            let mut output = BlockFirstWrite {
+                entered: Some(entered_tx),
+                release: release_rx,
+            };
+            serve(
+                events,
+                child_sender,
+                &mut output,
+                &mut Vec::new(),
+                process,
+                EngineSettings::default(),
+            )
+        });
+        sender.send(Event::Line("uci".into())).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        sender.send(Event::Line("go infinite".into())).unwrap();
+        assert_eq!(close.request(), PriorityCancelRequest::Recorded);
+        let until = Instant::now() + Duration::from_secs(3);
+        while close.observe().cancel_acknowledgment.is_none() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let observed = close.observe();
+        let _ = release_tx.send(());
+        let finish_until = Instant::now() + Duration::from_secs(5);
+        while !child.is_finished() && Instant::now() < finish_until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(observed.admission_closed);
+        assert_eq!(
+            observed.cancel_acknowledgment,
+            Some(PriorityCancelAcknowledgment::NoActiveSearch)
+        );
+        assert!(!observed.physical_completion_observed);
+        assert!(child.is_finished(), "fixture service did not terminate");
+        assert!(child.join().unwrap().is_err());
+        assert_eq!(starts.load(Ordering::Acquire), 0);
+        assert!(close.observe().owner_closed);
+    }
+
+    #[cfg(feature = "pals-adaptive")]
+    #[test]
+    fn priority_close_waits_for_original_start_lock_then_cancels_that_search() {
+        use std::sync::mpsc;
+
+        struct LockedStart {
+            entered: mpsc::SyncSender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            canceled: mpsc::SyncSender<()>,
+        }
+        impl crate::search_driver::SearchSessionDriver for LockedStart {
+            fn kind(&self) -> crate::search_driver::SearchKind {
+                crate::search_driver::SearchKind::Cpu
+            }
+            fn implementation(&self) -> contract::Digest {
+                contract::Digest([15; 32])
+            }
+            fn identity(&self) -> EngineIdentity {
+                EngineIdentity {
+                    name: "start race fixture".into(),
+                    author: "test".into(),
+                }
+            }
+            fn supports_ponder_clock(&self) -> bool {
+                let _ = self.entered.send(());
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+                false
+            }
+            fn run(
+                &self,
+                _: &Position,
+                context: &crate::search_driver::SearchSessionContext,
+                _: &mut dyn FnMut(BoardMove),
+            ) -> Result<
+                crate::search_driver::SearchSessionReport,
+                crate::search_driver::SearchSessionFailure,
+            > {
+                let until = Instant::now() + Duration::from_secs(5);
+                while !context.control.cancellation.load(Ordering::Acquire)
+                    && Instant::now() < until
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                if context.control.cancellation.load(Ordering::Acquire) {
+                    let _ = self.canceled.send(());
+                }
+                Err(crate::search_driver::SearchSessionFailure {
+                    physical_completion: crate::search_driver::DriverPhysicalCompletion::Confirmed,
+                    code: "CloseRaceFixture",
+                    detail: "fixture ended".into(),
+                })
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (canceled_tx, canceled_rx) = mpsc::sync_channel(1);
+        let mut process = EngineProcess::with_search_driver(
+            Arc::new(LockedStart {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                canceled: canceled_tx,
+            }),
+            Arc::new(OwnerRegistry::default()),
+            ProcessClock::new(contract::ProcessEpoch(85)),
+        );
+        let close = process.install_priority_close().unwrap();
+        let (sender, events) = event_channel();
+        let child_sender = sender.clone();
+        let child = thread::spawn(move || {
+            serve(
+                events,
+                child_sender,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                process,
+                EngineSettings::default(),
+            )
+        });
+        sender.send(Event::Line("go infinite".into())).unwrap();
+        let entered = entered_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+        if entered {
+            let _ = close.request();
+        }
+        let before_release = close.observe();
+        let _ = release_tx.send(());
+        let canceled = canceled_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+        let ack_until = Instant::now() + Duration::from_secs(3);
+        while close.observe().cancel_acknowledgment.is_none() && Instant::now() < ack_until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let after = close.observe();
+        let _ = sender.try_send(Event::Line("quit".into()));
+        let until = Instant::now() + Duration::from_secs(5);
+        while !child.is_finished() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            entered && canceled,
+            "fixture did not start and observe cancellation"
+        );
+        assert!(
+            !before_release.admission_closed,
+            "close cannot pass the held Owner lock"
+        );
+        assert!(after.admission_closed);
+        assert_eq!(
+            after.cancel_acknowledgment,
+            Some(PriorityCancelAcknowledgment::ActiveSearch)
+        );
+        assert!(!after.physical_completion_observed);
+        assert!(child.is_finished(), "fixture service did not terminate");
+        let _ = child.join().unwrap();
+    }
+
+    #[cfg(feature = "pals-adaptive")]
+    #[test]
+    fn priority_cancel_is_observed_while_uci_queue_and_output_are_blocked() {
+        use std::io;
+        use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
+
+        struct BlockFirstWrite {
+            entered: Option<mpsc::SyncSender<()>>,
+            release: mpsc::Receiver<()>,
+        }
+        impl io::Write for BlockFirstWrite {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                    match self.release.recv_timeout(Duration::from_secs(5)) {
+                        Ok(()) => {}
+                        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                            return Err(io::Error::new(io::ErrorKind::TimedOut, "fixture release"));
+                        }
+                    }
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut process = EngineProcess::with_search_driver(
+            Arc::new(CloseObservedDriver {
+                state: crate::search_driver::DriverPhysicalCompletion::Confirmed,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            Arc::new(OwnerRegistry::default()),
+            ProcessClock::new(contract::ProcessEpoch(82)),
+        );
+        let control = process.install_priority_cancel().unwrap();
+        // This fixture owns its queue capacity; it does not pin the engine's
+        // production queue size as a performance or compatibility constant.
+        let capacity = 4;
+        let (sender, events) = mpsc::sync_channel(capacity);
+        let child_sender = sender.clone();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let child = thread::spawn(move || {
+            let mut output = BlockFirstWrite {
+                entered: Some(entered_tx),
+                release: release_rx,
+            };
+            serve(
+                events,
+                child_sender,
+                &mut output,
+                &mut Vec::new(),
+                process,
+                EngineSettings::default(),
+            )
+        });
+        sender.send(Event::Line("uci".into())).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut saturated = false;
+        for _ in 0..=capacity {
+            match sender.try_send(Event::RejectedInput {
+                code: "OwnerWake",
+                message: String::new(),
+            }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    saturated = true;
+                    break;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    panic!("fixture service ended before queue saturation")
+                }
+            }
+        }
+        if !saturated {
+            let _ = release_tx.send(());
+            panic!("fixture queue did not reach capacity");
+        }
+        assert_eq!(control.request(), PriorityCancelRequest::Recorded);
+        assert_eq!(control.request(), PriorityCancelRequest::AlreadyRecorded);
+        let until = Instant::now() + Duration::from_secs(3);
+        while control.observe().acknowledgment.is_none() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let observation = control.observe();
+        // Always release the test writer before asserting so no test worker is stranded.
+        let _ = release_tx.send(());
+        let mut quit = Event::Line("quit".into());
+        let quit_until = Instant::now() + Duration::from_secs(3);
+        let mut quit_sent = false;
+        while Instant::now() < quit_until {
+            match sender.try_send(quit) {
+                Ok(()) => {
+                    quit_sent = true;
+                    break;
+                }
+                Err(TrySendError::Full(event)) => {
+                    quit = event;
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+        }
+        assert_eq!(
+            observation.acknowledgment,
+            Some(PriorityCancelAcknowledgment::NoActiveSearch)
+        );
+        assert!(!observation.physical_completion_observed);
+        assert!(quit_sent, "fixture quit was not enqueued");
+        while !child.is_finished() && Instant::now() < quit_until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(child.is_finished(), "fixture service did not terminate");
+        assert!(child.join().unwrap().is_ok());
+        assert!(control.observe().owner_closed);
+    }
+
+    #[cfg(feature = "pals-adaptive")]
+    #[test]
+    fn priority_cancel_reaches_original_active_search_without_claiming_drain() {
+        use std::sync::mpsc;
+
+        struct WaitingDriver {
+            started: mpsc::SyncSender<()>,
+            canceled: mpsc::SyncSender<()>,
+        }
+        impl crate::search_driver::SearchSessionDriver for WaitingDriver {
+            fn kind(&self) -> crate::search_driver::SearchKind {
+                crate::search_driver::SearchKind::Cpu
+            }
+            fn implementation(&self) -> contract::Digest {
+                contract::Digest([13; 32])
+            }
+            fn identity(&self) -> EngineIdentity {
+                EngineIdentity {
+                    name: "cancel fixture".into(),
+                    author: "test".into(),
+                }
+            }
+            fn run(
+                &self,
+                _: &Position,
+                context: &crate::search_driver::SearchSessionContext,
+                _: &mut dyn FnMut(BoardMove),
+            ) -> Result<
+                crate::search_driver::SearchSessionReport,
+                crate::search_driver::SearchSessionFailure,
+            > {
+                let _ = self.started.send(());
+                let until = Instant::now() + Duration::from_secs(5);
+                while !context.control.cancellation.load(Ordering::Acquire)
+                    && Instant::now() < until
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                if context.control.cancellation.load(Ordering::Acquire) {
+                    let _ = self.canceled.send(());
+                }
+                Err(crate::search_driver::SearchSessionFailure {
+                    physical_completion: crate::search_driver::DriverPhysicalCompletion::Confirmed,
+                    code: "CpuCancelFixture",
+                    detail: "fixture ended".into(),
+                })
+            }
+        }
+
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (canceled_tx, canceled_rx) = mpsc::sync_channel(1);
+        let mut process = EngineProcess::with_search_driver(
+            Arc::new(WaitingDriver {
+                started: started_tx,
+                canceled: canceled_tx,
+            }),
+            Arc::new(OwnerRegistry::default()),
+            ProcessClock::new(contract::ProcessEpoch(83)),
+        );
+        let control = process.install_priority_cancel().unwrap();
+        let (sender, events) = event_channel();
+        let child_sender = sender.clone();
+        let child = thread::spawn(move || {
+            serve(
+                events,
+                child_sender,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                process,
+                EngineSettings::default(),
+            )
+        });
+        sender.send(Event::Line("go infinite".into())).unwrap();
+        let started = started_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+        if started {
+            let _ = control.request();
+        }
+        let canceled = canceled_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+        let ack_until = Instant::now() + Duration::from_secs(3);
+        while control.observe().acknowledgment.is_none() && Instant::now() < ack_until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let observation = control.observe();
+        let _ = sender.try_send(Event::Line("quit".into()));
+        let until = Instant::now() + Duration::from_secs(5);
+        while !child.is_finished() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            started && canceled,
+            "fixture search did not observe cancellation"
+        );
+        assert_eq!(
+            observation.acknowledgment,
+            Some(PriorityCancelAcknowledgment::ActiveSearch)
+        );
+        assert!(!observation.physical_completion_observed);
+        assert!(child.is_finished(), "fixture service did not terminate");
+        let _ = child.join().unwrap(); // The CPU fixture deliberately returns an error.
+        assert!(control.observe().owner_closed);
+    }
+
+    #[test]
+    fn persistent_driver_close_runs_once_and_unknown_prevents_success() {
+        use crate::search_driver::DriverPhysicalCompletion::{Confirmed, Unknown};
+        for state in [Confirmed, Unknown] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let process = EngineProcess::with_search_driver(
+                Arc::new(CloseObservedDriver {
+                    state,
+                    calls: Arc::clone(&calls),
+                }),
+                Arc::new(OwnerRegistry::default()),
+                ProcessClock::new(contract::ProcessEpoch(78)),
+            );
+            let (sender, events) = event_channel();
+            sender.send(Event::Line("quit".into())).unwrap();
+            let mut protocol = Vec::new();
+            let mut diagnostics = Vec::new();
+            let result = serve(
+                events,
+                sender,
+                &mut protocol,
+                &mut diagnostics,
+                process,
+                EngineSettings::default(),
+            );
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+            if state == Confirmed {
+                result.unwrap();
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("PhysicalCompletionUnknown")
+                );
+            }
+            assert!(!String::from_utf8(protocol).unwrap().contains("bestmove "));
+        }
+    }
 
     struct UnknownPhysicalDriver;
     impl crate::search_driver::SearchSessionDriver for UnknownPhysicalDriver {
@@ -2794,9 +4374,12 @@ mod tests {
             ponder: None,
             held_ponder_bestmove: None,
             admitted_ponder_report: None,
+            pending_original_go: None,
             pending_close: None,
             fence_failure: None,
             diagnostics: Arc::new(Mutex::new(Vec::new())),
+            go_admission_observer: None,
+            go_sequence: 0,
         };
         let session = Session::new(
             RulesUciPort::new(owners, settings.position),
@@ -2826,6 +4409,147 @@ mod tests {
             )
             .unwrap();
         (owner, session)
+    }
+
+    #[test]
+    fn driver_preadmission_rejection_preserves_the_active_ticket_and_control() {
+        struct RejectGo;
+        impl crate::search_driver::SearchSessionDriver for RejectGo {
+            fn kind(&self) -> crate::search_driver::SearchKind {
+                crate::search_driver::SearchKind::Rovent
+            }
+            fn implementation(&self) -> contract::Digest {
+                contract::Digest([31; 32])
+            }
+            fn identity(&self) -> EngineIdentity {
+                EngineIdentity {
+                    name: "pure rejection fixture".into(),
+                    author: "test".into(),
+                }
+            }
+            fn validate_go(
+                &self,
+                _: &Position,
+                _: &crate::parser::GoLimits,
+            ) -> Result<(), contract::ContractError> {
+                Err(contract::ContractError::new(
+                    contract::ErrorCode::InvalidInput,
+                    contract::Stage::Admission,
+                    "exact workload differs",
+                ))
+            }
+            fn run(
+                &self,
+                _: &Position,
+                _: &crate::search_driver::SearchSessionContext,
+                _: &mut dyn FnMut(BoardMove),
+            ) -> Result<
+                crate::search_driver::SearchSessionReport,
+                crate::search_driver::SearchSessionFailure,
+            > {
+                panic!("pure rejected go cannot dispatch a worker")
+            }
+        }
+        let (mut owner, mut session) = fixture();
+        assert!(
+            owner
+                .handle(&mut session, Event::Line("go infinite".into()))
+                .accepted
+        );
+        let ticket = session.active_ticket().unwrap();
+        let scope = owner.session_owner.lifecycle_scope();
+        let control = owner.session_owner.control().unwrap().clone();
+        owner.driver = Some(Arc::new(RejectGo));
+        let (observer, events) = GoAdmissionObserver::channel();
+        owner.go_admission_observer = Some(observer.clone());
+        let rejected = owner.handle(&mut session, Event::Line("go nodes 7".into()));
+        assert!(!rejected.accepted);
+        assert!(rejected.effects.is_empty() && rejected.protocol.is_empty());
+        assert!(
+            rejected
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "DriverGoRejected"
+                    && d.message.contains("exact workload differs"))
+        );
+        assert_eq!(session.active_ticket(), Some(ticket.clone()));
+        assert_eq!(owner.session_owner.lifecycle_scope(), scope);
+        assert!(!control.cancellation.load(Ordering::Acquire));
+        assert_eq!(
+            events.try_recv().unwrap(),
+            GoAdmissionRejection {
+                go_sequence: 1,
+                epoch: owner.clock.epoch(),
+                game: scope.game(),
+                root: scope.root(),
+                prior_search: PriorSearchObservation::SearchDrainOrFailurePending,
+                stage: contract::Stage::Admission,
+                code: contract::ErrorCode::InvalidInput,
+            }
+        );
+        assert_eq!(observer.missed(), 0);
+        let another = owner.handle(&mut session, Event::Line("go nodes 8".into()));
+        assert!(!another.accepted);
+        assert_eq!(events.try_recv().unwrap().go_sequence, 2);
+        // A closed observer cannot alter command acceptance or the old search.
+        drop(events);
+        let rejected_again = owner.handle(&mut session, Event::Line("go nodes 7".into()));
+        assert!(!rejected_again.accepted);
+        assert_eq!(observer.missed(), 1);
+        assert_eq!(session.active_ticket(), Some(ticket));
+        assert!(!control.cancellation.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn go_admission_observer_is_bounded_and_nonblocking_when_full() {
+        let (observer, events) = GoAdmissionObserver::channel();
+        let rejection = contract::ContractError::new(
+            contract::ErrorCode::InvalidInput,
+            contract::Stage::Admission,
+            "test failure",
+        );
+        let (owner, _) = fixture();
+        for sequence in 1..=16 {
+            observer.rejected(
+                sequence,
+                owner.session_owner.lifecycle_scope(),
+                owner.clock.epoch(),
+                PriorSearchObservation::NoOwnerSearchOrDrainObserved,
+                rejection,
+            );
+        }
+        assert!(observer.missed() > 0);
+        let received: Vec<_> = events.try_iter().collect();
+        assert!(!received.is_empty());
+        assert!(
+            received
+                .windows(2)
+                .all(|pair| pair[0].go_sequence < pair[1].go_sequence)
+        );
+    }
+
+    #[test]
+    fn observer_unwind_is_counted_without_escaping() {
+        struct PanickingSink;
+        impl GoAdmissionSink for PanickingSink {
+            fn try_publish(&self, _: GoAdmissionRejection) -> bool {
+                panic!("observer failure")
+            }
+        }
+        let observer = GoAdmissionObserver::from_sink(Arc::new(PanickingSink));
+        let (owner, _) = fixture();
+        observer.rejected(
+            1,
+            owner.session_owner.lifecycle_scope(),
+            owner.clock.epoch(),
+            PriorSearchObservation::NoOwnerSearchOrDrainObserved,
+            contract::ContractError::new(
+                contract::ErrorCode::InvalidInput,
+                contract::Stage::Admission,
+                "test rejection",
+            ),
+        );
+        assert_eq!(observer.missed(), 1);
     }
 
     fn assert_canceled_result_ignored(out: &SessionResult<RulesSearchPosition>) {
@@ -3038,6 +4762,10 @@ mod tests {
             ticket: ticket.clone(),
             control: control.clone(),
             authority: None,
+            driver_output: None,
+            driver_output_until: None,
+            driver_start: None,
+            ponder_clock: None,
         });
         assert_eq!(
             owner.deadline_ticket(None, control.deadline),
@@ -4329,6 +6057,77 @@ mod tests {
         assert!(owner.session_owner.control().unwrap().deadline > Instant::now());
     }
 
+    #[test]
+    fn ponder_normalization_preserves_root_restriction_and_registered_goals() {
+        let (mut owner, mut session) = fixture();
+        session
+            .set_search_goal_capability(std::num::NonZeroU16::new(8))
+            .unwrap();
+        owner.handle(
+            &mut session,
+            Event::Line("setoption name Ponder value true".into()),
+        );
+        let started = owner.handle(
+            &mut session,
+            Event::Line(
+                "go ponder wtime 1000 btime 2000 winc 1 binc 2 movestogo 8 nodes 1 depth 6 mate 3 searchmoves e2e4".into(),
+            ),
+        );
+        assert!(started.accepted, "{:?}", started.diagnostics);
+        let [Effect::Start { limits, .. }] = started.effects.as_slice() else {
+            panic!(
+                "expected one constrained ponder start: {:?}",
+                started.effects
+            );
+        };
+        assert_eq!(limits.searchmoves, Some(vec!["e2e4".into()]));
+        assert_eq!(limits.depth_plies, std::num::NonZeroU16::new(6));
+        assert_eq!(limits.mate_moves, std::num::NonZeroU16::new(3));
+        assert_eq!(limits.nodes, Some(1));
+        assert!(limits.infinite && !limits.ponder);
+        assert_eq!(limits.white_time_ms, None);
+        assert_eq!(limits.black_time_ms, None);
+        assert_eq!(limits.white_increment_ms, None);
+        assert_eq!(limits.black_increment_ms, None);
+        assert_eq!(limits.moves_to_go, None);
+        let (original_ticket, original_go) = owner.pending_original_go.as_ref().unwrap();
+        let Effect::Start { ticket, .. } = &started.effects[0] else {
+            unreachable!();
+        };
+        assert_eq!(original_ticket, ticket);
+        assert!(original_go.ponder && !original_go.infinite);
+        assert_eq!(original_go.white_time_ms, Some(1000));
+        assert_eq!(original_go.black_time_ms, Some(2000));
+        assert_eq!(original_go.white_increment_ms, Some(1));
+        assert_eq!(original_go.black_increment_ms, Some(2));
+        assert_eq!(original_go.moves_to_go, Some(8));
+        assert_eq!(
+            owner.session_owner.active_binding().unwrap().goal(),
+            contract::rovent::SearchGoal {
+                depth_plies: std::num::NonZeroU16::new(6),
+                mate_moves: std::num::NonZeroU16::new(3),
+            }
+        );
+        let stopped = owner.handle(&mut session, Event::Line("stop".into()));
+        let [line] = stopped.protocol.as_slice() else {
+            panic!("expected one constrained bestmove: {:?}", stopped.protocol);
+        };
+        let fields: Vec<_> = line.split_ascii_whitespace().collect();
+        let ["bestmove", "e2e4", "ponder", prediction] = fields.as_slice() else {
+            panic!("enabled Ponder must retain the restricted root move: {line}");
+        };
+        // searchmoves restricts this root's move, not the opponent's reply.
+        let mut child = Position::startpos();
+        child
+            .make_move(BoardMove::from_uci("e2e4").unwrap())
+            .unwrap();
+        assert!(
+            child
+                .legal_moves()
+                .contains(&BoardMove::from_uci(prediction).unwrap())
+        );
+    }
+
     type DriverOutputAcks = Arc<Mutex<Vec<(contract::pals::SearchAuthority, String, bool)>>>;
 
     struct DriverOutputProbe {
@@ -4377,7 +6176,7 @@ mod tests {
         }
     }
 
-    fn search_driver_output_fixture(
+    pub(super) fn search_driver_output_fixture(
         pals: bool,
     ) -> (Owner, Session<RulesUciPort>, DriverOutputAcks) {
         let (mut owner, session) = fixture();
@@ -4429,7 +6228,7 @@ mod tests {
         (owner, session, acknowledgments)
     }
 
-    fn completed_driver_search(
+    pub(super) fn completed_driver_search(
         owner: &mut Owner,
         session: &mut Session<RulesUciPort>,
         ponder: bool,
@@ -4644,6 +6443,10 @@ mod tests {
                 ticket: ticket.clone(),
                 control: owner.session_owner.control().unwrap().clone(),
                 authority: None,
+                driver_output: None,
+                driver_output_until: None,
+                driver_start: None,
+                ponder_clock: None,
             });
             owner.handle(
                 &mut session,

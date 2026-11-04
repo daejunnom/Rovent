@@ -30,6 +30,9 @@ mod legacy_descriptor;
 mod selected_view_tests;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub mod startup_legacy;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+#[path = "pals_native/startup_system_v6.rs"]
+pub(crate) mod startup_system_v6;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 #[path = "pals_native/startup_virtual.rs"]
 pub mod startup_virtual;

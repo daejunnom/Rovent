@@ -603,8 +603,8 @@ class PinnedSnapshotTests(SourceOnlyTests):
                             writer.write(b"567890")
                     return self.stream.read(size)
 
-            def growing_fdopen(descriptor, mode):
-                return GrowingStream(original_fdopen(descriptor, mode))
+            def growing_fdopen(descriptor, mode, *args, **kwargs):
+                return GrowingStream(original_fdopen(descriptor, mode, *args, **kwargs))
 
             sink = mock.Mock()
             sink.write = writes

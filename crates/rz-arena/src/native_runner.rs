@@ -8,11 +8,13 @@ use crate::{
     ProcessOutput, ProcessReceipt,
 };
 use serde::Serialize;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::{
     fmt,
     sync::{
         Mutex, TryLockError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -34,6 +36,39 @@ fn clamp_original_wall(
         })?;
     Ok(declared_ms.min(remaining))
 }
+
+#[cfg(target_os = "linux")]
+fn earlier_deadline(
+    first: Option<std::time::Instant>,
+    second: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn v6_effective_deadlines(
+    run_until: std::time::Instant,
+    cleanup_until: std::time::Instant,
+    provider_until: Option<std::time::Instant>,
+) -> Result<(std::time::Instant, std::time::Instant, u64), ArenaError> {
+    let reserve = cleanup_until
+        .checked_duration_since(run_until)
+        .ok_or_else(|| ArenaError::Budget("V6 original cleanup window is invalid".into()))?;
+    let run = provider_until.map_or(run_until, |deadline| deadline.min(run_until));
+    let cleanup = run
+        .checked_add(reserve)
+        .ok_or_else(|| ArenaError::Budget("V6 effective cleanup window overflow".into()))?
+        .min(cleanup_until);
+    // The existing process supervisor permits twice its integer-millisecond
+    // grace. Round up only enough to cover the original whole deadline.
+    let grace_ms = u64::try_from(reserve.as_nanos().div_ceil(2_000_000))
+        .map_err(|_| ArenaError::Budget("V6 cleanup grace overflow".into()))?;
+    Ok((run, cleanup, grace_ms))
+}
 #[cfg(test)]
 mod original_window_tests {
     use super::*;
@@ -48,6 +83,77 @@ mod original_window_tests {
         assert!(
             clamp_original_wall(100, Some(now + std::time::Duration::from_nanos(1)), now).is_err()
         );
+    }
+
+    #[test]
+    fn v6_stricter_deadline_and_odd_cleanup_do_not_extend_the_original_window() {
+        let now = std::time::Instant::now();
+        let run = now + std::time::Duration::from_secs(10);
+        let cleanup = run + std::time::Duration::from_millis(5);
+        let earlier = now + std::time::Duration::from_secs(8);
+        assert_eq!(
+            v6_effective_deadlines(run, cleanup, Some(earlier)).unwrap(),
+            (earlier, earlier + std::time::Duration::from_millis(5), 3)
+        );
+        assert_eq!(
+            v6_effective_deadlines(run, cleanup, None).unwrap(),
+            (run, cleanup, 3)
+        );
+        assert!(v6_effective_deadlines(cleanup, run, None).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v6_control_busy_does_not_block_or_replace_the_original_owner() {
+        struct Control(Arc<std::sync::atomic::AtomicUsize>);
+        impl NativeV6Control for Control {
+            fn poll_run(
+                &mut self,
+                _: &crate::process::SpawnCustody,
+                _: std::time::Instant,
+            ) -> Result<(), ArenaError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            fn poll_cleanup(
+                &mut self,
+                _: &crate::process::SpawnCustody,
+                _: std::time::Instant,
+            ) -> Result<(), ArenaError> {
+                self.0.fetch_add(10, Ordering::Relaxed);
+                Ok(())
+            }
+            fn pre_signal_enabled(&self) -> bool {
+                true
+            }
+            fn poll_pre_signal(
+                &mut self,
+                _: &crate::process::SpawnCustody,
+                _: std::time::Instant,
+            ) -> Result<crate::process::PreSignalProgress, ArenaError> {
+                self.0.fetch_add(100, Ordering::Relaxed);
+                Ok(crate::process::PreSignalProgress::Acknowledged)
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let control: Arc<Mutex<Box<dyn NativeV6Control>>> =
+            Arc::new(Mutex::new(Box::new(Control(Arc::clone(&calls)))));
+        let custody = crate::process::SpawnCustody::default();
+        let held = control.lock().unwrap();
+        poll_v6_control(&control, &custody, std::time::Instant::now(), false).unwrap();
+        assert_eq!(
+            poll_v6_pre_signal(&control, &custody, std::time::Instant::now()).unwrap(),
+            crate::process::PreSignalProgress::Pending { partial: false }
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        drop(held);
+        poll_v6_control(&control, &custody, std::time::Instant::now(), false).unwrap();
+        poll_v6_control(&control, &custody, std::time::Instant::now(), true).unwrap();
+        assert_eq!(
+            poll_v6_pre_signal(&control, &custody, std::time::Instant::now()).unwrap(),
+            crate::process::PreSignalProgress::Acknowledged
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 111);
     }
 }
 
@@ -118,6 +224,42 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
     }
     fn expected_provider_sessions(&self) -> usize {
         4
+    }
+    /// Opt-in only: this provider can launch work whose physical completion
+    /// cannot be inferred from OS process-group cleanup. Historical providers
+    /// retain their original behavior until they explicitly implement this.
+    fn requires_physical_lifetime_guard(&self) -> bool {
+        false
+    }
+    /// Verify the actual supervisor-owned preflight child has not created a
+    /// GPU session. An argument or a child-reported flag alone is insufficient.
+    #[cfg(target_os = "linux")]
+    fn verify_preflight_no_gpu(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+        _probe: NativePreflightProbe,
+        _process: &ProcessOutput,
+        _runtime_directory: &cap_std::fs::Dir,
+        _inputs: &NativeProviderInputContext<'_>,
+    ) -> Result<(), ArenaError> {
+        Err(ArenaError::Invalid(
+            "guarded preflight GPU lifetime is unknown".into(),
+        ))
+    }
+    /// Independently verify physical completion from the original supervised
+    /// process, role-bound sessions and pinned inputs. This must not depend on
+    /// unrelated PGN, logging or model-output acceptance succeeding.
+    #[cfg(target_os = "linux")]
+    fn verify_pair_physical_completion(
+        &self,
+        _process: &ProcessOutput,
+        _baseline_runtime: &cap_std::fs::Dir,
+        _candidate_runtime: &cap_std::fs::Dir,
+        _inputs: &NativeProviderInputContext<'_>,
+    ) -> Result<(), ArenaError> {
+        Err(ArenaError::Invalid(
+            "guarded pair GPU lifetime is unknown".into(),
+        ))
     }
     fn uses_provider_records(
         &self,
@@ -250,6 +392,12 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
         Ok(())
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativePreflightProbe {
+    Identification,
+    Readiness,
+}
 impl NativeProviderDeclaration for rz_experiments::LockedIntegrationPairSpecV1 {
     type Audit = NativeProviderSessionAudit;
     fn scope(&self) -> &'static str {
@@ -303,6 +451,8 @@ pub struct NativePairReceipt<A = NativeProviderSessionAudit> {
     pub snapshot_cache_hints: Vec<SnapshotCacheHint>,
     pub artifacts: Vec<rz_experiments::ArtifactRef>,
     pub provider_sessions: Vec<A>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_lifetime_error: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub external_preflight: Vec<crate::ExternalUciPreflight>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -385,62 +535,2297 @@ impl SnapshotCacheHint {
     }
 }
 
+/// The original V6 control owner remains in the same bundle as the runner.
+/// Its callbacks must be bounded/nonblocking and do not attest completion.
+#[cfg(target_os = "linux")]
+pub(crate) enum NoGameProgressReadback {
+    Observed(crate::pals_adaptive_launch::SmokeControlProgress),
+    Busy,
+    Poisoned,
+    Unavailable,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) trait NativeV6Control: Send {
+    /// The actual original execution allocation held by this control owner.
+    /// A missing owner is never accepted as an equivalent declaration.
+    fn original_execution(
+        &self,
+    ) -> Option<&Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>> {
+        None
+    }
+    /// The same original role listeners must be retained by this control on
+    /// every completion or quarantine path; names alone grant no authority.
+    fn original_role_sockets(
+        &self,
+    ) -> Option<&Arc<crate::pals_adaptive_launch::PalsV6RoleSockets>> {
+        None
+    }
+    /// This is a borrow of optional NoGame frame observations, never an
+    /// acknowledgement, process completion, or generic V6 game receipt.
+    fn no_game_grants(
+        &self,
+    ) -> Option<&[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]> {
+        None
+    }
+    fn no_game_progress(&self) -> NoGameProgressReadback {
+        NoGameProgressReadback::Unavailable
+    }
+    fn poll_run(
+        &mut self,
+        custody: &crate::process::SpawnCustody,
+        until: std::time::Instant,
+    ) -> Result<(), ArenaError>;
+    fn poll_cleanup(
+        &mut self,
+        custody: &crate::process::SpawnCustody,
+        until: std::time::Instant,
+    ) -> Result<(), ArenaError>;
+    /// Declare support for this control's whole lifetime. A control may
+    /// acquire its original role channels later, after the child is spawned;
+    /// its callback must refuse to send without an authenticated sender.
+    /// Existing controls keep prior behavior.
+    fn pre_signal_enabled(&self) -> bool {
+        false
+    }
+    fn poll_pre_signal(
+        &mut self,
+        _custody: &crate::process::SpawnCustody,
+        _until: std::time::Instant,
+    ) -> Result<crate::process::PreSignalProgress, ArenaError> {
+        Err(ArenaError::Invalid(
+            "V6 pre-signal control unavailable".into(),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct NativeV6Supervisor {
+    execution: Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>,
+    control: Arc<Mutex<Box<dyn NativeV6Control>>>,
+    role_sockets: Option<Arc<crate::pals_adaptive_launch::PalsV6RoleSockets>>,
+    // If pinned input inspection fails, retain the same owner/control in the
+    // normal failure bundle without starting preflight or a child.
+    original_pin_error: Option<ArenaError>,
+    pre_signal_enabled: bool,
+    pre_signal_observation: crate::process::PreSignalObservation,
+    no_game_evidence: Option<NoGameEvidence>,
+    // Compiled source-byte observation only; it does not attest the separate
+    // proxy executable or affect admission and older canonical records.
+    cancel_source_observation: crate::pals_adaptive_launch::CancelSourceObservation,
+}
+
+/// Rejected construction returns the exact original control owner. The
+/// caller retains its own execution Arc because construction only borrows it.
+#[cfg(target_os = "linux")]
+#[must_use = "retain or return the original V6 control owner"]
+pub(crate) struct NativeV6SupervisorRejection {
+    pub(crate) error: ArenaError,
+    pub(crate) control: Box<dyn NativeV6Control>,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for NativeV6SupervisorRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeV6SupervisorRejection")
+            .field("error", &self.error)
+            .field("original_control_retained", &true)
+            .finish()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl NativeV6Supervisor {
+    pub(crate) fn new(
+        execution: &Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>,
+        control: Box<dyn NativeV6Control>,
+    ) -> Result<Self, NativeV6SupervisorRejection> {
+        let capabilities = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (
+                control
+                    .original_execution()
+                    .is_some_and(|original| Arc::ptr_eq(original, execution)),
+                control.pre_signal_enabled(),
+                control.original_role_sockets().cloned(),
+            )
+        }));
+        let (same_owner, pre_signal_enabled, role_sockets) = match capabilities {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(NativeV6SupervisorRejection {
+                    error: ArenaError::Io("V6 control capability observation panicked".into()),
+                    control,
+                });
+            }
+        };
+        if !same_owner {
+            return Err(NativeV6SupervisorRejection {
+                error: ArenaError::Integrity(
+                    "V6 control and supervisor execution owners differ".into(),
+                ),
+                control,
+            });
+        }
+        Ok(Self {
+            execution: Arc::clone(execution),
+            control: Arc::new(Mutex::new(control)),
+            role_sockets,
+            original_pin_error: None,
+            pre_signal_enabled,
+            pre_signal_observation: crate::process::PreSignalObservation::default(),
+            no_game_evidence: None,
+            cancel_source_observation:
+                crate::pals_adaptive_launch::compiled_cancel_source_observation(),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn poll_v6_pre_signal(
+    control: &Mutex<Box<dyn NativeV6Control>>,
+    custody: &crate::process::SpawnCustody,
+    until: std::time::Instant,
+) -> Result<crate::process::PreSignalProgress, ArenaError> {
+    let mut owner = match control.try_lock() {
+        Ok(owner) => owner,
+        Err(TryLockError::WouldBlock) => {
+            return Ok(crate::process::PreSignalProgress::Pending { partial: false });
+        }
+        Err(TryLockError::Poisoned(_)) => {
+            return Err(ArenaError::Io("v6 original control owner poisoned".into()));
+        }
+    };
+    owner.poll_pre_signal(custody, until)
+}
+
+#[cfg(target_os = "linux")]
+fn poll_v6_control(
+    control: &Mutex<Box<dyn NativeV6Control>>,
+    custody: &crate::process::SpawnCustody,
+    until: std::time::Instant,
+    cleanup: bool,
+) -> Result<(), ArenaError> {
+    let mut owner = match control.try_lock() {
+        Ok(owner) => owner,
+        // The original owner remains intact and the supervisor will poll
+        // again; transient contention is not a process failure or completion.
+        Err(TryLockError::WouldBlock) => return Ok(()),
+        Err(TryLockError::Poisoned(_)) => {
+            return Err(ArenaError::Io("v6 original control owner poisoned".into()));
+        }
+    };
+    if cleanup {
+        owner.poll_cleanup(custody, until)
+    } else {
+        owner.poll_run(custody, until)
+    }
+}
+
 struct NativeRunBundle<S: NativeProviderDeclaration> {
     owner: Option<NativeLaunchOwner<S>>,
     process: Option<ProcessOutput>,
     receipt: Option<NativePairReceipt<S::Audit>>,
     receipt_artifact: Option<rz_experiments::ArtifactRef>,
     original_error: Option<String>,
+    guarded_preflight_failures: Vec<String>,
+    probe_evidence: Option<GuardedProbeReservation>,
+    /// Set by the original process owner immediately after actual spawn and
+    /// cleared only by the matching physical/no-GPU evidence verifier.
+    spawn_custody: crate::process::SpawnCustody,
+    physical_guard_required: bool,
+    #[cfg(target_os = "linux")]
+    v6_supervisor: Option<NativeV6Supervisor>,
 }
+
+/// Independent NoGame preparation cannot use NativeRunBundle's paired owner.
+/// Keep the selected snapshot, execution and listeners together, and use the
+/// same quarantine as the paired runner if a future supervised child remains
+/// unresolved. Construction alone neither starts a child nor applies resources.
+#[cfg(target_os = "linux")]
+struct IndependentNoGameOwners {
+    // One binding is moved into one custody owner. Its control owns the same
+    // snapshot/execution/socket Arcs and the selected proxy FD.
+    _binding: crate::pals_adaptive_launch::DirectNoGameBinding,
+    dispatch_identity: Arc<()>,
+    dispatch_reserved: Arc<AtomicBool>,
+    envelope: IndependentNoGameSupervisorEnvelope,
+    resource: Option<crate::pals_adaptive_launch::NoGameResourceOwnerV1>,
+    plan_sha256: String,
+    observation: Option<crate::process::OriginalSmokeUciObservation>,
+    quarantined_error: Option<ArenaError>,
+    grants: Arc<Mutex<[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]>>,
+    cancel_not_granted: Arc<AtomicBool>,
+    cancel_failure: Arc<std::sync::OnceLock<Arc<ArenaError>>>,
+    raw_persistence_started: AtomicBool,
+}
+
+/// Limits and tree-watch declaration derived from this selected snapshot.
+/// These values do not apply CPU, memory, affinity or any physical fence.
+#[cfg(target_os = "linux")]
+struct IndependentNoGameSupervisorEnvelope {
+    limits: crate::process::ProcessLimits,
+    watch: crate::process::OwnedArtifactTreeWatch,
+}
+
+#[cfg(target_os = "linux")]
+impl IndependentNoGameSupervisorEnvelope {
+    fn from_original(
+        binding: &crate::pals_adaptive_launch::DirectNoGameBinding,
+    ) -> Result<Self, ArenaError> {
+        let snapshot = binding.snapshot();
+        let input = snapshot.plan.input();
+        let budget = &input.budget;
+        let inputs = snapshot
+            .receipts
+            .iter()
+            .try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
+            .ok_or_else(|| ArenaError::Budget("NoGame snapshot bytes overflow".into()))?;
+        if inputs > budget.max_input_bytes {
+            return Err(ArenaError::Budget(
+                "NoGame snapshot exceeds original input budget".into(),
+            ));
+        }
+        let watched_bytes = inputs
+            .checked_add(budget.max_runtime_bytes)
+            .and_then(|sum| sum.checked_add(budget.max_output_bytes))
+            .ok_or_else(|| ArenaError::Budget("NoGame watched bytes overflow".into()))?;
+        if watched_bytes > budget.max_artifact_bytes {
+            return Err(ArenaError::Budget(
+                "NoGame watched bytes exceed original artifact budget".into(),
+            ));
+        }
+        let max_files = usize::try_from(budget.max_runtime_files)
+            .ok()
+            .and_then(|n| n.checked_add(snapshot.pins.len()))
+            .and_then(|n| n.checked_add(snapshot.input_subdirectories.len()))
+            .and_then(|n| n.checked_add(2))
+            .ok_or_else(|| ArenaError::Budget("NoGame watched entry count overflow".into()))?;
+        let max_depth = usize::from(budget.max_runtime_depth)
+            .checked_add(1)
+            .ok_or_else(|| ArenaError::Budget("NoGame watched depth overflow".into()))?;
+        let window = &input.endpoint.startup_lock.config.window;
+        let envelope = Self {
+            limits: crate::process::ProcessLimits {
+                wall_ms: window.wall_time_max_ms,
+                shutdown_grace_ms: window.cleanup_max_ms.div_ceil(2),
+                max_output_bytes: budget.max_output_bytes,
+                max_child_processes: budget.max_child_processes,
+            },
+            watch: crate::process::OwnedArtifactTreeWatch {
+                max_total_bytes: watched_bytes,
+                max_file_bytes: budget
+                    .max_input_bytes
+                    .max(budget.max_runtime_bytes)
+                    .max(budget.max_output_bytes),
+                max_files,
+                max_depth,
+            },
+        };
+        envelope.limits.validate()?;
+        envelope.watch.validate()?;
+        Ok(envelope)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct PreparedIndependentNoGameOwner {
+    owners: Option<IndependentNoGameOwners>,
+    process: Option<ProcessOutput>,
+    spawn_custody: crate::process::SpawnCustody,
+    // Vacuously true only while no child has been started. Any future spawn
+    // adapter must clear this before dispatch and restore it only on the
+    // original owner's verified physical fence.
+    physical_fence_confirmed: bool,
+    evidence_transferred: bool,
+    original_error: Option<ArenaError>,
+    failures: Vec<String>,
+}
+
+/// Each failed stage returns the original owner already acquired at that
+/// stage; none of these variants imply a process or GPU was started.
+#[cfg(target_os = "linux")]
+#[must_use = "retain or explicitly handle the original NoGame setup failure"]
+pub(crate) enum IndependentNoGameSetupFailure {
+    Preflight(ArenaError),
+    Snapshot(Box<crate::pals_adaptive_launch::NoGamePreparationFailure>),
+    Sockets {
+        error: ArenaError,
+        snapshot: Arc<crate::pals_adaptive_launch::ProxyEntrySmokeSnapshotOwnerV1>,
+    },
+    Binding {
+        error: ArenaError,
+        snapshot: Arc<crate::pals_adaptive_launch::ProxyEntrySmokeSnapshotOwnerV1>,
+        sockets: Arc<crate::pals_adaptive_launch::NoGameRoleSocketsV1>,
+    },
+    Supervisor {
+        error: ArenaError,
+        binding: crate::pals_adaptive_launch::DirectNoGameBinding,
+    },
+}
+
+/// Assemble the actual original owners up to the still-guarded dispatch
+/// boundary. The caller supplies the locked plan and its original clock; no
+/// new time window, process, GPU or independent result is manufactured.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_independent_no_game_original(
+    plan: &crate::pals_adaptive_launch::LockedNoGameSmokePlanV1,
+    execution: &Arc<crate::pals_adaptive_launch::NoGameExecutionStartV1>,
+    owner_id: [u8; 16],
+    owner_epoch: u64,
+    request_ids: [u64; 2],
+    source_root: &std::path::Path,
+    output_root: &std::path::Path,
+    output_directory: &str,
+) -> Result<PreparedIndependentNoGameOwner, Box<IndependentNoGameSetupFailure>> {
+    use crate::pals_adaptive_launch::{
+        DirectNoGameBinding, NoGameRoleSocketsV1, prepare_proxy_entry_smoke_snapshot_v1,
+        validate_smoke_request_ids,
+    };
+    validate_smoke_request_ids(request_ids)
+        .map_err(|error| Box::new(IndependentNoGameSetupFailure::Preflight(error)))?;
+    let snapshot = Arc::new(
+        prepare_proxy_entry_smoke_snapshot_v1(
+            plan,
+            execution,
+            owner_id,
+            owner_epoch,
+            source_root,
+            output_root,
+            output_directory,
+        )
+        .map_err(|failure| Box::new(IndependentNoGameSetupFailure::Snapshot(failure)))?,
+    );
+    let sockets = NoGameRoleSocketsV1::bind_original(&snapshot, execution).map_err(|error| {
+        Box::new(IndependentNoGameSetupFailure::Sockets {
+            error,
+            snapshot: Arc::clone(&snapshot),
+        })
+    })?;
+    let binding = DirectNoGameBinding::prepare(
+        &snapshot,
+        execution,
+        &sockets,
+        owner_id,
+        owner_epoch,
+        request_ids,
+    )
+    .map_err(|error| {
+        Box::new(IndependentNoGameSetupFailure::Binding {
+            error,
+            snapshot: Arc::clone(&snapshot),
+            sockets: Arc::clone(&sockets),
+        })
+    })?;
+    PreparedIndependentNoGameOwner::prepare(binding).map_err(|(error, binding)| {
+        Box::new(IndependentNoGameSetupFailure::Supervisor { error, binding })
+    })
+}
+
+/// Returned bytes and observations; neither is a physical-completion proof.
+#[cfg(target_os = "linux")]
+pub(crate) struct IndependentNoGameRawEvidence {
+    pub(crate) plan_sha256: String,
+    pub(crate) role: rz_experiments::NativeEngineRole,
+    // Values supplied to this original execution, not globally unique IDs.
+    pub(crate) owner_id: [u8; 16],
+    pub(crate) owner_epoch: u64,
+    pub(crate) process: Option<ProcessOutput>,
+    pub(crate) original_error: Option<ArenaError>,
+    pub(crate) failures: Vec<String>,
+    pub(crate) observation: Option<crate::process::OriginalSmokeUciObservation>,
+    pub(crate) grants: Arc<Mutex<[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]>>,
+    pub(crate) cancel_not_granted: bool,
+    pub(crate) cancel_failure: Option<Arc<ArenaError>>,
+}
+
+/// Borrowed original evidence; observing or persisting this view does not
+/// transfer ownership or assert physical completion.
+#[cfg(target_os = "linux")]
+pub(crate) struct IndependentNoGameEvidenceView<'a> {
+    pub(crate) plan_sha256: &'a str,
+    pub(crate) role: rz_experiments::NativeEngineRole,
+    pub(crate) owner_id: [u8; 16],
+    pub(crate) owner_epoch: u64,
+    pub(crate) process: Option<&'a ProcessOutput>,
+    pub(crate) original_error: Option<&'a ArenaError>,
+    pub(crate) failures: &'a [String],
+    pub(crate) observation: Option<&'a crate::process::OriginalSmokeUciObservation>,
+    pub(crate) cancel_not_granted: bool,
+    pub(crate) cancel_failure: Option<&'a ArenaError>,
+    pub(crate) physical_or_process_completion_unknown: bool,
+    grants: &'a Mutex<[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]>,
+    control: &'a Mutex<crate::pals_adaptive_launch::SmokeDeadlineControl>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) enum IndependentNoGameBorrowResult<T> {
+    Observed(T),
+    Busy,
+    Poisoned,
+}
+
+/// Each write is independently reported; a failed or partial file remains in
+/// the original directory, and no result implies a physical GPU fence.
+#[cfg(target_os = "linux")]
+pub(crate) struct IndependentNoGamePersistence {
+    pub(crate) files: Vec<(String, Result<(), ArenaError>)>,
+    pub(crate) directory_sync: Result<(), ArenaError>,
+}
+
+#[cfg(target_os = "linux")]
+impl IndependentNoGameEvidenceView<'_> {
+    /// Short read-only observation. Keep callbacks nonblocking; no ownership
+    /// or physical authority is transferred by this mutex borrow.
+    pub(crate) fn with_grants<T>(
+        &self,
+        inspect: impl FnOnce(&[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]) -> T,
+    ) -> IndependentNoGameBorrowResult<T> {
+        match self.grants.try_lock() {
+            Ok(guard) => {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inspect(&guard)));
+                drop(guard);
+                match result {
+                    Ok(value) => IndependentNoGameBorrowResult::Observed(value),
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            }
+            Err(TryLockError::WouldBlock) => IndependentNoGameBorrowResult::Busy,
+            Err(TryLockError::Poisoned(_)) => IndependentNoGameBorrowResult::Poisoned,
+        }
+    }
+
+    /// The caller may inspect the exact control's offsets and first error;
+    /// Busy/Poisoned are unknown observations, not a successful cancel.
+    pub(crate) fn with_control<T>(
+        &self,
+        inspect: impl FnOnce(&crate::pals_adaptive_launch::SmokeDeadlineControl) -> T,
+    ) -> IndependentNoGameBorrowResult<T> {
+        match self.control.try_lock() {
+            Ok(guard) => {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inspect(&guard)));
+                drop(guard);
+                match result {
+                    Ok(value) => IndependentNoGameBorrowResult::Observed(value),
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            }
+            Err(TryLockError::WouldBlock) => IndependentNoGameBorrowResult::Busy,
+            Err(TryLockError::Poisoned(_)) => IndependentNoGameBorrowResult::Poisoned,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+static NO_GAME_RAW_EVIDENCE: Mutex<Vec<IndependentNoGameRawEvidence>> = Mutex::new(Vec::new());
+#[cfg(target_os = "linux")]
+static NO_GAME_RAW_UNOBSERVABLE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static NO_GAME_RAW_WARNING: AtomicBool = AtomicBool::new(false);
+
+/// Transfer the uniquely matching completed scope for durable recovery. The
+/// original ID/epoch are caller-supplied, so ambiguous matches are refused.
+#[cfg(target_os = "linux")]
+pub(crate) fn take_independent_no_game_raw_evidence(
+    owner_id: [u8; 16],
+    owner_epoch: u64,
+    role: rz_experiments::NativeEngineRole,
+    plan_sha256: &str,
+) -> Result<Option<IndependentNoGameRawEvidence>, ArenaError> {
+    let mut slots = NO_GAME_RAW_EVIDENCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut matched = slots
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            e.owner_id == owner_id
+                && e.owner_epoch == owner_epoch
+                && e.role == role
+                && e.plan_sha256 == plan_sha256
+        })
+        .map(|(index, _)| index);
+    let Some(index) = matched.next() else {
+        return Ok(None);
+    };
+    if matched.next().is_some() {
+        return Err(ArenaError::Integrity(
+            "ambiguous NoGame raw evidence scope".into(),
+        ));
+    }
+    Ok(Some(slots.remove(index)))
+}
+
+/// A single recovery owner may explicitly transfer the entire collection,
+/// including duplicate identifiers, without silently choosing between them.
+#[cfg(target_os = "linux")]
+pub(crate) fn take_all_independent_no_game_raw_evidence() -> Vec<IndependentNoGameRawEvidence> {
+    std::mem::take(
+        &mut *NO_GAME_RAW_EVIDENCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn independent_no_game_unobservable_raw_retained() -> bool {
+    NO_GAME_RAW_UNOBSERVABLE.load(Ordering::Acquire)
+}
+
+/// Sticky warning, which a caller can surface without blocking owner drop.
+#[cfg(target_os = "linux")]
+pub(crate) fn independent_no_game_raw_warning_observed() -> bool {
+    NO_GAME_RAW_WARNING.load(Ordering::Acquire)
+}
+
+/// Diagnostics only: counts retained stdout/stderr bytes, not total memory.
+#[cfg(target_os = "linux")]
+pub(crate) fn independent_no_game_raw_evidence_usage() -> (usize, u64) {
+    let slots = NO_GAME_RAW_EVIDENCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let bytes = slots
+        .iter()
+        .fold(0u64, |sum, e| sum.saturating_add(no_game_raw_bytes(e)));
+    (slots.len(), bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn no_game_raw_bytes(evidence: &IndependentNoGameRawEvidence) -> u64 {
+    let process = evidence
+        .process
+        .as_ref()
+        .map_or(0, |p| p.stdout.len().saturating_add(p.stderr.len()));
+    let observation = evidence.observation.as_ref().map_or(0, |o| {
+        o.buffered_stdout()
+            .len()
+            .saturating_add(o.buffered_stderr().len())
+    });
+    u64::try_from(process.saturating_add(observation)).unwrap_or(u64::MAX)
+}
+
+/// Single-use authority for one prepared owner. A weak identity keeps this
+/// declaration from extending a snapshot/control/GPU lifetime by itself.
+#[cfg(target_os = "linux")]
+pub(crate) struct IndependentNoGameDispatchAdmission {
+    owner: std::sync::Weak<()>,
+    reservation: Arc<AtomicBool>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for IndependentNoGameDispatchAdmission {
+    fn drop(&mut self) {
+        self.reservation.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) enum IndependentNoGameSupervisorOutcome {
+    /// The ProcessOutput is retained, but its stop and all higher-level
+    /// acceptance conditions remain unassessed.
+    ReturnedUnassessed,
+    /// The original failure is retained by the same owner.
+    FailedRetained,
+}
+
+/// A blocked call has not started a child and preserves the original owner.
+#[cfg(target_os = "linux")]
+pub(crate) enum IndependentNoGameDispatchOutcome {
+    UnsupportedDeclaredEnvironment,
+    Supervisor(IndependentNoGameSupervisorOutcome),
+    Rejected(ArenaError),
+}
+
+#[cfg(target_os = "linux")]
+fn poll_independent_no_game_control(
+    control: &Mutex<crate::pals_adaptive_launch::SmokeDeadlineControl>,
+    grants: &Mutex<[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]>,
+    custody: &crate::process::SpawnCustody,
+    until: std::time::Instant,
+    cleanup: bool,
+) -> Result<(), ArenaError> {
+    let mut observations = match grants.try_lock() {
+        Ok(value) => value,
+        Err(TryLockError::WouldBlock) => return Ok(()),
+        Err(TryLockError::Poisoned(_)) => {
+            return Err(ArenaError::Io("NoGame grant observation poisoned".into()));
+        }
+    };
+    let mut original = match control.try_lock() {
+        Ok(value) => value,
+        Err(TryLockError::WouldBlock) => return Ok(()),
+        Err(TryLockError::Poisoned(_)) => {
+            return Err(ArenaError::Io("NoGame control poisoned".into()));
+        }
+    };
+    let event = if cleanup {
+        original.poll_cleanup(custody, until)?
+    } else {
+        original.poll_run(custody, until)?
+    };
+    if let Some(event) = event {
+        let index = match event.scope.phase {
+            rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Run => 0,
+            rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Cleanup => 1,
+        };
+        if observations[index].is_some() {
+            return Err(ArenaError::Integrity(
+                "duplicate NoGame grant observation".into(),
+            ));
+        }
+        observations[index] = Some(event);
+    }
+    Ok(())
+}
+
+/// Cooperatively request cancellation through the very same control that
+/// issued the original NoGame run grant. Acknowledgement is only acceptance,
+/// not process-tree closure, a device fence or permission to release owners.
+#[cfg(target_os = "linux")]
+fn poll_independent_no_game_cancel(
+    control: &Mutex<crate::pals_adaptive_launch::SmokeDeadlineControl>,
+    not_granted: &AtomicBool,
+    retained_failure: &std::sync::OnceLock<Arc<ArenaError>>,
+    custody: &crate::process::SpawnCustody,
+    until: std::time::Instant,
+) -> Result<crate::process::PreSignalProgress, ArenaError> {
+    use crate::pals_adaptive_launch::SmokeCancelProgress;
+    let mut original = match control.try_lock() {
+        Ok(value) => value,
+        Err(TryLockError::WouldBlock) => {
+            return Ok(crate::process::PreSignalProgress::Pending { partial: false });
+        }
+        Err(TryLockError::Poisoned(_)) => {
+            let error = Arc::new(ArenaError::Io("NoGame cancel control poisoned".into()));
+            let _ = retained_failure.set(Arc::clone(&error));
+            return Err(ArenaError::Io(error.to_string()));
+        }
+    };
+    match original.poll_no_game_cancel(custody, until) {
+        SmokeCancelProgress::NotGranted => {
+            not_granted.store(true, Ordering::Release);
+            Ok(crate::process::PreSignalProgress::Pending { partial: false })
+        }
+        SmokeCancelProgress::Pending { written, received } => {
+            Ok(crate::process::PreSignalProgress::Pending {
+                partial: written != 0 || received != 0,
+            })
+        }
+        SmokeCancelProgress::Acknowledged => Ok(crate::process::PreSignalProgress::Acknowledged),
+        // The exact typed first failure remains in this same retained control.
+        SmokeCancelProgress::Failed => {
+            if let Some(error) = original.no_game_cancel_failure_owner() {
+                let _ = retained_failure.set(error);
+            }
+            Err(ArenaError::Io(format!(
+                "NoGame cancel failed: {}",
+                original
+                    .no_game_cancel_first_failure()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "unknown".into())
+            )))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PreparedIndependentNoGameOwner {
+    /// A rejected binding is returned intact. Moving the binding prevents it
+    /// from being reused to construct a second custody owner.
+    pub(crate) fn prepare(
+        binding: crate::pals_adaptive_launch::DirectNoGameBinding,
+    ) -> Result<Self, (ArenaError, crate::pals_adaptive_launch::DirectNoGameBinding)> {
+        let checked = binding
+            .execution()
+            .require_running()
+            .and_then(|()| {
+                binding
+                    .sockets()
+                    .verify_original(binding.snapshot(), binding.execution())
+            })
+            .and_then(|()| binding.execution().require_running());
+        if let Err(error) = checked {
+            return Err((error, binding));
+        }
+        let envelope = match IndependentNoGameSupervisorEnvelope::from_original(&binding) {
+            Ok(envelope) => envelope,
+            Err(error) => return Err((error, binding)),
+        };
+        let plan_sha256 = binding.snapshot().plan.sha256().to_owned();
+        Ok(Self {
+            owners: Some(IndependentNoGameOwners {
+                _binding: binding,
+                dispatch_identity: Arc::new(()),
+                dispatch_reserved: Arc::new(AtomicBool::new(false)),
+                envelope,
+                resource: None,
+                plan_sha256,
+                observation: None,
+                quarantined_error: None,
+                grants: Arc::new(Mutex::new([None, None])),
+                cancel_not_granted: Arc::new(AtomicBool::new(false)),
+                cancel_failure: Arc::new(std::sync::OnceLock::new()),
+                raw_persistence_started: AtomicBool::new(false),
+            }),
+            process: None,
+            spawn_custody: crate::process::SpawnCustody::default(),
+            physical_fence_confirmed: true,
+            evidence_transferred: false,
+            original_error: None,
+            failures: Vec::new(),
+        })
+    }
+
+    fn unresolved(&self) -> bool {
+        !self.physical_fence_confirmed
+            || self.spawn_custody.pending.load(Ordering::Acquire)
+            || self.spawn_custody.child().is_some()
+            || self.process.as_ref().is_some_and(|process| {
+                process.receipt.group_cleanup != CleanupStatus::Gone
+                    || process.pending_child.is_some()
+            })
+    }
+
+    /// A borrow transfers neither custody nor a completion assertion.
+    pub(crate) fn process(&self) -> Option<&ProcessOutput> {
+        self.process.as_ref()
+    }
+
+    /// May include bytes read before an interrupted supervisor returns.
+    pub(crate) fn observation(&self) -> Option<&crate::process::OriginalSmokeUciObservation> {
+        self.owners.as_ref()?.observation.as_ref()
+    }
+
+    /// The original owner, output buffers and errors stay in place even if
+    /// physical completion is unknown, the callback fails or it unwinds.
+    pub(crate) fn with_raw_evidence<T, E>(
+        &self,
+        persist: impl FnOnce(IndependentNoGameEvidenceView<'_>) -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        let Some(owners) = self.owners.as_ref() else {
+            return Ok(None);
+        };
+        let binding = &owners._binding;
+        let execution = binding.execution();
+        persist(IndependentNoGameEvidenceView {
+            plan_sha256: binding.snapshot().plan.sha256(),
+            role: binding.snapshot().role,
+            owner_id: execution.owner_id(),
+            owner_epoch: execution.owner_epoch(),
+            process: self.process.as_ref(),
+            original_error: self.original_error.as_ref(),
+            failures: &self.failures,
+            observation: owners.observation.as_ref(),
+            cancel_not_granted: owners.cancel_not_granted.load(Ordering::Acquire),
+            cancel_failure: owners.cancel_failure.get().map(Arc::as_ref),
+            physical_or_process_completion_unknown: self.unresolved(),
+            grants: owners.grants.as_ref(),
+            control: binding.control().as_ref(),
+        })
+        .map(Some)
+    }
+
+    /// Explicitly persist borrowed raw buffers under the original pinned
+    /// output directory. Existing names are never overwritten. The caller
+    /// still owns the original evidence even if all writes and sync succeed.
+    pub(crate) fn persist_raw_evidence(
+        &self,
+        basename: &str,
+    ) -> Result<IndependentNoGamePersistence, ArenaError> {
+        if !crate::native_launch::safe_output_basename(basename) {
+            return Err(ArenaError::Invalid(
+                "NoGame evidence basename invalid".into(),
+            ));
+        }
+        let owners = self
+            .owners
+            .as_ref()
+            .ok_or_else(|| ArenaError::Invalid("NoGame original owner unavailable".into()))?;
+        let snapshot = owners._binding.snapshot();
+        let cap = snapshot.plan.input().budget.max_output_bytes;
+        let process = self.process.as_ref();
+        let observed = owners.observation.as_ref();
+        if process.is_none()
+            && observed.is_none()
+            && self.original_error.is_none()
+            && self.failures.is_empty()
+            && !owners.cancel_not_granted.load(Ordering::Acquire)
+            && owners.cancel_failure.get().is_none()
+        {
+            return Err(ArenaError::Invalid(
+                "NoGame evidence is not yet available".into(),
+            ));
+        }
+        let mut files: Vec<(String, &[u8])> = Vec::new();
+        if let Some(process) = process {
+            files.push((format!("{basename}.stdout"), &process.stdout));
+            files.push((format!("{basename}.stderr"), &process.stderr));
+        }
+        if let Some(observation) = observed {
+            if !observation.buffered_stdout().is_empty() {
+                files.push((
+                    format!("{basename}.observed-stdout"),
+                    observation.buffered_stdout(),
+                ));
+            }
+            if !observation.buffered_stderr().is_empty() {
+                files.push((
+                    format!("{basename}.observed-stderr"),
+                    observation.buffered_stderr(),
+                ));
+            }
+        }
+        let grant_observation = match owners.grants.try_lock() {
+            Ok(grants) => serde_json::json!({
+                "state": "observed",
+                "items": grants.iter().flatten().map(|grant| serde_json::json!({
+                    "phase": match grant.scope.phase {
+                        rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Run => "run",
+                        rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Cleanup => "cleanup",
+                    },
+                    "request_id": grant.scope.request_id,
+                    "peer_pid": grant.peer_pid,
+                    "peer_start_ticks": grant.peer_start_ticks,
+                    "completion_observed_during_cleanup": grant.completion_observed_during_cleanup,
+                })).collect::<Vec<_>>(),
+            }),
+            Err(TryLockError::WouldBlock) => serde_json::json!({"state":"busy"}),
+            Err(TryLockError::Poisoned(_)) => serde_json::json!({"state":"poisoned"}),
+        };
+        let control_observation = match owners._binding.control().try_lock() {
+            Ok(control) => {
+                let progress = control.progress();
+                serde_json::json!({
+                    "state": "observed",
+                    "challenge_written": progress.challenge_written,
+                    "request_read": progress.request_read,
+                    "grant_written": progress.grant_written,
+                    "retained_grants": progress.retained_grants,
+                    "interrupted_grants": progress.interrupted_grants,
+                    "run_closed": progress.no_game_run_closed,
+                    "first_failure": progress.first_failure,
+                    "cancel_offsets_and_ack": control.no_game_cancel_offsets(),
+                })
+            }
+            Err(TryLockError::WouldBlock) => serde_json::json!({"state":"busy"}),
+            Err(TryLockError::Poisoned(_)) => serde_json::json!({"state":"poisoned"}),
+        };
+        let summary = serde_json::to_vec(&serde_json::json!({
+            "scope": "original_nogame_observations_not_physical_fence",
+            "owner_id": owners._binding.execution().owner_id(),
+            "owner_epoch": owners._binding.execution().owner_epoch(),
+            "plan_sha256": snapshot.plan.sha256(),
+            "physical_or_process_completion_unknown": self.unresolved(),
+            "process_receipt": process.map(|p| &p.receipt),
+            "original_error": self.original_error.as_ref().map(ToString::to_string),
+            "failures": self.failures,
+            "cancel_not_granted": owners.cancel_not_granted.load(Ordering::Acquire),
+            "cancel_failure": owners.cancel_failure.get().map(ToString::to_string),
+            "grant_observation": grant_observation,
+            "control_observation": control_observation,
+            "uci_attempt_started": observed.map(|o| o.attempt_started()),
+            "uci_attempt_returned": observed.map(|o| o.attempt_returned()),
+            "uci_exchange_observed": observed.map(|o| o.uci_exchange_observed()),
+        }))
+        .map_err(|_| ArenaError::Io("NoGame evidence summary encoding failed".into()))?;
+        let raw_total = files
+            .iter()
+            .try_fold(0u64, |sum, (_, bytes)| {
+                sum.checked_add(u64::try_from(bytes.len()).ok()?)
+            })
+            .ok_or_else(|| ArenaError::Budget("NoGame evidence bytes overflow".into()))?;
+        if raw_total > cap {
+            return Err(ArenaError::Budget(
+                "NoGame raw evidence exceeds original output budget".into(),
+            ));
+        }
+        // At most one internal persistence attempt per original scope. This
+        // bounds this consumer across partial writes and repeated basenames;
+        // it is not a total directory/disk quota. The caller can still borrow
+        // the original data for recovery through its own storage policy.
+        owners
+            .raw_persistence_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                ArenaError::Invalid("NoGame internal evidence persistence already attempted".into())
+            })?;
+        let mut files: Vec<_> = files
+            .into_iter()
+            .map(|(name, bytes)| {
+                let result = linux::put_directory(&snapshot.directory, &name, bytes, cap);
+                (name, result)
+            })
+            .collect();
+        let summary_name = format!("{basename}.summary.json");
+        let summary_result = linux::put_directory(
+            &snapshot.directory,
+            &summary_name,
+            &summary,
+            cap - raw_total,
+        );
+        files.push((summary_name, summary_result));
+        let directory_sync = crate::native_launch::linux::readable_directory_pin(
+            &snapshot.directory,
+        )
+        .and_then(|dir| {
+            dir.sync_all()
+                .map_err(|_| ArenaError::Io("NoGame evidence directory sync failed".into()))
+        });
+        Ok(IndependentNoGamePersistence {
+            files,
+            directory_sync,
+        })
+    }
+
+    /// Keep the original optional resource observation owner with this same
+    /// scope. Rejection returns the unchanged owner and its original FD.
+    /// Neither attaching it nor a later readback authorizes dispatch.
+    pub(crate) fn attach_resource_observer(
+        &mut self,
+        resource: crate::pals_adaptive_launch::NoGameResourceOwnerV1,
+    ) -> Result<
+        (),
+        (
+            ArenaError,
+            crate::pals_adaptive_launch::NoGameResourceOwnerV1,
+        ),
+    > {
+        let Some(owners) = self.owners.as_mut() else {
+            return Err((
+                ArenaError::Invalid("NoGame original owner unavailable".into()),
+                resource,
+            ));
+        };
+        if owners.resource.is_some() {
+            return Err((
+                ArenaError::Invalid("NoGame resource observer already attached".into()),
+                resource,
+            ));
+        }
+        if !resource.matches_original(owners._binding.snapshot(), owners._binding.execution()) {
+            return Err((
+                ArenaError::Integrity("NoGame resource observer owner differs".into()),
+                resource,
+            ));
+        }
+        owners.resource = Some(resource);
+        Ok(())
+    }
+
+    /// Explicit, best-effort caller-requested observation; never an admission
+    /// or proof of CPU/memory enforcement, child barrier or GPU completion.
+    pub(crate) fn observe_resource(
+        &self,
+    ) -> Option<crate::pals_adaptive_launch::NoGameResourceObservationV1> {
+        let owners = self.owners.as_ref()?;
+        Some(owners.resource.as_ref()?.observe(Some(&self.spawn_custody)))
+    }
+
+    /// Authorize one attempt for this original prepared owner, without
+    /// interpreting resource readback or predicting physical completion.
+    /// This WIP producer is deliberately excluded until the real proxy and
+    /// owner boundary have been integrated and reviewed.
+    #[cfg(any())]
+    pub(crate) fn admit_dispatch(&self) -> Result<IndependentNoGameDispatchAdmission, ArenaError> {
+        if self.evidence_transferred
+            || self.unresolved()
+            || self.original_error.is_some()
+            || self.process.is_some()
+        {
+            return Err(ArenaError::Invalid("NoGame owner is not fresh".into()));
+        }
+        let owners = self
+            .owners
+            .as_ref()
+            .ok_or_else(|| ArenaError::Invalid("NoGame original owner unavailable".into()))?;
+        if owners.observation.is_some() {
+            return Err(ArenaError::Invalid("NoGame attempt already started".into()));
+        }
+        let binding = &owners._binding;
+        binding.execution().require_running()?;
+        binding
+            .sockets()
+            .verify_original(binding.snapshot(), binding.execution())?;
+        binding.execution().require_running()?;
+        owners
+            .dispatch_reserved
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                ArenaError::Invalid("NoGame dispatch admission already reserved".into())
+            })?;
+        Ok(IndependentNoGameDispatchAdmission {
+            owner: Arc::downgrade(&owners.dispatch_identity),
+            reservation: Arc::clone(&owners.dispatch_reserved),
+        })
+    }
+
+    /// Direct caller for the original UCI supervisor. An explicitly declared
+    /// environment cannot be silently discarded. The token is consumed once.
+    pub(crate) fn dispatch(
+        &mut self,
+        admission: IndependentNoGameDispatchAdmission,
+        cancel: Option<&AtomicBool>,
+    ) -> IndependentNoGameDispatchOutcome {
+        let Some(owners) = self.owners.as_ref() else {
+            return IndependentNoGameDispatchOutcome::Rejected(ArenaError::Invalid(
+                "NoGame original owner unavailable".into(),
+            ));
+        };
+        if !admission
+            .owner
+            .upgrade()
+            .is_some_and(|identity| Arc::ptr_eq(&identity, &owners.dispatch_identity))
+        {
+            return IndependentNoGameDispatchOutcome::Rejected(ArenaError::Integrity(
+                "NoGame admission owner differs".into(),
+            ));
+        }
+        let binding = &owners._binding;
+        if binding
+            .snapshot()
+            .plan
+            .input()
+            .endpoint
+            .environment
+            .is_some()
+        {
+            return IndependentNoGameDispatchOutcome::UnsupportedDeclaredEnvironment;
+        }
+        let checked = binding
+            .execution()
+            .require_running()
+            .and_then(|()| {
+                binding
+                    .sockets()
+                    .verify_original(binding.snapshot(), binding.execution())
+            })
+            .and_then(|()| binding.execution().require_running());
+        if let Err(error) = checked {
+            return IndependentNoGameDispatchOutcome::Rejected(error);
+        }
+        IndependentNoGameDispatchOutcome::Supervisor(self.supervise_admitted(&admission, cancel))
+    }
+
+    /// Returned results and any unwound observation stay with this owner. An
+    /// Ok return means only that ProcessOutput was retained, not that the
+    /// process, model, resource policy or physical lifetime succeeded.
+    fn supervise_admitted(
+        &mut self,
+        _admission: &IndependentNoGameDispatchAdmission,
+        cancel: Option<&AtomicBool>,
+    ) -> IndependentNoGameSupervisorOutcome {
+        if self.evidence_transferred || self.unresolved() {
+            self.original_error
+                .get_or_insert_with(|| ArenaError::Invalid("NoGame owner is not fresh".into()));
+            return IndependentNoGameSupervisorOutcome::FailedRetained;
+        }
+        let Some(owners) = self.owners.as_mut() else {
+            return IndependentNoGameSupervisorOutcome::FailedRetained;
+        };
+        let binding = &owners._binding;
+        let execution = binding.execution();
+        let window = match crate::process::OriginalProcessWindow::new(
+            execution.started(),
+            execution.run_until(),
+            execution.cleanup_until(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.original_error.get_or_insert(error);
+                return IndependentNoGameSupervisorOutcome::FailedRetained;
+            }
+        };
+        if owners.observation.is_some() {
+            self.original_error.get_or_insert_with(|| {
+                ArenaError::Invalid("NoGame observation already installed".into())
+            });
+            return IndependentNoGameSupervisorOutcome::FailedRetained;
+        }
+        owners.observation = Some(crate::process::OriginalSmokeUciObservation::new(window));
+        let run_control = Arc::clone(binding.control());
+        let cleanup_control = Arc::clone(binding.control());
+        let cancel_control = Arc::clone(binding.control());
+        let cancel_not_granted = Arc::clone(&owners.cancel_not_granted);
+        let cancel_failure = Arc::clone(&owners.cancel_failure);
+        let run_grants = Arc::clone(&owners.grants);
+        let cleanup_grants = Arc::clone(&owners.grants);
+        let mut run = |custody: &crate::process::SpawnCustody, until| {
+            poll_independent_no_game_control(&run_control, &run_grants, custody, until, false)
+        };
+        let mut cleanup = |custody: &crate::process::SpawnCustody, until| {
+            poll_independent_no_game_control(
+                &cleanup_control,
+                &cleanup_grants,
+                custody,
+                until,
+                true,
+            )
+        };
+        let mut pre_signal = |custody: &crate::process::SpawnCustody, until| {
+            poll_independent_no_game_cancel(
+                &cancel_control,
+                &cancel_not_granted,
+                &cancel_failure,
+                custody,
+                until,
+            )
+        };
+        self.physical_fence_confirmed = false;
+        let result = crate::process::supervise_smoke_uci_in_original_window(
+            binding.proxy().as_ref(),
+            binding.arguments(),
+            &binding.snapshot().cwd,
+            owners.envelope.limits,
+            cancel,
+            &owners.envelope.watch,
+            window,
+            &mut self.spawn_custody,
+            &mut run,
+            Some(&mut cleanup),
+            Some(&mut pre_signal),
+            owners.observation.as_mut().expect("installed observation"),
+        );
+        match result {
+            Ok(output) => {
+                self.process = Some(output);
+                IndependentNoGameSupervisorOutcome::ReturnedUnassessed
+            }
+            Err(error) => {
+                // If no child was ever installed, no physical scope existed.
+                // Any spawned or uncertain child remains protected instead.
+                if !self.spawn_custody.pending.load(Ordering::Acquire)
+                    && self.spawn_custody.child().is_none()
+                    && self.spawn_custody.last_spawn_pid.is_none()
+                {
+                    self.physical_fence_confirmed = true;
+                }
+                self.original_error.get_or_insert(error);
+                IndependentNoGameSupervisorOutcome::FailedRetained
+            }
+        }
+    }
+
+    /// Physical completion must be resolved before moving evidence away from
+    /// the original owner. The caller is responsible for durable storage.
+    pub(crate) fn take_raw_evidence(&mut self) -> Option<IndependentNoGameRawEvidence> {
+        if self.unresolved() || self.evidence_transferred {
+            return None;
+        }
+        let owners = self.owners.as_mut()?;
+        if self.process.is_none()
+            && self.original_error.is_none()
+            && self.failures.is_empty()
+            && owners.observation.is_none()
+            && !owners.cancel_not_granted.load(Ordering::Acquire)
+            && owners.cancel_failure.get().is_none()
+        {
+            return None;
+        }
+        let role = owners._binding.snapshot().role;
+        let execution = owners._binding.execution();
+        self.evidence_transferred = true;
+        Some(IndependentNoGameRawEvidence {
+            plan_sha256: std::mem::take(&mut owners.plan_sha256),
+            role,
+            owner_id: execution.owner_id(),
+            owner_epoch: execution.owner_epoch(),
+            process: self.process.take(),
+            original_error: self.original_error.take(),
+            failures: std::mem::take(&mut self.failures),
+            observation: owners.observation.take(),
+            grants: Arc::clone(&owners.grants),
+            cancel_not_granted: owners.cancel_not_granted.load(Ordering::Acquire),
+            cancel_failure: owners.cancel_failure.get().cloned(),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PreparedIndependentNoGameOwner {
+    fn drop(&mut self) {
+        if !self.unresolved() {
+            if let Some(evidence) = self.take_raw_evidence() {
+                let mut slots = NO_GAME_RAW_EVIDENCE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if slots.try_reserve(1).is_ok() {
+                    slots.push(evidence);
+                    let bytes = slots
+                        .iter()
+                        .fold(0u64, |sum, e| sum.saturating_add(no_game_raw_bytes(e)));
+                    if slots.len() >= GUARDED_EVIDENCE_CAPACITY
+                        || bytes >= GUARDED_EVIDENCE_PAYLOAD_LIMIT_BYTES
+                    {
+                        NO_GAME_RAW_WARNING.store(true, Ordering::Release);
+                    }
+                } else {
+                    // Preserve bytes even if the recovery handle cannot be
+                    // allocated, and explicitly report that limitation.
+                    NO_GAME_RAW_UNOBSERVABLE.store(true, Ordering::Release);
+                    std::mem::forget(evidence);
+                }
+            }
+            return;
+        }
+        let physical_lifetime_unknown = !self.physical_fence_confirmed
+            || self.spawn_custody.pending.load(Ordering::Acquire)
+            || self.spawn_custody.child().is_some();
+        let error_description = self.original_error.as_ref().map(ToString::to_string);
+        if let Some(owners) = self.owners.as_mut() {
+            owners.quarantined_error = self.original_error.take();
+        }
+        crate::native_launch::close_native_admission();
+        let retained = Box::new(RetainedNativeScope {
+            _owner: Box::new(
+                self.owners
+                    .take()
+                    .expect("NoGame owns its original snapshot"),
+            ),
+            process: self.process.take(),
+            spawned_child: self.spawn_custody.take_child(),
+            last_spawn_pid: self.spawn_custody.last_spawn_pid,
+            physical_lifetime_unknown,
+            receipt: None,
+            original_error: error_description,
+            guarded_preflight_failures: std::mem::take(&mut self.failures),
+            interrupted_by_unwind: std::thread::panicking(),
+            guarded_probe_scope: None,
+            _v6_supervisor: None,
+        });
+        let mut slots = QUARANTINE.lock().unwrap_or_else(|error| error.into_inner());
+        retain_in_slot(&mut slots, retained);
+    }
+}
+
+/// Retained inside the same supervisor as the original NoGame control, also
+/// when NativeRunBundle moves an unresolved owner into quarantine. These are
+/// declared endpoint resources; no installation or readback is inferred.
+#[cfg(target_os = "linux")]
+struct NoGameEvidence {
+    smoke: Arc<Mutex<crate::pals_adaptive_launch::ProxyEntryFunctionalSmokeOwnerV1>>,
+    declared_resources: rz_experiments::PalsResourcePlanV5,
+    transport: Option<crate::process::OriginalSmokeTransportObservation>,
+}
+
+/// A read-only projection of an already sent NoGame frame. It is neither a
+/// proxy acknowledgement nor evidence that a process or device is finished.
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+struct NoGameFrameSnapshot {
+    phase: &'static str,
+    role: &'static str,
+    request_id: u64,
+    generation: u64,
+    peer_pid: u32,
+    peer_start_ticks: u64,
+    original_monotonic_deadline: &'static str,
+    completion_observed_during_cleanup: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+struct NoGameFrameProgressSnapshot {
+    challenge_written: Option<usize>,
+    request_read: Option<usize>,
+    grant_written: Option<usize>,
+    retained_grants: usize,
+    first_failure: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+struct NoGameObservationSnapshot<'a> {
+    domain: &'static str,
+    smoke_lock: Option<serde_json::Value>,
+    smoke_lock_observation: &'static str,
+    declared_endpoint_resources: &'a rz_experiments::PalsResourcePlanV5,
+    resource_application: &'static str,
+    resource_readback: &'static str,
+    transport_attempt_started: Option<bool>,
+    transport_attempt_returned: Option<bool>,
+    transport_spawn_timestamp_semantics: &'static str,
+    transport: Option<&'a crate::process::OriginalProcessObservation>,
+    process: Option<&'a ProcessReceipt>,
+    frame_observation: &'static str,
+    frames: Option<Vec<NoGameFrameSnapshot>>,
+    frame_progress: Option<NoGameFrameProgressSnapshot>,
+    frame_progress_observation: &'static str,
+    physical_completion: &'static str,
+    eligible_for_paired_or_performance_acceptance: bool,
+}
+
+/// NoGame preparation reuses the original bundle's existing quarantine on
+/// drop. It deliberately has no execution entrypoint or paired receipt.
+#[cfg(target_os = "linux")]
+pub(crate) struct PreparedNoGameSmokeOwner {
+    bundle: NativeRunBundle<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>,
+    proxy: Option<Arc<std::fs::File>>,
+    arguments: Vec<std::ffi::OsString>,
+    rejected_control: Option<Box<dyn NativeV6Control>>,
+}
+
+/// Failure returns the same preparation owner; a future spawn must never be
+/// hidden behind this declaration-only error path.
+#[cfg(target_os = "linux")]
+pub(crate) struct NoGameSmokePreparationFailure {
+    pub(crate) error: ArenaError,
+    pub(crate) original: PreparedNoGameSmokeOwner,
+}
+
+#[cfg(target_os = "linux")]
+struct NoGameRetainedControl {
+    execution: Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>,
+    sockets: Arc<crate::pals_adaptive_launch::PalsV6RoleSockets>,
+    control: Arc<Mutex<crate::pals_adaptive_launch::SmokeDeadlineControl>>,
+    /// Frame-delivery observations stay with this owner; they do not prove
+    /// process exit, acknowledgement, or device completion.
+    grants: [Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2],
+}
+
+#[cfg(target_os = "linux")]
+impl NoGameRetainedControl {
+    fn poll_smoke(
+        &mut self,
+        custody: &crate::process::SpawnCustody,
+        until: std::time::Instant,
+        cleanup: bool,
+    ) -> Result<(), ArenaError> {
+        let observed = {
+            let mut control = match self.control.try_lock() {
+                Ok(control) => control,
+                // The same control and every partial frame remain owned; the
+                // bounded supervisor can retry on a later tick.
+                Err(TryLockError::WouldBlock) => return Ok(()),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(ArenaError::Io(
+                        "NoGame original control owner poisoned".into(),
+                    ));
+                }
+            };
+            if cleanup {
+                control.poll_cleanup(custody, until)?
+            } else {
+                control.poll_run(custody, until)?
+            }
+        };
+        if let Some(observation) = observed {
+            let index = match observation.scope.phase {
+                rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Run => 0,
+                rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Cleanup => 1,
+            };
+            if self.grants[index].is_some() {
+                return Err(ArenaError::Integrity(
+                    "duplicate NoGame grant observation".into(),
+                ));
+            }
+            self.grants[index] = Some(observation);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl NativeV6Control for NoGameRetainedControl {
+    fn original_execution(
+        &self,
+    ) -> Option<&Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>> {
+        Some(&self.execution)
+    }
+
+    fn original_role_sockets(
+        &self,
+    ) -> Option<&Arc<crate::pals_adaptive_launch::PalsV6RoleSockets>> {
+        Some(&self.sockets)
+    }
+
+    fn no_game_grants(
+        &self,
+    ) -> Option<&[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]> {
+        Some(&self.grants)
+    }
+
+    fn no_game_progress(&self) -> NoGameProgressReadback {
+        match self.control.try_lock() {
+            Ok(control) => NoGameProgressReadback::Observed(control.progress()),
+            Err(TryLockError::WouldBlock) => NoGameProgressReadback::Busy,
+            Err(TryLockError::Poisoned(_)) => NoGameProgressReadback::Poisoned,
+        }
+    }
+
+    fn poll_run(
+        &mut self,
+        custody: &crate::process::SpawnCustody,
+        until: std::time::Instant,
+    ) -> Result<(), ArenaError> {
+        self.poll_smoke(custody, until, false)
+    }
+
+    fn poll_cleanup(
+        &mut self,
+        custody: &crate::process::SpawnCustody,
+        until: std::time::Instant,
+    ) -> Result<(), ArenaError> {
+        self.poll_smoke(custody, until, true)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PreparedNoGameSmokeOwner {
+    /// Prepare without spawning. The exact owner, live control and any later
+    /// unresolved custody/output use NativeRunBundle's existing retention path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn assemble(
+        owner: NativeLaunchOwner<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>,
+        smoke: &Arc<Mutex<crate::pals_adaptive_launch::ProxyEntryFunctionalSmokeOwnerV1>>,
+        execution: &Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>,
+        sockets: &Arc<crate::pals_adaptive_launch::PalsV6RoleSockets>,
+        role: rz_experiments::NativeEngineRole,
+        owner_id: [u8; 16],
+        owner_epoch: u64,
+        request_ids: [u64; 2],
+    ) -> Result<Self, Box<NoGameSmokePreparationFailure>> {
+        let mut original = Self {
+            bundle: NativeRunBundle {
+                owner: Some(owner),
+                process: None,
+                receipt: None,
+                receipt_artifact: None,
+                original_error: None,
+                guarded_preflight_failures: Vec::new(),
+                probe_evidence: None,
+                spawn_custody: crate::process::SpawnCustody::default(),
+                physical_guard_required: true,
+                v6_supervisor: None,
+            },
+            proxy: None,
+            arguments: Vec::new(),
+            rejected_control: None,
+        };
+        let prepared = {
+            let source = original
+                .bundle
+                .owner
+                .as_ref()
+                .expect("fresh original owner");
+            crate::pals_adaptive_launch::DirectSmokeBinding::bind(
+                source,
+                smoke,
+                execution,
+                sockets,
+                &mut original.bundle.spawn_custody,
+                role,
+                owner_id,
+                owner_epoch,
+                request_ids,
+            )
+            .map(|binding| {
+                (
+                    Arc::clone(binding.proxy()),
+                    Arc::clone(binding.control()),
+                    binding.common_arguments().to_vec(),
+                )
+            })
+        };
+        let (proxy, control, arguments) = match prepared {
+            Ok(value) => value,
+            Err(error) => return Err(Box::new(NoGameSmokePreparationFailure { error, original })),
+        };
+        original.proxy = Some(proxy);
+        original.arguments = arguments;
+        let control: Box<dyn NativeV6Control> = Box::new(NoGameRetainedControl {
+            execution: Arc::clone(execution),
+            sockets: Arc::clone(sockets),
+            control,
+            grants: [None, None],
+        });
+        match NativeV6Supervisor::new(execution, control) {
+            Ok(mut supervisor) => {
+                let declared_resources = original
+                    .bundle
+                    .owner
+                    .as_ref()
+                    .expect("fresh original owner")
+                    .spec()
+                    .endpoint(role)
+                    .startup_lock
+                    .config
+                    .endpoint
+                    .resources
+                    .clone();
+                supervisor.no_game_evidence = Some(NoGameEvidence {
+                    smoke: Arc::clone(smoke),
+                    declared_resources,
+                    transport: None,
+                });
+                original.bundle.v6_supervisor = Some(supervisor);
+            }
+            Err(rejection) => {
+                original.rejected_control = Some(rejection.control);
+                return Err(Box::new(NoGameSmokePreparationFailure {
+                    error: rejection.error,
+                    original,
+                }));
+            }
+        }
+        Ok(original)
+    }
+
+    /// Reserve the transport observation in the same retained supervisor as
+    /// the child owner. The input uses the original execution's exact window;
+    /// reserving it neither applies resources nor starts a process.
+    pub(crate) fn reserve_transport<'a>(
+        &mut self,
+        bytes: &'a [u8],
+    ) -> Result<crate::process::OriginalProcessInput<'a>, ArenaError> {
+        let supervisor =
+            self.bundle.v6_supervisor.as_mut().ok_or_else(|| {
+                ArenaError::Invalid("NoGame original supervisor unavailable".into())
+            })?;
+        supervisor.execution.require_running()?;
+        let window = crate::process::OriginalProcessWindow::new(
+            supervisor.execution.started(),
+            supervisor.execution.run_until(),
+            supervisor.execution.cleanup_until(),
+        )?;
+        let evidence = supervisor.no_game_evidence.as_mut().ok_or_else(|| {
+            ArenaError::Invalid("NoGame original evidence owner unavailable".into())
+        })?;
+        if evidence.transport.is_some() {
+            return Err(ArenaError::Invalid(
+                "NoGame transport already reserved".into(),
+            ));
+        }
+        let input = crate::process::OriginalProcessInput { bytes, window };
+        evidence.transport = Some(crate::process::OriginalSmokeTransportObservation::new(
+            input,
+        )?);
+        Ok(input)
+    }
+
+    /// A later direct supervisor may update only this already reserved
+    /// observation; unresolved Drop retains it with the original supervisor.
+    pub(crate) fn transport_observation_mut(
+        &mut self,
+    ) -> Option<&mut crate::process::OriginalSmokeTransportObservation> {
+        self.bundle
+            .v6_supervisor
+            .as_mut()?
+            .no_game_evidence
+            .as_mut()?
+            .transport
+            .as_mut()
+    }
+
+    /// Transfer an observed output into the existing original bundle. This
+    /// local PID check is not proof of the output's origin; a future execution
+    /// path must keep the adapter return and owner in the same call. An error
+    /// returns the same output, including any pending child handle.
+    fn retain_process_output(
+        &mut self,
+        output: ProcessOutput,
+    ) -> Result<(), (ArenaError, ProcessOutput)> {
+        if self.bundle.process.is_some()
+            || self.bundle.spawn_custody.last_spawn_pid != Some(output.receipt.pid)
+        {
+            return Err((
+                ArenaError::Integrity("NoGame output does not match original custody".into()),
+                output,
+            ));
+        }
+        self.bundle.process = Some(output);
+        Ok(())
+    }
+
+    /// Borrow raw output while the same owner remains live. A borrow or a
+    /// process receipt does not establish durable recovery or physical finish.
+    pub(crate) fn retained_process_output(&self) -> Option<&ProcessOutput> {
+        self.bundle.process.as_ref()
+    }
+
+    /// Produce a bounded in-memory observation snapshot. A busy observation
+    /// lock is reported as unavailable and never blocks unrelated execution.
+    /// Raw output remains in the original bundle; this is not durable storage.
+    pub(crate) fn observation_json(&self) -> Result<Vec<u8>, ArenaError> {
+        let supervisor =
+            self.bundle.v6_supervisor.as_ref().ok_or_else(|| {
+                ArenaError::Invalid("NoGame original supervisor unavailable".into())
+            })?;
+        let evidence = supervisor.no_game_evidence.as_ref().ok_or_else(|| {
+            ArenaError::Invalid("NoGame original evidence owner unavailable".into())
+        })?;
+        let (smoke_lock, smoke_lock_observation) = match evidence.smoke.try_lock() {
+            // The same Mutex can contain a replacement object. Until the
+            // control's original identity is checked, publish no lock value.
+            Ok(_) => (None, "unknown_original_identity"),
+            Err(TryLockError::WouldBlock) => (None, "unavailable_busy"),
+            Err(TryLockError::Poisoned(_)) => (None, "unavailable_poisoned"),
+        };
+        let (frames, frame_progress, frame_observation, frame_progress_observation) =
+            match supervisor.control.try_lock() {
+                Ok(control) => match control.no_game_grants() {
+                    Some(grants) => {
+                        let (progress, progress_status) = match control.no_game_progress() {
+                            NoGameProgressReadback::Observed(value) => (
+                                Some(NoGameFrameProgressSnapshot {
+                                    challenge_written: value.challenge_written,
+                                    request_read: value.request_read,
+                                    grant_written: value.grant_written,
+                                    retained_grants: value.retained_grants,
+                                    first_failure: value.first_failure,
+                                }),
+                                "original_control_observed",
+                            ),
+                            NoGameProgressReadback::Busy => (None, "unavailable_busy"),
+                            NoGameProgressReadback::Poisoned => (None, "unavailable_poisoned"),
+                            NoGameProgressReadback::Unavailable => (None, "unavailable"),
+                        };
+                        (
+                    Some(grants.iter().flatten().map(|grant| NoGameFrameSnapshot {
+                        phase: match grant.scope.phase {
+                            rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Run => "run",
+                            rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Cleanup => "cleanup",
+                        },
+                        role: match grant.scope.role {
+                            rz_contracts::pals::deadline_grant_v1::DeadlineRole::Baseline => "baseline",
+                            rz_contracts::pals::deadline_grant_v1::DeadlineRole::Candidate => "candidate",
+                        },
+                        request_id: grant.scope.request_id,
+                        generation: grant.scope.generation,
+                        peer_pid: grant.peer_pid,
+                        peer_start_ticks: grant.peer_start_ticks,
+                        original_monotonic_deadline: "retained_in_original_control",
+                        completion_observed_during_cleanup: grant.completion_observed_during_cleanup,
+                    }).collect()),
+                    progress,
+                    "original_owner_borrowed",
+                    progress_status,
+                )
+                    }
+                    None => (None, None, "unavailable", "unavailable"),
+                },
+                Err(TryLockError::WouldBlock) => {
+                    (None, None, "unavailable_busy", "unavailable_busy")
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    (None, None, "unavailable_poisoned", "unavailable_poisoned")
+                }
+            };
+        let transport = evidence.transport.as_ref();
+        let snapshot = NoGameObservationSnapshot {
+            domain: "rz-pals-nogame-original-observation/1",
+            smoke_lock,
+            smoke_lock_observation,
+            declared_endpoint_resources: &evidence.declared_resources,
+            resource_application: "unknown",
+            resource_readback: "unknown",
+            transport_attempt_started: transport.map(|v| v.attempt_started()),
+            transport_attempt_returned: transport.map(|v| v.attempt_returned()),
+            transport_spawn_timestamp_semantics: "supervisor_pre_spawn_not_os_spawn",
+            transport: transport.map(|v| v.transport()),
+            process: self.bundle.process.as_ref().map(|v| &v.receipt),
+            frame_observation,
+            frames,
+            frame_progress,
+            frame_progress_observation,
+            physical_completion: "unknown",
+            eligible_for_paired_or_performance_acceptance: false,
+        };
+        serde_json::to_vec(&snapshot)
+            .map_err(|_| ArenaError::Io("NoGame observation serialization failed".into()))
+    }
+}
+
+/// Original probe output retained after a storage failure.  Taking this value
+/// transfers evidence custody to the caller; it is not a GPU reservation.
+pub struct GuardedPreflightEvidence {
+    pub run_id: u64,
+    pub input_sha256: String,
+    pub role: &'static str,
+    pub probe: &'static str,
+    pub declared_output_limit_bytes: u64,
+    pub observed_retained_output_bytes: u64,
+    pub interrupted_by_unwind: bool,
+    pub original_error: Option<String>,
+    pub failures: Vec<String>,
+    pub process: ProcessOutput,
+    /// Original generic pair receipt, if one was constructed before failure.
+    pub pair_receipt: Option<Box<dyn std::any::Any + Send>>,
+}
+impl fmt::Debug for GuardedPreflightEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GuardedPreflightEvidence")
+            .field("run_id", &self.run_id)
+            .field("role", &self.role)
+            .field("probe", &self.probe)
+            .field("pair_receipt_retained", &self.pair_receipt.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+enum GuardedEvidenceSlot {
+    Retained(GuardedPreflightEvidence),
+}
+struct GuardedEvidenceEntry {
+    run_id: u64,
+    role: &'static str,
+    probe: &'static str,
+    retained_payload_bytes: u64,
+    slot: GuardedEvidenceSlot,
+}
+/// Bounded process-local evidence capacity; this is not a GPU or VRAM limit.
+const GUARDED_EVIDENCE_CAPACITY: usize = 16;
+const GUARDED_EVIDENCE_PAYLOAD_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+static GUARDED_EVIDENCE_SLOTS: Mutex<Vec<GuardedEvidenceEntry>> = Mutex::new(Vec::new());
+static GUARDED_EVIDENCE_NEXT_RUN: AtomicU64 = AtomicU64::new(1);
+static GUARDED_EVIDENCE_FALLBACK_LOST: AtomicU64 = AtomicU64::new(0);
+static GUARDED_EVIDENCE_LOSSES: Mutex<[Option<GuardedEvidenceLoss>; GUARDED_EVIDENCE_CAPACITY]> =
+    Mutex::new([const { None }; GUARDED_EVIDENCE_CAPACITY]);
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GuardedEvidenceLoss {
+    pub run_id: u64,
+    pub input_sha256: String,
+    pub role: &'static str,
+    pub probe: &'static str,
+    pub observed_retained_output_bytes: u64,
+    pub reason: GuardedEvidenceFallbackError,
+    pub interrupted_by_unwind: bool,
+}
+
+/// Recent bounded observations. The separate lost counter includes entries
+/// that have rolled off and is unrelated to GPU or storage admission.
+pub fn guarded_evidence_recent_losses() -> Vec<GuardedEvidenceLoss> {
+    GUARDED_EVIDENCE_LOSSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+fn retain_guarded_evidence(
+    evidence: GuardedPreflightEvidence,
+) -> Result<(), (GuardedEvidenceFallbackError, GuardedPreflightEvidence)> {
+    let mut slots = GUARDED_EVIDENCE_SLOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if slots.iter().any(|e| {
+        e.run_id == evidence.run_id && e.role == evidence.role && e.probe == evidence.probe
+    }) {
+        return Err((GuardedEvidenceFallbackError::ScopeInUse, evidence));
+    }
+    if slots.len() >= GUARDED_EVIDENCE_CAPACITY {
+        return Err((GuardedEvidenceFallbackError::TotalSlotsExhausted, evidence));
+    }
+    let total = slots
+        .iter()
+        .try_fold(0u64, |sum, e| sum.checked_add(e.retained_payload_bytes))
+        .and_then(|sum| sum.checked_add(evidence.observed_retained_output_bytes));
+    if total.is_none_or(|sum| sum > GUARDED_EVIDENCE_PAYLOAD_LIMIT_BYTES) {
+        return Err((
+            GuardedEvidenceFallbackError::TotalPayloadCapacityExhausted,
+            evidence,
+        ));
+    }
+    slots.push(GuardedEvidenceEntry {
+        run_id: evidence.run_id,
+        role: evidence.role,
+        probe: evidence.probe,
+        retained_payload_bytes: evidence.observed_retained_output_bytes,
+        slot: GuardedEvidenceSlot::Retained(evidence),
+    });
+    Ok(())
+}
+
+/// Count of dropped fallback evidence when callers did not take it and the
+/// bounded in-memory fallback could not accept it; not a GPU failure count.
+pub fn guarded_evidence_fallback_lost_count() -> u64 {
+    GUARDED_EVIDENCE_FALLBACK_LOST.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardedEvidenceFallbackError {
+    ScopeInUse,
+    TotalSlotsExhausted,
+    TotalPayloadCapacityExhausted,
+}
+impl fmt::Display for GuardedEvidenceFallbackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ScopeInUse => "guarded_evidence_scope_in_use",
+            Self::TotalSlotsExhausted => "guarded_evidence_total_slots_exhausted",
+            Self::TotalPayloadCapacityExhausted => {
+                "guarded_evidence_total_payload_capacity_exhausted"
+            }
+        })
+    }
+}
+
+struct GuardedProbeReservation {
+    run_id: u64,
+    input_sha256: String,
+    role: &'static str,
+    probe: &'static str,
+    output_limit_bytes: u64,
+    persistence_failed: bool,
+    process_available: bool,
+}
+
+impl GuardedProbeReservation {
+    fn acquire(
+        run_id: u64,
+        input_sha256: String,
+        role: &'static str,
+        probe: &'static str,
+        output_limit_bytes: u64,
+    ) -> Self {
+        Self {
+            run_id,
+            input_sha256,
+            role,
+            probe,
+            output_limit_bytes,
+            // Until every write succeeds, unwind must preserve the original.
+            persistence_failed: true,
+            process_available: false,
+        }
+    }
+}
+
+/// Returns owned output for caller-directed recovery. A reservation in use is
+/// not disturbed. No process or GPU resource owner is included.
+pub fn take_guarded_preflight_evidence(
+    run_id: u64,
+    role: &str,
+    probe: &str,
+) -> Option<GuardedPreflightEvidence> {
+    let mut slots = GUARDED_EVIDENCE_SLOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let index = slots.iter().position(|e| {
+        e.run_id == run_id
+            && e.role == role
+            && e.probe == probe
+            && matches!(e.slot, GuardedEvidenceSlot::Retained(_))
+    })?;
+    let GuardedEvidenceSlot::Retained(evidence) = slots.remove(index).slot;
+    Some(evidence)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum GuardedPreflightEvidenceStatus {
+    Retained {
+        run_id: u64,
+        input_sha256: String,
+        role: &'static str,
+        probe: &'static str,
+        declared_output_limit_bytes: u64,
+        observed_retained_output_bytes: u64,
+        interrupted_by_unwind: bool,
+        failures: Vec<String>,
+    },
+}
+
+/// Payload bytes are observed retained stream lengths, not process RSS.
+pub fn guarded_preflight_evidence_status() -> (usize, u64, Vec<GuardedPreflightEvidenceStatus>) {
+    let slots = GUARDED_EVIDENCE_SLOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let statuses = slots
+        .iter()
+        .map(|entry| match &entry.slot {
+            GuardedEvidenceSlot::Retained(e) => GuardedPreflightEvidenceStatus::Retained {
+                run_id: e.run_id,
+                input_sha256: e.input_sha256.clone(),
+                role: e.role,
+                probe: e.probe,
+                declared_output_limit_bytes: e.declared_output_limit_bytes,
+                observed_retained_output_bytes: e.observed_retained_output_bytes,
+                interrupted_by_unwind: e.interrupted_by_unwind,
+                failures: e.failures.clone(),
+            },
+        })
+        .collect();
+    (
+        GUARDED_EVIDENCE_CAPACITY,
+        GUARDED_EVIDENCE_PAYLOAD_LIMIT_BYTES,
+        statuses,
+    )
+}
+
 impl<S: NativeProviderDeclaration> NativeRunBundle<S> {
     fn unresolved(&self) -> bool {
-        self.process.as_ref().is_some_and(|p| {
-            p.receipt.group_cleanup != CleanupStatus::Gone || p.pending_child.is_some()
+        (self.physical_guard_required
+            && (self.spawn_custody.pending.load(Ordering::Acquire)
+                || self.spawn_custody.child().is_some()))
+            || self.process.as_ref().is_some_and(|p| {
+                p.receipt.group_cleanup != CleanupStatus::Gone || p.pending_child.is_some()
+            })
+    }
+    fn take_evidence(&mut self) -> Option<GuardedPreflightEvidence> {
+        if self.unresolved()
+            || !self
+                .probe_evidence
+                .as_ref()
+                .is_some_and(|r| r.persistence_failed && r.process_available)
+        {
+            return None;
+        }
+        let reservation = self.probe_evidence.take()?;
+        let process = self.process.take()?;
+        let observed = u64::try_from(process.stdout.len().saturating_add(process.stderr.len()))
+            .unwrap_or(u64::MAX);
+        Some(GuardedPreflightEvidence {
+            run_id: reservation.run_id,
+            input_sha256: reservation.input_sha256,
+            role: reservation.role,
+            probe: reservation.probe,
+            declared_output_limit_bytes: reservation.output_limit_bytes,
+            observed_retained_output_bytes: observed,
+            interrupted_by_unwind: std::thread::panicking(),
+            original_error: self.original_error.take(),
+            failures: std::mem::take(&mut self.guarded_preflight_failures),
+            process,
+            pair_receipt: self
+                .receipt
+                .take()
+                .map(|r| Box::new(r) as Box<dyn std::any::Any + Send>),
         })
+    }
+}
+
+#[cfg(test)]
+mod physical_guard_tests {
+    use super::*;
+
+    #[test]
+    fn guarded_spawn_without_process_output_stays_unresolved() {
+        // No owner is constructed in this state-only test. Clear the pending
+        // flag before Drop so the normal quarantine invariant is untouched.
+        let bundle = NativeRunBundle::<rz_experiments::LockedIntegrationPairSpecV1> {
+            owner: None,
+            process: None,
+            receipt: None,
+            receipt_artifact: None,
+            original_error: None,
+            guarded_preflight_failures: Vec::new(),
+            probe_evidence: None,
+            spawn_custody: crate::process::SpawnCustody::default(),
+            physical_guard_required: true,
+            #[cfg(target_os = "linux")]
+            v6_supervisor: None,
+        };
+        assert!(!bundle.unresolved()); // no child was spawned
+        bundle.spawn_custody.pending.store(true, Ordering::Release);
+        assert!(bundle.unresolved()); // spawn returned, output still absent
+        bundle.spawn_custody.pending.store(false, Ordering::Release);
+        assert!(!bundle.unresolved()); // caller recorded independent proof
+    }
+
+    #[test]
+    fn historical_unprotected_provider_does_not_inherit_new_gate() {
+        let bundle = NativeRunBundle::<rz_experiments::LockedIntegrationPairSpecV1> {
+            owner: None,
+            process: None,
+            receipt: None,
+            receipt_artifact: None,
+            original_error: None,
+            guarded_preflight_failures: Vec::new(),
+            probe_evidence: None,
+            spawn_custody: crate::process::SpawnCustody::default(),
+            physical_guard_required: false,
+            #[cfg(target_os = "linux")]
+            v6_supervisor: None,
+        };
+        bundle.spawn_custody.pending.store(true, Ordering::Release);
+        assert!(!bundle.unresolved());
+    }
+
+    #[test]
+    fn previous_probe_is_not_relabelled_as_current_even_with_reused_pid() {
+        assert!(guarded_process_is_previous(true, true, Some(41), Some(41)));
+        assert!(guarded_process_is_previous(true, false, Some(42), Some(41)));
+        assert!(!guarded_process_is_previous(
+            true,
+            false,
+            Some(42),
+            Some(42)
+        ));
+        assert!(!guarded_process_is_previous(
+            false,
+            true,
+            Some(41),
+            Some(41)
+        ));
+    }
+
+    #[test]
+    fn failed_probe_storage_retains_original_streams_without_gpu_quarantine() {
+        let mut reservation = GuardedProbeReservation::acquire(
+            u64::MAX,
+            "input".into(),
+            "candidate",
+            "readiness",
+            256 * 1024,
+        );
+        let independent = GuardedProbeReservation::acquire(
+            u64::MAX - 1,
+            "other".into(),
+            "baseline",
+            "identification",
+            256 * 1024,
+        );
+        assert_eq!(independent.output_limit_bytes, 256 * 1024);
+        let large = GuardedProbeReservation::acquire(
+            u64::MAX - 2,
+            "other".into(),
+            "pair",
+            "runner",
+            GUARDED_EVIDENCE_PAYLOAD_LIMIT_BYTES + 1,
+        );
+        assert!(large.output_limit_bytes > GUARDED_EVIDENCE_PAYLOAD_LIMIT_BYTES);
+        reservation.persistence_failed = true;
+        reservation.process_available = true;
+        let process = ProcessOutput {
+            receipt: crate::ProcessReceipt {
+                supervisor_version: 1,
+                pid: 17,
+                elapsed_ns: 0,
+                cleanup_elapsed_ns: None,
+                cleanup_timing_unavailable_reason: None,
+                stop: crate::ProcessStop::Exited,
+                exit_code: Some(0),
+                exit_signal: None,
+                group_cleanup: CleanupStatus::Gone,
+                stdout_bytes: 3,
+                stderr_bytes: 2,
+                observed_output_bytes: 5,
+                descendant_cleanup_required: false,
+                child_limit_enforcement: "test".into(),
+                watched_artifact_bytes: None,
+                artifact_limit_enforcement: None,
+                errors: Vec::new(),
+            },
+            stdout: b"out".to_vec(),
+            stderr: b"er".to_vec(),
+            pending_child: None,
+        };
+        let bundle = NativeRunBundle::<rz_experiments::LockedIntegrationPairSpecV1> {
+            owner: None,
+            process: Some(process),
+            receipt: None,
+            receipt_artifact: None,
+            original_error: None,
+            guarded_preflight_failures: vec!["storage failed".into()],
+            probe_evidence: Some(reservation),
+            spawn_custody: crate::process::SpawnCustody::default(),
+            physical_guard_required: true,
+            #[cfg(target_os = "linux")]
+            v6_supervisor: None,
+        };
+        assert!(!bundle.unresolved());
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _bundle = bundle;
+            panic!("simulated guarded probe persistence panic");
+        }));
+        assert!(unwind.is_err());
+        let evidence = take_guarded_preflight_evidence(u64::MAX, "candidate", "readiness")
+            .expect("raw evidence retained");
+        assert_eq!(evidence.process.stdout, b"out");
+        assert_eq!(evidence.process.stderr, b"er");
+        assert_eq!(evidence.observed_retained_output_bytes, 5);
+        assert!(evidence.interrupted_by_unwind);
+        assert_eq!(evidence.failures, ["storage failed"]);
+        assert!(!guarded_preflight_evidence_status().2.iter().any(|e| matches!(e, GuardedPreflightEvidenceStatus::Retained { run_id, .. } if *run_id == u64::MAX)));
+        let mut next = GuardedProbeReservation::acquire(
+            u64::MAX - 3,
+            "input".into(),
+            "pair",
+            "runner",
+            GUARDED_EVIDENCE_PAYLOAD_LIMIT_BYTES + 1,
+        );
+        next.process_available = true;
+        let mut bundle = NativeRunBundle::<rz_experiments::LockedIntegrationPairSpecV1> {
+            owner: None,
+            process: Some(evidence.process),
+            receipt: None,
+            receipt_artifact: None,
+            original_error: Some("save failed".into()),
+            guarded_preflight_failures: Vec::new(),
+            probe_evidence: Some(next),
+            spawn_custody: crate::process::SpawnCustody::default(),
+            physical_guard_required: true,
+            #[cfg(target_os = "linux")]
+            v6_supervisor: None,
+        };
+        let caller_owned = bundle
+            .take_evidence()
+            .expect("caller can recover without fallback capacity");
+        assert_eq!(caller_owned.process.stdout, b"out");
+        assert_eq!(caller_owned.original_error.as_deref(), Some("save failed"));
+
+        let mut pending = GuardedProbeReservation::acquire(
+            u64::MAX - 4,
+            "input".into(),
+            "pair",
+            "runner",
+            256 * 1024,
+        );
+        pending.process_available = true;
+        let mut failure = NativePairFailure::<rz_experiments::LockedIntegrationPairSpecV1> {
+            cause: ArenaError::Io("save failed".into()),
+            receipt: None,
+            receipt_artifact: None,
+            bundle: NativeRunBundle {
+                owner: None,
+                process: Some(caller_owned.process),
+                receipt: None,
+                receipt_artifact: None,
+                original_error: Some("save failed".into()),
+                guarded_preflight_failures: Vec::new(),
+                probe_evidence: Some(pending),
+                spawn_custody: crate::process::SpawnCustody::default(),
+                physical_guard_required: true,
+                #[cfg(target_os = "linux")]
+                v6_supervisor: None,
+            },
+        };
+        let refused = failure.with_guarded_evidence(|view| {
+            assert_eq!(view.process.stdout, b"out");
+            Err::<(), _>("storage unavailable")
+        });
+        assert_eq!(refused, Err("storage unavailable"));
+        assert!(failure.process().is_some());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = failure.with_guarded_evidence::<(), ()>(|_| panic!("save interrupted"));
+        }));
+        assert!(panic.is_err());
+        assert!(
+            failure
+                .bundle
+                .probe_evidence
+                .as_ref()
+                .unwrap()
+                .persistence_failed
+        );
+        failure
+            .bundle
+            .spawn_custody
+            .pending
+            .store(true, Ordering::Release);
+        let saved = failure.with_guarded_evidence(|view| {
+            assert!(view.physical_or_process_completion_unknown);
+            Ok::<_, ()>(view.process.stdout.len())
+        });
+        assert_eq!(saved, Ok(Some(3)));
+        assert!(failure.bundle.unresolved());
+        assert!(failure.take_guarded_evidence().is_none());
+        // This state-only test did not spawn a child or construct an owner.
+        failure
+            .bundle
+            .spawn_custody
+            .pending
+            .store(false, Ordering::Release);
+        let evidence = failure
+            .take_guarded_evidence()
+            .expect("callback success did not release original evidence");
+        assert_eq!(evidence.process.stdout, b"out");
     }
 }
 impl<S: NativeProviderDeclaration> Drop for NativeRunBundle<S> {
     fn drop(&mut self) {
+        // A successful physical fence does not imply the raw output was saved.
+        // Retain only the evidence here, so its recovery never owns a GPU or
+        // keeps the native admission lease alive.
         if !self.unresolved() {
+            if let Some(evidence) = self.take_evidence() {
+                if let Err((error, evidence)) = retain_guarded_evidence(evidence) {
+                    let count = GUARDED_EVIDENCE_FALLBACK_LOST.fetch_add(1, Ordering::Relaxed);
+                    let mut losses = GUARDED_EVIDENCE_LOSSES
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let index = (count % GUARDED_EVIDENCE_CAPACITY as u64) as usize;
+                    losses[index] = Some(GuardedEvidenceLoss {
+                        run_id: evidence.run_id,
+                        input_sha256: evidence.input_sha256,
+                        role: evidence.role,
+                        probe: evidence.probe,
+                        observed_retained_output_bytes: evidence.observed_retained_output_bytes,
+                        reason: error,
+                        interrupted_by_unwind: evidence.interrupted_by_unwind,
+                    });
+                    drop(losses);
+                }
+            }
             return;
         }
+        let physical_lifetime_unknown = self.physical_guard_required
+            && (self.spawn_custody.pending.load(Ordering::Acquire)
+                || self.spawn_custody.child().is_some());
+        // A reaped leader and a gone process group do not prove that no child
+        // escaped into a new session. Keep the whole resource protected until
+        // a supervisor-owned, independently verified tree fence exists.
         crate::native_launch::close_native_admission();
         let retained = Box::new(RetainedNativeScope {
             _owner: Box::new(self.owner.take().expect("native bundle owns its lease")),
-            process: self
-                .process
-                .take()
-                .expect("unresolved bundle owns process evidence"),
+            process: self.process.take(),
+            spawned_child: self.spawn_custody.take_child(),
+            last_spawn_pid: self.spawn_custody.last_spawn_pid,
+            physical_lifetime_unknown,
             receipt: self.receipt.take().map(|r| Box::new(r) as Box<dyn Send>),
             original_error: self.original_error.take(),
+            guarded_preflight_failures: std::mem::take(&mut self.guarded_preflight_failures),
+            interrupted_by_unwind: std::thread::panicking(),
+            guarded_probe_scope: self.probe_evidence.as_ref().map(|p| GuardedProbeScope {
+                run_id: p.run_id,
+                input_sha256: p.input_sha256.clone(),
+                role: p.role,
+                probe: p.probe,
+            }),
+            #[cfg(target_os = "linux")]
+            _v6_supervisor: self.v6_supervisor.take(),
         });
-        // The active lease forbids a second unresolved bundle. Do not abort the
-        // parent: abort would not ensure its runner/process group is terminated.
-        // A busy/poisoned synchronization boundary must not free child inputs.
-        match QUARANTINE.try_lock() {
-            Ok(mut slot) => retain_in_slot(&mut slot, retained),
-            Err(TryLockError::Poisoned(error)) => retain_in_slot(&mut error.into_inner(), retained),
-            Err(TryLockError::WouldBlock) => {
-                QUARANTINE_FALLBACK.store(true, Ordering::Release);
-                std::mem::forget(retained);
-            }
-        }
+        // The mutex protects only a short vector append; transient contention must not
+        // turn an otherwise recoverable owner into an inaccessible leak.
+        let mut slots = QUARANTINE.lock().unwrap_or_else(|e| e.into_inner());
+        retain_in_slot(&mut slots, retained);
     }
 }
 struct RetainedNativeScope {
     _owner: Box<dyn Send>,
-    process: ProcessOutput,
+    process: Option<ProcessOutput>,
+    spawned_child: Option<std::process::Child>,
+    last_spawn_pid: Option<u32>,
+    physical_lifetime_unknown: bool,
     receipt: Option<Box<dyn Send>>,
     original_error: Option<String>,
+    guarded_preflight_failures: Vec<String>,
+    interrupted_by_unwind: bool,
+    guarded_probe_scope: Option<GuardedProbeScope>,
+    #[cfg(target_os = "linux")]
+    _v6_supervisor: Option<NativeV6Supervisor>,
 }
-static QUARANTINE: Mutex<Option<Box<RetainedNativeScope>>> = Mutex::new(None);
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GuardedProbeScope {
+    pub run_id: u64,
+    pub input_sha256: String,
+    pub role: &'static str,
+    pub probe: &'static str,
+}
+static QUARANTINE: Mutex<Vec<Box<RetainedNativeScope>>> = Mutex::new(Vec::new());
 static QUARANTINE_FALLBACK: AtomicBool = AtomicBool::new(false);
-fn retain_in_slot(slot: &mut Option<Box<RetainedNativeScope>>, retained: Box<RetainedNativeScope>) {
-    if slot.is_none() {
-        *slot = Some(retained);
+fn retain_in_slot(slots: &mut Vec<Box<RetainedNativeScope>>, retained: Box<RetainedNativeScope>) {
+    if slots.try_reserve(1).is_ok() {
+        slots.push(retained);
     } else {
-        // Never overwrite an owned scope. This can only be an invariant failure
-        // because the unreleased first lease prevents a second admission.
+        // Drop cannot return an allocation error. Preserve the complete owner
+        // rather than dropping live inputs; the fallback is observable.
         QUARANTINE_FALLBACK.store(true, Ordering::Release);
         std::mem::forget(retained);
     }
@@ -452,39 +2837,214 @@ pub struct NativeQuarantineStatus {
     pub slot_observed: bool,
     pub slot_busy: bool,
     pub bounded_fallback_retained: bool,
+    /// At least one owner remains preserved without an enumerable handle; its
+    /// identity and the number of such owners are unknown.
+    pub unobservable_owner_fallback: bool,
+    /// All scopes stay owned; the legacy detail fields describe the first.
+    pub retained_scope_count: usize,
     pub process_id: Option<u32>,
     pub pending_leader_handle: Option<bool>,
     pub receipt_retained: bool,
     pub original_error_retained: bool,
+    pub original_error: Option<String>,
+    /// Separate from process-group state; absent for historical providers and
+    /// never a claim that their physical GPU completion was observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_physical_lifetime_unknown: Option<bool>,
+    /// An observed PID is not authority to signal or reap by number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_last_spawn_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_original_spawn_handle_retained: Option<bool>,
+    /// Prior probe evidence is not attributed to a later spawned child.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_previous_probe_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub guarded_preflight_failures: Vec<String>,
+    /// The child started but its local pipe buffers did not become a complete
+    /// ProcessOutput. The original child handle may still be retained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_spawn_raw_evidence_incomplete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_probe_scope: Option<GuardedProbeScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_interrupted_by_unwind: Option<bool>,
 }
-/// Passive, nonblocking observation only. No numeric-PID signal, wait/reap,
-/// release, deletion, retry or reopening of native admission is provided.
-pub fn native_quarantine_status() -> NativeQuarantineStatus {
-    let mut status = NativeQuarantineStatus {
+
+fn guarded_process_is_previous(
+    physical_unknown: bool,
+    current_child_held: bool,
+    current_pid: Option<u32>,
+    process_pid: Option<u32>,
+) -> bool {
+    physical_unknown && process_pid.is_some() && (current_child_held || process_pid != current_pid)
+}
+fn empty_quarantine_status() -> NativeQuarantineStatus {
+    NativeQuarantineStatus {
         admission_closed: crate::native_admission_closed(),
         slot_observed: false,
         slot_busy: false,
         bounded_fallback_retained: QUARANTINE_FALLBACK.load(Ordering::Acquire),
+        unobservable_owner_fallback: QUARANTINE_FALLBACK.load(Ordering::Acquire),
+        retained_scope_count: 0,
         process_id: None,
         pending_leader_handle: None,
         receipt_retained: false,
         original_error_retained: false,
-    };
-    let read = |slot: &Option<Box<RetainedNativeScope>>, status: &mut NativeQuarantineStatus| {
-        status.slot_observed = true;
-        if let Some(scope) = slot {
-            status.process_id = Some(scope.process.receipt.pid);
-            status.pending_leader_handle = Some(scope.process.pending_child.is_some());
-            status.receipt_retained = scope.receipt.is_some();
-            status.original_error_retained = scope.original_error.is_some();
+        original_error: None,
+        guarded_physical_lifetime_unknown: None,
+        guarded_last_spawn_pid: None,
+        guarded_original_spawn_handle_retained: None,
+        guarded_previous_probe_pid: None,
+        guarded_preflight_failures: Vec::new(),
+        guarded_spawn_raw_evidence_incomplete: None,
+        guarded_probe_scope: None,
+        guarded_interrupted_by_unwind: None,
+    }
+}
+
+fn observe_quarantine_scope(
+    slot: Option<&RetainedNativeScope>,
+    status: &mut NativeQuarantineStatus,
+) {
+    status.slot_observed = true;
+    if let Some(scope) = slot {
+        let current_pid = scope
+            .spawned_child
+            .as_ref()
+            .map(std::process::Child::id)
+            .or(scope.last_spawn_pid);
+        let previous_process = guarded_process_is_previous(
+            scope.physical_lifetime_unknown,
+            scope.spawned_child.is_some(),
+            current_pid,
+            scope.process.as_ref().map(|process| process.receipt.pid),
+        );
+        if previous_process {
+            status.guarded_previous_probe_pid =
+                scope.process.as_ref().map(|process| process.receipt.pid);
+        } else {
+            status.process_id = scope.process.as_ref().map(|process| process.receipt.pid);
+            status.pending_leader_handle = scope
+                .process
+                .as_ref()
+                .map(|process| process.pending_child.is_some());
         }
-    };
+        status.receipt_retained = scope.receipt.is_some();
+        status.original_error_retained = scope.original_error.is_some();
+        status.original_error = scope.original_error.clone();
+        status.guarded_preflight_failures = scope.guarded_preflight_failures.clone();
+        status.guarded_probe_scope = scope.guarded_probe_scope.clone();
+        if scope.physical_lifetime_unknown {
+            status.guarded_interrupted_by_unwind = Some(scope.interrupted_by_unwind);
+        }
+        if scope.physical_lifetime_unknown {
+            status.guarded_physical_lifetime_unknown = Some(true);
+            status.guarded_spawn_raw_evidence_incomplete =
+                Some(scope.spawned_child.is_some() || previous_process || scope.process.is_none());
+            status.guarded_last_spawn_pid = current_pid;
+            status.guarded_original_spawn_handle_retained = Some(
+                scope.spawned_child.is_some()
+                    || scope.process.as_ref().is_some_and(|process| {
+                        Some(process.receipt.pid) == current_pid && process.pending_child.is_some()
+                    }),
+            );
+        }
+    }
+}
+
+/// Passive, nonblocking observation only. No numeric-PID signal, wait/reap,
+/// release, deletion, retry or reopening of native admission is provided.
+pub fn native_quarantine_status() -> NativeQuarantineStatus {
+    let mut status = empty_quarantine_status();
     match QUARANTINE.try_lock() {
-        Ok(slot) => read(&slot, &mut status),
-        Err(TryLockError::Poisoned(e)) => read(&e.into_inner(), &mut status),
+        Ok(slots) => {
+            status.retained_scope_count = slots.len();
+            observe_quarantine_scope(slots.first().map(Box::as_ref), &mut status);
+        }
+        Err(TryLockError::Poisoned(e)) => {
+            let slots = e.into_inner();
+            status.retained_scope_count = slots.len();
+            observe_quarantine_scope(slots.first().map(Box::as_ref), &mut status);
+        }
         Err(TryLockError::WouldBlock) => status.slot_busy = true,
     }
     status
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NativeQuarantineSnapshot {
+    /// An owner is retained outside the enumerable list; its identity and
+    /// count are unknown. Never interpret an empty list as no owners if true.
+    pub unobservable_owner_fallback: bool,
+    pub scopes: Vec<NativeQuarantineStatus>,
+}
+
+/// Snapshot every enumerable owner. `None` means contention or allocation
+/// failure prevented a complete observation; it must not be treated as empty.
+/// The fallback flag on each result reports only that an owner was retained
+/// without an enumerable handle, not its identity or count.
+pub fn native_quarantine_statuses() -> Option<NativeQuarantineSnapshot> {
+    let slots = match QUARANTINE.try_lock() {
+        Ok(slots) => slots,
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(TryLockError::WouldBlock) => return None,
+    };
+    snapshot_retained_scopes(&slots, QUARANTINE_FALLBACK.load(Ordering::Acquire))
+}
+
+fn snapshot_retained_scopes(
+    slots: &[Box<RetainedNativeScope>],
+    fallback: bool,
+) -> Option<NativeQuarantineSnapshot> {
+    let mut statuses = Vec::new();
+    statuses.try_reserve_exact(slots.len()).ok()?;
+    for scope in slots.iter() {
+        let mut status = empty_quarantine_status();
+        status.retained_scope_count = slots.len();
+        observe_quarantine_scope(Some(scope), &mut status);
+        statuses.push(status);
+    }
+    Some(NativeQuarantineSnapshot {
+        unobservable_owner_fallback: fallback,
+        scopes: statuses,
+    })
+}
+
+#[cfg(test)]
+mod quarantine_observation_tests {
+    use super::*;
+
+    #[test]
+    fn observes_each_owner_and_unenumerable_fallback_separately() {
+        let owner = |pid, message: &str| {
+            Box::new(RetainedNativeScope {
+                _owner: Box::new(()),
+                process: None,
+                spawned_child: None,
+                last_spawn_pid: Some(pid),
+                physical_lifetime_unknown: true,
+                receipt: None,
+                original_error: Some(message.into()),
+                guarded_preflight_failures: Vec::new(),
+                interrupted_by_unwind: false,
+                guarded_probe_scope: None,
+                #[cfg(target_os = "linux")]
+                _v6_supervisor: None,
+            })
+        };
+        let slots = vec![owner(11, "first"), owner(22, "second")];
+        let snapshot = snapshot_retained_scopes(&slots, true).unwrap();
+        assert!(snapshot.unobservable_owner_fallback);
+        assert_eq!(snapshot.scopes.len(), 2);
+        assert_eq!(snapshot.scopes[0].guarded_last_spawn_pid, Some(11));
+        assert_eq!(snapshot.scopes[1].guarded_last_spawn_pid, Some(22));
+        assert_eq!(snapshot.scopes[0].original_error.as_deref(), Some("first"));
+        assert_eq!(snapshot.scopes[1].original_error.as_deref(), Some("second"));
+        let empty = snapshot_retained_scopes(&[], true).unwrap();
+        assert!(empty.unobservable_owner_fallback);
+        assert!(empty.scopes.is_empty());
+    }
 }
 
 pub struct NativePairOutput<
@@ -495,6 +3055,27 @@ pub struct NativePairOutput<
     bundle: NativeRunBundle<S>,
 }
 impl<S: NativeProviderDeclaration> NativePairOutput<S> {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn v6_cancel_source_observation(
+        &self,
+    ) -> Option<&crate::pals_adaptive_launch::CancelSourceObservation> {
+        self.bundle
+            .v6_supervisor
+            .as_ref()
+            .map(|owner| &owner.cancel_source_observation)
+    }
+    /// Borrow the same V6 control observation before closing this owner.
+    /// An ACK is not physical completion or a durable receipt.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn v6_pre_signal_observation(
+        &self,
+    ) -> Option<&crate::process::PreSignalObservation> {
+        self.bundle.v6_supervisor.as_ref().and_then(|owner| {
+            owner
+                .pre_signal_enabled
+                .then_some(&owner.pre_signal_observation)
+        })
+    }
     pub fn process(&self) -> &ProcessOutput {
         self.bundle
             .process
@@ -526,7 +3107,8 @@ impl<S: NativeProviderDeclaration> NativePairOutput<S> {
             )
         }) && self.bundle.receipt_artifact.as_ref()
             == Some(&self.receipt_artifact);
-        let closed = projections_match
+        let closed = !self.bundle.unresolved()
+            && projections_match
             && original.is_some_and(|receipt| {
                 receipt.integration_checks_passed
                     && receipt.cleanup_verified
@@ -643,7 +3225,81 @@ pub struct NativePairFailure<
     pub receipt_artifact: Option<rz_experiments::ArtifactRef>,
     bundle: NativeRunBundle<S>,
 }
+
+/// Borrowed originals for a caller-controlled persistence operation. The
+/// caller must not report the callback as successful before its own durability
+/// requirements have been met. No data or GPU capability is copied here.
+pub struct GuardedEvidenceView<'a, A> {
+    pub run_id: u64,
+    pub input_sha256: &'a str,
+    pub role: &'static str,
+    pub probe: &'static str,
+    pub declared_output_limit_bytes: u64,
+    pub process: &'a ProcessOutput,
+    pub pair_receipt: Option<&'a NativePairReceipt<A>>,
+    pub original_error: &'a ArenaError,
+    pub failures: &'a [String],
+    pub physical_or_process_completion_unknown: bool,
+}
+
 impl<S: NativeProviderDeclaration> NativePairFailure<S> {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn v6_cancel_source_observation(
+        &self,
+    ) -> Option<&crate::pals_adaptive_launch::CancelSourceObservation> {
+        self.bundle
+            .v6_supervisor
+            .as_ref()
+            .map(|owner| &owner.cancel_source_observation)
+    }
+    /// The failure retains this same observation with the original owner.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn v6_pre_signal_observation(
+        &self,
+    ) -> Option<&crate::process::PreSignalObservation> {
+        self.bundle.v6_supervisor.as_ref().and_then(|owner| {
+            owner
+                .pre_signal_enabled
+                .then_some(&owner.pre_signal_observation)
+        })
+    }
+    /// Transfer original output and receipt when physical completion is known.
+    /// The caller becomes responsible for durable storage of the returned data.
+    pub fn take_guarded_evidence(&mut self) -> Option<GuardedPreflightEvidence> {
+        self.bundle.take_evidence()
+    }
+    /// Let the original caller inspect or persist borrowed evidence. Callback
+    /// success is not proof of durable storage and never releases the original.
+    /// After independent storage verification the caller may explicitly take
+    /// custody with `take_guarded_evidence` when physical completion is known.
+    pub fn with_guarded_evidence<T, E>(
+        &mut self,
+        persist: impl FnOnce(GuardedEvidenceView<'_, S::Audit>) -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        let Some(reservation) = self.bundle.probe_evidence.as_ref() else {
+            return Ok(None);
+        };
+        if !reservation.persistence_failed || !reservation.process_available {
+            return Ok(None);
+        }
+        let Some(process) = self.bundle.process.as_ref() else {
+            return Ok(None);
+        };
+        let result = persist(GuardedEvidenceView {
+            run_id: reservation.run_id,
+            input_sha256: &reservation.input_sha256,
+            role: reservation.role,
+            probe: reservation.probe,
+            declared_output_limit_bytes: reservation.output_limit_bytes,
+            process,
+            pair_receipt: self.bundle.receipt.as_ref(),
+            original_error: &self.cause,
+            failures: &self.bundle.guarded_preflight_failures,
+            physical_or_process_completion_unknown: self.bundle.unresolved(),
+        })?;
+        // A callback result cannot prove durable storage or a physical fence.
+        Ok(Some(result))
+    }
     pub fn process(&self) -> Option<&ProcessOutput> {
         self.bundle.process.as_ref()
     }
@@ -683,15 +3339,71 @@ pub(crate) fn run_native_pair_for<S: NativeProviderDeclaration>(
     owner: NativeLaunchOwner<S>,
     cancel: Option<&AtomicBool>,
 ) -> Result<NativePairOutput<S>, Box<NativePairFailure<S>>> {
+    run_native_pair_inner(owner, cancel, None)
+}
+
+/// V6-only opt-in. The caller transfers its original execution/control owner;
+/// no deadline is created from dispatch time and no physical fence is implied.
+#[cfg(target_os = "linux")]
+pub(crate) fn run_native_pair_for_v6_controlled(
+    mut owner: NativeLaunchOwner<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>,
+    cancel: Option<&AtomicBool>,
+    mut supervisor: NativeV6Supervisor,
+) -> Result<
+    NativePairOutput<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>,
+    Box<NativePairFailure<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>>,
+> {
+    supervisor.original_pin_error = match supervisor.role_sockets.as_ref() {
+        Some(sockets) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sockets.build_invocation(&owner, &supervisor.execution)
+        })) {
+            Ok(Ok(invocation)) => {
+                owner.snapshot.invocation = invocation;
+                None
+            }
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some(ArenaError::Io(
+                "V6 original invocation preparation panicked".into(),
+            )),
+        },
+        None => Some(ArenaError::Invalid(
+            "V6 original role listeners unavailable".into(),
+        )),
+    };
+    run_native_pair_inner(owner, cancel, Some(supervisor))
+}
+
+fn run_native_pair_inner<S: NativeProviderDeclaration>(
+    owner: NativeLaunchOwner<S>,
+    cancel: Option<&AtomicBool>,
+    #[cfg(target_os = "linux")] supervisor: Option<NativeV6Supervisor>,
+    #[cfg(not(target_os = "linux"))] _supervisor: Option<()>,
+) -> Result<NativePairOutput<S>, Box<NativePairFailure<S>>> {
+    // Existing V1/V5 and Rovent V3 declarations keep their established
+    // behavior. PALS V6 must explicitly opt in before its launch guard opens.
+    let physical_guard_required = owner.spec.requires_physical_lifetime_guard();
     let mut bundle = NativeRunBundle {
         owner: Some(owner),
         process: None,
         receipt: None,
         receipt_artifact: None,
         original_error: None,
+        guarded_preflight_failures: Vec::new(),
+        probe_evidence: None,
+        spawn_custody: crate::process::SpawnCustody::default(),
+        physical_guard_required,
+        #[cfg(target_os = "linux")]
+        v6_supervisor: supervisor,
     };
     #[cfg(target_os = "linux")]
-    let result = linux::run(&mut bundle, cancel);
+    let result = match bundle
+        .v6_supervisor
+        .as_mut()
+        .and_then(|supervisor| supervisor.original_pin_error.take())
+    {
+        Some(error) => Err(error),
+        None => linux::run(&mut bundle, cancel),
+    };
     #[cfg(not(target_os = "linux"))]
     let result: Result<(NativePairReceipt<S::Audit>, rz_experiments::ArtifactRef), ArenaError> = {
         let _ = cancel;
@@ -780,6 +3492,17 @@ pub(crate) mod linux {
         bytes: &[u8],
         cap: u64,
     ) -> Result<ArtifactRef, ArenaError> {
+        put_directory(&owner.snapshot.directory, name, bytes, cap)?;
+        Ok(artifact(owner, name, bytes))
+    }
+
+    /// Common exclusive evidence writer. A failed/partial file is retained.
+    pub(super) fn put_directory(
+        directory: &Dir,
+        name: &str,
+        bytes: &[u8],
+        cap: u64,
+    ) -> Result<(), ArenaError> {
         if bytes.len() as u64 > cap {
             return Err(ArenaError::Budget(
                 "native evidence exceeds reserved bytes".into(),
@@ -792,22 +3515,18 @@ pub(crate) mod linux {
             .follow(FollowSymlinks::No)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .mode(0o600);
-        let mut file = owner
-            .snapshot
-            .directory
-            .open_with(name, &options)
-            .map_err(|_| {
-                ArenaError::Io(
-                    "cannot create exclusive native evidence; prior/partial bytes retained".into(),
-                )
-            })?;
+        let mut file = directory.open_with(name, &options).map_err(|_| {
+            ArenaError::Io(
+                "cannot create exclusive native evidence; prior/partial bytes retained".into(),
+            )
+        })?;
         use std::io::Write;
         file.write_all(bytes)
             .and_then(|()| file.sync_all())
             .map_err(|_| {
                 ArenaError::Io("cannot finish native evidence; partial bytes retained".into())
             })?;
-        Ok(artifact(owner, name, bytes))
+        Ok(())
     }
     pub(crate) fn read_file(directory: &Dir, name: &str, cap: u64) -> Result<Vec<u8>, ArenaError> {
         let mut options = OpenOptions::new();
@@ -1141,9 +3860,153 @@ pub(crate) mod linux {
             .collect();
         assert!(validate_preflight_provider_evidence(&excessive).is_err());
     }
+    fn owned_role_runtime_directory<S: NativeProviderDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+        index: usize,
+    ) -> Result<cap_std::fs::Dir, ArenaError> {
+        use cap_fs_ext::DirExt;
+        use std::os::unix::fs::MetadataExt;
+        let name = match index {
+            0 => "baseline-runtime",
+            1 => "candidate-runtime",
+            _ => return Err(invalid("guarded role index is invalid")),
+        };
+        let pinned = owner.snapshot._runtime_root_pins[index]
+            .try_clone()
+            .map_err(|_| invalid("cannot clone owned role runtime pin"))?;
+        let held = pinned
+            .metadata()
+            .map_err(|_| invalid("owned role runtime pin unavailable"))?;
+        let named = owner
+            .snapshot
+            .directory
+            .open_dir_nofollow(name)
+            .map_err(|_| invalid("named role runtime directory unavailable"))?
+            .into_std_file()
+            .metadata()
+            .map_err(|_| invalid("named role runtime metadata unavailable"))?;
+        if !held.is_dir()
+            || !named.is_dir()
+            || (held.dev(), held.ino()) != (named.dev(), named.ino())
+        {
+            return Err(invalid(
+                "role runtime name differs from its original owned pin",
+            ));
+        }
+        Ok(cap_std::fs::Dir::from_std_file(pinned))
+    }
+
+    fn verify_guarded_preflight<S: NativeProviderDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+        process: &ProcessOutput,
+        role: NativeEngineRole,
+        probe: NativePreflightProbe,
+        pending: &AtomicBool,
+        required: bool,
+    ) -> Result<(), ArenaError> {
+        if !required {
+            return Ok(());
+        }
+        crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot)?;
+        verify_provider_input_names(owner)?;
+        let index = if role == NativeEngineRole::Baseline {
+            0
+        } else {
+            1
+        };
+        let directory = match &owner.snapshot.preflight_runtime_roots[index] {
+            Some(root) => root
+                .directory
+                .try_clone()
+                .map_err(|_| invalid("guarded preflight runtime directory unavailable"))?,
+            None => owned_role_runtime_directory(owner, index)?,
+        };
+        let pins = provider_input_views(owner);
+        let inputs = NativeProviderInputContext {
+            directory: &owner.snapshot.input_directory,
+            pins: &pins,
+        };
+        owner
+            .spec
+            .verify_preflight_no_gpu(role, probe, process, &directory, &inputs)?;
+        verify_provider_input_names(owner)?;
+        if owner.snapshot.preflight_runtime_roots[index].is_none() {
+            owned_role_runtime_directory(owner, index)?;
+        }
+        crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot)?;
+        pending.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn verify_guarded_pair<S: NativeProviderDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+        process: &ProcessOutput,
+        pending: &AtomicBool,
+        required: bool,
+    ) -> Result<(), ArenaError> {
+        if !required {
+            return Ok(());
+        }
+        verify_provider_input_names(owner)?;
+        let baseline = owned_role_runtime_directory(owner, 0)?;
+        let candidate = owned_role_runtime_directory(owner, 1)?;
+        let pins = provider_input_views(owner);
+        let inputs = NativeProviderInputContext {
+            directory: &owner.snapshot.input_directory,
+            pins: &pins,
+        };
+        owner
+            .spec
+            .verify_pair_physical_completion(process, &baseline, &candidate, &inputs)?;
+        verify_provider_input_names(owner)?;
+        owned_role_runtime_directory(owner, 0)?;
+        owned_role_runtime_directory(owner, 1)?;
+        pending.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn persist_guarded_probe<S: NativeProviderDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+        process: &ProcessOutput,
+        tag: &str,
+        stage: &str,
+    ) -> Vec<ArenaError> {
+        let mut failures = Vec::new();
+        // Attempt each independent byte stream even if a previous write fails.
+        for (suffix, bytes) in [
+            ("stdout.log", &process.stdout),
+            ("stderr.log", &process.stderr),
+        ] {
+            if let Err(error) = put(
+                owner,
+                &format!("external-{tag}-{stage}.{suffix}"),
+                bytes,
+                256 * 1024,
+            ) {
+                failures.push(error);
+            }
+        }
+        match serde_json::to_vec_pretty(&process.receipt) {
+            Ok(bytes) => {
+                if let Err(error) = put(
+                    owner,
+                    &format!("external-{tag}-{stage}-process.v2.json"),
+                    &bytes,
+                    64 * 1024,
+                ) {
+                    failures.push(error);
+                }
+            }
+            Err(_) => failures.push(invalid("preflight process receipt encoding failed")),
+        }
+        failures
+    }
+
     fn preflight_endpoints<S: NativeProviderDeclaration>(
         bundle: &mut NativeRunBundle<S>,
         cancel: Option<&AtomicBool>,
+        run_id: Option<u64>,
+        v6_deadline: Option<std::time::Instant>,
     ) -> Result<(Vec<crate::ExternalUciPreflight>, Vec<ArtifactRef>), ArenaError> {
         let mut receipts = Vec::new();
         let mut provider_artifacts = Vec::new();
@@ -1207,7 +4070,7 @@ pub(crate) mod linux {
             let mut limits = crate::ProcessLimits {
                 wall_ms: clamp_original_wall(
                     e.handshake_timeout_ms,
-                    owner.spec.original_wall_deadline()?,
+                    earlier_deadline(owner.spec.original_wall_deadline()?, v6_deadline),
                     std::time::Instant::now(),
                 )?,
                 shutdown_grace_ms: owner.spec.view().timeouts.shutdown_ms,
@@ -1215,7 +4078,20 @@ pub(crate) mod linux {
                 max_child_processes: owner.spec.view().budget.max_child_processes,
             };
             preflight_runtime_totals(owner)?;
-            let process = crate::supervise_protocol_in_directory(
+            let tag = match role {
+                NativeEngineRole::Baseline => "baseline",
+                NativeEngineRole::Candidate => "candidate",
+            };
+            if bundle.physical_guard_required {
+                bundle.probe_evidence = Some(GuardedProbeReservation::acquire(
+                    run_id.expect("guarded run has evidence identity"),
+                    owner.spec.input_sha256().to_string(),
+                    tag,
+                    "identification",
+                    limits.max_output_bytes,
+                ));
+            }
+            let process = crate::process::supervise_protocol_in_directory_with_spawn(
                 &launch.program.file,
                 &launch.arguments,
                 &owner.snapshot.cwd,
@@ -1223,37 +4099,79 @@ pub(crate) mod linux {
                 cancel,
                 &owner.snapshot.watch,
                 b"uci\nquit\n",
+                if bundle.physical_guard_required {
+                    Some(&mut bundle.spawn_custody)
+                } else {
+                    None
+                },
             )?;
             bundle.process = Some(process);
+            if let Some(reservation) = bundle.probe_evidence.as_mut() {
+                reservation.process_available = true;
+            }
             let process = bundle.process.as_ref().expect("probe process retained");
             let root_recheck =
                 crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot);
-            let tag = match role {
-                NativeEngineRole::Baseline => "baseline",
-                NativeEngineRole::Candidate => "candidate",
-            };
-            put(
-                owner,
-                &format!("external-{tag}-identification.stdout.log"),
-                &process.stdout,
-                256 * 1024,
-            )?;
-            put(
-                owner,
-                &format!("external-{tag}-identification.stderr.log"),
-                &process.stderr,
-                256 * 1024,
-            )?;
             // Save the actual bounded process receipt before the success
             // gate. Failure evidence changes no cleanup/admission requirement.
             let identification_process = process.receipt.clone();
-            put(
-                owner,
-                &format!("external-{tag}-identification-process.v2.json"),
-                &serde_json::to_vec_pretty(&process.receipt)
-                    .map_err(|_| invalid("preflight process receipt encoding failed"))?,
-                64 * 1024,
-            )?;
+            let root_recheck = if bundle.physical_guard_required {
+                let physical = if root_recheck.is_ok() {
+                    verify_guarded_preflight(
+                        owner,
+                        process,
+                        role,
+                        NativePreflightProbe::Identification,
+                        &bundle.spawn_custody.pending,
+                        true,
+                    )
+                } else {
+                    Err(invalid("guarded preflight root binding was not verified"))
+                };
+                let mut persistence = persist_guarded_probe(owner, process, tag, "identification");
+                if let Err(error) = &physical {
+                    bundle
+                        .guarded_preflight_failures
+                        .push(format!("identification physical: {error}"));
+                }
+                for error in &persistence {
+                    bundle
+                        .guarded_preflight_failures
+                        .push(format!("identification persistence: {error}"));
+                }
+                if persistence.is_empty() && physical.is_ok() && root_recheck.is_ok() {
+                    bundle.probe_evidence.take();
+                } else if let Some(reservation) = bundle.probe_evidence.as_mut() {
+                    reservation.persistence_failed = !persistence.is_empty();
+                }
+                root_recheck?;
+                physical?;
+                if !persistence.is_empty() {
+                    return Err(persistence.remove(0));
+                }
+                Ok(())
+            } else {
+                put(
+                    owner,
+                    &format!("external-{tag}-identification.stdout.log"),
+                    &process.stdout,
+                    256 * 1024,
+                )?;
+                put(
+                    owner,
+                    &format!("external-{tag}-identification.stderr.log"),
+                    &process.stderr,
+                    256 * 1024,
+                )?;
+                put(
+                    owner,
+                    &format!("external-{tag}-identification-process.v2.json"),
+                    &serde_json::to_vec_pretty(&process.receipt)
+                        .map_err(|_| invalid("preflight process receipt encoding failed"))?,
+                    64 * 1024,
+                )?;
+                root_recheck
+            };
             let clean = |p: &ProcessOutput| {
                 p.receipt.stop == ProcessStop::Exited
                     && p.receipt.exit_code == Some(0)
@@ -1274,10 +4192,19 @@ pub(crate) mod linux {
             preflight_runtime_totals(owner)?;
             limits.wall_ms = clamp_original_wall(
                 limits.wall_ms,
-                owner.spec.original_wall_deadline()?,
+                earlier_deadline(owner.spec.original_wall_deadline()?, v6_deadline),
                 std::time::Instant::now(),
             )?;
-            let process = crate::supervise_protocol_in_directory(
+            if bundle.physical_guard_required {
+                bundle.probe_evidence = Some(GuardedProbeReservation::acquire(
+                    run_id.expect("guarded run has evidence identity"),
+                    owner.spec.input_sha256().to_string(),
+                    tag,
+                    "readiness",
+                    limits.max_output_bytes,
+                ));
+            }
+            let process = crate::process::supervise_protocol_in_directory_with_spawn(
                 &launch.program.file,
                 &launch.arguments,
                 &owner.snapshot.cwd,
@@ -1285,30 +4212,76 @@ pub(crate) mod linux {
                 cancel,
                 &owner.snapshot.watch,
                 &commands,
+                if bundle.physical_guard_required {
+                    Some(&mut bundle.spawn_custody)
+                } else {
+                    None
+                },
             )?;
             bundle.process = Some(process);
+            if let Some(reservation) = bundle.probe_evidence.as_mut() {
+                reservation.process_available = true;
+            }
             let process = bundle.process.as_ref().expect("readiness process retained");
             let root_recheck =
                 crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot);
-            put(
-                owner,
-                &format!("external-{tag}-readiness.stdout.log"),
-                &process.stdout,
-                256 * 1024,
-            )?;
-            put(
-                owner,
-                &format!("external-{tag}-readiness.stderr.log"),
-                &process.stderr,
-                256 * 1024,
-            )?;
-            put(
-                owner,
-                &format!("external-{tag}-readiness-process.v2.json"),
-                &serde_json::to_vec_pretty(&process.receipt)
-                    .map_err(|_| invalid("preflight process receipt encoding failed"))?,
-                64 * 1024,
-            )?;
+            let root_recheck = if bundle.physical_guard_required {
+                let physical = if root_recheck.is_ok() {
+                    verify_guarded_preflight(
+                        owner,
+                        process,
+                        role,
+                        NativePreflightProbe::Readiness,
+                        &bundle.spawn_custody.pending,
+                        true,
+                    )
+                } else {
+                    Err(invalid("guarded preflight root binding was not verified"))
+                };
+                let mut persistence = persist_guarded_probe(owner, process, tag, "readiness");
+                if let Err(error) = &physical {
+                    bundle
+                        .guarded_preflight_failures
+                        .push(format!("readiness physical: {error}"));
+                }
+                for error in &persistence {
+                    bundle
+                        .guarded_preflight_failures
+                        .push(format!("readiness persistence: {error}"));
+                }
+                if persistence.is_empty() && physical.is_ok() && root_recheck.is_ok() {
+                    bundle.probe_evidence.take();
+                } else if let Some(reservation) = bundle.probe_evidence.as_mut() {
+                    reservation.persistence_failed = !persistence.is_empty();
+                }
+                root_recheck?;
+                physical?;
+                if !persistence.is_empty() {
+                    return Err(persistence.remove(0));
+                }
+                Ok(())
+            } else {
+                put(
+                    owner,
+                    &format!("external-{tag}-readiness.stdout.log"),
+                    &process.stdout,
+                    256 * 1024,
+                )?;
+                put(
+                    owner,
+                    &format!("external-{tag}-readiness.stderr.log"),
+                    &process.stderr,
+                    256 * 1024,
+                )?;
+                put(
+                    owner,
+                    &format!("external-{tag}-readiness-process.v2.json"),
+                    &serde_json::to_vec_pretty(&process.receipt)
+                        .map_err(|_| invalid("preflight process receipt encoding failed"))?,
+                    64 * 1024,
+                )?;
+                root_recheck
+            };
             if !clean(process) {
                 return Err(invalid(
                     "external readiness/stop/quit failed process/cleanup gate",
@@ -1442,7 +4415,42 @@ pub(crate) mod linux {
         cancel: Option<&AtomicBool>,
     ) -> Result<(NativePairReceipt<S::Audit>, ArtifactRef), ArenaError> {
         let run_started = std::time::Instant::now();
-        {
+        let (v6_window, v6_deadline, v6_grace) =
+            if let Some(supervisor) = bundle.v6_supervisor.as_ref() {
+                let owner = bundle.owner.as_ref().expect("prepared native owner");
+                if !bundle.physical_guard_required
+                    || owner.spec.input_sha256() != supervisor.execution.pair_sha256()
+                {
+                    return Err(invalid(
+                        "V6 control requires the same guarded original pair",
+                    ));
+                }
+                // A provider may specify a stricter limit; accept it without
+                // extending the original run or its cleanup reserve.
+                let (run_until, cleanup_until, grace) = v6_effective_deadlines(
+                    supervisor.execution.run_until(),
+                    supervisor.execution.cleanup_until(),
+                    owner.spec.original_wall_deadline()?,
+                )?;
+                let window = crate::process::OriginalProcessWindow::new(
+                    supervisor.execution.started(),
+                    run_until,
+                    cleanup_until,
+                )?;
+                (Some(window), Some(run_until), Some(grace))
+            } else {
+                (None, None, None)
+            };
+        let run_id = if bundle.physical_guard_required {
+            Some(
+                GUARDED_EVIDENCE_NEXT_RUN
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                    .map_err(|_| ArenaError::Budget("guarded_evidence_run_id_exhausted".into()))?,
+            )
+        } else {
+            None
+        };
+        if v6_window.is_none() {
             let owner = bundle.owner.as_mut().expect("prepared native owner");
             owner.snapshot.limits.wall_ms = clamp_original_wall(
                 owner.snapshot.limits.wall_ms,
@@ -1456,7 +4464,8 @@ pub(crate) mod linux {
             .expect("prepared native owner")
             .spec
             .validate_runtime_admission()?;
-        let (external_preflight, preflight_artifacts) = preflight_endpoints(bundle, cancel)?;
+        let (external_preflight, preflight_artifacts) =
+            preflight_endpoints(bundle, cancel, run_id, v6_deadline)?;
         let owner = bundle.owner.as_mut().expect("prepared native owner");
         crate::emit_native_phase("prelaunch_verification_started");
         let mut rolling = SnapshotCacheHint::rolling(
@@ -1468,6 +4477,15 @@ pub(crate) mod linux {
             status.emit();
         }
         checked?;
+        if let Some(supervisor) = bundle.v6_supervisor.as_ref() {
+            supervisor
+                .role_sockets
+                .as_ref()
+                .ok_or_else(|| {
+                    ArenaError::Invalid("V6 original role listeners unavailable".into())
+                })?
+                .verify_listeners()?;
+        }
         let mut cache_hints: Vec<_> = owner
             .snapshot
             .preparation_cache_hint
@@ -1489,33 +4507,93 @@ pub(crate) mod linux {
             }
         };
         let mut limits = s.limits;
-        limits.wall_ms = limits
-            .wall_ms
-            .checked_sub(u64::try_from(run_started.elapsed().as_millis()).unwrap_or(u64::MAX))
-            .filter(|n| *n > 0)
-            .ok_or_else(|| invalid("V2 prelaunch consumed whole pair runtime budget"))?;
-        limits.wall_ms = clamp_original_wall(
-            limits.wall_ms,
-            owner.spec.original_wall_deadline()?,
-            std::time::Instant::now(),
-        )?;
-        let process = crate::process::supervise_tree_observed(
-            &if let Some(execution) = owner.spec.match_execution() {
-                crate::native_launch::linux::pin(&s.pins, &execution.executor)?
+        if let Some(grace) = v6_grace {
+            limits.shutdown_grace_ms = limits.shutdown_grace_ms.max(grace);
+        }
+        if v6_window.is_none() {
+            limits.wall_ms = limits
+                .wall_ms
+                .checked_sub(u64::try_from(run_started.elapsed().as_millis()).unwrap_or(u64::MAX))
+                .filter(|n| *n > 0)
+                .ok_or_else(|| invalid("V2 prelaunch consumed whole pair runtime budget"))?;
+            limits.wall_ms = clamp_original_wall(
+                limits.wall_ms,
+                owner.spec.original_wall_deadline()?,
+                std::time::Instant::now(),
+            )?;
+        }
+        if bundle.physical_guard_required {
+            bundle.probe_evidence = Some(GuardedProbeReservation::acquire(
+                run_id.expect("guarded run has evidence identity"),
+                owner.spec.input_sha256().to_string(),
+                "pair",
+                "runner",
+                limits.max_output_bytes,
+            ));
+        }
+        let runner = &if let Some(execution) = owner.spec.match_execution() {
+            crate::native_launch::linux::pin(&s.pins, &execution.executor)?
+        } else {
+            &s.pins[s.runner_index]
+        }
+        .file;
+        let process =
+            if let (Some(window), Some(supervisor)) = (v6_window, bundle.v6_supervisor.as_mut()) {
+                let run_owner = Arc::clone(&supervisor.control);
+                let cleanup_owner = Arc::clone(&supervisor.control);
+                let cancel_owner = Arc::clone(&supervisor.control);
+                let mut run_control = |custody: &crate::process::SpawnCustody, until| {
+                    poll_v6_control(&run_owner, custody, until, false)
+                };
+                let mut cleanup_control = |custody: &crate::process::SpawnCustody, until| {
+                    poll_v6_control(&cleanup_owner, custody, until, true)
+                };
+                let mut pre_signal_control = |custody: &crate::process::SpawnCustody, until| {
+                    poll_v6_pre_signal(&cancel_owner, custody, until)
+                };
+                let pre_signal = supervisor
+                    .pre_signal_enabled
+                    .then_some(&mut pre_signal_control as crate::process::PreSignalControl<'_>);
+                let pre_signal_observation = supervisor
+                    .pre_signal_enabled
+                    .then_some(&mut supervisor.pre_signal_observation);
+                crate::process::supervise_tree_observed_with_v6_controls(
+                    runner,
+                    &s.invocation.args,
+                    &s.cwd,
+                    limits,
+                    cancel,
+                    &s.watch,
+                    Some(&mut on_stdout),
+                    Some(&mut bundle.spawn_custody),
+                    Some(&mut run_control),
+                    Some(&mut cleanup_control),
+                    Some(window),
+                    pre_signal,
+                    pre_signal_observation,
+                )?
             } else {
-                &s.pins[s.runner_index]
-            }
-            .file,
-            &s.invocation.args,
-            &s.cwd,
-            limits,
-            cancel,
-            &s.watch,
-            Some(&mut on_stdout),
-        )?;
+                crate::process::supervise_tree_observed_with_spawn(
+                    runner,
+                    &s.invocation.args,
+                    &s.cwd,
+                    limits,
+                    cancel,
+                    &s.watch,
+                    Some(&mut on_stdout),
+                    if bundle.physical_guard_required {
+                        Some(&mut bundle.spawn_custody)
+                    } else {
+                        None
+                    },
+                )?
+            };
         crate::native_diagnostics::finish_logs();
         crate::emit_native_phase("runner_supervision_finished");
         bundle.process = Some(process);
+        if let Some(reservation) = bundle.probe_evidence.as_mut() {
+            reservation.process_available = true;
+        }
         let owner = bundle
             .owner
             .as_ref()
@@ -1524,6 +4602,17 @@ pub(crate) mod linux {
             .process
             .as_ref()
             .expect("native process output retained after spawn");
+        // This independent evidence path runs even when the game fails for an
+        // unrelated reason. Failure here preserves physical ownership but does
+        // not prevent other available failure/PGN diagnostics being recorded.
+        let physical_lifetime_error = verify_guarded_pair(
+            owner,
+            process,
+            &bundle.spawn_custody.pending,
+            bundle.physical_guard_required,
+        )
+        .err()
+        .map(|error| error.to_string());
         let completed = process.receipt.stop == ProcessStop::Exited
             && process.receipt.exit_code == Some(0)
             && process.receipt.group_cleanup == CleanupStatus::Gone
@@ -1546,6 +4635,7 @@ pub(crate) mod linux {
             snapshot_cache_hints: cache_hints,
             artifacts: preflight_artifacts,
             provider_sessions: Vec::new(),
+            physical_lifetime_error,
             external_preflight,
             external_execution: Vec::new(),
             environments: [NativeEngineRole::Baseline, NativeEngineRole::Candidate]
@@ -1727,6 +4817,7 @@ pub(crate) mod linux {
                 Err(error) => receipt.failure_audit_error = Some(error.to_string()),
             }
         }
+        receipt.unresolved_owner_retained = bundle.unresolved();
         bundle.receipt = Some(receipt.clone());
         crate::emit_native_phase("postlaunch_verification_started");
         let mut rolling = SnapshotCacheHint::rolling(
@@ -1762,6 +4853,7 @@ pub(crate) mod linux {
             );
         }
         receipt.integration_checks_passed = completed
+            && !bundle.unresolved()
             && receipt.pgn_audit.is_some()
             && receipt.provider_audit_error.is_none()
             && receipt.external_audit_error.is_none()
@@ -1808,15 +4900,23 @@ pub(crate) mod linux {
             owner.spec.pair_metadata_cap(),
         )?;
         bundle.receipt_artifact = Some(artifact.clone());
+        if let Some(reservation) = bundle.probe_evidence.as_mut() {
+            reservation.persistence_failed = false;
+        }
+        if !bundle.unresolved() {
+            bundle.probe_evidence.take();
+        }
         crate::emit_native_phase("receipt_saved");
         // Keep receipts/PGN first. Process exit alone grants no NN-drain claim.
         // Each accepted provider session includes its matched physical drain.
-        if crate::native_retention::eligible_expected(
-            owner.spec.expected_provider_sessions(),
-            receipt.cleanup_verified,
-            receipt.provider_audit_error.is_none(),
-            receipt.provider_sessions.len(),
-        ) {
+        if !bundle.unresolved()
+            && crate::native_retention::eligible_expected(
+                owner.spec.expected_provider_sessions(),
+                receipt.cleanup_verified,
+                receipt.provider_audit_error.is_none(),
+                receipt.provider_sessions.len(),
+            )
+        {
             crate::native_retention::retire(
                 &mut bundle
                     .owner

@@ -9,3 +9,6 @@ description = "Small read-only operating-system CPU observation boundary for Rov
 
 [lib]
 path = "src/lib.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix.workspace = true

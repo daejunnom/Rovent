@@ -304,7 +304,22 @@ def _source_review(raws, source):
         if by_path.get(path) != actual:
             raise ValueError("actual transition source bytes absent from original registered build manifest")
         actual_pair[path] = actual
-    reviewed_pair = _reviewed_source_pair(actual_pair)
+    closure = None
+    try:
+        reviewed_pair = _reviewed_source_pair(actual_pair)
+    except _Unsupported as historical_error:
+        # Historical monolithic profiles keep their original bytes and lookup.
+        # A split implementation must additionally match an independently
+        # reviewed, literal helper closure; a manifest roster cannot enroll it.
+        from .native_source_review import review_transition_sources, UnsupportedTransitionSource
+        try:
+            closure = review_transition_sources(pair=actual_pair, manifest=manifest,
+                source=source, lane="default_disabled")
+        except UnsupportedTransitionSource as error:
+            if str(error) == "unreviewed_transition_source_closure":
+                raise historical_error
+            raise _Unsupported(str(error)) from error
+        reviewed_pair = copy.deepcopy(actual_pair)
     native_source = source.get("native")
     if type(native_source) is not dict:
         raise ValueError("actual native collector source description required")
@@ -321,10 +336,13 @@ def _source_review(raws, source):
     if any(owner.get("search_version", _DISABLED_SEARCH_VERSION) != _DISABLED_SEARCH_VERSION
            for owner in policy_owners):
         raise _Unsupported("unreviewed_collector_refinement_policy")
-    return {"source_commit": commit, "collector_binary_sha256": binary["sha256"],
+    result = {"source_commit": commit, "collector_binary_sha256": binary["sha256"],
             "build_registration": byte_pin(raws["build_registration"]), "source_manifest": byte_pin(raws["source_manifest"]),
             "reviewed_transition_sources": reviewed_pair,
             "assurance": "independently_pinned_caller_build_observation;static_source_pair_review;not_self_reported_execution_certification"}
+    if closure is not None:
+        result["reviewed_transition_closure"] = closure
+    return result
 
 
 def _source_profile(raws, source):

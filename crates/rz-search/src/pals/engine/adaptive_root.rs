@@ -5,9 +5,14 @@
 
 use super::archive_lifecycle::allocation_controls;
 use super::*;
-use crate::pals::store::StoreReadOwner;
+use crate::pals::store::{ArchiveOwnerSnapshot, ArchiveStats, StoreReadOwner};
 use rz_contracts::pals::SearchAuthority;
 use std::sync::{Arc, Weak};
+
+#[path = "no_researcher_lifecycle.rs"]
+mod no_researcher_lifecycle;
+#[path = "preparing_root/registration.rs"]
+mod preparing_registration;
 
 #[derive(Default)]
 pub struct AdaptiveRootRegistry {
@@ -24,6 +29,58 @@ struct RegisteredRoot {
     root: SituationId,
     snapshot: PositionSnapshot,
 }
+/// First-go readiness belongs to the original reset, not a registered root.
+/// Setup must preserve both this registry and the still-zero Store generation.
+pub(super) struct UnusedArchiveSetupSeal {
+    registry: Weak<()>,
+    store: StoreReadOwner,
+    scope: SearchAuthority,
+    next_nonce: u64,
+}
+impl UnusedArchiveSetupSeal {
+    pub(super) fn validate_engine_game_preparation<M: RoleModel>(
+        &self,
+        semantic: &PalsSemanticState<M>,
+    ) -> Result<(), PalsError> {
+        semantic.ensure_adaptive_logical_quiescence()?;
+        semantic.stores.validate_unused_archive_setup()?;
+        let registry = &semantic.adaptive_root_registry;
+        if !self.registry.ptr_eq(&semantic.adaptive_registry_identity())
+            || !self.store.matches(&semantic.stores)
+            || semantic.game_generation != Some(self.scope.game.0)
+            || registry.last.is_some()
+            || registry.pending_nonce.is_some()
+            || registry.next_nonce != 0
+            || self.next_nonce != 0
+            || registry
+                .new_game_ready
+                .is_some_and(|ready| ready != self.scope)
+        {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        Ok(())
+    }
+    pub(super) fn validate<M: RoleModel>(
+        &self,
+        semantic: &PalsSemanticState<M>,
+    ) -> Result<(), PalsError> {
+        semantic.ensure_adaptive_logical_quiescence()?;
+        let registry = &semantic.adaptive_root_registry;
+        if !self.registry.ptr_eq(&semantic.adaptive_registry_identity())
+            || !self.store.matches(&semantic.stores)
+            || semantic.stores.generation() != 0
+            || semantic.stores.root().is_some()
+            || semantic.game_generation != Some(self.scope.game.0)
+            || registry.last.is_some()
+            || registry.pending_nonce.is_some()
+            || registry.next_nonce != self.next_nonce
+            || registry.new_game_ready != Some(self.scope)
+        {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        Ok(())
+    }
+}
 /// NonClone and tied to one engine registry and its exact live Store. It proves
 /// a checked logical root registration only, never a physical release fence.
 pub struct AdaptiveRootRegistration {
@@ -36,23 +93,178 @@ pub struct AdaptiveRootRegistration {
     snapshot: PositionSnapshot,
 }
 
-impl<M: RoleModel> PalsEngine<M> {
+/// Private, move-only permission for one already idle archive-game transition.
+/// It binds the old Store and unspent registry state, not merely a next tuple.
+pub(super) struct IdleArchiveGameSeal {
+    registry: Weak<()>,
+    store: StoreReadOwner,
+    generation: u64,
+    game: u64,
+    last: Option<SearchAuthority>,
+    nonce: u64,
+    next: SearchAuthority,
+    archive: ArchiveOwnerSnapshot,
+}
+impl IdleArchiveGameSeal {
+    pub(super) fn validate<M: RoleModel>(
+        &self,
+        semantic: &PalsSemanticState<M>,
+    ) -> Result<(), PalsError> {
+        semantic.ensure_adaptive_logical_quiescence()?;
+        if !self.registry.ptr_eq(&semantic.adaptive_registry_identity())
+            || !self.store.matches(&semantic.stores)
+            || semantic.stores.generation() != self.generation
+            || semantic.game_generation != Some(self.game)
+            || semantic.last_adaptive_authority() != self.last
+            || semantic.adaptive_root_registry.next_nonce != self.nonce
+            || semantic.adaptive_root_registry.pending_nonce.is_some()
+        {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        Ok(())
+    }
+}
+
+impl<M: RoleModel> PalsSemanticState<M> {
+    pub(super) fn seal_unused_engine_game_preparation(
+        &self,
+        scope: SearchAuthority,
+    ) -> Result<UnusedArchiveSetupSeal, PalsError> {
+        let seal = UnusedArchiveSetupSeal {
+            registry: self.adaptive_registry_identity(),
+            store: self.stores.read_owner(),
+            scope,
+            next_nonce: self.adaptive_root_registry.next_nonce,
+        };
+        seal.validate_engine_game_preparation(self)?;
+        Ok(seal)
+    }
+    pub(super) fn commit_unused_engine_game_preparation(
+        &mut self,
+        scope: SearchAuthority,
+    ) -> Result<(), PalsError> {
+        self.seal_unused_engine_game_preparation(scope)?;
+        self.adaptive_root_registry.new_game_ready = Some(scope);
+        Ok(())
+    }
+    pub(super) fn seal_unused_archive_setup(
+        &self,
+        scope: SearchAuthority,
+    ) -> Result<UnusedArchiveSetupSeal, PalsError> {
+        if self.adaptive_root_registry.next_nonce != 0 {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        let seal = UnusedArchiveSetupSeal {
+            registry: self.adaptive_registry_identity(),
+            store: self.stores.read_owner(),
+            scope,
+            next_nonce: self.adaptive_root_registry.next_nonce,
+        };
+        seal.validate(self)?;
+        Ok(seal)
+    }
+
+    pub(super) fn validate_idle_new_game_target(
+        &self,
+        next: SearchAuthority,
+    ) -> Result<IdleArchiveGameSeal, PalsError> {
+        self.ensure_archive_admission_open()?;
+        self.ensure_adaptive_logical_quiescence()?;
+        self.validate_adaptive_namespace(next)?;
+        let game = self.game_generation.ok_or(StoreError::StaleConsumer)?;
+        if next.game.0 <= game || self.adaptive_root_registry.pending_nonce.is_some() {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        let archive = self
+            .stores
+            .archive_owner_snapshot()?
+            .ok_or(StoreError::ArchiveDisabled)?;
+        if archive.admission_closed || !archive.complete {
+            return Err(
+                StoreError::InvalidConditions("idle newgame archive owner is not open").into(),
+            );
+        }
+        Ok(IdleArchiveGameSeal {
+            registry: self.adaptive_registry_identity(),
+            store: self.stores.read_owner(),
+            generation: self.stores.generation(),
+            game,
+            last: self.last_adaptive_authority(),
+            nonce: self.adaptive_root_registry.next_nonce,
+            next,
+            archive,
+        })
+    }
+
+    pub(super) fn commit_idle_new_game_scope(
+        &mut self,
+        seal: &IdleArchiveGameSeal,
+        replacement: &mut Option<Box<PalsStores>>,
+    ) -> Result<(), PalsError> {
+        seal.validate(self)?;
+        let previous =
+            self.archive_state
+                .closed_current_owner
+                .ok_or(StoreError::InvalidConditions(
+                    "idle newgame original close missing",
+                ))?;
+        let next_store = replacement.as_ref().ok_or(StoreError::InvalidConditions(
+            "idle newgame original replacement missing",
+        ))?;
+        let next = next_store
+            .archive_owner_snapshot()?
+            .ok_or(StoreError::ArchiveDisabled)?;
+        if previous.owner_id != seal.archive.owner_id
+            || !previous.admission_closed
+            || !previous.complete
+            || next.owner_id == previous.owner_id
+            || next.admission_closed
+            || !next.complete
+            || next.root_sha256 != previous.root_sha256
+            || next.repository_sha256 != previous.repository_sha256
+            || next.runtime_limits != previous.runtime_limits
+            || next.session_write_ledger_id != previous.session_write_ledger_id
+            || next.session_write_bytes_max != previous.session_write_bytes_max
+            || next.session_write_bytes_consumed != previous.session_write_bytes_consumed
+            || next.write_bytes_reserved != 0
+            || next_store.generation() != 0
+            || next_store.root().is_some()
+            || next_store.hot_stats() != ArchiveStats::default()
+            || seal.store.matches(next_store)
+        {
+            return Err(StoreError::InvalidConditions(
+                "idle newgame original Store/ledger transfer",
+            )
+            .into());
+        }
+        // A model callback can panic. Keep both actual Stores in their owner
+        // slots until it returns; all later publication steps are infallible.
+        self.model.new_game_with_generation(Some(seal.next.game.0));
+        self.publish_idle_archive_game(
+            seal.next,
+            replacement.take().expect("validated original replacement"),
+            previous,
+        );
+        self.adaptive_root_registry.new_game_ready = Some(seal.next);
+        Ok(())
+    }
+
     pub(super) fn adaptive_registry_identity(&self) -> Weak<()> {
         Arc::downgrade(&self.adaptive_root_registry.identity)
     }
+
     pub(super) fn adaptive_new_game_scope(&self) -> Option<SearchAuthority> {
         self.adaptive_root_registry.new_game_ready
     }
-    pub fn last_adaptive_authority(&self) -> Option<SearchAuthority> {
+
+    pub(super) fn last_adaptive_authority(&self) -> Option<SearchAuthority> {
         self.adaptive_root_registry
             .last
             .as_ref()
             .map(|last| last.authority)
     }
 
-    /// Current maintenance envelope for this exact Store, independently of the
-    /// later search root. It carries no authority to admit a neural question.
-    pub fn adaptive_archive_authority(
+    pub(super) fn adaptive_archive_authority(
         &self,
         next: SearchAuthority,
     ) -> Result<SearchAuthority, PalsError> {
@@ -65,21 +277,10 @@ impl<M: RoleModel> PalsEngine<M> {
         })
     }
 
-    fn ensure_adaptive_logical_quiescence(&self) -> Result<(), PalsError> {
-        if self.stores.tasks.active_states().next().is_some()
-            || self.stores.review_pin_count()? != 0
-            || self.held_cpu_task.is_some()
-            || self.nodes.iter().any(|node| node.resume.is_some())
-        {
-            return Err(StoreError::InvalidConditions(
-                "adaptive root still owns live logical work",
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    fn validate_adaptive_namespace(&self, next: SearchAuthority) -> Result<(), PalsError> {
+    pub(super) fn validate_adaptive_namespace(
+        &self,
+        next: SearchAuthority,
+    ) -> Result<(), PalsError> {
         if let Some(last) = &self.adaptive_root_registry.last {
             if next.epoch != last.authority.epoch
                 || next.implementation != last.authority.implementation
@@ -92,9 +293,7 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(())
     }
 
-    /// Register the exact new Rules root with its actual UCI-issued generation.
-    /// Skipped accepted Go/Position commands are ordinary monotonic gaps.
-    pub fn register_adaptive_root(
+    pub(super) fn register_adaptive_root(
         &mut self,
         position: &Position,
         authority: SearchAuthority,
@@ -188,7 +387,7 @@ impl<M: RoleModel> PalsEngine<M> {
         })
     }
 
-    pub fn consume_adaptive_root_registration(
+    pub(super) fn consume_adaptive_root_registration(
         &mut self,
         registration: AdaptiveRootRegistration,
         position: &Position,
@@ -218,10 +417,7 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(registration.root)
     }
 
-    /// Cancel an unpublished port admission while retaining the already checked
-    /// Store root and its monotonic scope. This revokes any outstanding proof;
-    /// it does not certify native completion or roll back a root generation.
-    pub fn abandon_unconsumed_adaptive_root(
+    pub(super) fn abandon_unconsumed_adaptive_root(
         &mut self,
         authority: SearchAuthority,
     ) -> Result<(), PalsError> {
@@ -248,6 +444,118 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(())
     }
 
+    pub(super) fn ensure_adaptive_logical_quiescence(&self) -> Result<(), PalsError> {
+        self.ensure_frontier_retired()?;
+        if self.stores.tasks.active_states().next().is_some()
+            || self.stores.review_pin_count()? != 0
+            || self.nodes.iter().any(|node| node.resume.is_some())
+        {
+            return Err(StoreError::InvalidConditions(
+                "adaptive root still owns live logical work",
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl<M: RoleModel> PcSemanticOwner<M> {
+    pub fn last_adaptive_authority(&self) -> Option<SearchAuthority> {
+        self.semantic.last_adaptive_authority()
+    }
+    pub fn register_adaptive_root(
+        &mut self,
+        position: &Position,
+        authority: SearchAuthority,
+    ) -> Result<AdaptiveRootRegistration, PalsError> {
+        self.semantic.register_adaptive_root(position, authority)
+    }
+    pub fn consume_adaptive_root_registration(
+        &mut self,
+        registration: AdaptiveRootRegistration,
+        position: &Position,
+        authority: SearchAuthority,
+    ) -> Result<SituationId, PalsError> {
+        self.semantic
+            .consume_adaptive_root_registration(registration, position, authority)
+    }
+    pub fn abandon_unconsumed_adaptive_root(
+        &mut self,
+        authority: SearchAuthority,
+    ) -> Result<(), PalsError> {
+        self.semantic.abandon_unconsumed_adaptive_root(authority)
+    }
+}
+
+impl<M: RoleModel> PalsEngine<M> {
+    pub(super) fn adaptive_registry_identity(&self) -> Weak<()> {
+        self.semantic.adaptive_registry_identity()
+    }
+    pub(super) fn adaptive_new_game_scope(&self) -> Option<SearchAuthority> {
+        self.semantic.adaptive_new_game_scope()
+    }
+    pub fn last_adaptive_authority(&self) -> Option<SearchAuthority> {
+        self.semantic.last_adaptive_authority()
+    }
+
+    /// Current maintenance envelope for this exact Store, independently of the
+    /// later search root. It carries no authority to admit a neural question.
+    pub fn adaptive_archive_authority(
+        &self,
+        next: SearchAuthority,
+    ) -> Result<SearchAuthority, PalsError> {
+        self.semantic.adaptive_archive_authority(next)
+    }
+
+    pub(super) fn ensure_adaptive_logical_quiescence(&self) -> Result<(), PalsError> {
+        self.semantic.ensure_adaptive_logical_quiescence()?;
+        if self.held_cpu_task.is_some() {
+            return Err(StoreError::InvalidConditions(
+                "adaptive root still owns live logical work",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn validate_adaptive_namespace(&self, next: SearchAuthority) -> Result<(), PalsError> {
+        self.semantic.validate_adaptive_namespace(next)
+    }
+
+    /// Register the exact new Rules root with its actual UCI-issued generation.
+    /// Skipped accepted Go/Position commands are ordinary monotonic gaps.
+    pub fn register_adaptive_root(
+        &mut self,
+        position: &Position,
+        authority: SearchAuthority,
+    ) -> Result<AdaptiveRootRegistration, PalsError> {
+        self.ensure_archive_admission_open()?;
+        self.ensure_adaptive_logical_quiescence()?;
+        self.semantic.register_adaptive_root(position, authority)
+    }
+
+    pub fn consume_adaptive_root_registration(
+        &mut self,
+        registration: AdaptiveRootRegistration,
+        position: &Position,
+        authority: SearchAuthority,
+    ) -> Result<SituationId, PalsError> {
+        self.ensure_adaptive_logical_quiescence()?;
+        self.semantic
+            .consume_adaptive_root_registration(registration, position, authority)
+    }
+
+    /// Cancel an unpublished port admission while retaining the already checked
+    /// Store root and its monotonic scope. This revokes any outstanding proof;
+    /// it does not certify native completion or roll back a root generation.
+    pub fn abandon_unconsumed_adaptive_root(
+        &mut self,
+        authority: SearchAuthority,
+    ) -> Result<(), PalsError> {
+        self.ensure_adaptive_logical_quiescence()?;
+        self.semantic.abandon_unconsumed_adaptive_root(authority)
+    }
+
     /// Private-worker operation. Existing official game reset performs checker,
     /// model and archive lifecycle work; the manager must not call this inline.
     /// One reset also handles skipped UCI newgame commands by explicitly binding
@@ -260,17 +568,22 @@ impl<M: RoleModel> PalsEngine<M> {
     ) -> Result<(), PalsError> {
         self.ensure_adaptive_logical_quiescence()?;
         self.validate_adaptive_namespace(next)?;
-        let previous_game = self.game_generation.ok_or(StoreError::StaleConsumer)?;
-        if next.game.0 <= previous_game || self.adaptive_root_registry.pending_nonce.is_some() {
+        let previous_game = self
+            .semantic
+            .game_generation
+            .ok_or(StoreError::StaleConsumer)?;
+        if next.game.0 <= previous_game
+            || self.semantic.adaptive_root_registry.pending_nonce.is_some()
+        {
             return Err(StoreError::StaleConsumer.into());
         }
         allocation_controls(Some((deadline, cancel)))?;
         self.try_new_game(deadline, cancel)?;
-        if self.game_generation != previous_game.checked_add(1)
-            || self.stores.root().is_some()
-            || self.stores.generation() != 0
-            || !self.nodes.is_empty()
-            || !self.records.is_empty()
+        if self.semantic.game_generation != previous_game.checked_add(1)
+            || self.semantic.stores.root().is_some()
+            || self.semantic.stores.generation() != 0
+            || !self.semantic.nodes.is_empty()
+            || !self.semantic.records.is_empty()
         {
             return Err(
                 StoreError::InvalidConditions("official adaptive newgame reset differs").into(),
@@ -280,10 +593,12 @@ impl<M: RoleModel> PalsEngine<M> {
         // This callback runs on the lifecycle worker, with actual UCI fences
         // already checked. It cannot be mixed into a manager semantic commit.
         if next.game.0 != previous_game + 1 {
-            self.model.new_game_with_generation(Some(next.game.0));
+            self.semantic
+                .model
+                .new_game_with_generation(Some(next.game.0));
         }
-        self.game_generation = Some(next.game.0);
-        self.adaptive_root_registry.new_game_ready = Some(next);
+        self.semantic.game_generation = Some(next.game.0);
+        self.semantic.adaptive_root_registry.new_game_ready = Some(next);
         allocation_controls(Some((deadline, cancel)))?;
         Ok(())
     }
@@ -341,7 +656,7 @@ mod tests {
         accept(&mut engine, &position, scope(0, 2));
         position.make_move("e2e4".parse().unwrap()).unwrap();
         accept(&mut engine, &position, scope(0, 7));
-        assert_eq!(engine.stores.generation(), 7);
+        assert_eq!(engine.semantic.stores.generation(), 7);
         assert_eq!(engine.last_adaptive_authority(), Some(scope(0, 7)));
         assert!(matches!(
             engine.register_adaptive_root(&position, scope(0, 7)),
@@ -355,7 +670,7 @@ mod tests {
         let first = accept(&mut engine, &position, scope(0, 1));
         let next = accept(&mut engine, &position, scope(0, 4));
         assert_eq!(first, next);
-        assert_eq!(engine.stores.generation(), 4);
+        assert_eq!(engine.semantic.stores.generation(), 4);
     }
     #[test]
     fn wrong_epoch_implementation_and_history_do_not_consume_registration() {
@@ -399,14 +714,14 @@ mod tests {
                 .consume_adaptive_root_registration(abandoned, &position, scope(0, 4))
                 .is_err()
         );
-        assert_eq!(engine.stores.generation(), 9);
+        assert_eq!(engine.semantic.stores.generation(), 9);
     }
     #[test]
     fn official_newgame_preserves_process_root_counter_and_binds_skipped_games() {
         let mut engine = engine();
         let position = Position::startpos();
         accept(&mut engine, &position, scope(0, 6));
-        let old_owner = engine.stores.read_owner();
+        let old_owner = engine.semantic.stores.read_owner();
         engine
             .try_adaptive_new_game(
                 scope(3, 12),
@@ -414,11 +729,11 @@ mod tests {
                 &AtomicBool::new(false),
             )
             .unwrap();
-        assert_eq!(engine.game_generation, Some(3));
-        assert!(!old_owner.matches(&engine.stores));
+        assert_eq!(engine.semantic.game_generation, Some(3));
+        assert!(!old_owner.matches(&engine.semantic.stores));
         assert_eq!(engine.last_adaptive_authority(), Some(scope(0, 6)));
         accept(&mut engine, &position, scope(3, 15));
-        assert_eq!(engine.stores.generation(), 15);
+        assert_eq!(engine.semantic.stores.generation(), 15);
         assert_eq!(engine.last_adaptive_authority(), Some(scope(3, 15)));
     }
     #[test]
@@ -439,13 +754,13 @@ mod tests {
         let root = accept(&mut engine, &position, scope(0, 2));
         let mut pins = crate::pals::store::StorePins::default();
         pins.situations.insert(root);
-        let held = engine.stores.pin_review(pins).unwrap();
+        let held = engine.semantic.stores.pin_review(pins).unwrap();
         assert!(
             engine
                 .register_adaptive_root(&position, scope(0, 4))
                 .is_err()
         );
-        assert_eq!(engine.stores.generation(), 2);
+        assert_eq!(engine.semantic.stores.generation(), 2);
         drop(held);
         accept(&mut engine, &position, scope(0, 4));
     }

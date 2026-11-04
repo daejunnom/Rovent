@@ -50,6 +50,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+#[allow(dead_code)]
+mod system_cuda;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+pub use system_cuda::{
+    Lc0ObservedPublication, Lc0ObservedRelease, Lc0ObservedService, Lc0OriginalSessionObservation,
+    Lc0ParentListener, Lc0PendingSupervisor, Lc0ReceiptOwner, Lc0SupervisedSession,
+    parent_preflight as lc0_parent_preflight,
+};
+
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_FATAL_RECEIPTS: usize = 32;
 const NATIVE_DIAGNOSTIC_CAPACITY: usize = 32;
@@ -92,6 +102,8 @@ pub struct NativeConfig {
     provider: NativeProvider,
     cuda_bundle: Option<PathBuf>,
     cuda_bundle_sha256: Option<[u8; 32]>,
+    system_cuda_lock: Option<PathBuf>,
+    system_cuda_lock_sha256: Option<[u8; 32]>,
 }
 impl fmt::Debug for NativeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -114,6 +126,8 @@ impl fmt::Debug for NativeConfig {
                 "bundle",
                 &(self.cuda_bundle.is_some(), &self.cuda_bundle_sha256),
             )
+            .field("system_cuda_lock", &self.system_cuda_lock.is_some())
+            .field("system_cuda_lock_sha256", &self.system_cuda_lock_sha256)
             .finish_non_exhaustive()
     }
 }
@@ -170,6 +184,8 @@ impl NativeConfig {
         let mut profiling = false;
         let mut cuda_bundle = None;
         let mut cuda_bundle_sha256 = None;
+        let mut system_cuda_lock = None;
+        let mut system_cuda_lock_sha256 = None;
         for argument in arguments {
             let experiment = match argument.as_str() {
                 "--experimental-io-buffers" => Some(&mut execution_experiments.reuse_buffers),
@@ -293,6 +309,8 @@ impl NativeConfig {
                 "--runtime-cache-root" => set_path(&mut runtime_cache_root, value)?,
                 "--cuda-bundle" => set_path(&mut cuda_bundle, value)?,
                 "--cuda-bundle-sha256" => set_hash(&mut cuda_bundle_sha256, value)?,
+                "--system-cuda-lock" => set_path(&mut system_cuda_lock, value)?,
+                "--system-cuda-lock-sha256" => set_hash(&mut system_cuda_lock_sha256, value)?,
                 _ => {
                     return Err(NativeBootstrapError::Config(
                         "unsupported or mixed native provider argument",
@@ -303,13 +321,35 @@ impl NativeConfig {
         let provider = provider.ok_or(NativeBootstrapError::Config(
             "explicit --onnx-cpu or --onnx-cuda selection is required",
         ))?;
+        let system_requested = system_cuda_lock.is_some() || system_cuda_lock_sha256.is_some();
+        if system_requested
+            && (provider != NativeProvider::Cuda
+                || system_cuda_lock.is_none()
+                || system_cuda_lock_sha256.is_none()
+                || cuda_bundle.is_some()
+                || cuda_bundle_sha256.is_some()
+                || runtime_cache_root.is_some()
+                || attestation
+                || batch_attestation
+                || !cfg!(all(
+                    feature = "pals-adaptive",
+                    feature = "onnx-cuda",
+                    target_os = "linux"
+                )))
+        {
+            return Err(NativeBootstrapError::Config(
+                "system CUDA requires its lock and SHA, Linux system support and no bundle, runtime cache or legacy attestation",
+            ));
+        }
         match provider {
             NativeProvider::Cpu if cuda_bundle.is_some() || cuda_bundle_sha256.is_some() => {
                 return Err(NativeBootstrapError::Config(
                     "CPU provider rejects CUDA bundle arguments",
                 ));
             }
-            NativeProvider::Cuda if cuda_bundle.is_none() || cuda_bundle_sha256.is_none() => {
+            NativeProvider::Cuda
+                if !system_requested && (cuda_bundle.is_none() || cuda_bundle_sha256.is_none()) =>
+            {
                 return Err(NativeBootstrapError::Config(
                     "CUDA provider requires the bundle file and its explicit SHA256",
                 ));
@@ -393,6 +433,8 @@ impl NativeConfig {
             provider,
             cuda_bundle,
             cuda_bundle_sha256,
+            system_cuda_lock,
+            system_cuda_lock_sha256,
         })
     }
     pub fn attestation_requested(&self) -> bool {
@@ -1150,6 +1192,7 @@ struct NativeSessionFactory {
     #[cfg(feature = "onnx-cuda")]
     loaded_cuda_profile: Option<CudaProfileV1>,
 }
+
 impl NativeSessionFactory {
     fn load_cpu(
         owners: &OwnerRegistry,
@@ -1200,6 +1243,20 @@ impl NativeSessionFactory {
         config: &NativeConfig,
     ) -> Result<(AssetMetadata, OrtRuntime, OnnxBackend, ClassicalProjection), NativeBootstrapError>
     {
+        if config.system_cuda_lock.is_some() {
+            // The system loader and worker support this runtime identity, but
+            // this legacy entry point has no original native-entry/failure
+            // custody yet. Reject before opening assets or creating an output
+            // until that owner can retain unknown physical completion.
+            return Err(NativeBootstrapError::Config(
+                "system CUDA native entry requires lifecycle custody; no runtime was started",
+            ));
+        }
+        if config.provider == NativeProvider::Cuda {
+            return Err(NativeBootstrapError::Config(
+                "legacy CUDA bundle execution is disabled; use a system CUDA runtime profile",
+            ));
+        }
         let parts_started = Instant::now();
         let asset = MaiaAsset::load(
             &config.source_weights,
@@ -1504,6 +1561,22 @@ impl NativeSessionFactory {
         served: Result<(), EngineError>,
         until: Instant,
     ) -> Result<NativeRunReport, NativeRunError> {
+        let mut service = served.err();
+        self.finish_until_with_mapping(&mut service, until, false).0
+    }
+
+    // System runtime mappings are a separate observation, not a reason to
+    // convert unavailable /proc evidence into a physical completion failure.
+    // The legacy bundled route keeps its strict mapping audit unchanged.
+    fn finish_until_with_mapping(
+        &self,
+        service: &mut Option<EngineError>,
+        until: Instant,
+        system_observation: bool,
+    ) -> (
+        Result<NativeRunReport, NativeRunError>,
+        Option<rz_eval::onnx::CudaRuntimeMappingEvidence>,
+    ) {
         let mut collection_error = None;
         let mut worker_shutdown_error = None;
         let mut worker_joined = false;
@@ -1548,12 +1621,32 @@ impl NativeSessionFactory {
             }
             thread::sleep(Duration::from_millis(1));
         }
+        let mut mapping_observation = None;
         let runtime_mapping_error =
             if collection_error.is_none() && self.owner.origin() == NativeWorkerOrigin::CudaOnnx {
-                self._runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.verify_cuda_runtime_mappings().err())
-                    .map(Box::new)
+                if system_observation {
+                    match self._runtime.as_ref() {
+                        Some(runtime) if runtime.is_system_cuda() => {
+                            match runtime.observe_cuda_runtime_mappings() {
+                                Ok(observation) => {
+                                    mapping_observation = Some(observation);
+                                    None
+                                }
+                                Err(error) => Some(Box::new(error)),
+                            }
+                        }
+                        _ => Some(Box::new(BackendError::new(
+                            FailureKind::IdentityMismatch,
+                            FailureStage::Backend,
+                            "original system CUDA runtime is unavailable during final observation",
+                        ))),
+                    }
+                } else {
+                    self._runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.verify_cuda_runtime_mappings().err())
+                        .map(Box::new)
+                }
             } else {
                 None
             };
@@ -1570,24 +1663,32 @@ impl NativeSessionFactory {
         } else {
             None
         };
-        let service = served.err().map(Box::new);
         if service.is_none()
             && collection_error.is_none()
             && worker_shutdown_error.is_none()
             && runtime_mapping_error.is_none()
             && report.as_ref().is_some_and(|report| !report.has_failure())
         {
-            return Ok(report.expect("checked report presence"));
+            return (
+                Ok(report.expect("checked report presence")),
+                mapping_observation,
+            );
         }
-        Err(NativeRunError {
-            service,
-            report: report.map(Box::new),
-            collection_error,
-            worker_shutdown_error,
-            runtime_mapping_error,
-            retained_evidence: self.evidence.clone(),
-            retained_owner: self.owner.clone(),
-        })
+        (
+            Err(NativeRunError {
+                report: report.map(Box::new),
+                collection_error,
+                worker_shutdown_error,
+                runtime_mapping_error,
+                retained_evidence: self.evidence.clone(),
+                retained_owner: self.owner.clone(),
+                // Move the original service failure only after the other
+                // report fields have been prepared. The caller retains it if
+                // those preparations unwind.
+                service: service.take().map(Box::new),
+            }),
+            mapping_observation,
+        )
     }
 }
 
@@ -1647,6 +1748,41 @@ pub struct NativeCudaFactory {
 }
 #[cfg(feature = "onnx-cuda")]
 impl NativeCudaFactory {
+    /// Uses only the same worker/runtime already held by the original system
+    /// custody. It does not start native execution or transfer the custody;
+    /// callers must retain that owner through shutdown and session release.
+    #[cfg(all(feature = "pals-adaptive", target_os = "linux"))]
+    #[allow(dead_code)]
+    fn from_system_custody(
+        custody: &system_cuda::Lc0SystemStartupCustody,
+    ) -> Result<Self, NativeBootstrapError> {
+        let owner = custody
+            .worker()
+            .cloned()
+            .ok_or(NativeBootstrapError::Config(
+                "original system CUDA worker is not available",
+            ))?;
+        let runtime = custody
+            .runtime()
+            .cloned()
+            .ok_or(NativeBootstrapError::Config(
+                "original system CUDA runtime is not available",
+            ))?;
+        if owner.origin() != NativeWorkerOrigin::CudaOnnx
+            || !runtime.is_system_cuda()
+            || !owner.system_cuda_metadata().is_some_and(|metadata| {
+                Some(metadata.system_runtime_identity.0) == runtime.cuda_runtime_identity()
+            })
+        {
+            return Err(NativeBootstrapError::Config(
+                "original system CUDA owner identity differs",
+            ));
+        }
+        Ok(Self {
+            inner: NativeSessionFactory::from_owner(owner, Some(runtime))?,
+        })
+    }
+
     #[cfg(feature = "experimental-batch")]
     pub fn batch_journal(
         &self,

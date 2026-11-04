@@ -189,6 +189,25 @@ pub(super) struct PendingCounter {
     source: Option<ObservationId>,
     repair_direct: bool,
 }
+#[cfg(test)]
+impl PendingCounter {
+    /// Authored queue metadata only; this grants no accepted observation.
+    pub(super) fn authored_without_observation_for_test(
+        first: BoardMove,
+        proposal: Vec<BoardMove>,
+        counter: Vec<BoardMove>,
+        attack: usize,
+    ) -> Self {
+        Self {
+            first,
+            proposal,
+            counter,
+            attack,
+            source: None,
+            repair_direct: false,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub enum AdaptiveBranchOutcome {
     Complete(FrameCompletionScope),
@@ -239,8 +258,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        if !self.engine.records.iter().any(|record| {
-            record.origin_state == self.engine.nodes[self.root].state
+        if !self.engine.semantic.records.iter().any(|record| {
+            record.origin_state == self.engine.semantic.nodes[self.root].state
                 && record.kind == RecordKind::Repair
                 && record.line == repaired
         }) {
@@ -447,8 +466,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     pub(super) fn enqueue_counter(&mut self, pending: PendingCounter) -> Result<bool, PalsError> {
         if pending.proposal.first() != Some(&pending.first)
             || pending.counter.first() != Some(&pending.first)
-            || pending.counter.len() > self.engine.config.line_plies
-            || pending.proposal.len() > self.engine.config.line_plies
+            || pending.counter.len() > self.continuation_limit()
+            || pending.proposal.len() > self.continuation_limit()
             || pending.attack >= pending.counter.len()
             || pending.attack >= pending.proposal.len()
             || pending.counter.get(..pending.attack) != pending.proposal.get(..pending.attack)
@@ -456,16 +475,28 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        let mut checked = self.engine.nodes[self.root].position.clone();
-        for movement in &pending.counter {
-            checked.make_move(*movement)?;
+        if self.rovent_frontier().is_some() {
+            // A queued alternative has not been selected for examination yet.
+            // Reserve/check its Rules path without publishing hot graph edges;
+            // begin_counter adopts those snapshots at the actual selection.
+            if self
+                .existing_checked_frontier_line(&pending.counter)?
+                .is_none()
+            {
+                self.checked_frontier_line(&pending.counter)?;
+            }
+        } else {
+            let mut checked = self.engine.semantic.nodes[self.root].position.clone();
+            for movement in &pending.counter {
+                checked.make_move(*movement)?;
+            }
         }
         let mut hash = Sha256::new();
         hash.update(b"rz-pals-pending-counter/1\0");
         hash.update(self.authority.epoch.0.to_le_bytes());
         hash.update(self.authority.game.0.to_le_bytes());
         hash.update(self.authority.root.0.to_le_bytes());
-        hash.update(self.engine.revision.to_le_bytes());
+        hash.update(self.engine.semantic.revision.to_le_bytes());
         hash.update(role_line_sha256(b"proposal", &pending.proposal)?);
         hash.update(role_line_sha256(b"counter", &pending.counter)?);
         hash.update([u8::from(pending.repair_direct)]);
@@ -499,6 +530,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     }
     pub(super) fn begin_counter(
         &mut self,
+        original: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
         pending: PendingCounter,
     ) -> Result<AdaptivePortTransition, PalsError> {
         let node = self.replay_node(&pending.counter)?;
@@ -514,7 +546,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .ok_or(RoleError::InvalidOutput)?
                 .to_vec();
             let anchor = self.replay_node(&prefix)?;
-            return self.begin_repair_continuation(
+            let mut transition = self.begin_repair_continuation(
                 anchor,
                 Some(pending.first),
                 prefix,
@@ -522,10 +554,19 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 pending.counter,
                 pending.attack,
                 pending.source,
-            );
+            )?;
+            self.bind_zero_step_repair_goal_transition(original, &mut transition)?;
+            return Ok(transition);
         }
-        let done = pending.counter.len() >= self.engine.config.line_plies
-            || self.engine.nodes[node].terminal.is_some();
+        let goal_selection = self.prepare_counter_goal_selection(
+            original,
+            &pending.counter,
+            &pending.proposal,
+            pending.attack,
+            pending.source,
+        )?;
+        let done = pending.counter.len() >= self.continuation_limit()
+            || self.engine.semantic.nodes[node].terminal.is_some();
         let stage = if done {
             self.record_hot(RecordKind::Counterexample, &pending.counter, pending.source)?;
             self.counters.refutations += 1;
@@ -547,7 +588,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             None,
         )?;
         Ok(AdaptivePortTransition::Continue(
-            next.with_counter_source(pending.source),
+            next.with_counter_source(pending.source)
+                .with_goal_lane_selection(goal_selection)?,
         ))
     }
     /// Preserve each branch outcome even when a sibling continues under the
@@ -624,7 +666,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .get_mut(&first)
             .and_then(VecDeque::pop_front);
         if let Some(next) = next {
-            return self.begin_counter(next);
+            return self.begin_counter(work, next);
         }
         // Queuing the exact accepted Repair is an administrative frontier
         // closure. Earlier Unknown receipts still describe unresolved sibling
@@ -662,11 +704,21 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .zip(&counter)
             .position(|(a, b)| a != b)
             .ok_or(RoleError::InvalidOutput)?;
-        let mut position = self.engine.nodes[self.root].position.clone();
-        for movement in &proposal[..attack] {
-            position.make_move(*movement)?;
-        }
-        if position.side_to_move() == self.engine.nodes[self.root].position.side_to_move() {
+        let position = if self.rovent_frontier().is_some() {
+            let node = self.replay_node(&proposal[..attack])?;
+            self.engine.semantic.nodes[node].position.clone()
+        } else {
+            let mut position = self.engine.semantic.nodes[self.root].position.clone();
+            for movement in &proposal[..attack] {
+                position.make_move(*movement)?;
+            }
+            position
+        };
+        if position.side_to_move()
+            == self.engine.semantic.nodes[self.root]
+                .position
+                .side_to_move()
+        {
             return Err(RoleError::InvalidOutput.into());
         }
         self.enqueue_counter(PendingCounter {

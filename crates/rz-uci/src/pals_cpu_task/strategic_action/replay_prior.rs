@@ -134,6 +134,11 @@ impl TryFrom<CpuCompletion> for PriorCompletion {
                 ));
             }
             CpuCompletion::QuiescenceLimit => Self::QuiescenceLimit,
+            CpuCompletion::AwaitReciprocal => {
+                return Err(fault(
+                    "reciprocal CPU wait is unsupported by legacy replay prior",
+                ));
+            }
             CpuCompletion::Terminal(_) => Self::RulesTerminal,
         })
     }

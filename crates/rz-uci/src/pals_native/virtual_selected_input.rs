@@ -228,9 +228,9 @@ fn perspective(color: Color) -> i8 {
     if color == Color::White { 1 } else { -1 }
 }
 
-pub(crate) fn exact_review_anchor_input(
-    position: &Position,
-) -> Result<ReviewAnchorInput, RoleError> {
+/// Pure original Rules board/metadata calculation. It issues no ReviewView,
+/// ticket, native worker, physical-completion or training authority.
+pub fn exact_review_anchor_input(position: &Position) -> Result<ReviewAnchorInput, RoleError> {
     let (board, metadata) = pals_native::board_and_metadata(position)?;
     Ok(ReviewAnchorInput { board, metadata })
 }
@@ -278,4 +278,18 @@ fn encode_divergences(
             Ok(feature)
         })
         .collect()
+}
+
+/// Reuse the original bounded Rules/proposal/index calculation for historical
+/// comparison. This function grants no live or historical execution authority.
+#[cfg(feature = "onnx-cpu")]
+pub fn encode_review_divergences(
+    root: &Position,
+    proposal: &[BoardMove],
+    indices: &[usize],
+) -> Result<Vec<[f32; 8]>, RoleError> {
+    if proposal.len() > 256 || indices.len() > 256 {
+        return Err(RoleError::InvalidOutput);
+    }
+    encode_divergences(root, proposal, indices)
 }

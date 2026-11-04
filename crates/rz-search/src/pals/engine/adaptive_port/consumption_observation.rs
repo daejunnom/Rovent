@@ -1,5 +1,6 @@
 //! Opt-in copied scalar facts at the original Search semantic boundaries.
 //! No output/model/view payload, callback or coordinator-transition authority.
+use super::profiled_external_port::feedback_observation::ProfiledFeedbackRoleEdge;
 use super::{BoardMove, LineId, ObservationId, PalsError, RoleError, StateId, StoreError};
 use crate::pals::coordinator::{FrameId, RefinementStage};
 use rz_contracts::pals::{Role, SearchAuthority};
@@ -57,7 +58,12 @@ impl AdaptiveRoleConsumptionRejection {
                 Self::PhysicalCompletionUnknown
             }
             PalsError::RoleCallLimit => Self::RoleCallLimit,
-            PalsError::Capacity | PalsError::Store(StoreError::Capacity(_)) => Self::Capacity,
+            PalsError::Capacity
+            | PalsError::Store(StoreError::Capacity(_))
+            | PalsError::Rovent(
+                crate::pals::rovent_frontier::FrontierError::PublicRecordCapacity
+                | crate::pals::rovent_frontier::FrontierError::PublicReviewIndexCapacity,
+            ) => Self::Capacity,
             _ => Self::OtherOriginalFailure,
         }
     }
@@ -150,6 +156,10 @@ pub struct AdaptiveRoleConsumptionObservation {
     authority: SearchAuthority,
     events: Vec<AdaptiveRoleConsumptionEvent>,
     unavailable: Option<AdaptiveRoleConsumptionUnavailable>,
+    // Same opaque journal, enabled once before the first observed operation.
+    // These copied facts neither retain a view nor become a role/R capability.
+    feedback_roles: Vec<ProfiledFeedbackRoleEdge>,
+    feedback_unavailable: bool,
 }
 impl AdaptiveRoleConsumptionObservation {
     pub(super) fn new(authority: SearchAuthority) -> Self {
@@ -158,10 +168,16 @@ impl AdaptiveRoleConsumptionObservation {
             .try_reserve_exact(MAX_ROLE_CONSUMPTION_EVENTS)
             .err()
             .map(|_| AdaptiveRoleConsumptionUnavailable::ReservationFailed);
+        let mut feedback_roles = Vec::new();
+        let feedback_unavailable = feedback_roles
+            .try_reserve_exact(MAX_ROLE_CONSUMPTION_EVENTS)
+            .is_err();
         Self {
             authority,
             events,
             unavailable,
+            feedback_roles,
+            feedback_unavailable,
         }
     }
     pub fn authority(&self) -> SearchAuthority {
@@ -173,6 +189,20 @@ impl AdaptiveRoleConsumptionObservation {
     pub fn unavailable(&self) -> Option<AdaptiveRoleConsumptionUnavailable> {
         self.unavailable
     }
+    pub(super) fn feedback_roles(&self) -> Option<&[ProfiledFeedbackRoleEdge]> {
+        (!self.feedback_unavailable && self.unavailable.is_none())
+            .then_some(self.feedback_roles.as_slice())
+    }
+    pub(super) fn record_feedback_role(&mut self, edge: ProfiledFeedbackRoleEdge) {
+        if self.feedback_unavailable || self.unavailable.is_some() {
+            return;
+        }
+        if self.feedback_roles.len() == MAX_ROLE_CONSUMPTION_EVENTS {
+            self.feedback_unavailable = true;
+            return;
+        }
+        self.feedback_roles.push(edge);
+    }
     pub(super) fn record(&mut self, event: AdaptiveRoleConsumptionEvent) {
         if self.unavailable.is_some() {
             return;
@@ -183,5 +213,37 @@ impl AdaptiveRoleConsumptionObservation {
         }
         // Reservation was made once at opt-in; this push never grows beyond it.
         self.events.push(event);
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    use crate::pals::review_context::ReviewError;
+    use crate::pals::rovent_frontier::FrontierError;
+
+    #[test]
+    fn original_frontier_capacity_causes_do_not_reclassify_generic_review_errors() {
+        for cause in [
+            FrontierError::PublicRecordCapacity,
+            FrontierError::PublicReviewIndexCapacity,
+        ] {
+            assert_eq!(
+                AdaptiveRoleConsumptionRejection::from_error(&PalsError::Rovent(cause)),
+                AdaptiveRoleConsumptionRejection::Capacity,
+            );
+        }
+        // Only the original producer joins the bundle refusal to its frontier.
+        // A standalone ReviewError value is never that same-controller evidence.
+        for cause in [
+            ReviewError::BundleRecordCapacity,
+            ReviewError::IndexCapacity,
+            ReviewError::OwnerMismatch,
+        ] {
+            assert_eq!(
+                AdaptiveRoleConsumptionRejection::from_error(&PalsError::Review(cause)),
+                AdaptiveRoleConsumptionRejection::OtherOriginalFailure,
+            );
+        }
     }
 }

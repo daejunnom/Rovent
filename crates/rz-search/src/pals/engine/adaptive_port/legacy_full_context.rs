@@ -54,6 +54,12 @@ impl LegacyFullRoleRecords {
     pub fn validates(&self, stores: &PalsStores) -> bool {
         self.pin.validates(stores)
     }
+    pub(crate) fn retirement_protected_pins(
+        &self,
+        stores: &PalsStores,
+    ) -> Result<crate::pals::store::StorePins, PalsError> {
+        Ok(self.pin.retirement_seed(stores)?)
+    }
     /// Known owned snapshot backing, not Store resident bytes or an RSS peak.
     /// Shared copies are conservatively charged per submitted question; no
     /// physical sharing deduction is inferred from the Arc identity.
@@ -78,23 +84,24 @@ impl LegacyFullRoleRecords {
         engine: &PalsEngine<M>,
         authority: SearchAuthority,
     ) -> Result<Self, PalsError> {
-        if engine.records.len() > engine.config.max_records
-            || engine.records.len() > LEGACY_ENCODER_RAW_RECORD_SCAN_LIMIT
+        if engine.semantic.records.len() > engine.config.max_records
+            || engine.semantic.records.len() > LEGACY_ENCODER_RAW_RECORD_SCAN_LIMIT
         {
             return Err(PalsError::Capacity);
         }
-        if engine.game_generation != Some(authority.game.0)
-            || engine.stores.generation() != authority.root.0
+        if engine.semantic.game_generation != Some(authority.game.0)
+            || engine.semantic.stores.generation() != authority.root.0
         {
             return Err(StoreError::StaleConsumer.into());
         }
         let root = engine
+            .semantic
             .stores
             .root()
             .ok_or(StoreError::InvalidHandle("legacy full context actual root"))?;
-        let root_state = engine.stores.situations.get(root)?.state;
+        let root_state = engine.semantic.stores.situations.get(root)?.state;
         let root_digest = rz_position::contracts::rules_snapshot_semantic_digest(
-            engine.stores.states.get(root_state)?,
+            engine.semantic.stores.states.get(root_state)?,
         )
         .0;
         let mut hash = Sha256::new();
@@ -103,20 +110,22 @@ impl LegacyFullRoleRecords {
         hash.update(authority.game.0.to_le_bytes());
         hash.update(authority.root.0.to_le_bytes());
         hash.update(authority.implementation.0);
-        hash.update(engine.revision.to_le_bytes());
-        hash.update(engine.stores.generation().to_le_bytes());
+        hash.update(engine.semantic.revision.to_le_bytes());
+        hash.update(engine.semantic.stores.generation().to_le_bytes());
         hash.update(root_digest);
         hash.update(
-            u64::try_from(engine.records.len())
+            u64::try_from(engine.semantic.records.len())
                 .map_err(|_| PalsError::Capacity)?
                 .to_le_bytes(),
         );
         let mut records = Vec::new();
         records
-            .try_reserve_exact(engine.records.len())
+            .try_reserve_exact(engine.semantic.records.len())
             .map_err(|_| PalsError::Capacity)?;
-        for source in &engine.records {
-            if source.revision > engine.revision || source.line.len() > LEGACY_ENCODER_LINE_LIMIT {
+        for source in &engine.semantic.records {
+            if source.revision > engine.semantic.revision
+                || source.line.len() > LEGACY_ENCODER_LINE_LIMIT
+            {
                 return Err(RoleError::InvalidOutput.into());
             }
             // Keep the raw row exactly: no rebase, suffix selection, relation
@@ -133,7 +142,7 @@ impl LegacyFullRoleRecords {
             }
             hash.update(
                 rz_position::contracts::rules_snapshot_semantic_digest(
-                    engine.stores.states.get(source.origin_state)?,
+                    engine.semantic.stores.states.get(source.origin_state)?,
                 )
                 .0,
             );
@@ -165,7 +174,7 @@ impl LegacyFullRoleRecords {
             }]);
             hash.update([u8::from(source.cpu_observation.is_some())]);
             if let Some(observation) = source.cpu_observation {
-                engine.stores.observations.get(observation)?;
+                engine.semantic.stores.observations.get(observation)?;
                 hash.update(
                     u64::try_from(observation.0)
                         .map_err(|_| PalsError::Capacity)?
@@ -197,12 +206,12 @@ impl LegacyFullRoleRecords {
         let mut pins = engine.resident_archive_pins()?;
         pins.states.insert(root_state);
         pins.situations.insert(root);
-        let pin = engine.stores.pin_review(pins)?;
+        let pin = engine.semantic.stores.pin_review(pins)?;
         let snapshot = Self {
             records,
             authority,
-            revision: engine.revision,
-            generation: engine.stores.generation(),
+            revision: engine.semantic.revision,
+            generation: engine.semantic.stores.generation(),
             root_state: root_digest,
             digest: hash.finalize().into(),
             pin,
@@ -218,16 +227,16 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         context: &RoleLogicalContext,
         view: &ReviewView,
     ) -> Result<Option<Arc<LegacyFullRoleRecords>>, PalsError> {
-        if !self.engine.legacy_full_native_context {
+        if !self.engine.semantic.legacy_full_native_context {
             return Ok(None);
         }
         let root_digest =
             rz_position::contracts::rules_snapshot_semantic_digest(&view.anchors()[0].snapshot).0;
-        if context.public_revision != self.engine.revision
-            || context.search_generation != self.engine.stores.generation()
+        if context.public_revision != self.engine.semantic.revision
+            || context.search_generation != self.engine.semantic.stores.generation()
             || view.generation() != context.search_generation
             || view.anchor_mode() != crate::pals::review_context::ReviewAnchorMode::CurrentRootOnly
-            || !view.validates(&self.engine.stores)
+            || !view.validates(&self.engine.semantic.stores)
         {
             return Err(RoleError::InvalidOutput.into());
         }
@@ -240,7 +249,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     && snapshot.revision() == context.public_revision
                     && snapshot.generation() == context.search_generation
                     && snapshot.root_state() == root_digest
-                    && snapshot.validates(&self.engine.stores)
+                    && snapshot.validates(&self.engine.semantic.stores)
             })
         {
             return Ok(Some(snapshot));
@@ -272,16 +281,16 @@ mod tests {
         );
         assert!(work.input.question.legacy_full_records.is_none());
         assert!(port.last_legacy_full_snapshot.is_none());
-        assert_eq!(port.engine.stores.review_pin_count().unwrap(), 1);
+        assert_eq!(port.engine.semantic.stores.review_pin_count().unwrap(), 1);
     }
 
     #[test]
     fn full_snapshot_keeps_more_than_selected_limit_and_freezes_original_rows() {
         let mut port = super::super::port_tests::setup(Position::startpos(), 2);
-        port.engine.legacy_full_native_context = true;
-        let state = port.engine.nodes[port.root].state;
+        port.engine.semantic.legacy_full_native_context = true;
+        let state = port.engine.semantic.nodes[port.root].state;
         for revision in 1..=97 {
-            port.engine.records.push(RoleRecord {
+            port.engine.semantic.records.push(RoleRecord {
                 revision,
                 parent_revision: (revision > 1).then_some(revision - 1),
                 supersedes_revision: None,
@@ -296,7 +305,7 @@ mod tests {
                 critical: true,
             });
         }
-        port.engine.revision = 97;
+        port.engine.semantic.revision = 97;
         let work = super::super::port_tests::work(
             &mut port,
             "e2e4",
@@ -309,18 +318,18 @@ mod tests {
         assert!(work.input.view.records().len() <= 64);
         assert_eq!(captured.records()[65].value, Some(66));
         let digest = captured.digest();
-        port.engine.records[65].value = Some(1234);
-        port.engine.records[65].line.clear();
+        port.engine.semantic.records[65].value = Some(1234);
+        port.engine.semantic.records[65].line.clear();
         assert_eq!(captured.records()[65].value, Some(66));
         assert_eq!(captured.records()[65].line.len(), 1);
         assert_eq!(captured.digest(), digest);
-        assert!(captured.validates(&port.engine.stores));
+        assert!(captured.validates(&port.engine.semantic.stores));
     }
 
     #[test]
     fn unchanged_revision_shares_original_full_scope_and_last_drop_releases_lease() {
         let mut port = super::super::port_tests::setup(Position::startpos(), 2);
-        port.engine.legacy_full_native_context = true;
+        port.engine.semantic.legacy_full_native_context = true;
         let first = super::super::port_tests::work(
             &mut port,
             "e2e4",
@@ -337,11 +346,11 @@ mod tests {
             first.input.question.legacy_full_records.as_ref().unwrap(),
             second.input.question.legacy_full_records.as_ref().unwrap(),
         ));
-        assert_eq!(port.engine.stores.review_pin_count().unwrap(), 3);
+        assert_eq!(port.engine.semantic.stores.review_pin_count().unwrap(), 3);
         drop(first);
-        assert_eq!(port.engine.stores.review_pin_count().unwrap(), 2);
+        assert_eq!(port.engine.semantic.stores.review_pin_count().unwrap(), 2);
         drop(second);
-        assert_eq!(port.engine.stores.review_pin_count().unwrap(), 0);
+        assert_eq!(port.engine.semantic.stores.review_pin_count().unwrap(), 0);
         assert!(
             port.last_legacy_full_snapshot
                 .as_ref()
@@ -358,12 +367,13 @@ mod tests {
         let mut changed = Position::startpos();
         changed.make_uci("e2e4").unwrap();
         port.engine
+            .semantic
             .stores
             .focus_actual_moves(changed.snapshot())
             .unwrap();
-        assert!(!snapshot.validates(&port.engine.stores));
-        let state = port.engine.nodes[port.root].state;
-        port.engine.records = (0..=port.engine.config.max_records)
+        assert!(!snapshot.validates(&port.engine.semantic.stores));
+        let state = port.engine.semantic.nodes[port.root].state;
+        port.engine.semantic.records = (0..=port.engine.config.max_records)
             .map(|index| RoleRecord {
                 revision: index as u64,
                 parent_revision: None,
@@ -379,7 +389,7 @@ mod tests {
                 critical: false,
             })
             .collect();
-        port.engine.revision = port.engine.config.max_records as u64;
+        port.engine.semantic.revision = port.engine.config.max_records as u64;
         assert!(matches!(
             LegacyFullRoleRecords::capture(&port.engine, port.authority),
             Err(PalsError::Capacity)

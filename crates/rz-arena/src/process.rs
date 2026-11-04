@@ -18,6 +18,41 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 type StdoutObserver<'a> = &'a mut dyn FnMut(&[u8]);
 type LoadedImageVerifier<'a> = &'a mut dyn FnMut(&File) -> Result<(), ()>;
+/// A nonblocking owner operation, polled only while the original child is
+/// alive and its supervisor still owns the wait relationship. The deadline is
+/// the original process execution deadline, never a new per-poll timeout.
+pub(crate) type SpawnControl<'a> =
+    &'a mut dyn FnMut(&SpawnCustody, Instant) -> Result<(), ArenaError>;
+
+/// A separate nonblocking cleanup operation. Its deadline is the earlier of
+/// the original whole window and the existing shutdown limit. It is observed
+/// only while the original child reservation remains under this supervisor.
+/// A callback must return promptly; this synchronous API cannot preempt one.
+pub(crate) type CleanupControl<'a> =
+    &'a mut dyn FnMut(&SpawnCustody, Instant) -> Result<(), ArenaError>;
+
+/// A cooperative V6 cancellation request, polled before signalling the owned
+/// process group. `Acknowledged` means only that the peer accepted the request;
+/// it is not session, device, or process completion evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreSignalProgress {
+    Pending { partial: bool },
+    Acknowledged,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PreSignalObservation {
+    pub calls: u64,
+    pub first_partial_at: Option<Instant>,
+    pub acknowledged_at: Option<Instant>,
+    pub timed_out: bool,
+    pub first_failure: Option<String>,
+}
+
+/// Callback must not wait; it retains its own partial I/O state. Its fixed
+/// deadline is supplied by the original process owner on every poll.
+pub(crate) type PreSignalControl<'a> =
+    &'a mut dyn FnMut(&SpawnCustody, Instant) -> Result<PreSignalProgress, ArenaError>;
 
 pub const MAX_ORIGINAL_INPUT_BYTES: usize = 2 * 1024 * 1024;
 
@@ -71,6 +106,252 @@ impl OriginalProcessWindow {
 pub struct OriginalProcessInput<'a> {
     pub bytes: &'a [u8],
     pub window: OriginalProcessWindow,
+}
+
+/// The existing supervisor drains directly into these same caller-owned
+/// buffers for smoke paths. They are transferred into `ProcessOutput` only
+/// on normal return; an error/unwind retains the bytes alongside the caller's
+/// original custody and observation. This is not a physical-completion proof.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct OriginalSmokeOutputBuffers {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// The caller owns this observation before entering the smoke supervisor and
+/// retains it even if supervision returns an error or unwinds. It describes
+/// transport only; it does not seal input contents or establish UCI/model,
+/// GPU, resource-policy, or physical-completion success.
+#[cfg(target_os = "linux")]
+pub(crate) struct OriginalSmokeTransportObservation {
+    window: OriginalProcessWindow,
+    transport: OriginalProcessObservation,
+    pre_signal: PreSignalObservation,
+    output: OriginalSmokeOutputBuffers,
+    started: bool,
+    returned: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl OriginalSmokeTransportObservation {
+    pub(crate) fn new(input: OriginalProcessInput<'_>) -> Result<Self, ArenaError> {
+        validate_smoke_protocol_input(input.bytes)?;
+        Ok(Self {
+            window: input.window,
+            transport: OriginalProcessObservation::new(input.bytes.len()),
+            pre_signal: PreSignalObservation::default(),
+            output: OriginalSmokeOutputBuffers::default(),
+            started: false,
+            returned: false,
+        })
+    }
+
+    pub(crate) fn transport(&self) -> &OriginalProcessObservation {
+        &self.transport
+    }
+
+    pub(crate) fn pre_signal(&self) -> &PreSignalObservation {
+        &self.pre_signal
+    }
+
+    pub(crate) fn buffered_stdout(&self) -> &[u8] {
+        &self.output.stdout
+    }
+
+    pub(crate) fn buffered_stderr(&self) -> &[u8] {
+        &self.output.stderr
+    }
+
+    pub(crate) fn stdin_closed_after_input(&self) -> bool {
+        self.transport.stdin_closed_after_input
+    }
+
+    /// A started attempt without a return may have unwound. The original
+    /// external custody must be resolved independently in that case.
+    pub(crate) fn attempt_started(&self) -> bool {
+        self.started
+    }
+
+    pub(crate) fn attempt_returned(&self) -> bool {
+        self.returned
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_smoke_protocol_input(input: &[u8]) -> Result<(), ArenaError> {
+    // Match the existing finite UCI preflight bound; no commands are added or
+    // interpreted here. The supervisor closes stdin after these bytes.
+    if input.is_empty() || input.len() > 64 * 1024 || !input.ends_with(b"\n") {
+        return Err(ArenaError::Budget(
+            "finite smoke protocol input requires 1..64KiB and a final newline".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A protocol observation retained by the original smoke owner. Response lines
+/// are read after their command was sent; UCI has no request ID, so this cannot
+/// prove when the peer generated buffered output or establish causality. No
+/// field here is model readiness, an arena result, or physical-completion.
+#[cfg(target_os = "linux")]
+pub(crate) struct OriginalSmokeUciObservation {
+    window: OriginalProcessWindow,
+    transport: OriginalProcessObservation,
+    pre_signal: PreSignalObservation,
+    output: OriginalSmokeOutputBuffers,
+    dialogue: SmokeUciDialogue,
+    started: bool,
+    returned: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl OriginalSmokeUciObservation {
+    pub(crate) fn new(window: OriginalProcessWindow) -> Self {
+        Self {
+            window,
+            transport: OriginalProcessObservation::new(
+                b"uci\n".len() + b"isready\n".len() + b"quit\n".len(),
+            ),
+            pre_signal: PreSignalObservation::default(),
+            output: OriginalSmokeOutputBuffers::default(),
+            dialogue: SmokeUciDialogue::default(),
+            started: false,
+            returned: false,
+        }
+    }
+    pub(crate) fn transport(&self) -> &OriginalProcessObservation {
+        &self.transport
+    }
+    pub(crate) fn pre_signal(&self) -> &PreSignalObservation {
+        &self.pre_signal
+    }
+    pub(crate) fn buffered_stdout(&self) -> &[u8] {
+        &self.output.stdout
+    }
+    pub(crate) fn buffered_stderr(&self) -> &[u8] {
+        &self.output.stderr
+    }
+    pub(crate) fn attempt_started(&self) -> bool {
+        self.started
+    }
+    pub(crate) fn attempt_returned(&self) -> bool {
+        self.returned
+    }
+    pub(crate) fn uci_sent(&self) -> bool {
+        self.dialogue.uci_sent
+    }
+    pub(crate) fn uciok_observed(&self) -> bool {
+        self.dialogue.uciok_observed
+    }
+    pub(crate) fn isready_sent(&self) -> bool {
+        self.dialogue.isready_sent
+    }
+    pub(crate) fn readyok_observed(&self) -> bool {
+        self.dialogue.readyok_observed
+    }
+    pub(crate) fn quit_sent(&self) -> bool {
+        self.dialogue.quit_sent
+    }
+    /// Observed writes and received protocol lines only; callers must still
+    /// assess process/pipe termination and any independent physical scope.
+    pub(crate) fn uci_exchange_observed(&self) -> bool {
+        self.uci_sent()
+            && self.uciok_observed()
+            && self.isready_sent()
+            && self.readyok_observed()
+            && self.quit_sent()
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SmokeUciPhase {
+    #[default]
+    SendUci,
+    WaitUciOk,
+    SendIsReady,
+    WaitReadyOk,
+    SendQuit,
+    Done,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct SmokeUciDialogue {
+    phase: SmokeUciPhase,
+    command_offset: usize,
+    written: usize,
+    scan_offset: usize,
+    line_start: usize,
+    response_fence: usize,
+    uci_sent: bool,
+    uciok_observed: bool,
+    isready_sent: bool,
+    readyok_observed: bool,
+    quit_sent: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl SmokeUciDialogue {
+    fn command(&self) -> Option<&'static [u8]> {
+        match self.phase {
+            SmokeUciPhase::SendUci => Some(b"uci\n"),
+            SmokeUciPhase::SendIsReady => Some(b"isready\n"),
+            SmokeUciPhase::SendQuit => Some(b"quit\n"),
+            _ => None,
+        }
+    }
+
+    fn wrote(&mut self, count: usize, observed_stdout_len: usize) {
+        self.command_offset += count;
+        self.written += count;
+        if self
+            .command()
+            .is_none_or(|command| self.command_offset != command.len())
+        {
+            return;
+        }
+        self.command_offset = 0;
+        self.response_fence = observed_stdout_len;
+        self.phase = match self.phase {
+            SmokeUciPhase::SendUci => {
+                self.uci_sent = true;
+                SmokeUciPhase::WaitUciOk
+            }
+            SmokeUciPhase::SendIsReady => {
+                self.isready_sent = true;
+                SmokeUciPhase::WaitReadyOk
+            }
+            SmokeUciPhase::SendQuit => {
+                self.quit_sent = true;
+                SmokeUciPhase::Done
+            }
+            phase => phase,
+        };
+    }
+
+    /// Scan the already bounded, retained stdout buffer once. An incomplete
+    /// earlier line crossing a new-command fence cannot answer that command.
+    fn observe_stdout(&mut self, stdout: &[u8]) {
+        while self.scan_offset < stdout.len() {
+            let at = self.scan_offset;
+            self.scan_offset += 1;
+            if stdout[at] != b'\n' {
+                continue;
+            }
+            let line = stdout[self.line_start..at].trim_ascii();
+            let eligible = self.line_start >= self.response_fence;
+            if eligible && self.phase == SmokeUciPhase::WaitUciOk && line == b"uciok" {
+                self.uciok_observed = true;
+                self.phase = SmokeUciPhase::SendIsReady;
+            } else if eligible && self.phase == SmokeUciPhase::WaitReadyOk && line == b"readyok" {
+                self.readyok_observed = true;
+                self.phase = SmokeUciPhase::SendQuit;
+            }
+            self.line_start = self.scan_offset;
+        }
+    }
 }
 
 /// 수치 캡처의 고정 FP32 조건만 전달한다. 임의 환경이나 부모의 CUDA/
@@ -458,6 +739,25 @@ pub struct ProcessOutput {
     pub pending_child: Option<std::process::Child>,
 }
 
+/// Original supervisor-owned child slot. For guarded launches the child is
+/// installed here immediately after spawn and borrowed by the supervisor;
+/// an error or unwind before `ProcessOutput` cannot drop that handle.
+#[derive(Default)]
+pub(crate) struct SpawnCustody {
+    child: Option<std::process::Child>,
+    pub(crate) pending: AtomicBool,
+    pub(crate) last_spawn_pid: Option<u32>,
+}
+
+impl SpawnCustody {
+    pub(crate) fn child(&self) -> Option<&std::process::Child> {
+        self.child.as_ref()
+    }
+    pub(crate) fn take_child(&mut self) -> Option<std::process::Child> {
+        self.child.take()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ArtifactWatch {
     /// Supported files are direct children of the pinned working directory.
@@ -499,17 +799,44 @@ impl OwnedArtifactTreeWatch {
         }
     }
 
-    fn validate(&self) -> Result<(), ArenaError> {
+    pub(crate) fn validate(&self) -> Result<(), ArenaError> {
+        self.validate_with_file_ceiling(Self::MAX_FILES)
+    }
+    fn validate_with_file_ceiling(&self, file_ceiling: usize) -> Result<(), ArenaError> {
         if self.max_total_bytes == 0
             || self.max_file_bytes == 0
-            || !(1..=Self::MAX_FILES).contains(&self.max_files)
+            || !(1..=32_768).contains(&file_ceiling)
+            || !(1..=file_ceiling).contains(&self.max_files)
             || self.max_depth > Self::MAX_DEPTH
         {
-            return Err(ArenaError::Budget(
-                "artifact tree requires positive bytes, 1..4096 files and depth at most 32".into(),
-            ));
+            return Err(ArenaError::Budget(format!(
+                "artifact tree requires positive bytes, 1..{file_ceiling} files and depth at most 32"
+            )));
         }
         Ok(())
+    }
+}
+
+/// Explicit finite Rovent training profile. The generic/public watch keeps its
+/// original 4096-file validation. Only the crate's new trainer entrypoint may
+/// consume this private wrapper with a separately registered ceiling.
+#[cfg(all(target_os = "linux", any(feature = "pals-collection-onnx", test)))]
+pub(crate) struct RoventTrainingArtifactTreeWatch(OwnedArtifactTreeWatch);
+#[cfg(all(target_os = "linux", any(feature = "pals-collection-onnx", test)))]
+impl RoventTrainingArtifactTreeWatch {
+    pub(crate) fn registered(
+        max_total_bytes: u64,
+        max_file_bytes: u64,
+        max_files: usize,
+    ) -> Result<Self, ArenaError> {
+        let watch = OwnedArtifactTreeWatch {
+            max_total_bytes,
+            max_file_bytes,
+            max_files,
+            max_depth: OwnedArtifactTreeWatch::MAX_DEPTH,
+        };
+        watch.validate_with_file_ceiling(max_files)?;
+        Ok(Self(watch))
     }
 }
 
@@ -603,7 +930,7 @@ impl ArtifactWatch {
 }
 
 impl ProcessLimits {
-    fn validate(self) -> Result<(), ArenaError> {
+    pub(crate) fn validate(self) -> Result<(), ArenaError> {
         if self.wall_ms == 0
             || self.shutdown_grace_ms == 0
             || self.max_output_bytes == 0
@@ -776,6 +1103,141 @@ pub(crate) fn supervise_tree_observed(
     watch: &OwnedArtifactTreeWatch,
     stdout_observer: Option<StdoutObserver<'_>>,
 ) -> Result<ProcessOutput, ArenaError> {
+    supervise_tree_observed_with_spawn(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        watch,
+        stdout_observer,
+        None,
+    )
+}
+
+/// `spawned` is set only after the original child has actually been created.
+/// It is a lifetime observation, never evidence of GPU execution or completion.
+pub(crate) fn supervise_tree_observed_with_spawn(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    stdout_observer: Option<StdoutObserver<'_>>,
+    spawned: Option<&mut SpawnCustody>,
+) -> Result<ProcessOutput, ArenaError> {
+    supervise_tree_observed_with_spawn_and_control(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        watch,
+        stdout_observer,
+        spawned,
+        None,
+    )
+}
+
+/// As above, additionally polling the caller's bounded native owner control in
+/// the same event loop that holds the actual child. The caller retains the
+/// control object and any native resources after all error paths.
+pub(crate) fn supervise_tree_observed_with_spawn_and_control<'v>(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    stdout_observer: Option<StdoutObserver<'_>>,
+    spawned: Option<&'v mut SpawnCustody>,
+    control: Option<SpawnControl<'v>>,
+) -> Result<ProcessOutput, ArenaError> {
+    supervise_tree_observed_with_controls(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        watch,
+        stdout_observer,
+        spawned,
+        control,
+        None,
+        None,
+    )
+}
+
+/// Opt in to a separate cleanup control while retaining the original child.
+/// The original window is mandatory for this path; existing callers continue
+/// using the historical execution-only control and relative limits.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_tree_observed_with_controls<'v>(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    stdout_observer: Option<StdoutObserver<'_>>,
+    spawned: Option<&'v mut SpawnCustody>,
+    control: Option<SpawnControl<'v>>,
+    cleanup_control: Option<CleanupControl<'v>>,
+    original: Option<OriginalProcessWindow>,
+) -> Result<ProcessOutput, ArenaError> {
+    supervise_tree_observed_with_v6_controls(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        watch,
+        stdout_observer,
+        spawned,
+        control,
+        cleanup_control,
+        original,
+        None,
+        None,
+    )
+}
+
+/// V6-only cooperative pre-signal stage. The caller owns both the original
+/// child slot and the observation and must retain its control owner through
+/// process quarantine; this function never promotes ACK to physical closure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_tree_observed_with_v6_controls<'v>(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    stdout_observer: Option<StdoutObserver<'_>>,
+    spawned: Option<&'v mut SpawnCustody>,
+    control: Option<SpawnControl<'v>>,
+    cleanup_control: Option<CleanupControl<'v>>,
+    original: Option<OriginalProcessWindow>,
+    pre_signal: Option<PreSignalControl<'v>>,
+    pre_signal_observation: Option<&'v mut PreSignalObservation>,
+) -> Result<ProcessOutput, ArenaError> {
+    if (control.is_some() || cleanup_control.is_some() || pre_signal.is_some()) && spawned.is_none()
+    {
+        return Err(ArenaError::Invalid(
+            "owner control requires original externally retained spawn custody".into(),
+        ));
+    }
+    if (cleanup_control.is_some() || pre_signal.is_some()) && original.is_none() {
+        return Err(ArenaError::Invalid(
+            "cleanup control requires an original process window".into(),
+        ));
+    }
+    if pre_signal.is_some() != pre_signal_observation.is_some() {
+        return Err(ArenaError::Invalid(
+            "pre-signal control requires its original observation".into(),
+        ));
+    }
     limits.validate()?;
     watch.validate()?;
     #[cfg(target_os = "linux")]
@@ -800,16 +1262,246 @@ pub(crate) fn supervise_tree_observed(
             cancel,
             Some(linux::ArtifactObservation::Tree(watch)),
             stdout_observer,
-            linux::InvocationIo::default(),
+            linux::InvocationIo {
+                spawned,
+                control,
+                cleanup_control,
+                pre_signal,
+                pre_signal_observation,
+                original,
+                ..Default::default()
+            },
         )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (program, args, directory, cancel, stdout_observer);
+        let _ = (
+            program,
+            args,
+            directory,
+            cancel,
+            stdout_observer,
+            spawned,
+            control,
+            cleanup_control,
+            original,
+            pre_signal,
+            pre_signal_observation,
+        );
         Err(ArenaError::Invalid(
             "native process supervision currently requires Linux".into(),
         ))
     }
+}
+
+/// Run a finite, explicitly supplied smoke transcript under the original clock
+/// and the caller's original child/control custody. Input is written once and
+/// stdin is then closed. In particular, proxy input EOF may initiate cleanup:
+/// this function does not wait for `uciok`/`readyok`, synthesize `quit`, or
+/// establish model execution, UCI protocol success, or physical completion.
+///
+/// The caller owns `spawned`, control callbacks, and `observation` even when
+/// this returns an error. A successful `ProcessOutput` retains the same output
+/// and any unresolved process handle under the existing supervisor contract.
+/// Resource profile application and same-owner/role admission remain the
+/// caller's responsibility.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_smoke_input_in_original_window<'v>(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    input: OriginalProcessInput<'_>,
+    spawned: &'v mut SpawnCustody,
+    mut control: SpawnControl<'v>,
+    mut cleanup_control: Option<CleanupControl<'v>>,
+    mut pre_signal: Option<PreSignalControl<'v>>,
+    observation: &'v mut OriginalSmokeTransportObservation,
+) -> Result<ProcessOutput, ArenaError> {
+    validate_smoke_protocol_input(input.bytes)?;
+    if observation.started
+        || observation.transport.input_bytes != input.bytes.len()
+        || observation.window.started != input.window.started
+        || observation.window.execution != input.window.execution
+        || observation.window.whole != input.window.whole
+    {
+        return Err(ArenaError::Invalid(
+            "smoke observation does not match this fresh original window and input length".into(),
+        ));
+    }
+    input.window.check_before_spawn(limits)?;
+    watch.validate()?;
+    if !directory
+        .metadata()
+        .map_err(|_| ArenaError::Io("process.cwd_metadata".into()))?
+        .is_dir()
+    {
+        return Err(ArenaError::Invalid(
+            "original smoke cwd handle must be a directory".into(),
+        ));
+    }
+    let directory = directory
+        .try_clone()
+        .map_err(|_| ArenaError::Io("process.cwd_clone".into()))?;
+    let has_cleanup = cleanup_control.is_some();
+    let has_pre_signal = pre_signal.is_some();
+    // Keep a panicking run callback on the normal original-child cleanup path
+    // so the returned ProcessOutput can still preserve its drained bytes.
+    // Cleanup/pre-signal callbacks already receive this handling in supervise.
+    let mut guarded_control = |owner: &SpawnCustody, until: Instant| match std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| control(owner, until)),
+    ) {
+        Ok(result) => result,
+        Err(_) => Err(ArenaError::Io("process.smoke_run_control:panic".into())),
+    };
+    // Short reborrows keep all callbacks inside this invocation. Passing the
+    // caller's original trait-object references directly would force the local
+    // guarded callback to outlive the caller's longer custody lifetime.
+    let mut guarded_cleanup = |owner: &SpawnCustody, until: Instant| {
+        cleanup_control
+            .as_deref_mut()
+            .ok_or_else(|| ArenaError::Io("process.smoke_cleanup_control_missing".into()))?(
+            owner, until,
+        )
+    };
+    let mut guarded_pre_signal = |owner: &SpawnCustody, until: Instant| {
+        pre_signal
+            .as_deref_mut()
+            .ok_or_else(|| ArenaError::Io("process.smoke_pre_signal_control_missing".into()))?(
+            owner, until,
+        )
+    };
+    observation.started = true;
+    observation.transport.original_supervisor_entry_ns = input.window.elapsed_ns(Instant::now());
+    let result = linux::supervise(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        Some(linux::ArtifactObservation::Tree(watch)),
+        None,
+        linux::InvocationIo {
+            commands: Some(input.bytes),
+            original: Some(input.window),
+            observation: Some(&mut observation.transport),
+            smoke_output: Some(&mut observation.output),
+            spawned: Some(&mut *spawned),
+            control: Some(&mut guarded_control),
+            cleanup_control: has_cleanup.then_some(&mut guarded_cleanup as CleanupControl<'_>),
+            pre_signal: has_pre_signal.then_some(&mut guarded_pre_signal as PreSignalControl<'_>),
+            pre_signal_observation: has_pre_signal.then_some(&mut observation.pre_signal),
+            ..Default::default()
+        },
+    );
+    let returned = Instant::now();
+    observation.transport.original_finished_ns = input.window.elapsed_ns(returned);
+    observation.transport.finished_before_whole = returned < input.window.whole;
+    observation.transport.cancelled_at_return =
+        cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+    observation.returned = true;
+    result
+}
+
+/// Observe the UCI startup dialogue over the same live child pipes. Response
+/// lines are received after each command is fully written; output already in a
+/// kernel pipe may have been generated earlier. The original owner's bounded
+/// nonblocking controls and deadlines remain authoritative. Sending quit or
+/// seeing `readyok` does not attest model or physical finish.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_smoke_uci_in_original_window<'v>(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    window: OriginalProcessWindow,
+    spawned: &'v mut SpawnCustody,
+    mut control: SpawnControl<'v>,
+    mut cleanup_control: Option<CleanupControl<'v>>,
+    mut pre_signal: Option<PreSignalControl<'v>>,
+    observation: &'v mut OriginalSmokeUciObservation,
+) -> Result<ProcessOutput, ArenaError> {
+    if observation.started
+        || observation.window.started != window.started
+        || observation.window.execution != window.execution
+        || observation.window.whole != window.whole
+    {
+        return Err(ArenaError::Invalid(
+            "smoke UCI observation does not match this fresh original window".into(),
+        ));
+    }
+    window.check_before_spawn(limits)?;
+    watch.validate()?;
+    if !directory
+        .metadata()
+        .map_err(|_| ArenaError::Io("process.cwd_metadata".into()))?
+        .is_dir()
+    {
+        return Err(ArenaError::Invalid(
+            "original smoke cwd handle must be a directory".into(),
+        ));
+    }
+    let directory = directory
+        .try_clone()
+        .map_err(|_| ArenaError::Io("process.cwd_clone".into()))?;
+    let has_cleanup = cleanup_control.is_some();
+    let has_pre_signal = pre_signal.is_some();
+    let mut guarded_control = |owner: &SpawnCustody, until: Instant| match std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| control(owner, until)),
+    ) {
+        Ok(result) => result,
+        Err(_) => Err(ArenaError::Io("process.smoke_run_control:panic".into())),
+    };
+    let mut guarded_cleanup = |owner: &SpawnCustody, until: Instant| {
+        cleanup_control
+            .as_deref_mut()
+            .ok_or_else(|| ArenaError::Io("process.smoke_cleanup_control_missing".into()))?(
+            owner, until,
+        )
+    };
+    let mut guarded_pre_signal = |owner: &SpawnCustody, until: Instant| {
+        pre_signal
+            .as_deref_mut()
+            .ok_or_else(|| ArenaError::Io("process.smoke_pre_signal_control_missing".into()))?(
+            owner, until,
+        )
+    };
+    observation.started = true;
+    observation.transport.original_supervisor_entry_ns = window.elapsed_ns(Instant::now());
+    let result = linux::supervise(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        Some(linux::ArtifactObservation::Tree(watch)),
+        None,
+        linux::InvocationIo {
+            dialogue: Some(&mut observation.dialogue),
+            original: Some(window),
+            observation: Some(&mut observation.transport),
+            smoke_output: Some(&mut observation.output),
+            spawned: Some(&mut *spawned),
+            control: Some(&mut guarded_control),
+            cleanup_control: has_cleanup.then_some(&mut guarded_cleanup as CleanupControl<'_>),
+            pre_signal: has_pre_signal.then_some(&mut guarded_pre_signal as PreSignalControl<'_>),
+            pre_signal_observation: has_pre_signal.then_some(&mut observation.pre_signal),
+            ..Default::default()
+        },
+    );
+    let returned = Instant::now();
+    observation.transport.original_finished_ns = window.elapsed_ns(returned);
+    observation.transport.finished_before_whole = returned < window.whole;
+    observation.transport.cancelled_at_return =
+        cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+    observation.returned = true;
+    result
 }
 
 /// Finite UCI preflight input through the same pinned ELF/process-group owner.
@@ -822,6 +1514,23 @@ pub fn supervise_protocol_in_directory(
     cancel: Option<&AtomicBool>,
     watch: &OwnedArtifactTreeWatch,
     commands: &[u8],
+) -> Result<ProcessOutput, ArenaError> {
+    supervise_protocol_in_directory_with_spawn(
+        program, args, directory, limits, cancel, watch, commands, None,
+    )
+}
+
+/// As above, but lets the original owner observe a successful spawn even if
+/// subsequent process supervision fails before a `ProcessOutput` is returned.
+pub(crate) fn supervise_protocol_in_directory_with_spawn(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    commands: &[u8],
+    spawned: Option<&mut SpawnCustody>,
 ) -> Result<ProcessOutput, ArenaError> {
     limits.validate()?;
     watch.validate()?;
@@ -854,13 +1563,14 @@ pub fn supervise_protocol_in_directory(
             None,
             linux::InvocationIo {
                 commands: Some(commands),
+                spawned,
                 ..Default::default()
             },
         )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (program, args, directory, cancel, commands);
+        let _ = (program, args, directory, cancel, commands, spawned);
         Err(ArenaError::Invalid(
             "native UCI preflight requires Linux".into(),
         ))
@@ -881,7 +1591,7 @@ pub fn supervise_input_in_original_window(
     input: OriginalProcessInput<'_>,
 ) -> Result<OriginalProcessOutput, ArenaError> {
     supervise_original_input(
-        program, args, directory, limits, cancel, watch, input, None, None, None,
+        program, args, directory, limits, cancel, watch, input, None, None, None, None,
     )
 }
 
@@ -911,6 +1621,7 @@ pub(crate) fn supervise_verified_input_in_original_window(
         Some(verify_loaded),
         None,
         None,
+        None,
     )
 }
 
@@ -938,6 +1649,37 @@ pub(crate) fn supervise_numerical_input_in_original_window(
         Some(verify_loaded),
         Some(environment),
         None,
+        None,
+    )
+}
+
+/// New trainer-only file-count profile. All execution, byte, deadline, link
+/// and owned-tree guards use the same supervisor as the generic 4096 profile.
+#[cfg(all(target_os = "linux", any(feature = "pals-collection-onnx", test)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_rovent_training_numerical_input_in_original_window(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &RoventTrainingArtifactTreeWatch,
+    input: OriginalProcessInput<'_>,
+    verify_loaded: LoadedImageVerifier<'_>,
+    environment: OriginalNumericalEnvironment,
+) -> Result<OriginalProcessOutput, ArenaError> {
+    supervise_original_input(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        &watch.0,
+        input,
+        Some(verify_loaded),
+        Some(environment),
+        None,
+        Some(watch.0.max_files),
     )
 }
 
@@ -967,6 +1709,7 @@ pub(crate) fn supervise_verified_input_with_delegated_tree_in_original_window(
         Some(verify_loaded),
         None,
         Some(delegated),
+        None,
     )
 }
 
@@ -995,6 +1738,7 @@ pub(crate) fn supervise_numerical_input_with_delegated_tree_in_original_window(
         Some(verify_loaded),
         Some(environment),
         Some(delegated),
+        None,
     )
 }
 
@@ -1010,9 +1754,13 @@ fn supervise_original_input(
     verify_loaded: Option<LoadedImageVerifier<'_>>,
     numerical_environment: Option<OriginalNumericalEnvironment>,
     delegated: Option<&dyn DelegatedArtifactTreeWatch>,
+    artifact_file_ceiling: Option<usize>,
 ) -> Result<OriginalProcessOutput, ArenaError> {
     input.window.check_before_spawn(limits)?;
-    watch.validate()?;
+    match artifact_file_ceiling {
+        Some(ceiling) => watch.validate_with_file_ceiling(ceiling)?,
+        None => watch.validate()?,
+    }
     if input.bytes.is_empty() || input.bytes.len() > MAX_ORIGINAL_INPUT_BYTES {
         return Err(ArenaError::Budget(
             "original input requires 1..2MiB bytes".into(),
@@ -1052,6 +1800,13 @@ fn supervise_original_input(
                 observation: Some(&mut observation),
                 verify_loaded,
                 numerical_environment,
+                spawned: None,
+                control: None,
+                cleanup_control: None,
+                pre_signal: None,
+                pre_signal_observation: None,
+                dialogue: None,
+                smoke_output: None,
             },
         )?;
         let returned = Instant::now();
@@ -1105,10 +1860,17 @@ mod linux {
     #[derive(Default)]
     pub(super) struct InvocationIo<'a, 'b, 'v> {
         pub commands: Option<&'a [u8]>,
+        pub dialogue: Option<&'b mut SmokeUciDialogue>,
+        pub smoke_output: Option<&'b mut OriginalSmokeOutputBuffers>,
         pub original: Option<OriginalProcessWindow>,
         pub observation: Option<&'b mut OriginalProcessObservation>,
         pub verify_loaded: Option<LoadedImageVerifier<'v>>,
         pub numerical_environment: Option<OriginalNumericalEnvironment>,
+        pub spawned: Option<&'v mut SpawnCustody>,
+        pub control: Option<SpawnControl<'v>>,
+        pub cleanup_control: Option<CleanupControl<'v>>,
+        pub pre_signal: Option<PreSignalControl<'v>>,
+        pub pre_signal_observation: Option<&'v mut PreSignalObservation>,
     }
 
     #[derive(Clone, Copy)]
@@ -1166,11 +1928,38 @@ mod linux {
     ) -> Result<ProcessOutput, ArenaError> {
         let InvocationIo {
             commands,
+            mut dialogue,
+            smoke_output,
             original,
             mut observation,
             mut verify_loaded,
             numerical_environment,
+            spawned,
+            mut control,
+            mut cleanup_control,
+            mut pre_signal,
+            mut pre_signal_observation,
         } = io;
+        if commands.is_some() && dialogue.is_some() {
+            return Err(ArenaError::Invalid(
+                "smoke dialogue and batch stdin cannot share one process".into(),
+            ));
+        }
+        if smoke_output
+            .as_ref()
+            .is_some_and(|output| !output.stdout.is_empty() || !output.stderr.is_empty())
+        {
+            return Err(ArenaError::Invalid(
+                "original smoke output buffers are not fresh".into(),
+            ));
+        }
+        let mut local_custody = SpawnCustody::default();
+        let custody = spawned.unwrap_or(&mut local_custody);
+        if custody.child.is_some() || custody.pending.load(Ordering::Acquire) {
+            return Err(ArenaError::Invalid(
+                "process original child custody is still pending".into(),
+            ));
+        }
         if let Some(window) = original {
             window.check_before_spawn(limits)?;
         }
@@ -1198,7 +1987,7 @@ mod linux {
             .ok_or_else(|| ArenaError::Budget("process monotonic deadline overflow".into()))?;
         let executable = format!("/proc/self/fd/{}", program.as_raw_fd());
         let pinned_cwd = format!("/proc/self/fd/{}", cwd_file.as_raw_fd());
-        let mut child = Command::new(executable)
+        let child = Command::new(executable)
             .args(args)
             .current_dir(pinned_cwd)
             .env_clear()
@@ -1211,7 +2000,7 @@ mod linux {
                 numerical_environment
                     .map(|OriginalNumericalEnvironment::Fp32Tf32Off| ("NVIDIA_TF32_OVERRIDE", "0")),
             )
-            .stdin(if commands.is_some() {
+            .stdin(if commands.is_some() || dialogue.is_some() {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -1221,7 +2010,21 @@ mod linux {
             .process_group(0)
             .spawn()
             .map_err(|error| ArenaError::Io(format!("process.spawn:{:?}", error.kind())))?;
-        let pid = child.id();
+        custody.child = Some(child);
+        custody.pending.store(true, Ordering::Release);
+        let (pid, mut stdin, mut stdout, mut stderr) = {
+            let child = custody
+                .child
+                .as_mut()
+                .expect("just installed original child");
+            (
+                child.id(),
+                child.stdin.take(),
+                child.stdout.take(),
+                child.stderr.take(),
+            )
+        };
+        custody.last_spawn_pid = Some(pid);
         crate::emit_native_phase("runner_spawned");
         let group = Pid::from_raw(
             i32::try_from(pid).map_err(|_| ArenaError::Io("process.pid_out_of_range".into()))?,
@@ -1245,10 +2048,7 @@ mod linux {
             artifact_limit_enforcement: watch.map(ArtifactObservation::enforcement),
             errors: Vec::new(),
         };
-        let mut stdin = child.stdin.take();
         let mut input_offset = 0;
-        let mut stdout = child.stdout.take();
-        let mut stderr = child.stderr.take();
         let pipe_setup = stdout
             .as_ref()
             .ok_or(Errno::EBADF)
@@ -1268,9 +2068,13 @@ mod linux {
         } else {
             None
         };
-        let mut out = Vec::new();
-        let mut err = Vec::new();
+        let mut local_output = OriginalSmokeOutputBuffers::default();
+        let output = smoke_output.unwrap_or(&mut local_output);
+        let out = &mut output.stdout;
+        let err = &mut output.stderr;
         let mut shutdown = None;
+        let mut pre_signal_until = None;
+        let mut term_sent = false;
         let mut killed = false;
         let mut leader_done = false;
         let mut ownership_lost = false;
@@ -1387,6 +2191,38 @@ mod linux {
                     }
                 }
             }
+            if stop.is_none()
+                && (original.is_none() || loaded_image_checked)
+                && let (Some(pipe), Some(dialogue)) = (stdin.as_mut(), dialogue.as_deref_mut())
+                && let Some(command) = dialogue.command()
+            {
+                match pipe.write(&command[dialogue.command_offset..]) {
+                    Ok(0) => {
+                        evidence(&mut receipt, "process.smoke_uci_write_zero");
+                        stop = Some(ProcessStop::IoFailure);
+                    }
+                    Ok(n) => {
+                        if dialogue.written == 0
+                            && let (Some(window), Some(o)) = (original, observation.as_deref_mut())
+                        {
+                            o.first_input_written_ns = window.elapsed_ns(Instant::now());
+                        }
+                        dialogue.wrote(n, out.len());
+                        if dialogue.phase == SmokeUciPhase::Done {
+                            stdin = None;
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => {
+                        evidence(&mut receipt, "process.smoke_uci_write");
+                        stop = Some(ProcessStop::IoFailure);
+                    }
+                }
+            }
             // Each pass drains a finite amount from each pipe, preserving time,
             // cancellation and process checks even under continuous output.
             let prior_out = out.len();
@@ -1394,8 +2230,8 @@ mod linux {
             let stdout_open = stdout.is_some();
             let stderr_open = stderr.is_some();
             let drained = [
-                drain(&mut stdout, &mut out, limits.max_output_bytes, &mut receipt),
-                drain(&mut stderr, &mut err, limits.max_output_bytes, &mut receipt),
+                drain(&mut stdout, out, limits.max_output_bytes, &mut receipt),
+                drain(&mut stderr, err, limits.max_output_bytes, &mut receipt),
             ];
             stdout_eof |= stdout_open && stdout.is_none() && drained[0].is_ok();
             stderr_eof |= stderr_open && stderr.is_none() && drained[1].is_ok();
@@ -1411,6 +2247,17 @@ mod linux {
                     _ => {}
                 }
             }
+            if stop.is_none()
+                && dialogue.is_some()
+                && original.is_some_and(|window| Instant::now() >= window.execution)
+            {
+                stop = Some(ProcessStop::WallLimit);
+            }
+            if stop.is_none()
+                && let Some(dialogue) = dialogue.as_deref_mut()
+            {
+                dialogue.observe_stdout(out);
+            }
             // Observe only newly retained bytes; the raw pipe budget and later
             // provider/clock acceptance still own the complete unchanged output.
             if out.len() > prior_out {
@@ -1423,6 +2270,7 @@ mod linux {
                 crate::native_diagnostics::observe_stream(false, &err[prior_err..]);
             }
             let previously_exited = leader_done;
+            let mut owner_live_this_tick = false;
             if !leader_done {
                 match waitid(
                     Id::Pid(group),
@@ -1442,7 +2290,7 @@ mod linux {
                             receipt.exit_signal = Some(signal as i32);
                         }
                     }
-                    Ok(WaitStatus::StillAlive) => {}
+                    Ok(WaitStatus::StillAlive) => owner_live_this_tick = true,
                     Ok(_) => {
                         evidence(&mut receipt, "process.wait_status");
                         stop.get_or_insert(ProcessStop::IoFailure);
@@ -1458,6 +2306,29 @@ mod linux {
                         evidence(&mut receipt, "process.ownership_lost");
                         break;
                     }
+                }
+            }
+            // V6 never makes a new control or signal decision on an interrupted
+            // wait observation. Preserve the owner if the original window has
+            // ended before the wait relationship can be observed again.
+            if pre_signal_observation.is_some() && !leader_done && !owner_live_this_tick {
+                if original.is_some_and(|window| Instant::now() >= window.whole) {
+                    evidence(&mut receipt, "process.pre_signal_wait_unverified");
+                    break;
+                }
+                std::thread::sleep(POLL);
+                continue;
+            }
+            if owner_live_this_tick
+                && !leader_done
+                && !ownership_lost
+                && stop.is_none()
+                && let Some(owner_control) = control.as_deref_mut()
+            {
+                let deadline = original.map_or_else(|| started + wall, |window| window.execution);
+                if let Err(error) = owner_control(custody, deadline) {
+                    evidence(&mut receipt, &format!("process.owner_control:{error}"));
+                    stop = Some(ProcessStop::IoFailure);
                 }
             }
             if !previously_exited
@@ -1524,10 +2395,104 @@ mod linux {
                 stop.get_or_insert(ProcessStop::Exited);
             }
             if stop.is_some() && shutdown.is_none() {
-                // The observation/drain work above can take time. Grace begins
-                // at the actual termination request, not this pass's old clock.
-                shutdown = Some(Instant::now());
+                // The entire existing shutdown allowance starts here, including
+                // the optional cooperative stage; it is never renewed by ACK.
+                let at = Instant::now();
+                shutdown = Some(at);
+                if pre_signal.is_some() && owner_live_this_tick && !leader_done {
+                    if let Some(window) = original {
+                        let kill_at =
+                            window.execution + window.whole.duration_since(window.execution) / 2;
+                        pre_signal_until = at
+                            .checked_add((grace / 2).min(Duration::from_millis(100)))
+                            .map(|until| until.min(kill_at).min(window.whole));
+                    }
+                }
+            }
+            if let Some(deadline) = pre_signal_until {
+                if Instant::now() < deadline && owner_live_this_tick && !leader_done {
+                    if let Some(callback) = pre_signal.as_deref_mut() {
+                        let observed = pre_signal_observation
+                            .as_deref_mut()
+                            .expect("pre-signal observation checked before spawn");
+                        observed.calls = observed.calls.saturating_add(1);
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            callback(custody, deadline)
+                        }));
+                        let at = Instant::now();
+                        match result {
+                            Ok(Ok(PreSignalProgress::Pending { partial })) => {
+                                if partial {
+                                    observed.first_partial_at.get_or_insert(at);
+                                }
+                            }
+                            Ok(Ok(PreSignalProgress::Acknowledged)) => {
+                                observed.acknowledged_at.get_or_insert(at);
+                                // Acceptance is not completion. Allow the
+                                // same bounded window for the peer to drain.
+                                pre_signal = None;
+                            }
+                            Ok(Err(error)) => {
+                                let reason = format!("process.pre_signal_control:{error}");
+                                observed.first_failure.get_or_insert_with(|| reason.clone());
+                                evidence(&mut receipt, &reason);
+                                pre_signal = None;
+                                pre_signal_until = None;
+                            }
+                            Err(_) => {
+                                let reason = "process.pre_signal_control:panic";
+                                observed.first_failure.get_or_insert_with(|| reason.into());
+                                evidence(&mut receipt, reason);
+                                pre_signal = None;
+                                pre_signal_until = None;
+                            }
+                        }
+                        // Callback code must not run after ownership is lost.
+                        // Recheck before any group signal, as with cleanup.
+                        match waitid(
+                            Id::Pid(group),
+                            WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                        ) {
+                            Ok(WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _))
+                            | Ok(WaitStatus::StillAlive) => {}
+                            _ => {
+                                ownership_lost = true;
+                                evidence(&mut receipt, "process.pre_signal_control_ownership_lost");
+                                break;
+                            }
+                        }
+                    }
+                } else if !leader_done && !owner_live_this_tick {
+                    // An interrupted wait cannot grant a new authority to poll.
+                    pre_signal_until = None;
+                }
+                if let Some(until) = pre_signal_until
+                    && Instant::now() >= until
+                {
+                    if let Some(observed) = pre_signal_observation.as_deref_mut() {
+                        observed.timed_out = observed.acknowledged_at.is_none_or(|at| at >= until);
+                    }
+                    pre_signal_until = None;
+                }
+            }
+            if pre_signal_observation.is_some()
+                && original.is_some_and(|window| Instant::now() >= window.whole)
+            {
+                evidence(&mut receipt, "process.original_whole_window_expired");
+                if stop.is_none() || stop == Some(ProcessStop::Exited) {
+                    stop = Some(ProcessStop::WallLimit);
+                }
+                signal(
+                    group,
+                    Signal::SIGKILL,
+                    &mut receipt,
+                    "process.kill_original_whole",
+                );
+                break;
+            }
+            if shutdown.is_some() && pre_signal_until.is_none() && !term_sent {
                 signal(group, Signal::SIGTERM, &mut receipt, "process.term");
+                term_sent = true;
             }
             if let Some(shutdown_at) = shutdown {
                 let age = shutdown_at.elapsed();
@@ -1545,6 +2510,105 @@ mod linux {
                     break;
                 }
             }
+            // The opt-in cleanup callback runs only after the existing
+            // termination signal/kill decisions. It neither changes the stop
+            // reason nor supplies a new grace period. Recheck an observed
+            // terminal leader without reaping before using its reservation.
+            if term_sent
+                && let (Some(shutdown_at), Some(callback), Some(window)) =
+                    (shutdown, cleanup_control.as_deref_mut(), original)
+            {
+                let cleanup_until = shutdown_at
+                    .checked_add(grace.saturating_mul(2))
+                    .map(|deadline| deadline.min(window.whole));
+                let owner_valid = if ownership_lost || (!leader_done && !owner_live_this_tick) {
+                    false
+                } else {
+                    match waitid(
+                        Id::Pid(group),
+                        WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                    ) {
+                        Ok(WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _)) => true,
+                        Ok(WaitStatus::StillAlive) if !leader_done => true,
+                        Err(Errno::EINTR) => false,
+                        _ => {
+                            ownership_lost = true;
+                            evidence(&mut receipt, "process.cleanup_control_ownership_lost");
+                            false
+                        }
+                    }
+                };
+                if ownership_lost {
+                    // A potentially recycled numeric PID must not be signaled.
+                    break;
+                }
+                if let Some(deadline) = cleanup_until
+                    && owner_valid
+                    && Instant::now() < deadline
+                {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        callback(custody, deadline)
+                    }));
+                    match outcome {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            evidence(&mut receipt, &format!("process.cleanup_control:{error}"));
+                            cleanup_control = None;
+                        }
+                        Err(_) => {
+                            evidence(&mut receipt, "process.cleanup_control:panic");
+                            cleanup_control = None;
+                        }
+                    }
+                    // The callback is outside the process owner's control.
+                    // Do not signal a numeric group after losing the original
+                    // wait relationship while it was running.
+                    match waitid(
+                        Id::Pid(group),
+                        WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                    ) {
+                        Ok(WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _)) => {}
+                        Ok(WaitStatus::StillAlive) if !leader_done => {}
+                        Err(Errno::EINTR) => {
+                            ownership_lost = true;
+                            evidence(&mut receipt, "process.cleanup_control_wait_interrupted");
+                            break;
+                        }
+                        _ => {
+                            ownership_lost = true;
+                            evidence(&mut receipt, "process.cleanup_control_ownership_lost");
+                            break;
+                        }
+                    }
+                    // A slow callback cannot renew either deadline; enforce
+                    // already-due signals immediately on return.
+                    if Instant::now() >= window.whole {
+                        evidence(&mut receipt, "process.original_whole_window_expired");
+                        if stop.is_none() || stop == Some(ProcessStop::Exited) {
+                            stop = Some(ProcessStop::WallLimit);
+                        }
+                        signal(
+                            group,
+                            Signal::SIGKILL,
+                            &mut receipt,
+                            "process.kill_original_whole",
+                        );
+                        break;
+                    }
+                    let half = window.whole.duration_since(window.execution) / 2;
+                    if !killed
+                        && (shutdown_at.elapsed() >= grace
+                            || Instant::now() >= window.execution + half)
+                    {
+                        signal(group, Signal::SIGKILL, &mut receipt, "process.kill");
+                        killed = true;
+                    }
+                    if shutdown_at.elapsed() >= grace.saturating_mul(2) {
+                        evidence(&mut receipt, "process.cleanup_unverified");
+                        break;
+                    }
+                }
+            }
             std::thread::sleep(POLL);
         }
         if original.is_some() && !loaded_image_checked {
@@ -1559,8 +2623,11 @@ mod linux {
                 stop = Some(ProcessStop::IoFailure);
             }
         }
-        let pending_child = finish_child(
-            child,
+        let retain_child = finish_child_in_place(
+            custody
+                .child
+                .as_mut()
+                .expect("original child remains in custody"),
             &mut receipt,
             &mut stop,
             leader_done,
@@ -1573,7 +2640,7 @@ mod linux {
             cleanup_started,
             cleanup_finished,
             ownership_lost,
-            pending_child.is_some(),
+            retain_child,
         );
         receipt.stop = stop.unwrap_or(ProcessStop::Exited);
         receipt.elapsed_ns = u64::try_from(started.elapsed().as_nanos())
@@ -1581,18 +2648,33 @@ mod linux {
         receipt.stdout_bytes = out.len() as u64;
         receipt.stderr_bytes = err.len() as u64;
         if let Some(o) = observation {
-            o.written_bytes = Some(input_offset);
-            o.stdin_closed_after_input =
-                commands.is_some_and(|bytes| input_offset == bytes.len()) && stdin.is_none();
+            o.written_bytes = Some(
+                dialogue
+                    .as_deref()
+                    .map_or(input_offset, |state| state.written),
+            );
+            o.stdin_closed_after_input = (commands
+                .is_some_and(|bytes| input_offset == bytes.len())
+                || dialogue
+                    .as_deref()
+                    .is_some_and(|state| state.phase == SmokeUciPhase::Done))
+                && stdin.is_none();
             o.stdout_eof = stdout_eof;
             o.stderr_eof = stderr_eof;
             o.ownership_lost = ownership_lost;
             o.loaded_image_progress = loaded_image_progress;
         }
+        // This is the only transfer from the original supervisor slot to its
+        // output. All preceding errors and unwinds leave the Child in custody.
+        let child = custody
+            .child
+            .take()
+            .expect("original child remains in custody");
+        let pending_child = retain_child.then_some(child);
         Ok(ProcessOutput {
             receipt,
-            stdout: out,
-            stderr: err,
+            stdout: std::mem::take(out),
+            stderr: std::mem::take(err),
             pending_child,
         })
     }
@@ -1642,6 +2724,7 @@ mod linux {
         }
     }
 
+    #[cfg(test)]
     fn finish_child(
         mut child: std::process::Child,
         receipt: &mut ProcessReceipt,
@@ -1650,6 +2733,25 @@ mod linux {
         ownership_lost: bool,
         preserve_unverified: bool,
     ) -> Option<std::process::Child> {
+        finish_child_in_place(
+            &mut child,
+            receipt,
+            stop,
+            leader_done,
+            ownership_lost,
+            preserve_unverified,
+        )
+        .then_some(child)
+    }
+
+    fn finish_child_in_place(
+        child: &mut std::process::Child,
+        receipt: &mut ProcessReceipt,
+        stop: &mut Option<ProcessStop>,
+        leader_done: bool,
+        ownership_lost: bool,
+        preserve_unverified: bool,
+    ) -> bool {
         if preserve_unverified && ownership_lost {
             // Preserve the original handle and evidence, not numeric PID
             // authority: a foreign/automatic reaper may already have freed it.
@@ -1674,7 +2776,7 @@ mod linux {
                         receipt.group_cleanup = CleanupStatus::Unverified;
                         *stop = Some(ProcessStop::IoFailure);
                         evidence(receipt, "process.ownership_lost");
-                        return Some(child);
+                        return true;
                     }
                 }
             }
@@ -1683,7 +2785,7 @@ mod linux {
             // not a claim that a foreign reaper left the child unreaped.
             evidence(receipt, "process.leader_unreaped");
         }
-        retain_child.then_some(child)
+        retain_child
     }
 
     fn loaded_image_observation_pending(code: &str) -> bool {
@@ -2283,6 +3385,25 @@ mod linux {
     mod tests {
         use super::*;
 
+        #[test]
+        fn rovent_artifact_count_profile_does_not_relax_generic_watch() {
+            let generic = OwnedArtifactTreeWatch::bounded_output(1024, 512);
+            assert_eq!(generic.max_files, 4096);
+            assert!(
+                OwnedArtifactTreeWatch {
+                    max_files: 4097,
+                    ..generic
+                }
+                .validate()
+                .is_err()
+            );
+            let registered = RoventTrainingArtifactTreeWatch::registered(1024, 512, 32768).unwrap();
+            assert_eq!(registered.0.max_files, 32768);
+            assert!(registered.0.validate().is_err());
+            assert!(RoventTrainingArtifactTreeWatch::registered(1024, 512, 32769).is_err());
+            assert!(RoventTrainingArtifactTreeWatch::registered(0, 512, 32768).is_err());
+        }
+
         fn original_watch() -> OwnedArtifactTreeWatch {
             OwnedArtifactTreeWatch {
                 max_total_bytes: 1024,
@@ -2299,6 +3420,933 @@ mod linux {
                 max_output_bytes: 256 * 1024,
                 max_child_processes: 1,
             }
+        }
+
+        const SMOKE_ADAPTER_MODE: &str = ".rz-smoke-input-adapter-mode";
+        const SMOKE_ADAPTER_READY: &str = ".rz-smoke-input-adapter-ready";
+        const SMOKE_ADAPTER_CHILD: &str = "process::linux::tests::smoke_input_adapter_mock_child";
+
+        /// If this fixture cannot prove that its own mock was reaped, keep
+        /// the exact Child handle alive for the rest of this test process.
+        /// This does not assert group or device completion.
+        fn retain_unresolved_smoke_mock(child: std::process::Child) {
+            use std::sync::{Mutex, OnceLock};
+            static UNRESOLVED: OnceLock<Mutex<Vec<std::process::Child>>> = OnceLock::new();
+            let mut owner = UNRESOLVED
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            owner.push(child);
+        }
+
+        /// Only the owned temporary cwd provides the mode file. A normal
+        /// workspace test run does not read stdin or start this mock worker.
+        #[test]
+        fn smoke_input_adapter_mock_child() {
+            let Ok(mode) = std::fs::read_to_string(SMOKE_ADAPTER_MODE) else {
+                return;
+            };
+            if mode == "capture-before-unwind" {
+                let mut input = Vec::new();
+                std::io::stdin().read_to_end(&mut input).unwrap();
+                let mut error = std::io::stderr().lock();
+                error.write_all(b"mock-stderr-before-unwind\n").unwrap();
+                error.flush().unwrap();
+                let mut output = std::io::stdout().lock();
+                output.write_all(b"mock-stdout-before-unwind\n").unwrap();
+                output.flush().unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+                return;
+            }
+            if mode == "dialogue"
+                || mode == "early-ready"
+                || mode == "partial-response"
+                || mode == "cancel-wait"
+            {
+                use std::io::BufRead;
+                let input = std::io::stdin();
+                let mut input = input.lock();
+                let mut output = std::io::stdout().lock();
+                let mut line = String::new();
+                input.read_line(&mut line).unwrap();
+                assert_eq!(line, "uci\n");
+                // The Rust test harness may have written its own nonterminated
+                // test label before this child's protocol output.
+                output.write_all(b"\n").unwrap();
+                if mode == "partial-response" {
+                    output.write_all(b"ucio").unwrap();
+                    output.flush().unwrap();
+                    // Avoid a test-harness suffix turning the partial line
+                    // into a fictitious complete protocol response.
+                    std::process::exit(0);
+                }
+                if mode == "early-ready" {
+                    output.write_all(b"readyok\n").unwrap();
+                }
+                output.write_all(b"uci").unwrap();
+                output.flush().unwrap();
+                output.write_all(b"ok\n").unwrap();
+                output.flush().unwrap();
+                line.clear();
+                input.read_line(&mut line).unwrap();
+                assert_eq!(line, "isready\n");
+                if mode == "cancel-wait" {
+                    output.write_all(b"info string pending-smoke\n").unwrap();
+                    output.flush().unwrap();
+                    let mut error = std::io::stderr().lock();
+                    error.write_all(b"mock-pending-stderr\n").unwrap();
+                    error.flush().unwrap();
+                    // The original owner observes this after both writes; it
+                    // requests cancellation without relying on a sleep.
+                    std::fs::write(SMOKE_ADAPTER_READY, b"ready").unwrap();
+                    std::thread::sleep(Duration::from_secs(30));
+                    return;
+                }
+                if mode == "early-ready" {
+                    // A zero exit still cannot make the missing readyok true.
+                    return;
+                }
+                output.write_all(b"readyok\n").unwrap();
+                output.flush().unwrap();
+                line.clear();
+                input.read_line(&mut line).unwrap();
+                assert_eq!(line, "quit\n");
+                return;
+            }
+            let mut input = Vec::new();
+            std::io::stdin().read_to_end(&mut input).unwrap();
+            let mut output = std::io::stdout().lock();
+            output.write_all(b"mock-input:").unwrap();
+            output.write_all(&input).unwrap();
+            output.flush().unwrap();
+            if mode == "hold" {
+                std::fs::write(SMOKE_ADAPTER_READY, b"ready").unwrap();
+                // The original supervisor owns the deadline and termination;
+                // this mock never represents native or GPU work.
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        }
+
+        #[test]
+        fn smoke_uci_dialogue_waits_for_real_responses_before_next_command() {
+            let root = OriginalTestDirectory::new();
+            let mode = root.0.join(SMOKE_ADAPTER_MODE);
+            std::fs::write(&mode, b"dialogue").unwrap();
+            let program = File::open(std::env::current_exe().unwrap()).unwrap();
+            let limits = original_limits();
+            let start = Instant::now();
+            let window = OriginalProcessWindow::new(
+                start,
+                start + Duration::from_millis(limits.wall_ms),
+                start + Duration::from_millis(limits.wall_ms + limits.shutdown_grace_ms * 2),
+            )
+            .unwrap();
+            let mut observation = OriginalSmokeUciObservation::new(window);
+            let mut custody = SpawnCustody::default();
+            let mut control = |_: &SpawnCustody, _: Instant| Ok(());
+            let output = supervise_smoke_uci_in_original_window(
+                &program,
+                &[
+                    "--exact".into(),
+                    SMOKE_ADAPTER_CHILD.into(),
+                    "--nocapture".into(),
+                ],
+                &root.file(),
+                limits,
+                None,
+                &original_watch(),
+                window,
+                &mut custody,
+                &mut control,
+                None,
+                None,
+                &mut observation,
+            )
+            .unwrap();
+            assert!(observation.attempt_started() && observation.attempt_returned());
+            assert!(observation.uci_sent() && observation.uciok_observed());
+            assert!(observation.isready_sent() && observation.readyok_observed());
+            assert!(observation.quit_sent());
+            assert_eq!(output.receipt.stop, ProcessStop::Exited);
+            assert_eq!(output.receipt.exit_code, Some(0));
+            assert_eq!(output.receipt.group_cleanup, CleanupStatus::Gone);
+            assert!(output.pending_child.is_none());
+            assert_eq!(
+                observation.transport().written_bytes(),
+                Some(b"uci\n".len() + b"isready\n".len() + b"quit\n".len())
+            );
+            std::fs::remove_file(mode).unwrap();
+        }
+
+        #[test]
+        fn smoke_uci_cancel_during_ready_preserves_original_output_and_owner() {
+            let root = OriginalTestDirectory::new();
+            let mode = root.0.join(SMOKE_ADAPTER_MODE);
+            let ready = root.0.join(SMOKE_ADAPTER_READY);
+            std::fs::write(&mode, b"cancel-wait").unwrap();
+            let program = File::open(std::env::current_exe().unwrap()).unwrap();
+            let limits = original_limits();
+            let start = Instant::now();
+            let window = OriginalProcessWindow::new(
+                start,
+                start + Duration::from_millis(limits.wall_ms),
+                start + Duration::from_millis(limits.wall_ms + limits.shutdown_grace_ms * 2),
+            )
+            .unwrap();
+            let mut observation = OriginalSmokeUciObservation::new(window);
+            let mut custody = SpawnCustody::default();
+            let cancelled = AtomicBool::new(false);
+            let mut observed_child_pid = None;
+            let mut control = |owner: &SpawnCustody, until: Instant| {
+                if ready.is_file() {
+                    let child = owner
+                        .child()
+                        .expect("same original child during cancellation");
+                    assert!(owner.pending.load(Ordering::Acquire));
+                    assert_eq!(owner.last_spawn_pid, Some(child.id()));
+                    assert!(until <= window.execution);
+                    observed_child_pid = Some(child.id());
+                    cancelled.store(true, Ordering::Release);
+                }
+                Ok(())
+            };
+            let attempt = supervise_smoke_uci_in_original_window(
+                &program,
+                &[
+                    "--exact".into(),
+                    SMOKE_ADAPTER_CHILD.into(),
+                    "--nocapture".into(),
+                ],
+                &root.file(),
+                limits,
+                Some(&cancelled),
+                &original_watch(),
+                window,
+                &mut custody,
+                &mut control,
+                None,
+                None,
+                &mut observation,
+            );
+            let mut output = match attempt {
+                Ok(output) => output,
+                Err(error) => {
+                    let unresolved = custody.pending.load(Ordering::Acquire);
+                    if let Some(child) = custody.take_child() {
+                        retain_unresolved_smoke_mock(child);
+                    } else if !unresolved {
+                        let _ = std::fs::remove_file(&ready);
+                        let _ = std::fs::remove_file(&mode);
+                    }
+                    panic!("smoke UCI cancellation supervisor failed: {error}");
+                }
+            };
+            let unresolved_child = output.pending_child.take();
+            let retained_unknown = unresolved_child.is_some();
+            if let Some(child) = unresolved_child {
+                // Unknown is not completion; retain the exact mock owner.
+                retain_unresolved_smoke_mock(child);
+            }
+            if !retained_unknown && output.receipt.group_cleanup == CleanupStatus::Gone {
+                let _ = std::fs::remove_file(&ready);
+                let _ = std::fs::remove_file(&mode);
+            }
+            assert!(cancelled.load(Ordering::Acquire));
+            assert_eq!(observed_child_pid, Some(output.receipt.pid));
+            assert_eq!(custody.last_spawn_pid, Some(output.receipt.pid));
+            assert_eq!(output.receipt.stop, ProcessStop::Cancelled);
+            assert_eq!(output.receipt.group_cleanup, CleanupStatus::Gone);
+            assert!(!retained_unknown);
+            assert!(observation.attempt_started() && observation.attempt_returned());
+            assert!(observation.uci_sent() && observation.uciok_observed());
+            assert!(observation.isready_sent());
+            assert!(!observation.readyok_observed() && !observation.quit_sent());
+            assert!(!observation.uci_exchange_observed());
+            assert_eq!(
+                observation.transport().written_bytes(),
+                Some(b"uci\n".len() + b"isready\n".len())
+            );
+            assert!(
+                output
+                    .stdout
+                    .windows(b"info string pending-smoke\n".len())
+                    .any(|part| part == b"info string pending-smoke\n")
+            );
+            assert!(
+                output
+                    .stderr
+                    .windows(b"mock-pending-stderr\n".len())
+                    .any(|part| part == b"mock-pending-stderr\n")
+            );
+            assert!(observation.buffered_stdout().is_empty());
+            assert!(observation.buffered_stderr().is_empty());
+            // Group cleanup is a CPU process observation, not a GPU fence.
+        }
+
+        #[test]
+        fn smoke_uci_does_not_accept_early_ready_or_invent_quit() {
+            let root = OriginalTestDirectory::new();
+            let mode = root.0.join(SMOKE_ADAPTER_MODE);
+            std::fs::write(&mode, b"early-ready").unwrap();
+            let program = File::open(std::env::current_exe().unwrap()).unwrap();
+            let limits = original_limits();
+            let start = Instant::now();
+            let window = OriginalProcessWindow::new(
+                start,
+                start + Duration::from_millis(limits.wall_ms),
+                start + Duration::from_millis(limits.wall_ms + limits.shutdown_grace_ms * 2),
+            )
+            .unwrap();
+            let mut observation = OriginalSmokeUciObservation::new(window);
+            let mut custody = SpawnCustody::default();
+            let mut control = |_: &SpawnCustody, _: Instant| Ok(());
+            let output = supervise_smoke_uci_in_original_window(
+                &program,
+                &[
+                    "--exact".into(),
+                    SMOKE_ADAPTER_CHILD.into(),
+                    "--nocapture".into(),
+                ],
+                &root.file(),
+                limits,
+                None,
+                &original_watch(),
+                window,
+                &mut custody,
+                &mut control,
+                None,
+                None,
+                &mut observation,
+            )
+            .unwrap();
+            assert!(observation.uci_sent() && observation.uciok_observed());
+            assert!(observation.isready_sent());
+            assert!(!observation.readyok_observed() && !observation.quit_sent());
+            assert_eq!(output.receipt.exit_code, Some(0));
+            assert_eq!(output.receipt.group_cleanup, CleanupStatus::Gone);
+            std::fs::remove_file(mode).unwrap();
+        }
+
+        #[test]
+        fn smoke_uci_preserves_partial_response_on_eof() {
+            let root = OriginalTestDirectory::new();
+            let mode = root.0.join(SMOKE_ADAPTER_MODE);
+            std::fs::write(&mode, b"partial-response").unwrap();
+            let program = File::open(std::env::current_exe().unwrap()).unwrap();
+            let limits = original_limits();
+            let start = Instant::now();
+            let window = OriginalProcessWindow::new(
+                start,
+                start + Duration::from_millis(limits.wall_ms),
+                start + Duration::from_millis(limits.wall_ms + limits.shutdown_grace_ms * 2),
+            )
+            .unwrap();
+            let mut observation = OriginalSmokeUciObservation::new(window);
+            let mut custody = SpawnCustody::default();
+            let mut control = |_: &SpawnCustody, _: Instant| Ok(());
+            let output = supervise_smoke_uci_in_original_window(
+                &program,
+                &[
+                    "--exact".into(),
+                    SMOKE_ADAPTER_CHILD.into(),
+                    "--nocapture".into(),
+                ],
+                &root.file(),
+                limits,
+                None,
+                &original_watch(),
+                window,
+                &mut custody,
+                &mut control,
+                None,
+                None,
+                &mut observation,
+            )
+            .unwrap();
+            assert!(observation.uci_sent());
+            assert!(!observation.uciok_observed());
+            assert!(!observation.isready_sent() && !observation.quit_sent());
+            assert!(output.stdout.ends_with(b"ucio"));
+            assert!(observation.transport().stdout_eof());
+            assert!(observation.buffered_stdout().is_empty());
+            assert!(observation.buffered_stderr().is_empty());
+            assert_eq!(output.receipt.group_cleanup, CleanupStatus::Gone);
+            std::fs::remove_file(mode).unwrap();
+        }
+
+        #[test]
+        fn smoke_output_buffers_survive_unwind_with_original_child() {
+            let root = OriginalTestDirectory::new();
+            let mode = root.0.join(SMOKE_ADAPTER_MODE);
+            std::fs::write(&mode, b"capture-before-unwind").unwrap();
+            let program = File::open(std::env::current_exe().unwrap()).unwrap();
+            let limits = original_limits();
+            let start = Instant::now();
+            let window = OriginalProcessWindow::new(
+                start,
+                start + Duration::from_millis(limits.wall_ms),
+                start + Duration::from_millis(limits.wall_ms + limits.shutdown_grace_ms * 2),
+            )
+            .unwrap();
+            let input = OriginalProcessInput {
+                bytes: b"uci\n",
+                window,
+            };
+            let mut observation = OriginalSmokeTransportObservation::new(input).unwrap();
+            let mut custody = SpawnCustody::default();
+            let mut accumulated = Vec::new();
+            let mut trigger = |bytes: &[u8]| {
+                accumulated.extend_from_slice(bytes);
+                if accumulated
+                    .windows(b"mock-stdout-before-unwind".len())
+                    .any(|part| part == b"mock-stdout-before-unwind")
+                {
+                    panic!("smoke output observation fixture");
+                }
+            };
+            observation.started = true;
+            let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                linux::supervise(
+                    &program,
+                    &[
+                        "--exact".into(),
+                        SMOKE_ADAPTER_CHILD.into(),
+                        "--nocapture".into(),
+                    ],
+                    root.file(),
+                    limits,
+                    None,
+                    Some(linux::ArtifactObservation::Tree(&original_watch())),
+                    Some(&mut trigger),
+                    linux::InvocationIo {
+                        commands: Some(input.bytes),
+                        original: Some(window),
+                        observation: Some(&mut observation.transport),
+                        smoke_output: Some(&mut observation.output),
+                        spawned: Some(&mut custody),
+                        ..Default::default()
+                    },
+                )
+            }));
+            let pending_in_original = custody.pending.load(Ordering::Acquire);
+            let held = custody.take_child();
+            let retained_original = held.is_some();
+            // No failure below may abandon this fixture's exact mock child.
+            // An unexpected normal result may hold it in ProcessOutput.
+            let unexpected_pending = match &mut result {
+                Ok(Ok(output)) => output.pending_child.take(),
+                _ => None,
+            };
+            let mut reaped = true;
+            for mut child in held.into_iter().chain(unexpected_pending) {
+                match child.try_wait() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        let _ = child.kill();
+                        if child.wait().is_err() {
+                            reaped = false;
+                            retain_unresolved_smoke_mock(child);
+                        }
+                    }
+                    Err(_) => {
+                        reaped = false;
+                        retain_unresolved_smoke_mock(child);
+                    }
+                }
+            }
+            if reaped {
+                std::fs::remove_file(mode).unwrap();
+            }
+            assert!(result.is_err());
+            assert!(observation.attempt_started() && !observation.attempt_returned());
+            assert!(
+                observation
+                    .buffered_stdout()
+                    .windows(b"mock-stdout-before-unwind".len())
+                    .any(|part| part == b"mock-stdout-before-unwind")
+            );
+            assert!(
+                observation
+                    .buffered_stderr()
+                    .windows(b"mock-stderr-before-unwind".len())
+                    .any(|part| part == b"mock-stderr-before-unwind")
+            );
+            assert!(pending_in_original && retained_original && reaped);
+            // This fixture only reaps its exact mock child; it makes no GPU or
+            // general descendant/physical-completion assertion.
+        }
+
+        #[test]
+        fn smoke_uci_ignores_response_line_started_before_command_fence() {
+            let mut state = SmokeUciDialogue::default();
+            state.wrote(b"uci\n".len(), 0);
+            let first = b"uciok\nready";
+            state.observe_stdout(first);
+            assert!(state.uciok_observed);
+            state.wrote(b"isready\n".len(), first.len());
+            state.observe_stdout(b"uciok\nreadyok\n");
+            assert!(!state.readyok_observed);
+            state.observe_stdout(b"uciok\nreadyok\nreadyok\n");
+            assert!(state.readyok_observed);
+        }
+
+        #[test]
+        fn smoke_input_adapter_writes_exact_bytes_and_observes_eof() {
+            let root = OriginalTestDirectory::new();
+            let mode = root.0.join(SMOKE_ADAPTER_MODE);
+            std::fs::write(&mode, b"echo").unwrap();
+            let program = File::open(std::env::current_exe().unwrap()).unwrap();
+            let limits = original_limits();
+            let start = Instant::now();
+            let window = OriginalProcessWindow::new(
+                start,
+                start + Duration::from_millis(limits.wall_ms),
+                start + Duration::from_millis(limits.wall_ms + limits.shutdown_grace_ms * 2),
+            )
+            .unwrap();
+            let bytes = b"uci\nisready\n";
+            let input = OriginalProcessInput { bytes, window };
+            let mut observation = OriginalSmokeTransportObservation::new(input).unwrap();
+            let mut custody = SpawnCustody::default();
+            let mut control = |owner: &SpawnCustody, until: Instant| {
+                assert!(owner.pending.load(Ordering::Acquire));
+                assert!(owner.child().is_some());
+                assert!(until <= window.execution);
+                Ok(())
+            };
+            let result = supervise_smoke_input_in_original_window(
+                &program,
+                &[
+                    "--exact".into(),
+                    SMOKE_ADAPTER_CHILD.into(),
+                    "--nocapture".into(),
+                ],
+                &root.file(),
+                limits,
+                None,
+                &original_watch(),
+                input,
+                &mut custody,
+                &mut control,
+                None,
+                None,
+                &mut observation,
+            )
+            .unwrap();
+            assert_eq!(result.receipt.stop, ProcessStop::Exited);
+            assert_eq!(result.receipt.exit_code, Some(0));
+            assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone);
+            assert!(result.pending_child.is_none());
+            assert!(observation.attempt_started() && observation.attempt_returned());
+            assert_eq!(observation.transport().written_bytes(), Some(bytes.len()));
+            assert!(observation.transport.stdin_closed_after_input);
+            assert!(observation.transport().stdout_eof());
+            assert!(
+                result
+                    .stdout
+                    .windows(b"mock-input:uci\nisready\n".len())
+                    .any(|part| { part == b"mock-input:uci\nisready\n" })
+            );
+            // No synthetic quit or successful chess/model observation is made.
+            assert!(!result.stdout.windows(5).any(|part| part == b"quit\n"));
+            std::fs::remove_file(mode).unwrap();
+        }
+
+        #[test]
+        fn smoke_input_adapter_catches_control_panic_and_retains_output() {
+            let root = OriginalTestDirectory::new();
+            let mode = root.0.join(SMOKE_ADAPTER_MODE);
+            let ready = root.0.join(SMOKE_ADAPTER_READY);
+            std::fs::write(&mode, b"hold").unwrap();
+            let program = File::open(std::env::current_exe().unwrap()).unwrap();
+            let limits = original_limits();
+            let start = Instant::now();
+            let window = OriginalProcessWindow::new(
+                start,
+                start + Duration::from_millis(limits.wall_ms),
+                start + Duration::from_millis(limits.wall_ms + limits.shutdown_grace_ms * 2),
+            )
+            .unwrap();
+            let input = OriginalProcessInput {
+                bytes: b"uci\n",
+                window,
+            };
+            let mut observation = OriginalSmokeTransportObservation::new(input).unwrap();
+            let mut custody = SpawnCustody::default();
+            let mut control = |owner: &SpawnCustody, _: Instant| {
+                assert!(owner.child().is_some());
+                if ready.is_file() {
+                    panic!("smoke control fixture");
+                }
+                Ok(())
+            };
+            let result = supervise_smoke_input_in_original_window(
+                &program,
+                &[
+                    "--exact".into(),
+                    SMOKE_ADAPTER_CHILD.into(),
+                    "--nocapture".into(),
+                ],
+                &root.file(),
+                limits,
+                None,
+                &original_watch(),
+                input,
+                &mut custody,
+                &mut control,
+                None,
+                None,
+                &mut observation,
+            )
+            .unwrap();
+            assert_eq!(result.receipt.stop, ProcessStop::IoFailure);
+            assert!(result.receipt.errors.iter().any(|error| {
+                error.contains("process.owner_control:")
+                    && error.contains("process.smoke_run_control:panic")
+            }));
+            assert!(
+                result
+                    .stdout
+                    .windows(b"mock-input:uci\n".len())
+                    .any(|part| { part == b"mock-input:uci\n" })
+            );
+            assert!(observation.attempt_started() && observation.attempt_returned());
+            assert_eq!(
+                observation.transport().written_bytes(),
+                Some(input.bytes.len())
+            );
+            assert_eq!(custody.last_spawn_pid, Some(result.receipt.pid));
+            assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone);
+            assert!(result.pending_child.is_none());
+            std::fs::remove_file(ready).unwrap();
+            std::fs::remove_file(mode).unwrap();
+        }
+
+        #[test]
+        fn owner_control_observes_original_live_child_and_preserves_its_error() {
+            let root = OriginalTestDirectory::new();
+            let cwd = root.file();
+            let program = File::open("/bin/sleep").unwrap();
+            let watch = original_watch();
+            let mut spawned = SpawnCustody::default();
+            let mut observations = Vec::new();
+            let mut control = |owner: &SpawnCustody, deadline: Instant| {
+                let child = owner.child().expect("the actual child is still owned");
+                let pid = child.id();
+                assert!(owner.pending.load(Ordering::Acquire));
+                assert_eq!(owner.last_spawn_pid, Some(pid));
+                assert!(matches!(
+                    waitid(
+                        Id::Pid(Pid::from_raw(i32::try_from(pid).unwrap())),
+                        WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                    ),
+                    Ok(WaitStatus::StillAlive)
+                ));
+                let now = Instant::now();
+                assert!(deadline > now);
+                assert!(deadline.duration_since(now) <= Duration::from_secs(5));
+                observations.push(pid);
+                Err(ArenaError::Invalid("control test failure".into()))
+            };
+            let result = crate::process::supervise_tree_observed_with_spawn_and_control(
+                &program,
+                &["10".into()],
+                &cwd,
+                original_limits(),
+                None,
+                &watch,
+                None,
+                Some(&mut spawned),
+                Some(&mut control),
+            )
+            .unwrap();
+            assert_eq!(observations, vec![result.receipt.pid]);
+            assert_eq!(result.receipt.stop, ProcessStop::IoFailure);
+            assert!(
+                result
+                    .receipt
+                    .errors
+                    .iter()
+                    .any(|item| item.starts_with("process.owner_control:")
+                        && item.contains("control test failure"))
+            );
+            assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone);
+        }
+
+        #[test]
+        fn owner_control_does_not_start_without_custody_or_after_cancellation() {
+            let root = OriginalTestDirectory::new();
+            let cwd = root.file();
+            let program = File::open("/bin/sleep").unwrap();
+            let watch = original_watch();
+            let mut spawned = SpawnCustody::default();
+            let cancelled = AtomicBool::new(true);
+            let mut calls = 0;
+            let mut control = |_: &SpawnCustody, _: Instant| {
+                calls += 1;
+                Ok(())
+            };
+            let without_owner = crate::process::supervise_tree_observed_with_spawn_and_control(
+                &program,
+                &["10".into()],
+                &cwd,
+                original_limits(),
+                None,
+                &watch,
+                None,
+                None,
+                Some(&mut control),
+            );
+            assert!(without_owner.is_err());
+            let after_cancel = crate::process::supervise_tree_observed_with_spawn_and_control(
+                &program,
+                &["10".into()],
+                &cwd,
+                original_limits(),
+                Some(&cancelled),
+                &watch,
+                None,
+                Some(&mut spawned),
+                Some(&mut control),
+            );
+            assert!(after_cancel.is_err());
+            assert_eq!(calls, 0);
+            assert!(spawned.child().is_none());
+            assert!(!spawned.pending.load(Ordering::Acquire));
+        }
+
+        #[test]
+        fn cleanup_control_observes_original_owner_without_replacing_cancel() {
+            let root = OriginalTestDirectory::new();
+            let cwd = root.file();
+            let program = File::open("/bin/sleep").unwrap();
+            let watch = original_watch();
+            let limits = original_limits();
+            let started = Instant::now();
+            let execution = started + Duration::from_millis(limits.wall_ms);
+            let whole = execution + Duration::from_millis(limits.shutdown_grace_ms * 2);
+            let window = OriginalProcessWindow::new(started, execution, whole).unwrap();
+            let mut spawned = SpawnCustody::default();
+            let cancelled = AtomicBool::new(false);
+            let mut active = |_: &SpawnCustody, _: Instant| {
+                cancelled.store(true, Ordering::Release);
+                Ok(())
+            };
+            let mut cleanup_calls = 0;
+            let mut cleanup = |owner: &SpawnCustody, deadline: Instant| {
+                assert!(owner.pending.load(Ordering::Acquire));
+                assert!(owner.child().is_some());
+                assert!(Instant::now() < deadline && deadline <= whole);
+                cleanup_calls += 1;
+                Err(ArenaError::Invalid("cleanup test failure".into()))
+            };
+            let result = crate::process::supervise_tree_observed_with_controls(
+                &program,
+                &["10".into()],
+                &cwd,
+                limits,
+                Some(&cancelled),
+                &watch,
+                None,
+                Some(&mut spawned),
+                Some(&mut active),
+                Some(&mut cleanup),
+                Some(window),
+            )
+            .unwrap();
+            assert_eq!(result.receipt.stop, ProcessStop::Cancelled);
+            assert_eq!(cleanup_calls, 1);
+            assert!(result.receipt.errors.iter().any(|error| {
+                error.starts_with("process.cleanup_control:")
+                    && error.contains("cleanup test failure")
+            }));
+        }
+
+        #[test]
+        fn v6_pre_signal_preserves_original_owner_and_ack_is_not_completion() {
+            let root = OriginalTestDirectory::new();
+            let cwd = root.file();
+            let program = File::open("/bin/sleep").unwrap();
+            let watch = original_watch();
+            let limits = original_limits();
+            let started = Instant::now();
+            let execution = started + Duration::from_millis(limits.wall_ms);
+            let whole = execution + Duration::from_millis(limits.shutdown_grace_ms * 2);
+            let window = OriginalProcessWindow::new(started, execution, whole).unwrap();
+            let cancelled = AtomicBool::new(false);
+            let mut custody = SpawnCustody::default();
+            let mut observation = PreSignalObservation::default();
+            let mut run = |_: &SpawnCustody, _: Instant| {
+                cancelled.store(true, Ordering::Release);
+                Ok(())
+            };
+            let mut calls = 0;
+            let mut request = |owner: &SpawnCustody, deadline: Instant| {
+                let pid = owner.child().unwrap().id();
+                assert_eq!(owner.last_spawn_pid, Some(pid));
+                assert!(deadline <= whole);
+                assert!(matches!(
+                    waitid(
+                        Id::Pid(Pid::from_raw(i32::try_from(pid).unwrap())),
+                        WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                    ),
+                    Ok(WaitStatus::StillAlive)
+                ));
+                calls += 1;
+                Ok(if calls == 1 {
+                    PreSignalProgress::Pending { partial: true }
+                } else {
+                    PreSignalProgress::Acknowledged
+                })
+            };
+            let result = crate::process::supervise_tree_observed_with_v6_controls(
+                &program,
+                &["10".into()],
+                &cwd,
+                limits,
+                Some(&cancelled),
+                &watch,
+                None,
+                Some(&mut custody),
+                Some(&mut run),
+                None,
+                Some(window),
+                Some(&mut request),
+                Some(&mut observation),
+            )
+            .unwrap();
+            assert_eq!(result.receipt.stop, ProcessStop::Cancelled);
+            if observation.calls != 0 {
+                assert!(observation.first_partial_at.is_some());
+            }
+            if observation.acknowledged_at.is_none() {
+                assert!(observation.timed_out);
+            }
+            assert!(observation.first_failure.is_none());
+            // /bin/sleep does not understand the ACK and must still receive
+            // the actual termination signal from the original supervisor.
+            assert_eq!(result.receipt.exit_signal, Some(Signal::SIGTERM as i32));
+        }
+
+        #[test]
+        fn v6_pre_signal_panic_falls_back_to_original_cleanup() {
+            let root = OriginalTestDirectory::new();
+            let cwd = root.file();
+            let program = File::open("/bin/sleep").unwrap();
+            let watch = original_watch();
+            let limits = original_limits();
+            let started = Instant::now();
+            let execution = started + Duration::from_millis(limits.wall_ms);
+            let whole = execution + Duration::from_millis(limits.shutdown_grace_ms * 2);
+            let window = OriginalProcessWindow::new(started, execution, whole).unwrap();
+            let cancelled = AtomicBool::new(false);
+            let mut custody = SpawnCustody::default();
+            let mut observation = PreSignalObservation::default();
+            let mut run = |_: &SpawnCustody, _: Instant| {
+                cancelled.store(true, Ordering::Release);
+                Ok(())
+            };
+            let mut request =
+                |_: &SpawnCustody, _: Instant| -> Result<PreSignalProgress, ArenaError> {
+                    panic!("pre-signal fixture")
+                };
+            let result = crate::process::supervise_tree_observed_with_v6_controls(
+                &program,
+                &["10".into()],
+                &cwd,
+                limits,
+                Some(&cancelled),
+                &watch,
+                None,
+                Some(&mut custody),
+                Some(&mut run),
+                None,
+                Some(window),
+                Some(&mut request),
+                Some(&mut observation),
+            )
+            .unwrap();
+            assert_eq!(result.receipt.stop, ProcessStop::Cancelled);
+            assert_eq!(observation.calls, 1);
+            assert_eq!(
+                observation.first_failure.as_deref(),
+                Some("process.pre_signal_control:panic")
+            );
+            assert!(observation.acknowledged_at.is_none());
+            assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone);
+        }
+
+        #[test]
+        fn original_owner_observes_spawn_only_after_real_child_creation() {
+            let root = OriginalTestDirectory::new();
+            let cwd = root.file();
+            let program = File::open("/bin/cat").unwrap();
+            let watch = original_watch();
+            let mut spawned = SpawnCustody::default();
+            let cancel = AtomicBool::new(true);
+            let before = crate::process::supervise_tree_observed_with_spawn(
+                &program,
+                &[],
+                &cwd,
+                original_limits(),
+                Some(&cancel),
+                &watch,
+                None,
+                Some(&mut spawned),
+            );
+            assert!(before.is_err());
+            assert!(!spawned.pending.load(Ordering::Acquire));
+            assert!(spawned.child().is_none());
+
+            cancel.store(false, Ordering::Release);
+            let result = crate::process::supervise_tree_observed_with_spawn(
+                &program,
+                &[],
+                &cwd,
+                original_limits(),
+                Some(&cancel),
+                &watch,
+                None,
+                Some(&mut spawned),
+            )
+            .unwrap();
+            assert!(spawned.pending.load(Ordering::Acquire));
+            assert_eq!(spawned.last_spawn_pid, Some(result.receipt.pid));
+            assert!(spawned.child().is_none());
+            assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone);
+            assert!(result.pending_child.is_none());
+        }
+
+        #[test]
+        fn guarded_spawn_unwind_keeps_the_original_child_handle() {
+            let root = OriginalTestDirectory::new();
+            let cwd = root.file();
+            let program = File::open("/bin/echo").unwrap();
+            let watch = original_watch();
+            let mut custody = SpawnCustody::default();
+            let mut observer = |_: &[u8]| panic!("test observer interrupted supervisor");
+            let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = crate::process::supervise_tree_observed_with_spawn(
+                    &program,
+                    &[OsString::from("probe")],
+                    &cwd,
+                    original_limits(),
+                    None,
+                    &watch,
+                    Some(&mut observer),
+                    Some(&mut custody),
+                );
+            }));
+            assert!(interrupted.is_err());
+            assert!(custody.pending.load(Ordering::Acquire));
+            let mut child = custody
+                .take_child()
+                .expect("original child must remain owned");
+            assert_eq!(custody.last_spawn_pid, Some(child.id()));
+            // This test starts only /bin/echo, with no descendants. Reap this
+            // exact Child; never signal or wait using a numeric PID.
+            let _ = child.kill();
+            child.wait().expect("test-owned child must be reaped");
         }
 
         struct OriginalTestDirectory(std::path::PathBuf);

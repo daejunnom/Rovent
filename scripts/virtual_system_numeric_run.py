@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""Run one V3 system-CUDA numeric capture under its original output owner.
+
+This wrapper starts no training and does not retry. Process exit is not a GPU
+fence. The caller supplies a previously registered binary, config and cgroup.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import sys
+import time
+
+sys.dont_write_bytecode = True
+from managed_outputs import OutputLease
+from managed_process import OwnedProcessGroup, ProcessNotSpawned, run_group
+from managed_storage import checked
+from pals_followup_run import outside_git, sha, unique_object, observe_resources
+from virtual_custody_transport import CustodyTransport
+from virtual_quarantine_owner import retain_original_owner
+
+
+def require_capture_window(config, supervisor_deadline_ns, *, now_ns=None):
+    """Check sealed child windows against the original supervisor deadline.
+
+    Child-side comparison against the inherited absolute deadline is also
+    required: process startup occurs after this admission check.
+    """
+    work = config.get("deadline_seconds")
+    cleanup = config.get("cleanup_seconds")
+    if type(work) is not int or not 1 <= work <= 7200:
+        raise ValueError("sealed capture work deadline is invalid")
+    if type(cleanup) is not int or not 1 <= cleanup <= 30:
+        raise ValueError("sealed capture cleanup deadline is invalid")
+    now = time.monotonic_ns() if now_ns is None else now_ns
+    remaining = supervisor_deadline_ns - now
+    required = (work + cleanup) * 1_000_000_000
+    if remaining < required:
+        raise TimeoutError("supervisor time remaining cannot contain sealed child work and cleanup")
+    return {"work_seconds": work, "cleanup_seconds": cleanup,
+            "remaining_ns_at_check": remaining, "required_ns": required,
+            "child_startup_recheck_required": True}
+
+
+def capture_process_status(code, gone, failure, observation, custody):
+    """Keep exit evidence even when its observation does not establish timing."""
+    if code != 0 or gone is not True or failure is not None:
+        return "capture_process_failed_or_incomplete"
+    if observation.get("exit_observation_timing") != "before_deadline":
+        return "capture_process_completed_deadline_unknown"
+    if (custody.get("peer_pid_verified") is not True
+            or custody.get("status") != "session_released"
+            or custody.get("native_authorization") != "sent"
+            or custody.get("error") is not None):
+        return "capture_process_completed_custody_unknown"
+    return "capture_process_completed"
+
+
+def output_lease_tree_observation(dispatch_attempted, proved_not_spawned):
+    """A group-only observation cannot rule out escaped descendants."""
+    return True if not dispatch_attempted or proved_not_spawned else "unknown"
+
+
+def capture_cleanup_partition(cleanup_seconds, deadline_ns):
+    """Divide the sealed cleanup allowance without increasing the deadline."""
+    if type(cleanup_seconds) is not int or not 1 <= cleanup_seconds <= 30:
+        raise ValueError("sealed capture cleanup deadline is invalid")
+    cleanup_ns = cleanup_seconds * 1_000_000_000
+    group_reserve_ns = cleanup_ns // 2
+    return cleanup_ns, group_reserve_ns, deadline_ns - group_reserve_ns
+
+
+def observe_unresolved_owned(group, transport_poll, deadline, *, clock=time.monotonic):
+    """Retain the original group and channel only until the registered deadline.
+
+    This observation cannot extend the registered window, or establish GPU
+    completion. A failed observation does not replace the original run result.
+    """
+    record = {"attempted": False, "tree_gone": "unknown", "reaped_exit_code": None,
+              "error": None, "scope": "original_group_and_channel_until_registered_deadline"}
+    if clock() >= deadline:
+        record["error"] = "registered_deadline_elapsed_before_reobservation"
+        return record
+    record["attempted"] = True
+    try:
+        gone, reaped, failure = group.reobserve_and_drain(
+            absolute_deadline=deadline, on_tick=transport_poll)
+        record.update(tree_gone=gone, reaped_exit_code=reaped, error=failure)
+    except Exception as error:
+        record["error"] = {"type": type(error).__name__, "message": str(error)}
+    return record
+
+
+def snapshot_file(path: Path, expected: str, maximum: int, deadline: float, *, content=False, exact_size=None, seal=True):
+    """Hold the source and pass a sealed anonymous copy of the exact bytes."""
+    if not path.is_absolute():
+        raise ValueError("absolute input path required")
+    path = checked(path)
+    expected = sha(expected)
+    info = path.lstat()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    image_fd = None
+    try:
+        opened = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or not stat.S_ISREG(opened.st_mode)
+                or (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino)
+                or not 0 < opened.st_size <= maximum
+                or (exact_size is not None and opened.st_size != exact_size)):
+            raise ValueError("original bounded regular input required")
+        digest = hashlib.sha256()
+        count = 0
+        captured = bytearray() if content else None
+        if seal:
+            image_fd = os.memfd_create("rovezero-pinned-input", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+        while chunk := os.read(fd, 1024 * 1024):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("preparation window elapsed during pinned read")
+            count += len(chunk)
+            if count > opened.st_size:
+                raise ValueError("input grew during identity observation")
+            digest.update(chunk)
+            if captured is not None:
+                captured.extend(chunk)
+            if image_fd is not None:
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(image_fd, view)
+                    if written <= 0:
+                        raise OSError("incomplete sealed image write")
+                    view = view[written:]
+        after = os.fstat(fd)
+        if (count != opened.st_size or digest.hexdigest() != expected
+                or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)):
+            raise ValueError("original input changed or differs from its registered SHA")
+        if image_fd is not None:
+            os.fchmod(image_fd, 0o400 if content else 0o500)
+            seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+            fcntl.fcntl(image_fd, fcntl.F_ADD_SEALS, seals)
+            if fcntl.fcntl(image_fd, fcntl.F_GET_SEALS) & seals != seals:
+                raise RuntimeError("input snapshot sealing failed")
+            os.lseek(image_fd, 0, os.SEEK_SET)
+        return fd, image_fd, bytes(captured) if captured is not None else None
+    except BaseException:
+        os.close(fd)
+        if image_fd is not None:
+            os.close(image_fd)
+        raise
+
+
+def metadata_getter(image_fd, label, cwd, env, deadline, receipt):
+    """Read metadata from the same sealed executable; output is bounded post-exit."""
+    output = os.memfd_create("rovezero-metadata", os.MFD_CLOEXEC)
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("preparation window elapsed before metadata getter")
+        observation = {"dispatch_attempted": True, "tree_gone": "unknown", "spawned": False, "result_observed": False}
+        receipt.setdefault("metadata_getters", {})[label] = observation
+        def spawned():
+            observation.update(tree_gone="unknown", spawned=True)
+        def budget():
+            if os.fstat(output).st_size > 64 * 1024:
+                raise ValueError("metadata getter output exceeds bound")
+        try:
+            code, gone, failure = run_group([f"/proc/self/fd/{image_fd}", label], cwd, env,
+                                            remaining, budget, pass_fds=(image_fd,), stdout=output,
+                                            on_spawn=spawned, verify_before_spawn=True)
+        except ProcessNotSpawned as error:
+            observation.update(tree_gone=True, not_spawned_cause={
+                "type": type(error.__cause__).__name__, "message": str(error.__cause__)})
+            raise
+        observation.update(exit_code=code, tree_gone=gone, supervisor_error=failure, result_observed=True)
+        if code != 0 or gone is not True or failure is not None:
+            raise RuntimeError(f"metadata getter failed: {label}, exit={code}, tree_gone={gone}")
+        size = os.fstat(output).st_size
+        if not 0 < size <= 64 * 1024:
+            raise ValueError("metadata getter output exceeds bound")
+        os.lseek(output, 0, os.SEEK_SET)
+        raw = os.read(output, size + 1)
+        if len(raw) != size:
+            raise OSError("metadata getter output changed")
+        return json.loads(raw, object_pairs_hook=unique_object,
+                          parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
+    finally:
+        os.close(output)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", required=True, type=Path)
+    parser.add_argument("--binary-sha256", required=True)
+    parser.add_argument("--binary-bytes", required=True, type=int)
+    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--config-sha256", required=True)
+    parser.add_argument("--receipt", required=True, type=Path)
+    parser.add_argument("--timeout", required=True, type=int)
+    parser.add_argument("--output-bytes-max", type=int, default=128 * 1024 * 1024)
+    args = parser.parse_args(argv)
+    if sys.platform != "linux" or not 1 <= args.timeout <= 7200 or not 1 <= args.binary_bytes <= 2**63 - 1:
+        parser.error("Linux, finite timeout and declared binary size are required")
+    if not 1 <= args.output_bytes_max <= 2**63 - 1:
+        parser.error("finite output allowance required")
+    start_ns = time.monotonic_ns()
+    start = start_ns / 1_000_000_000
+    deadline_ns = start_ns + args.timeout * 1_000_000_000
+    deadline = deadline_ns / 1_000_000_000
+    source = Path(__file__).resolve().parent.parent
+    receipt_path = outside_git(args.receipt)
+    if not receipt_path.parent.is_dir():
+        raise ValueError("receipt requires an existing parent")
+    # Reserve the receipt first; an existing user file is never replaced.
+    receipt_file = receipt_path.open("x", encoding="utf-8")
+    receipt = {
+        "schema": "rovezero.virtual-system-numeric-supervisor.v1",
+        "status": "failed_before_dispatch", "producer_exit_code": None,
+        "producer_result_observed": False, "producer_tree_gone": True,
+        "producer_group_gone": True,
+        "producer_group_gone_scope": "original_process_group_and_joined_leader_only_setsids_unobserved",
+        "producer_tree_gone_scope": "unknown_for_spawned_child_escaped_descendants_unobserved",
+        "producer_supervisor_error": None, "dispatch_attempted": False,
+        "native_binary_sha256": args.binary_sha256, "capture_config_sha256": args.config_sha256,
+        "binary_identity_scope": "same_sha_sealed_anonymous_image_not_original_inode",
+        "window_scope": "preparation_metadata_and_child; individual blocking OS reads cannot be preempted",
+        "gpu_physical_completion": "unknown", "numerical_acceptance": False,
+        "kernel_placement": "unknown", "training_executed": False,
+        "output_lease": {"acquired": False, "finish_attempted": False, "finish_returned": False},
+    }
+    lease = None
+    pending = None
+    first_error = None
+    descriptors = []
+    try:
+        env = os.environ.copy()
+        env.update({"OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "PYTHONDONTWRITEBYTECODE": "1",
+                    "NVIDIA_TF32_OVERRIDE": "0"})
+        try:
+            resource = observe_resources(sorted(os.sched_getaffinity(0)))
+            affinity = resource.get("observations", {}).get("cpu_affinity", {})
+            affinity.update(requested="not_registered_by_this_wrapper", status="observed_only")
+            receipt["resources_before"] = resource
+        except Exception as error:
+            receipt["resources_before"] = {"status": "unknown", "error_type": type(error).__name__}
+        source_fd, binary_fd, _ = snapshot_file(args.binary, args.binary_sha256, args.binary_bytes,
+                                                deadline, exact_size=args.binary_bytes)
+        descriptors.extend((source_fd, binary_fd))
+        config_fd, config_image, config_bytes = snapshot_file(args.config, args.config_sha256, 64 * 1024,
+                                                             deadline, content=True)
+        descriptors.extend((config_fd, config_image))
+        config = json.loads(config_bytes, object_pairs_hook=unique_object,
+                            parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
+        if type(config) is not dict or config.get("provider") != "cuda-system" or not isinstance(config.get("output_root"), str):
+            raise ValueError("explicit V3 system-CUDA config/output required")
+        receipt["capture_window_preparation"] = require_capture_window(config, deadline_ns)
+        target = outside_git(Path(config["output_root"]))
+        if receipt_path == target or receipt_path.is_relative_to(target):
+            raise ValueError("receipt must be outside the fresh capture output")
+        plan_fd, _, plan_bytes = snapshot_file(Path(config["case_plan"]), config["case_plan_sha256"],
+                                               4 * 1024 * 1024, deadline, content=True, seal=False)
+        descriptors.append(plan_fd)
+        plan = json.loads(plan_bytes, object_pairs_hook=unique_object,
+                          parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
+        pins = metadata_getter(binary_fd, "--source-pins", args.binary.parent, env, deadline, receipt)
+        registry = metadata_getter(binary_fd, "--model-registry", args.binary.parent, env, deadline, receipt)
+        binding = plan["bindings"]
+        if (binding["source_components"] != pins
+                or binding["model_semantic_sha256"] != registry["model_semantic_sha256"]
+                or binding["encoding_sha256"] != registry["encoding_sha256"]):
+            raise ValueError("same sealed ELF metadata differs from registered V6 plan")
+        receipt.update(source_pins=pins, model_registry=registry,
+                       sealed_image_bytes=args.binary_bytes,
+                       input_identity_scope="sealed_binary_and_config_bytes; plan_rechecked_by_native")
+        receipt["capture_window_dispatch"] = require_capture_window(config, deadline_ns)
+        remaining = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
+        cleanup_ns, group_drain_reserve_ns, child_cleanup_deadline_ns = capture_cleanup_partition(
+            config["cleanup_seconds"], deadline_ns)
+        receipt["cleanup_partition"] = {
+            "policy": "registered_cleanup_half_for_group_drain_v1",
+            "child_cleanup_deadline_monotonic_ns": child_cleanup_deadline_ns,
+            "group_drain_reserve_ns": group_drain_reserve_ns,
+            "supervisor_deadline_monotonic_ns": deadline_ns,
+            "child_deadline_recheck_required": True,
+            "group_termination_is_gpu_fence": False,
+        }
+        receipt["dispatch_attempted"] = True
+        receipt["producer_tree_gone"] = "unknown"
+        receipt["producer_group_gone"] = "unknown"
+        admission_error = None
+        def acquire_output_and_allow_native():
+            nonlocal lease, admission_error
+            if stop_signals or time.monotonic_ns() + cleanup_ns >= deadline_ns:
+                return False
+            try:
+                if lease is not None:
+                    raise RuntimeError("capture output lease was already acquired")
+                lease = OutputLease(target, source, reserve=args.output_bytes_max, deferred=True).acquire()
+                receipt["output_lease"]["acquired"] = True
+            except Exception as error:
+                admission_error = error
+                receipt["output_lease"]["admission_error"] = {
+                    "type": type(error).__name__, "message": str(error)}
+                raise
+            # Acquiring the original lease may itself consume the remaining
+            # window. Never grant output creation or native entry after it.
+            return not stop_signals and time.monotonic_ns() + cleanup_ns < deadline_ns
+
+        transport = CustodyTransport(
+            allow_native=acquire_output_and_allow_native,
+            reobserve_interval_ns=(cleanup_ns - group_drain_reserve_ns) // 32,
+        )
+        receipt["custody_transport"] = transport.state
+        observation = {}
+        receipt["producer_deadline_observation"] = observation
+        group = OwnedProcessGroup()
+        env["ROVEZERO_CUSTODY_FD"] = str(transport.child_fd())
+        env["ROVEZERO_SUPERVISOR_DEADLINE_MONOTONIC_NS"] = str(deadline_ns)
+        env["ROVEZERO_CHILD_CLEANUP_DEADLINE_MONOTONIC_NS"] = str(child_cleanup_deadline_ns)
+        def producer_spawned():
+            receipt["producer_spawned"] = True
+            transport.child_started(group._child.pid)
+        def transport_poll():
+            try:
+                transport.poll()
+            except Exception as error:
+                transport.stop_sending(f"poll:{type(error).__name__}")
+        stop_signals = []
+        stop_signal_delivered = [False]
+        def owner_tick():
+            if stop_signals and not stop_signal_delivered[0]:
+                stop_signal_delivered[0] = True
+                transport.close_native_admission()
+                raise KeyboardInterrupt(f"supervisor received signal {stop_signals[0]}")
+            transport_poll()
+            if stop_signals and not stop_signal_delivered[0]:
+                stop_signal_delivered[0] = True
+                transport.close_native_admission()
+                raise KeyboardInterrupt(f"supervisor received signal {stop_signals[0]}")
+        def producer_check():
+            try:
+                if admission_error is not None:
+                    raise admission_error
+                if lease is not None:
+                    lease.check_budget()
+            except BaseException:
+                transport.close_native_admission()
+                raise
+        def stop_and_retain_unresolved():
+            def publish_quarantine(record):
+                receipt["status"] = "quarantined_original_owner"
+                receipt["quarantine_owner"] = dict(record)
+                receipt["producer_stop_cause"] = group.stop_cause
+                receipt["supervisor_stop_signal"] = stop_signals[0] if stop_signals else None
+                receipt_file.seek(0)
+                receipt_file.truncate()
+                json.dump(receipt, receipt_file, sort_keys=True, ensure_ascii=False, allow_nan=False)
+                receipt_file.write("\n")
+                receipt_file.flush()
+                os.fsync(receipt_file.fileno())
+            while True:
+                try:
+                    transport.close_native_admission()
+                    transport_poll()
+                    custody = transport.state
+                    if (custody.get("native_authorization") not in {"sent", "send_in_flight"}
+                            or (custody.get("peer_pid_verified") is True
+                                and custody.get("status") in {"session_released", "owner_recovered", "no_native_entry"}
+                                and custody.get("terminal_observation_valid") is True)):
+                        return None
+                    original = group._child
+                    if original is None:
+                        raise RuntimeError("original spawned process owner is unavailable")
+                    state = retain_original_owner(original, transport, publish_quarantine)
+                    receipt["quarantine_owner"] = state
+                    return state["state"] == "original_owner_release_observed"
+                except BaseException as error:
+                    # Once native admission was granted, an observation or
+                    # interruption is not a release. Keep the same owners and
+                    # retry the quarantine path without starting work.
+                    if transport.state.get("native_authorization") not in {"sent", "send_in_flight"}:
+                        raise
+                    errors = receipt.setdefault("quarantine_setup_errors", [])
+                    if len(errors) < 16:
+                        errors.append({"type": type(error).__name__, "message": str(error)[:1024]})
+                    try:
+                        time.sleep(1)
+                    except BaseException:
+                        pass
+        def request_supervisor_stop(signum, _frame):
+            if not stop_signals:
+                stop_signals.append(signum)
+        old_signal_handlers = {}
+        try:
+            # Normal external stop requests must go through the original owner
+            # path. SIGKILL, OOM and host loss remain outside this guarantee.
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                old_signal_handlers[sig] = signal.signal(sig, request_supervisor_stop)
+            code, gone, failure = run_group([f"/proc/self/fd/{binary_fd}", f"/proc/self/fd/{config_image}"],
+                                            args.binary.parent, env, remaining, producer_check,
+                                            pass_fds=(binary_fd, config_image, transport.child_fd()), on_spawn=producer_spawned,
+                                            verify_before_spawn=True, absolute_deadline=deadline,
+                                            deadline_observation=observation, on_tick=owner_tick,
+                                            on_stop=stop_and_retain_unresolved, owned_group=group,
+                                            graceful_drain_deadline=child_cleanup_deadline_ns / 1_000_000_000)
+            # Preserve the original tuple before any transport cleanup.
+            receipt.update(producer_result_observed=True, producer_exit_code=code,
+                           producer_group_gone=gone, producer_supervisor_error=failure,
+                           producer_initial_group_observation={
+                               "supervisor_return_code": code, "group_gone": gone,
+                               "supervisor_error": failure},
+                           status="capture_process_result_observed")
+            if group.cleanup_error is not None:
+                receipt["producer_cleanup_error"] = group.cleanup_error
+            if group.stop_error is not None:
+                receipt["producer_admission_stop_error"] = group.stop_error
+                transport.stop_sending("native_admission_stop_failed")
+            if gone is not True:
+                extra = observe_unresolved_owned(group, transport_poll, deadline)
+                receipt["producer_owned_reobservation"] = extra
+                if (extra["tree_gone"] is True and type(extra["reaped_exit_code"]) is int
+                        and extra["error"] is None):
+                    receipt["producer_group_gone"] = True
+        except ProcessNotSpawned as error:
+            receipt["producer_tree_gone"] = True
+            receipt["producer_group_gone"] = True
+            receipt["producer_proved_not_spawned"] = True
+            receipt["producer_not_spawned_cause"] = {
+                "type": type(error.__cause__).__name__, "message": str(error.__cause__)}
+            raise
+        finally:
+            for sig, previous in old_signal_handlers.items():
+                signal.signal(sig, previous)
+            for label, operation in (("poll", transport.poll), ("close", transport.close)):
+                try:
+                    operation()
+                except BaseException as error:
+                    receipt.setdefault("transport_cleanup_errors", []).append({
+                        "operation": label, "type": type(error).__name__, "message": str(error)})
+                    transport.state["error"] = f"{label}:{type(error).__name__}"
+        receipt["status"] = capture_process_status(code, gone, failure, observation, transport.state)
+        if stop_signals:
+            # waitid can observe child exit before the next signal-aware tick;
+            # preserve the outcome without assuming their actual order.
+            receipt["supervisor_stop_signal"] = stop_signals[0]
+            if receipt["status"] == "capture_process_completed":
+                receipt["status"] = "capture_process_stop_requested_timing_unknown"
+    except BaseException as error:
+        first_error = error
+        receipt.update(status="supervisor_error", wrapper_error={"type": type(error).__name__, "message": str(error)})
+        if not isinstance(error, Exception):
+            pending = error
+    finally:
+        receipt["producer_tree_gone"] = output_lease_tree_observation(
+            receipt["dispatch_attempted"], bool(receipt.get("producer_proved_not_spawned")))
+        if receipt.get("producer_spawned") and receipt["producer_group_gone"] is not True:
+            receipt["unresolved_owner_after_wrapper_exit"] = {
+                "status": "not_retained_by_this_process_after_exit",
+                "output_lease": "active_catalog_record_only_if_finish_succeeds",
+                "gpu_physical_completion": "unknown",
+            }
+        if lease is not None:
+            receipt["output_lease"]["finish_attempted"] = True
+            try:
+                lease.finish(status=receipt["status"], tree_gone=receipt["producer_tree_gone"])
+                receipt["output_lease"]["finish_returned"] = True
+            except BaseException as error:
+                receipt["output_lease"]["error"] = {"type": type(error).__name__, "message": str(error)}
+                if first_error is None:
+                    first_error = error
+                if pending is None and not isinstance(error, Exception):
+                    pending = error
+        for fd in reversed(descriptors):
+            try:
+                os.close(fd)
+            except OSError as error:
+                receipt.setdefault("descriptor_close_errors", []).append(type(error).__name__)
+        receipt["elapsed_seconds"] = time.monotonic() - start
+        receipt_error = None
+        try:
+            # A quarantined run may already have written an interim receipt.
+            # Publish one final JSON document while keeping its incident data.
+            receipt_file.seek(0)
+            receipt_file.truncate()
+            json.dump(receipt, receipt_file, sort_keys=True, ensure_ascii=False, allow_nan=False)
+            receipt_file.write("\n")
+            receipt_file.flush()
+            os.fsync(receipt_file.fileno())
+        except BaseException as error:
+            receipt_error = error
+        finally:
+            try:
+                receipt_file.close()
+            except BaseException as error:
+                if receipt_error is None:
+                    receipt_error = error
+        if receipt_error is not None:
+            # A producer can fail via its returned tuple without raising a
+            # Python exception. Preserve that original outcome even when the
+            # dedicated receipt itself could not be durably written.
+            try:
+                print("virtual_system_receipt_write_failure=" + json.dumps({
+                    "producer_exit_code": receipt["producer_exit_code"],
+                    "producer_tree_gone": receipt["producer_tree_gone"],
+                    "producer_supervisor_error": receipt["producer_supervisor_error"],
+                    "receipt_error_type": type(receipt_error).__name__,
+                    "receipt_error": str(receipt_error),
+                }, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+            except Exception:
+                pass
+            if first_error is not None:
+                raise first_error from receipt_error
+            raise receipt_error
+    if pending is not None:
+        raise pending
+    print(f"virtual_system_supervisor_receipt={receipt_path}")
+    return 0 if receipt["status"] == "capture_process_completed" and receipt["output_lease"]["finish_returned"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

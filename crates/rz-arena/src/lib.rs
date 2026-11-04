@@ -27,6 +27,12 @@ pub mod pals_replay;
 mod pgn;
 mod plan;
 mod process;
+#[cfg(feature = "pals-collection-onnx")]
+pub mod rovent_collect;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+pub mod rovent_resource_scope;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+pub mod rovent_training_process;
 mod runner;
 
 pub use contract::*;

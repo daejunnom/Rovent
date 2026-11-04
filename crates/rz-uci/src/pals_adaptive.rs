@@ -16,6 +16,24 @@ mod driver;
 pub use driver::*;
 mod validator;
 pub use validator::*;
+mod utility_route;
+pub use utility_route::*;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod utility_cohort;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use utility_cohort::*;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod utility_cohort_historical;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use utility_cohort_historical::*;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod utility_intervention;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use utility_intervention::*;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod utility_intervention_historical;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use utility_intervention_historical::*;
 mod native_accounting;
 mod session_driver;
 pub use native_accounting::AdaptiveNativeAccountingSnapshot;
@@ -39,12 +57,20 @@ pub fn adaptive_execution_manager_source_digest() -> [u8; 32] {
             include_bytes!("pals_adaptive/manager.rs").as_slice(),
         ),
         (
+            "pals_adaptive/manager/reciprocal.rs",
+            include_bytes!("pals_adaptive/manager/reciprocal.rs").as_slice(),
+        ),
+        (
             "pals_adaptive/continuation_diagnostic.rs",
             include_bytes!("pals_adaptive/continuation_diagnostic.rs").as_slice(),
         ),
         (
             "pals_adaptive/cpu_slice_observation.rs",
             include_bytes!("pals_adaptive/cpu_slice_observation.rs").as_slice(),
+        ),
+        (
+            "pals_adaptive/cpu_slice_observation/nnuec_chain.rs",
+            include_bytes!("pals_adaptive/cpu_slice_observation/nnuec_chain.rs").as_slice(),
         ),
         (
             "pals_adaptive/projection.rs",
@@ -61,6 +87,10 @@ pub fn adaptive_execution_manager_source_digest() -> [u8; 32] {
         (
             "pals_adaptive/session_driver.rs",
             include_bytes!("pals_adaptive/session_driver.rs").as_slice(),
+        ),
+        (
+            "pals_adaptive/session_driver/collection_v2.rs",
+            include_bytes!("pals_adaptive/session_driver/collection_v2.rs").as_slice(),
         ),
         (
             "pals_adaptive/native_accounting.rs",

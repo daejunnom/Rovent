@@ -9,14 +9,19 @@ use rz_position::{
 };
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "archive-origin-diagnostics")]
+pub use super::engine::archive_lifecycle::ArchiveRecordOrigin;
 use super::engine::{RecordKind, RoleQueryPurpose, RoleRecord};
 use super::store::{
     EvidenceScope, Move16, ObservationId, ObservationKind, PalsStores, StateId, StoreError,
     StorePins, StoreReadOwner, StoreReadPin,
 };
 
+pub mod cpu7_capture;
+pub mod historical;
+
 pub const REVIEW_CONTEXT_VERSION: &str = "rz-pals-selected-review/1";
-const MAX_LINE: usize = 256;
+pub(in crate::pals) const MAX_LINE: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReviewIndexLimits {
@@ -91,6 +96,9 @@ pub enum ReviewError {
     InvalidLine,
     AnchorMismatch,
     ViewCapacity,
+    /// This original (anchor, first move) bundle cannot retain another record.
+    /// Active-bundle admission and sequence exhaustion remain IndexCapacity.
+    BundleRecordCapacity,
     IndexCapacity,
     AlreadyConsumed,
     Store(StoreError),
@@ -141,6 +149,65 @@ pub struct ReviewRecordMetadata {
     pub original_first_move: Option<BoardMove>,
 }
 
+/// Original, bounded index contents observed at CPU7 selection. A compacted
+/// index is not the complete game journal. This is detached evidence only:
+/// it cannot create a view, trial, or worker authority.
+#[derive(Debug)]
+pub struct CohortCpu7OriginalRecord {
+    record: RoleRecord,
+    evidence: Option<ObservationId>,
+}
+impl CohortCpu7OriginalRecord {
+    /// Detached history only; this does not issue a Store pin or a live view.
+    pub(in crate::pals) fn historical(record: RoleRecord, evidence: Option<ObservationId>) -> Self {
+        Self { record, evidence }
+    }
+    pub fn record(&self) -> &RoleRecord {
+        &self.record
+    }
+    pub fn evidence(&self) -> Option<ObservationId> {
+        self.evidence
+    }
+}
+
+#[derive(Debug)]
+pub struct CohortCpu7OriginalBundle {
+    bundle_id: u64,
+    generation: u64,
+    root: StateId,
+    root_snapshot: PositionSnapshot,
+    anchor: PositionSnapshot,
+    records: Vec<CohortCpu7OriginalRecord>,
+    selected_len: usize,
+    digest: [u8; 32],
+}
+impl CohortCpu7OriginalBundle {
+    pub fn bundle_id(&self) -> u64 {
+        self.bundle_id
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn root(&self) -> StateId {
+        self.root
+    }
+    pub fn root_snapshot(&self) -> &PositionSnapshot {
+        &self.root_snapshot
+    }
+    pub fn anchor(&self) -> &PositionSnapshot {
+        &self.anchor
+    }
+    pub fn records(&self) -> &[CohortCpu7OriginalRecord] {
+        &self.records
+    }
+    pub fn selected_len(&self) -> usize {
+        self.selected_len
+    }
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+}
+
 /// The pin, source seal and atomic consumption authority are owned by the
 /// immutable view. None of its selected input can be edited after submission.
 #[derive(Debug)]
@@ -150,9 +217,21 @@ pub struct ReviewView {
     root_state: StateId,
     generation: u64,
     policy: ReviewSelectionPolicy,
+    cohort_cpu7: Option<Arc<CohortCpu7OriginalBundle>>,
+    cohort_cpu7_binding: Option<[u8; 32]>,
+    // Selection-local diagnostic only. Never carried to another query/view.
+    cpu7_raw_capture:
+        Option<Result<cpu7_capture::SelectedCpuRawCapture, cpu7_capture::CaptureUnavailable>>,
     records: Vec<RoleRecord>,
     metadata: Vec<ReviewRecordMetadata>,
+    // Optional diagnostic evidence, aligned with selected records if present.
+    // It never authorizes a load, selection, submission, or consumption.
+    #[cfg(feature = "archive-origin-diagnostics")]
+    archive_origins: Vec<Option<ArchiveRecordOrigin>>,
     anchors: Vec<ReviewAnchor>,
+    // 원 selected-record 순서의 source 이력이다. 모델 입력·seal의 추가 feature가
+    // 아니며 native 수집과 NNUEC 준비가 같은 immutable backing을 공유한다.
+    source_snapshots: Arc<[PositionSnapshot]>,
     query: ReviewQueryInput,
     bundles: Vec<u64>,
     tokens: u16,
@@ -163,6 +242,32 @@ pub struct ReviewView {
     consumed: AtomicBool,
 }
 impl ReviewView {
+    /// True only for an original view selected by the explicit CPU7 cohort
+    /// policy; it is not an acceptance or physical-completion receipt.
+    pub fn is_cohort_cpu7(&self) -> bool {
+        self.cohort_cpu7.is_some()
+    }
+    pub fn cohort_cpu7_original_bundle(&self) -> Option<&CohortCpu7OriginalBundle> {
+        self.cohort_cpu7.as_deref()
+    }
+    pub fn cohort_cpu7_binding(&self) -> Option<[u8; 32]> {
+        self.cohort_cpu7_binding
+    }
+    pub fn cpu7_raw_capture(
+        &self,
+    ) -> Option<&Result<cpu7_capture::SelectedCpuRawCapture, cpu7_capture::CaptureUnavailable>>
+    {
+        self.cpu7_raw_capture.as_ref()
+    }
+    pub(in crate::pals) fn capture_cpu7_on_original_view(
+        &mut self,
+        stores: &PalsStores,
+        control: Result<cpu7_capture::CapturePermit<'_>, cpu7_capture::CaptureUnavailable>,
+    ) {
+        self.cpu7_raw_capture = Some(control.and_then(|control| {
+            cpu7_capture::capture_selected_cpu_raw_permitted(self, stores, control)
+        }));
+    }
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
@@ -178,11 +283,42 @@ impl ReviewView {
     pub fn records_metadata(&self) -> &[ReviewRecordMetadata] {
         &self.metadata
     }
+    /// Bounded historical provenance for an actually selected record. Store
+    /// and archive owners matched when this view was formed, not necessarily
+    /// when this getter is called. `None` is unknown, not evidence of a hot
+    /// origin. This is not submission or physical-completion evidence and it
+    /// does not issue a Store capability.
+    #[cfg(feature = "archive-origin-diagnostics")]
+    pub fn selected_archive_origin(&self, index: usize) -> Option<&ArchiveRecordOrigin> {
+        self.archive_origins.get(index).and_then(Option::as_ref)
+    }
     pub fn anchors(&self) -> &[ReviewAnchor] {
         &self.anchors
     }
+    /// 원 metadata와 같은 순서·개수의 source snapshot이다. 각 snapshot의 깊은
+    /// history는 Rules의 immutable Arc를 공유하며 Store 조회나 FEN 복원을 하지 않는다.
+    /// 반환값은 역사 입력 자료로서 현재 source·pin·실행·소비 권한을 발급하지 않는다.
+    pub fn source_snapshots(&self) -> &Arc<[PositionSnapshot]> {
+        &self.source_snapshots
+    }
     pub fn query(&self) -> &ReviewQueryInput {
         &self.query
+    }
+    /// Historical selected-input metadata only. This cannot select a bundle,
+    /// reconstruct a view pin or authorize another head consumption.
+    pub(crate) fn selected_bundle_ids(&self) -> &[u64] {
+        &self.bundles
+    }
+    /// Historical observation only; it does not replace the actual index's
+    /// original view/Store checks or authorize another consumption.
+    pub(crate) fn consumption_observed(&self) -> bool {
+        self.consumed.load(Ordering::Acquire)
+    }
+    pub(crate) fn retirement_protected_pins(
+        &self,
+        stores: &PalsStores,
+    ) -> Result<StorePins, ReviewError> {
+        Ok(self.pin.retirement_seed(stores)?)
     }
     pub fn token_count(&self) -> u16 {
         self.tokens
@@ -192,6 +328,11 @@ impl ReviewView {
     }
     pub fn anchor_mode(&self) -> ReviewAnchorMode {
         self.policy.mode
+    }
+    /// 원 선택 정책의 읽기 전용 메타데이터다. 이 값은 source·Store 소유권이나
+    /// required bundle의 현재 제출 권한을 발급하지 않는다.
+    pub fn selection_policy(&self) -> ReviewSelectionPolicy {
+        self.policy
     }
     pub fn length_bucket(&self) -> u16 {
         self.bucket
@@ -208,11 +349,50 @@ impl ReviewView {
     pub fn validates(&self, stores: &PalsStores) -> bool {
         self.pin.validates(stores)
     }
+    /// Project the original CPU7 view's pinned Store dependency closure.
+    /// The result is historical data only: it grants no execution authority,
+    /// physical completion, or proof that any observation was actually run.
+    /// `check` must enforce the caller's original finite deadline and cancel
+    /// state without re-entering the Store or blocking. Output is discarded on
+    /// any error, including an unavailable hot
+    /// record, owner change, exhausted record/byte limit, deadline or cancel.
+    pub fn project_cohort_cpu7_store(
+        &self,
+        stores: &PalsStores,
+        max_records: usize,
+        max_bytes: usize,
+        check: &mut dyn FnMut() -> Result<(), StoreError>,
+    ) -> Result<Vec<u8>, StoreError> {
+        if self.cohort_cpu7.is_none() {
+            return Err(StoreError::InvalidConditions("CPU7 view required"));
+        }
+        stores.project_review_store_closure(&self.pin, max_records, max_bytes, check)
+    }
+    /// Capture this exact live CPU7 selection and its Store projection under
+    /// caller-owned deadline/cancel control. This detached evidence is not yet
+    /// a published trial sidecar or a physical-completion proof.
+    pub fn capture_cohort_cpu7_evidence(
+        &self,
+        stores: &PalsStores,
+        max_records: usize,
+        max_bytes: usize,
+        check: &mut dyn FnMut() -> Result<(), StoreError>,
+    ) -> Result<Vec<u8>, StoreError> {
+        stores.capture_cohort_cpu7_view(self, &self.pin, max_records, max_bytes, check)
+    }
     /// Known owned host backing, not a measured peak. Shared Rules history
-    /// chains are conservatively charged once per retained anchor; physical
-    /// sharing is deliberately not guessed from Arc identities.
+    /// chains are conservatively charged once per retained anchor/source;
+    /// physical sharing is deliberately not guessed from Arc identities.
     pub fn owned_host_bytes(&self) -> Option<u64> {
         let mut bytes = std::mem::size_of::<Self>();
+        #[cfg(feature = "archive-origin-diagnostics")]
+        {
+            bytes = bytes.checked_add(
+                self.archive_origins
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Option<ArchiveRecordOrigin>>())?,
+            )?;
+        }
         for backing in [
             self.records
                 .capacity()
@@ -223,6 +403,9 @@ impl ReviewView {
             self.anchors
                 .capacity()
                 .checked_mul(std::mem::size_of::<ReviewAnchor>())?,
+            self.source_snapshots
+                .len()
+                .checked_mul(std::mem::size_of::<PositionSnapshot>())?,
             self.bundles
                 .capacity()
                 .checked_mul(std::mem::size_of::<u64>())?,
@@ -263,37 +446,37 @@ impl ReviewView {
         for anchor in &self.anchors {
             bytes = bytes.checked_add(anchor.snapshot.retained_history_bytes()?)?;
         }
+        for source in self.source_snapshots.iter() {
+            bytes = bytes.checked_add(source.retained_history_bytes()?)?;
+        }
+        if let Some(original) = &self.cohort_cpu7 {
+            bytes = bytes.checked_add(std::mem::size_of::<CohortCpu7OriginalBundle>())?;
+            bytes = bytes.checked_add(
+                original
+                    .records
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<CohortCpu7OriginalRecord>())?,
+            )?;
+            for record in &original.records {
+                bytes = bytes.checked_add(
+                    record
+                        .record
+                        .line
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<BoardMove>())?,
+                )?;
+            }
+            bytes = bytes.checked_add(original.anchor.retained_history_bytes()?)?;
+            bytes = bytes.checked_add(original.root_snapshot.retained_history_bytes()?)?;
+        }
         u64::try_from(bytes).ok()
     }
     /// Fresh endpoint queries differ; their immutable public record/anchor
     /// scope must still be identical. No private endpoint/query is erased from
     /// the actual full input digest exposed by digest().
     pub fn record_scope_digest(&self) -> [u8; 32] {
-        let query = ReviewQueryInput {
-            purpose: RoleQueryPurpose::ProposePolicy,
-            prefix: Vec::new(),
-            proposal: Vec::new(),
-            counterexample: None,
-            legal: Vec::new(),
-            divergences: Vec::new(),
-        };
-        let input = input_digest(
-            &self.anchors,
-            &self.records,
-            &self.metadata,
-            &query,
-            self.policy,
-            self.records
-                .iter()
-                .map(|record| record.line.len() as u16)
-                .sum(),
-            256,
-        )
-        .expect("sealed validated immutable record scope");
-        let mut hash = Sha256::new();
-        hash.update(b"rz-pals-frozen-public-review-scope/1\0");
-        hash.update(input);
-        hash.finalize().into()
+        record_scope_digest(&self.anchors, &self.records, &self.metadata, self.policy)
+            .expect("sealed validated immutable record scope")
     }
 }
 
@@ -319,6 +502,8 @@ struct IndexedRecord {
     record: RoleRecord,
     evidence: Option<ObservationId>,
     bundle: u64,
+    #[cfg(feature = "archive-origin-diagnostics")]
+    archive_origin: Option<ArchiveRecordOrigin>,
 }
 
 /// The single Search writer updates only the changed record/bundle. Selection
@@ -408,6 +593,98 @@ impl ReviewContextIndex {
         }
         Ok(())
     }
+    /// Called only for a newly installed source record after the load owner has
+    /// completed installation, release and re-pinning. Existing entries are
+    /// never relabelled unless the caller has established that the entry was
+    /// absent before that same load. Failure is diagnostic-only.
+    #[cfg(feature = "archive-origin-diagnostics")]
+    pub(crate) fn attach_archive_origin(
+        &mut self,
+        stores: &PalsStores,
+        original: &RoleRecord,
+        origin: ArchiveRecordOrigin,
+    ) {
+        if self.check_owner(stores).is_err() || !origin.matches_original(stores, original) {
+            return;
+        }
+        let Some(entry) = self.records.get_mut(&original.revision) else {
+            return;
+        };
+        let current = &entry.record;
+        // `critical` is deliberately mutable index state and can differ after
+        // normal root refresh or another publication of the same kind.
+        if entry.archive_origin.is_some()
+            || current.revision != original.revision
+            || current.parent_revision != original.parent_revision
+            || current.supersedes_revision != original.supersedes_revision
+            || current.origin_state != original.origin_state
+            || current.kind != original.kind
+            || current.line != original.line
+            || current.value != original.value
+            || current.completed_depth != original.completed_depth
+            || current.score_scope != original.score_scope
+            || current.cpu_observation != original.cpu_observation
+            || current.perspective != original.perspective
+        {
+            return;
+        }
+        entry.archive_origin = Some(origin);
+    }
+    /// Preserve the existing bounded projection during idle Store maintenance.
+    /// This is not a submitted view, another lease, or consumption authority.
+    /// Keeping the source facts hot prevents optional cold-anchor skips from
+    /// changing an otherwise identical question after metadata reclamation.
+    pub(super) fn archive_projection_pins(
+        &self,
+        stores: &PalsStores,
+    ) -> Result<StorePins, ReviewError> {
+        self.check_owner(stores)?;
+        if self.bundles.len() > self.limits.active_bundles
+            || self.records.len() > self.limits.active_bundles * self.limits.records_per_bundle
+        {
+            return Err(ReviewError::IndexCapacity);
+        }
+        let mut pins = StorePins::default();
+        for (revision, entry) in &self.records {
+            let bundle = self
+                .bundles
+                .get(&entry.bundle)
+                .ok_or(ReviewError::RelationMismatch)?;
+            if entry.record.revision != *revision
+                || bundle.anchor != entry.record.origin_state
+                || bundle.revisions.len() > self.limits.records_per_bundle
+                || !bundle.revisions.contains(revision)
+            {
+                return Err(ReviewError::RelationMismatch);
+            }
+            for relation in [
+                entry.record.parent_revision,
+                entry.record.supersedes_revision,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if self
+                    .records
+                    .get(&relation)
+                    .is_none_or(|parent| parent.bundle != entry.bundle)
+                    || relation >= *revision
+                {
+                    return Err(ReviewError::MissingRelation(relation));
+                }
+            }
+            stores.states.get(entry.record.origin_state)?;
+            pins.states.insert(entry.record.origin_state);
+            for observation in [entry.evidence, entry.record.cpu_observation]
+                .into_iter()
+                .flatten()
+            {
+                stores.observations.get(observation)?;
+                pins.observations.insert(observation);
+            }
+        }
+        Ok(pins)
+    }
     /// Publication requires actual store ownership and a complete Rules line.
     /// Parent/supersedes records must have been published earlier in the same
     /// coherent original-first-move bundle; no guessed relationship is issued.
@@ -489,6 +766,7 @@ impl ReviewContextIndex {
             if !matches!(
                 observation.scope,
                 EvidenceScope::DepthLimited { .. }
+                    | EvidenceScope::ProfiledExternalUci { .. }
                     | EvidenceScope::ExternalUci { .. }
                     | EvidenceScope::RulesTerminal
             ) || !matches!(
@@ -536,7 +814,7 @@ impl ReviewContextIndex {
         }
         if let Some(id) = existing {
             if self.bundles[&id].revisions.len() >= self.limits.records_per_bundle {
-                return Err(ReviewError::IndexCapacity);
+                return Err(ReviewError::BundleRecordCapacity);
             }
         } else {
             self.compact_internal(None);
@@ -586,6 +864,8 @@ impl ReviewContextIndex {
                 record: record.clone(),
                 evidence,
                 bundle: id,
+                #[cfg(feature = "archive-origin-diagnostics")]
+                archive_origin: None,
             },
         );
         if self.owner.is_none() {
@@ -637,6 +917,106 @@ impl ReviewContextIndex {
         root: StateId,
         query: ReviewQuerySequences<'_>,
         policy: ReviewSelectionPolicy,
+    ) -> Result<ReviewView, ReviewError> {
+        self.select_inner(stores, root, query, policy, None)
+    }
+
+    /// Experimental cohort-only prefix. The original index and observations
+    /// are untouched; this does not manufacture completion or trial authority.
+    /// The required bundle must contain seven actual CPU verification records.
+    pub fn select_cohort_cpu7(
+        &mut self,
+        stores: &PalsStores,
+        root: StateId,
+        query: ReviewQuerySequences<'_>,
+        policy: ReviewSelectionPolicy,
+    ) -> Result<ReviewView, ReviewError> {
+        if policy.required_bundle.is_none() || policy.mode != ReviewAnchorMode::AnchoredCompact {
+            return Err(ReviewError::InvalidPolicy);
+        }
+        self.select_inner(stores, root, query, policy, Some(7))
+    }
+
+    /// Optional diagnostic capture at the same single-writer selection call.
+    /// Capture failure is returned separately and never changes the selected
+    /// view or makes an otherwise valid neural request fail.
+    pub fn select_cohort_cpu7_with_raw_capture(
+        &mut self,
+        stores: &PalsStores,
+        root: StateId,
+        query: ReviewQuerySequences<'_>,
+        policy: ReviewSelectionPolicy,
+        control: Option<&cpu7_capture::CaptureControl<'_>>,
+    ) -> Result<
+        (
+            ReviewView,
+            Result<cpu7_capture::SelectedCpuRawCapture, cpu7_capture::CaptureUnavailable>,
+        ),
+        ReviewError,
+    > {
+        let view = self.select_cohort_cpu7(stores, root, query, policy)?;
+        let capture = cpu7_capture::capture_selected_cpu_raw(&view, stores, control);
+        Ok((view, capture))
+    }
+
+    /// A readiness hint only: selection still validates owner, Rules,
+    /// relations, budget and all original records before issuing any view.
+    pub fn cohort_cpu7_ready(&self, stores: &PalsStores, policy: ReviewSelectionPolicy) -> bool {
+        if policy.mode != ReviewAnchorMode::AnchoredCompact {
+            return false;
+        }
+        let Some(bundle) = policy.required_bundle.and_then(|id| self.bundles.get(&id)) else {
+            return false;
+        };
+        let (mut cpus, mut total) = (0, 0);
+        let mut observations = std::collections::BTreeSet::new();
+        for revision in &bundle.revisions {
+            let Some(entry) = self.records.get(revision) else {
+                return false;
+            };
+            total += 1;
+            if total == 1 && entry.record.kind != RecordKind::Proposal {
+                return false;
+            }
+            if entry.record.kind == RecordKind::CpuVerification {
+                let Some(observation) = entry.record.cpu_observation else {
+                    return false;
+                };
+                if !observations.insert(observation) {
+                    return false;
+                }
+                let Ok(actual) = stores.observations.get(observation) else {
+                    return false;
+                };
+                if !matches!(
+                    (actual.kind, actual.scope),
+                    (
+                        ObservationKind::CpuAnalysis,
+                        EvidenceScope::DepthLimited { .. }
+                    ) | (
+                        ObservationKind::ExternalCpuAnalysis,
+                        EvidenceScope::ProfiledExternalUci { .. }
+                            | EvidenceScope::ExternalUci { .. }
+                    )
+                ) {
+                    return false;
+                }
+                cpus += 1;
+            }
+            if cpus == 7 {
+                return total <= usize::from(policy.max_records);
+            }
+        }
+        false
+    }
+
+    fn select_inner(
+        &mut self,
+        stores: &PalsStores,
+        root: StateId,
+        query: ReviewQuerySequences<'_>,
+        mut policy: ReviewSelectionPolicy,
+        cohort_cpu_prefix: Option<usize>,
     ) -> Result<ReviewView, ReviewError> {
         self.check_owner(stores)?;
         policy.validate()?;
@@ -700,7 +1080,13 @@ impl ReviewContextIndex {
         }
         let mut records = Vec::new();
         let mut metadata = Vec::new();
+        #[cfg(feature = "archive-origin-diagnostics")]
+        let mut archive_origins = Vec::new();
+        #[cfg(feature = "archive-origin-diagnostics")]
+        let mut archive_origins_unavailable = false;
+        let mut source_snapshots = Vec::new();
         let mut selected_bundles = Vec::new();
+        let mut cpu7_original_bundle = None;
         let mut anchors = vec![ReviewAnchor {
             state: root,
             snapshot: root_snapshot.clone(),
@@ -711,6 +1097,75 @@ impl ReviewContextIndex {
         for id in ordered {
             let bundle = &self.bundles[&id];
             let required = Some(id) == policy.required_bundle;
+            if cohort_cpu_prefix.is_some() && !required {
+                continue;
+            }
+            let revisions = if required {
+                if let Some(limit) = cohort_cpu_prefix {
+                    let mut observed = 0usize;
+                    let end = bundle.revisions.iter().position(|revision| {
+                        if self.records[revision].record.kind == RecordKind::CpuVerification {
+                            observed += 1;
+                        }
+                        observed == limit
+                    });
+                    let end = end.ok_or(ReviewError::ViewCapacity)?;
+                    let selected = &bundle.revisions[..=end];
+                    if selected.len() > usize::from(policy.max_records)
+                        || self.records[&selected[0]].record.kind != RecordKind::Proposal
+                    {
+                        return Err(ReviewError::ViewCapacity);
+                    }
+                    let mut observations = std::collections::BTreeSet::new();
+                    for revision in selected {
+                        let record = &self.records[revision].record;
+                        if record.kind == RecordKind::CpuVerification {
+                            let observation =
+                                record.cpu_observation.ok_or(ReviewError::ViewCapacity)?;
+                            if !observations.insert(observation) {
+                                return Err(ReviewError::RelationMismatch);
+                            }
+                            let actual = stores.observations.get(observation)?;
+                            if !matches!(
+                                (actual.kind, actual.scope),
+                                (
+                                    ObservationKind::CpuAnalysis,
+                                    EvidenceScope::DepthLimited { .. }
+                                ) | (
+                                    ObservationKind::ExternalCpuAnalysis,
+                                    EvidenceScope::ProfiledExternalUci { .. }
+                                        | EvidenceScope::ExternalUci { .. }
+                                )
+                            ) {
+                                return Err(ReviewError::ViewCapacity);
+                            }
+                        }
+                    }
+                    // Bind the actual prefix length into the existing context
+                    // policy digest, without exceeding the registered cap.
+                    policy.max_records = selected.len() as u16;
+                    selected
+                } else {
+                    bundle.revisions.as_slice()
+                }
+            } else {
+                bundle.revisions.as_slice()
+            };
+            // A prefix is valid only when every included parent/supersedes
+            // really belongs to the same retained prefix, never a missing tail.
+            if required && cohort_cpu_prefix.is_some() {
+                for revision in revisions {
+                    let record = &self.records[revision].record;
+                    for parent in [record.parent_revision, record.supersedes_revision]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if !revisions.contains(&parent) {
+                            return Err(ReviewError::MissingRelation(parent));
+                        }
+                    }
+                }
+            }
             let anchor = match stores.states.get(bundle.anchor) {
                 Ok(anchor) => anchor,
                 Err(error) => {
@@ -720,9 +1175,47 @@ impl ReviewContextIndex {
                     continue;
                 }
             };
-            let mut offsets = Vec::with_capacity(bundle.revisions.len());
+            if required && cohort_cpu_prefix.is_some() {
+                let mut original = Vec::with_capacity(bundle.revisions.len());
+                for revision in &bundle.revisions {
+                    let entry = self
+                        .records
+                        .get(revision)
+                        .ok_or(ReviewError::MissingRelation(*revision))?;
+                    if entry.bundle != id || entry.record.origin_state != bundle.anchor {
+                        return Err(ReviewError::RelationMismatch);
+                    }
+                    pins.states.insert(entry.record.origin_state);
+                    pins.observations.extend(entry.evidence);
+                    pins.observations.extend(entry.record.cpu_observation);
+                    original.push(CohortCpu7OriginalRecord {
+                        record: entry.record.clone(),
+                        evidence: entry.evidence,
+                    });
+                }
+                let digest = cohort_cpu7_original_digest(
+                    id,
+                    stores.generation(),
+                    root,
+                    root_snapshot,
+                    anchor,
+                    &original,
+                    revisions.len(),
+                )?;
+                cpu7_original_bundle = Some(Arc::new(CohortCpu7OriginalBundle {
+                    bundle_id: id,
+                    generation: stores.generation(),
+                    root,
+                    root_snapshot: root_snapshot.clone(),
+                    anchor: anchor.clone(),
+                    records: original,
+                    selected_len: revisions.len(),
+                    digest,
+                }));
+            }
+            let mut offsets = Vec::with_capacity(revisions.len());
             let mut all_rebased = true;
-            for revision in &bundle.revisions {
+            for revision in revisions {
                 let line = &self.records[revision].record.line;
                 match checked_rebase_offset(anchor, root_snapshot, line)? {
                     Some(offset) => offsets.push(offset),
@@ -758,13 +1251,12 @@ impl ReviewContextIndex {
             if !all_rebased {
                 offsets.fill(0);
             }
-            let additional: usize = bundle
-                .revisions
+            let additional: usize = revisions
                 .iter()
                 .zip(&offsets)
                 .map(|(rev, offset)| self.records[rev].record.line.len() - offset)
                 .sum();
-            if records.len() + bundle.revisions.len() > usize::from(policy.max_records)
+            if records.len() + revisions.len() > usize::from(policy.max_records)
                 || tokens + additional > usize::from(policy.token_budget)
             {
                 if required {
@@ -778,14 +1270,35 @@ impl ReviewContextIndex {
                     snapshot: anchor.clone(),
                 });
             }
-            let local: BTreeMap<_, _> = bundle
-                .revisions
+            let local: BTreeMap<_, _> = revisions
                 .iter()
                 .enumerate()
                 .map(|(index, revision)| (*revision, (records.len() + index) as u16))
                 .collect();
-            for (revision, offset) in bundle.revisions.iter().zip(offsets) {
+            for (revision, offset) in revisions.iter().zip(offsets) {
                 let entry = &self.records[revision];
+                #[cfg(feature = "archive-origin-diagnostics")]
+                if !archive_origins_unavailable {
+                    let origin = entry
+                        .archive_origin
+                        .as_ref()
+                        .filter(|origin| origin.matches_owner(stores));
+                    if archive_origins.is_empty() && origin.is_some() {
+                        if archive_origins
+                            .try_reserve_exact(usize::from(policy.max_records))
+                            .is_err()
+                        {
+                            archive_origins_unavailable = true;
+                        } else {
+                            archive_origins.resize_with(records.len(), || None);
+                        }
+                    }
+                    if !archive_origins_unavailable
+                        && (origin.is_some() || !archive_origins.is_empty())
+                    {
+                        archive_origins.push(origin.cloned());
+                    }
+                }
                 let mut selected = entry.record.clone();
                 selected.line = selected.line[offset..].to_vec();
                 selected.origin_state = anchors[anchor_index].state;
@@ -798,6 +1311,7 @@ impl ReviewContextIndex {
                     source_line_offset: offset as u16,
                     original_first_move: bundle.original_first_move,
                 });
+                source_snapshots.push(anchor.clone());
                 pins.states.insert(entry.record.origin_state);
                 pins.observations.extend(entry.evidence);
                 pins.observations.extend(entry.record.cpu_observation);
@@ -839,17 +1353,10 @@ impl ReviewContextIndex {
             tokens as u16,
             bucket,
         )?;
-        let mut seal = Sha256::new();
-        seal.update(b"rz-pals-review-view-seal/1\0");
-        seal.update(digest);
-        seal.update(sequence.to_le_bytes());
-        seal.update(stores.generation().to_le_bytes());
-        seal.update((root.0 as u64).to_le_bytes());
-        for record in &metadata {
-            seal.update(record.source_revision.to_le_bytes());
-            seal.update((record.source_state.0 as u64).to_le_bytes());
-            seal.update(record.source_line_offset.to_le_bytes());
-        }
+        let seal = view_seal_digest(digest, sequence, stores.generation(), root, &metadata);
+        let cohort_cpu7_binding = cpu7_original_bundle
+            .as_ref()
+            .map(|source| cohort_cpu7_view_binding(source.digest(), policy.digest(), digest, seal));
         let pin = stores.pin_review(pins)?;
         Ok(ReviewView {
             index_owner: Arc::downgrade(&self.identity),
@@ -857,15 +1364,21 @@ impl ReviewContextIndex {
             root_state: root,
             generation: stores.generation(),
             policy,
+            cohort_cpu7: cpu7_original_bundle,
+            cohort_cpu7_binding,
+            cpu7_raw_capture: None,
             records,
             metadata,
+            #[cfg(feature = "archive-origin-diagnostics")]
+            archive_origins,
             anchors,
+            source_snapshots: source_snapshots.into(),
             query,
             bundles: selected_bundles,
             tokens: tokens as u16,
             bucket,
             digest,
-            seal: seal.finalize().into(),
+            seal,
             pin,
             consumed: AtomicBool::new(false),
         })
@@ -934,7 +1447,7 @@ impl ReviewContextIndex {
             Ok((first, second))
         }
     }
-    fn fork_query(
+    pub(in crate::pals) fn fork_query(
         &mut self,
         stores: &PalsStores,
         source: &ReviewView,
@@ -1023,32 +1536,53 @@ impl ReviewContextIndex {
             tokens as u16,
             bucket,
         )?;
-        let mut seal = Sha256::new();
-        seal.update(b"rz-pals-review-view-seal/1\0");
-        seal.update(digest);
-        seal.update(sequence.to_le_bytes());
-        seal.update(stores.generation().to_le_bytes());
-        seal.update((source.root_state.0 as u64).to_le_bytes());
-        for record in &source.metadata {
-            seal.update(record.source_revision.to_le_bytes());
-            seal.update((record.source_state.0 as u64).to_le_bytes());
-            seal.update(record.source_line_offset.to_le_bytes());
-        }
+        let seal = view_seal_digest(
+            digest,
+            sequence,
+            stores.generation(),
+            source.root_state,
+            &source.metadata,
+        );
+        let cohort_cpu7_binding = source.cohort_cpu7.as_ref().map(|original| {
+            cohort_cpu7_view_binding(original.digest(), source.policy.digest(), digest, seal)
+        });
+        #[cfg(feature = "archive-origin-diagnostics")]
+        let archive_origins = {
+            let mut origins = Vec::new();
+            if origins
+                .try_reserve_exact(source.archive_origins.len())
+                .is_ok()
+            {
+                origins.extend(source.archive_origins.iter().map(|origin| {
+                    origin
+                        .as_ref()
+                        .filter(|origin| origin.matches_owner(stores))
+                        .cloned()
+                }));
+            }
+            origins
+        };
         Ok(ReviewView {
             index_owner: Arc::downgrade(&self.identity),
             sequence,
             root_state: source.root_state,
             generation: source.generation,
             policy: source.policy,
+            cohort_cpu7: source.cohort_cpu7.clone(),
+            cohort_cpu7_binding,
+            cpu7_raw_capture: None,
             records: source.records.clone(),
             metadata: source.metadata.clone(),
+            #[cfg(feature = "archive-origin-diagnostics")]
+            archive_origins,
             anchors: source.anchors.clone(),
+            source_snapshots: Arc::clone(&source.source_snapshots),
             query,
             bundles: source.bundles.clone(),
             tokens: tokens as u16,
             bucket,
             digest,
-            seal: seal.finalize().into(),
+            seal,
             pin: source.pin.reborrow(stores)?,
             consumed: AtomicBool::new(false),
         })
@@ -1116,7 +1650,81 @@ fn write_moves(hash: &mut Sha256, moves: &[BoardMove]) -> Result<(), ReviewError
     }
     Ok(())
 }
-fn snapshot_digest(snapshot: &PositionSnapshot) -> Result<[u8; 32], ReviewError> {
+/// Link an original index snapshot to this exact selected query view. This
+/// remains per-root metadata, not a substitute for trial or model authority.
+pub(in crate::pals) fn cohort_cpu7_view_binding(
+    original: [u8; 32],
+    policy: [u8; 32],
+    input: [u8; 32],
+    view_seal: [u8; 32],
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"rz-pals-cohort-cpu7-view-binding/1\0");
+    hash.update(original);
+    hash.update(policy);
+    hash.update(input);
+    hash.update(view_seal);
+    hash.finalize().into()
+}
+
+/// Hash original index records and observation handles independently from the
+/// selected model input. Observation/line payloads are not hashed here. Each
+/// root has its own evidence digest and identity; this is not historical proof.
+pub(in crate::pals) fn cohort_cpu7_original_digest(
+    bundle_id: u64,
+    generation: u64,
+    root: StateId,
+    root_snapshot: &PositionSnapshot,
+    anchor: &PositionSnapshot,
+    records: &[CohortCpu7OriginalRecord],
+    selected_len: usize,
+) -> Result<[u8; 32], ReviewError> {
+    fn optional(hash: &mut Sha256, value: Option<u64>) {
+        hash.update([u8::from(value.is_some())]);
+        hash.update(value.unwrap_or_default().to_le_bytes());
+    }
+    if selected_len == 0 || selected_len > records.len() || records.len() > 64 {
+        return Err(ReviewError::ViewCapacity);
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"rz-pals-cohort-cpu7-original-bundle/1\0");
+    hash.update(bundle_id.to_le_bytes());
+    hash.update(generation.to_le_bytes());
+    hash.update((root.0 as u64).to_le_bytes());
+    hash.update(snapshot_digest(root_snapshot)?);
+    hash.update(snapshot_digest(anchor)?);
+    hash.update((selected_len as u16).to_le_bytes());
+    hash.update((records.len() as u16).to_le_bytes());
+    for item in records {
+        let record = &item.record;
+        hash.update(record.revision.to_le_bytes());
+        optional(&mut hash, record.parent_revision);
+        optional(&mut hash, record.supersedes_revision);
+        hash.update((record.origin_state.0 as u64).to_le_bytes());
+        hash.update([
+            record.kind as u8,
+            u8::from(record.perspective == Color::Black),
+            u8::from(record.critical),
+        ]);
+        write_moves(&mut hash, &record.line)?;
+        hash.update([u8::from(record.value.is_some())]);
+        hash.update(record.value.unwrap_or_default().to_le_bytes());
+        hash.update(record.completed_depth.to_le_bytes());
+        hash.update([match record.score_scope {
+            None => 0,
+            Some(crate::cpu::CpuScoreScope::FrontierOnly) => 1,
+            Some(crate::cpu::CpuScoreScope::CompletedIteration) => 2,
+            Some(crate::cpu::CpuScoreScope::RulesTerminal) => 3,
+        }]);
+        optional(&mut hash, record.cpu_observation.map(|id| id.0 as u64));
+        optional(&mut hash, item.evidence.map(|id| id.0 as u64));
+    }
+    Ok(hash.finalize().into())
+}
+
+pub(in crate::pals) fn snapshot_digest(
+    snapshot: &PositionSnapshot,
+) -> Result<[u8; 32], ReviewError> {
     let trace = snapshot
         .uci_replay(MAX_UCI_REPLAY_PLIES)
         .map_err(|_| ReviewError::AnchorMismatch)?;
@@ -1129,6 +1737,59 @@ fn snapshot_digest(snapshot: &PositionSnapshot) -> Result<[u8; 32], ReviewError>
     hash.update(snapshot.to_fen().as_bytes());
     Ok(hash.finalize().into())
 }
+
+/// 같은 입력의 별도 제출을 구별하는 기존 seal framing이다. 현재 owner나 pin은
+/// 발급하지 않으며 live view와 historical metadata가 같은 계산을 사용한다.
+fn view_seal_digest(
+    input: [u8; 32],
+    sequence: u64,
+    generation: u64,
+    root: StateId,
+    metadata: &[ReviewRecordMetadata],
+) -> [u8; 32] {
+    let mut seal = Sha256::new();
+    seal.update(b"rz-pals-review-view-seal/1\0");
+    seal.update(input);
+    seal.update(sequence.to_le_bytes());
+    seal.update(generation.to_le_bytes());
+    seal.update((root.0 as u64).to_le_bytes());
+    for record in metadata {
+        seal.update(record.source_revision.to_le_bytes());
+        seal.update((record.source_state.0 as u64).to_le_bytes());
+        seal.update(record.source_line_offset.to_le_bytes());
+    }
+    seal.finalize().into()
+}
+
+fn record_scope_digest(
+    anchors: &[ReviewAnchor],
+    records: &[RoleRecord],
+    metadata: &[ReviewRecordMetadata],
+    policy: ReviewSelectionPolicy,
+) -> Result<[u8; 32], ReviewError> {
+    let query = ReviewQueryInput {
+        purpose: RoleQueryPurpose::ProposePolicy,
+        prefix: Vec::new(),
+        proposal: Vec::new(),
+        counterexample: None,
+        legal: Vec::new(),
+        divergences: Vec::new(),
+    };
+    let input = input_digest(
+        anchors,
+        records,
+        metadata,
+        &query,
+        policy,
+        records.iter().map(|record| record.line.len() as u16).sum(),
+        256,
+    )?;
+    let mut hash = Sha256::new();
+    hash.update(b"rz-pals-frozen-public-review-scope/1\0");
+    hash.update(input);
+    Ok(hash.finalize().into())
+}
+
 fn input_digest(
     anchors: &[ReviewAnchor],
     records: &[RoleRecord],
@@ -1247,6 +1908,50 @@ mod tests {
         }
     }
 
+    // Typed fixture evidence, not a claim that a physical CPU worker ran.
+    fn cpu_fixture_observation(
+        stores: &mut PalsStores,
+        state: StateId,
+        sequence: u64,
+    ) -> ObservationId {
+        use super::super::store::{BoundKind, Observation, RawScore};
+        stores
+            .observations
+            .append(Observation {
+                state,
+                line: None,
+                source: sequence,
+                epoch: 1,
+                value_identity: Some(crate::cpu_value::CpuValueIdentity {
+                    semantics: crate::cpu::BOOTSTRAP_SCORE_VERSION.into(),
+                    weights_sha256: None,
+                    training: crate::cpu_value::CpuTrainingState::Bootstrap,
+                }),
+                checker_identity: None,
+                checker_work: None,
+                external_report: None,
+                model_value_identity: None,
+                model_value_input: None,
+                cpu_condition: Some("cpu7-fixture-conditions".into()),
+                cpu_pv: None,
+                scope: EvidenceScope::DepthLimited {
+                    depth: 1,
+                    profile: 1,
+                    condition: 1,
+                },
+                score: RawScore::Cpu {
+                    value: 0,
+                    perspective: Color::White,
+                    bound: BoundKind::ExactWithinSearch,
+                },
+                budget: 1,
+                kind: ObservationKind::CpuAnalysis,
+                supersedes: None,
+                execution: None,
+            })
+            .unwrap()
+    }
+
     #[test]
     fn selected_bundle_keeps_parent_supersedes_and_query_duplicates_are_charged() {
         let (stores, state) = stores(&Position::startpos());
@@ -1292,6 +1997,737 @@ mod tests {
     }
 
     #[test]
+    fn cohort_cpu_prefix_requires_seven_and_preserves_later_observations() {
+        let (mut stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::default();
+        let p = record(state, 1, RecordKind::Proposal, "e2e4 e7e5", None);
+        let c = record(
+            state,
+            2,
+            RecordKind::Counterexample,
+            "e2e4 e7e5 g1f3",
+            Some(1),
+        );
+        let bundle = index.publish(&stores, &p, None).unwrap();
+        index.publish(&stores, &c, None).unwrap();
+        for revision in 3..=8 {
+            let mut cpu = record(
+                state,
+                revision,
+                RecordKind::CpuVerification,
+                "e2e4 e7e5",
+                Some(if revision == 3 { 1 } else { revision - 1 }),
+            );
+            cpu.supersedes_revision = (revision > 3).then_some(revision - 1);
+            cpu.cpu_observation = Some(cpu_fixture_observation(&mut stores, state, revision));
+            index.publish(&stores, &cpu, None).unwrap();
+        }
+        let policy = ReviewSelectionPolicy {
+            required_bundle: Some(bundle),
+            mode: ReviewAnchorMode::AnchoredCompact,
+            ..ReviewSelectionPolicy::default()
+        };
+        assert!(matches!(
+            index.select_cohort_cpu7(&stores, state, empty_query(), policy),
+            Err(ReviewError::ViewCapacity)
+        ));
+        let mut seventh = record(state, 9, RecordKind::CpuVerification, "e2e4 e7e5", Some(8));
+        seventh.supersedes_revision = Some(8);
+        seventh.cpu_observation = Some(cpu_fixture_observation(&mut stores, state, 9));
+        index.publish(&stores, &seventh, None).unwrap();
+        let limited = ReviewSelectionPolicy {
+            max_records: 8,
+            ..policy
+        };
+        assert!(!index.cohort_cpu7_ready(&stores, limited));
+        assert!(matches!(
+            index.select_cohort_cpu7(&stores, state, empty_query(), limited),
+            Err(ReviewError::ViewCapacity)
+        ));
+        let legacy = ReviewSelectionPolicy {
+            mode: ReviewAnchorMode::CurrentRootOnly,
+            ..policy
+        };
+        assert!(!index.cohort_cpu7_ready(&stores, legacy));
+        assert!(matches!(
+            index.select_cohort_cpu7(&stores, state, empty_query(), legacy),
+            Err(ReviewError::InvalidPolicy)
+        ));
+        let (_, missing_control) = index
+            .select_cohort_cpu7_with_raw_capture(&stores, state, empty_query(), policy, None)
+            .unwrap();
+        assert!(matches!(
+            missing_control,
+            Err(cpu7_capture::CaptureUnavailable::MissingOriginalControl)
+        ));
+        let canceled = AtomicBool::new(false);
+        let mut control = cpu7_capture::CaptureControl {
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+            canceled: &canceled,
+            limits: cpu7_capture::CaptureLimits {
+                max_observations: 7,
+                max_line_chunks: 0,
+                max_states: 1,
+                max_owned_bytes: 1 << 16,
+                max_retained_history_bytes: 1 << 20,
+            },
+        };
+        let (captured_view, raw) = index
+            .select_cohort_cpu7_with_raw_capture(
+                &stores,
+                state,
+                empty_query(),
+                policy,
+                Some(&control),
+            )
+            .unwrap();
+        let raw = raw.unwrap();
+        assert_eq!(
+            raw.view_binding(),
+            captured_view.cohort_cpu7_binding().unwrap()
+        );
+        assert_eq!(raw.original_bundle().selected_len(), 9);
+        assert_eq!(raw.states().len(), 1);
+        assert!(raw.lines().is_empty());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(raw.observations_json())
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        // A test scope exercises the reservation mechanics; it is not an
+        // admission or a claim about the UCI session owner.
+        struct DiagnosticTestScope;
+        impl cpu7_capture::CaptureScope for DiagnosticTestScope {
+            fn check_scope(&self) -> Result<(), cpu7_capture::CaptureUnavailable> {
+                Ok(())
+            }
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let grant = cpu7_capture::RootCaptureGrant::unverified_diagnostic(
+            Arc::clone(&cancel),
+            deadline,
+            deadline,
+            Arc::new(DiagnosticTestScope),
+        )
+        .with_diagnostic_limits(control.limits, std::time::Duration::from_secs(10));
+        let permit = grant.control(Some(&cancel), deadline).unwrap();
+        let guarded =
+            cpu7_capture::capture_selected_cpu_raw_permitted(&captured_view, &stores, permit)
+                .unwrap();
+        assert_eq!(
+            guarded.view_binding(),
+            captured_view.cohort_cpu7_binding().unwrap()
+        );
+        assert!(guarded.original_bundle_projection().is_none());
+        assert!(matches!(
+            grant.control(Some(&cancel), deadline),
+            Err(cpu7_capture::CaptureUnavailable::CaptureBusy)
+        ));
+        drop(guarded);
+        drop(grant.control(Some(&cancel), deadline).unwrap());
+
+        let mut projected_limits = control.limits;
+        projected_limits.max_observations = 64;
+        projected_limits.max_line_chunks = 64;
+        projected_limits.max_states = 16;
+        projected_limits.max_owned_bytes = 1 << 20;
+        let projection_grant = cpu7_capture::RootCaptureGrant::unverified_diagnostic(
+            Arc::clone(&cancel),
+            deadline,
+            deadline,
+            Arc::new(DiagnosticTestScope),
+        )
+        .with_diagnostic_limits(projected_limits, std::time::Duration::from_secs(10))
+        .with_original_bundle_projection(cpu7_capture::BundleProjectionLimits {
+            max_records: 128,
+            max_serialized_bytes: 1 << 20,
+        });
+        let projected = cpu7_capture::capture_selected_cpu_raw_permitted(
+            &captured_view,
+            &stores,
+            projection_grant.control(Some(&cancel), deadline).unwrap(),
+        )
+        .unwrap();
+        let projection = projected.original_bundle_projection().unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(projection.bytes()).unwrap();
+        assert_eq!(value["schema"], "rz-pals-cpu7-view-evidence/1");
+        assert_eq!(value["selected_len"], 9);
+        drop(projected);
+        assert!(matches!(
+            projection_grant.control(Some(&cancel), deadline),
+            Err(cpu7_capture::CaptureUnavailable::CaptureBusy)
+        ));
+        drop(projection);
+        drop(projection_grant.control(Some(&cancel), deadline).unwrap());
+
+        // A separate one-byte projection budget cannot hold the JSON object;
+        // the already-complete selected-observation capture remains valid.
+        let limited_projection_grant = cpu7_capture::RootCaptureGrant::unverified_diagnostic(
+            Arc::clone(&cancel),
+            deadline,
+            deadline,
+            Arc::new(DiagnosticTestScope),
+        )
+        .with_diagnostic_limits(projected_limits, std::time::Duration::from_secs(10))
+        .with_original_bundle_projection(cpu7_capture::BundleProjectionLimits {
+            max_records: 128,
+            max_serialized_bytes: 1,
+        });
+        let raw_with_failed_projection = cpu7_capture::capture_selected_cpu_raw_permitted(
+            &captured_view,
+            &stores,
+            limited_projection_grant
+                .control(Some(&cancel), deadline)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            raw_with_failed_projection.original_bundle_projection(),
+            Some(Err(_))
+        ));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                raw_with_failed_projection.observations_json()
+            )
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+            7
+        );
+        drop(raw_with_failed_projection);
+        drop(
+            limited_projection_grant
+                .control(Some(&cancel), deadline)
+                .unwrap(),
+        );
+
+        // Failure must release the same root reservation, not poison it.
+        let mut tiny = control.limits;
+        tiny.max_owned_bytes = 1;
+        let small_grant = cpu7_capture::RootCaptureGrant::unverified_diagnostic(
+            Arc::clone(&cancel),
+            deadline,
+            deadline,
+            Arc::new(DiagnosticTestScope),
+        )
+        .with_diagnostic_limits(tiny, std::time::Duration::from_secs(10));
+        let permit = small_grant.control(Some(&cancel), deadline).unwrap();
+        assert!(matches!(
+            cpu7_capture::capture_selected_cpu_raw_permitted(&captured_view, &stores, permit),
+            Err(cpu7_capture::CaptureUnavailable::Capacity)
+        ));
+        drop(small_grant.control(Some(&cancel), deadline).unwrap());
+        control.limits.max_owned_bytes = 1;
+        let (still_valid, exhausted) = index
+            .select_cohort_cpu7_with_raw_capture(
+                &stores,
+                state,
+                empty_query(),
+                policy,
+                Some(&control),
+            )
+            .unwrap();
+        assert!(still_valid.is_cohort_cpu7());
+        assert!(matches!(
+            exhausted,
+            Err(cpu7_capture::CaptureUnavailable::Capacity)
+        ));
+        canceled.store(true, Ordering::Release);
+        let (still_valid, interrupted) = index
+            .select_cohort_cpu7_with_raw_capture(
+                &stores,
+                state,
+                empty_query(),
+                policy,
+                Some(&control),
+            )
+            .unwrap();
+        assert!(still_valid.is_cohort_cpu7());
+        assert!(matches!(
+            interrupted,
+            Err(cpu7_capture::CaptureUnavailable::Canceled)
+        ));
+        canceled.store(false, Ordering::Release);
+        control.limits.max_owned_bytes = 1 << 16;
+        control.limits.max_retained_history_bytes = 1;
+        let (still_valid, history_limit) = index
+            .select_cohort_cpu7_with_raw_capture(
+                &stores,
+                state,
+                empty_query(),
+                policy,
+                Some(&control),
+            )
+            .unwrap();
+        assert!(still_valid.is_cohort_cpu7());
+        assert!(matches!(
+            history_limit,
+            Err(cpu7_capture::CaptureUnavailable::Capacity)
+        ));
+        control.deadline = std::time::Instant::now();
+        let (still_valid, expired) = index
+            .select_cohort_cpu7_with_raw_capture(
+                &stores,
+                state,
+                empty_query(),
+                policy,
+                Some(&control),
+            )
+            .unwrap();
+        assert!(still_valid.is_cohort_cpu7());
+        assert!(matches!(
+            expired,
+            Err(cpu7_capture::CaptureUnavailable::Deadline)
+        ));
+        let first = index
+            .select_cohort_cpu7(&stores, state, empty_query(), policy)
+            .unwrap();
+        assert_eq!(first.records().len(), 9);
+        assert!(first.is_cohort_cpu7());
+        let first_evidence = first
+            .capture_cohort_cpu7_evidence(&stores, 128, 1 << 20, &mut || Ok(()))
+            .unwrap();
+        let captured: serde_json::Value = serde_json::from_slice(&first_evidence).unwrap();
+        assert_eq!(captured["schema"], "rz-pals-cpu7-view-evidence/1");
+        assert_eq!(captured["records"].as_array().unwrap().len(), 9);
+        assert_eq!(captured["selected_len"], 9);
+        assert_eq!(
+            captured["store"]["observations"].as_array().unwrap().len(),
+            7
+        );
+        let standalone = first
+            .project_cohort_cpu7_store(&stores, 128, 1 << 20, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(
+            captured["store"],
+            serde_json::from_slice::<serde_json::Value>(&standalone).unwrap()
+        );
+        assert_eq!(
+            first.capture_cohort_cpu7_evidence(&stores, 128, 1, &mut || Ok(())),
+            Err(StoreError::ArchiveByteBudget)
+        );
+        assert_eq!(
+            first.capture_cohort_cpu7_evidence(&stores, 128, 1 << 20, &mut || Err(
+                StoreError::CancelledConsumer
+            )),
+            Err(StoreError::CancelledConsumer)
+        );
+        assert_eq!(
+            first.cohort_cpu7_original_bundle().unwrap().records().len(),
+            9
+        );
+        assert_ne!(first.selection_policy().digest(), policy.digest());
+        // Keep the actual pinned source while later observations arrive.
+        let first_scope = first.record_scope_digest();
+        for extra in 10..=12 {
+            let mut later = record(
+                state,
+                extra,
+                RecordKind::CpuVerification,
+                "e2e4 e7e5",
+                Some(extra - 1),
+            );
+            later.supersedes_revision = Some(extra - 1);
+            later.cpu_observation = Some(cpu_fixture_observation(&mut stores, state, extra));
+            index.publish(&stores, &later, None).unwrap();
+        }
+        let again = index
+            .select_cohort_cpu7(&stores, state, empty_query(), policy)
+            .unwrap();
+        assert_eq!(again.record_scope_digest(), first_scope);
+        assert_eq!(again.records_metadata()[8].supersedes, Some(7));
+        let original = again.cohort_cpu7_original_bundle().unwrap();
+        assert_eq!(original.records().len(), 12);
+        assert_eq!(original.selected_len(), 9);
+        let evidence = again
+            .capture_cohort_cpu7_evidence(&stores, 128, 1 << 20, &mut || Ok(()))
+            .unwrap();
+        let captured: serde_json::Value = serde_json::from_slice(&evidence).unwrap();
+        assert_eq!(captured["records"].as_array().unwrap().len(), 12);
+        assert_eq!(
+            captured["store"]["observations"].as_array().unwrap().len(),
+            10
+        );
+        assert_eq!(
+            original.records()[8].record().revision,
+            again.records_metadata()[8].source_revision
+        );
+        assert_eq!(
+            first.cohort_cpu7_original_bundle().unwrap().records().len(),
+            9
+        );
+        assert_ne!(
+            original.digest(),
+            first.cohort_cpu7_original_bundle().unwrap().digest()
+        );
+        assert_ne!(again.cohort_cpu7_binding(), first.cohort_cpu7_binding());
+        let ordinary = index.select(&stores, state, empty_query(), policy).unwrap();
+        assert_eq!(ordinary.records().len(), 12);
+        assert!(!ordinary.is_cohort_cpu7());
+        assert!(matches!(
+            ordinary.capture_cohort_cpu7_evidence(&stores, 128, 1 << 20, &mut || Ok(())),
+            Err(StoreError::InvalidConditions(_))
+        ));
+    }
+
+    #[test]
+    fn cpu7_raw_capture_preserves_marker_model_dependencies_and_non_cpu_record_cpu() {
+        use super::super::store::{Observation, ObservationKind, RawScore};
+        let (mut stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::default();
+        let root_line = stores.lines.root(state).unwrap();
+        let p_line = stores.lines.append(root_line, &line("e2e4 e7e5")).unwrap();
+        let c_line = stores
+            .lines
+            .append(root_line, &line("e2e4 e7e5 g1f3"))
+            .unwrap();
+        let r_line = stores
+            .lines
+            .append(root_line, &line("e2e4 e7e5 b1c3"))
+            .unwrap();
+        let extra_cpu = cpu_fixture_observation(&mut stores, state, 40);
+        let marker = Observation {
+            state,
+            line: Some(p_line),
+            source: 2,
+            epoch: 0,
+            value_identity: None,
+            checker_identity: None,
+            checker_work: None,
+            external_report: None,
+            model_value_identity: None,
+            model_value_input: None,
+            cpu_condition: None,
+            cpu_pv: None,
+            scope: EvidenceScope::Model {
+                model: 2,
+                encoding: 3,
+                input: 4,
+            },
+            score: RawScore::Unknown,
+            budget: 0,
+            kind: ObservationKind::Proposal,
+            supersedes: None,
+            execution: None,
+        };
+        let marker_id = stores.observations.append(marker.clone()).unwrap();
+        let identity = crate::pals::value::ModelValueIdentity {
+            semantics: crate::pals::value::MODEL_WDL_VALUE_SEMANTICS.into(),
+            model: "fixture-model".into(),
+            encoding: "fixture-encoding".into(),
+            precision: "fp32".into(),
+            model_epoch: [7; 32],
+        };
+        let mut position = Position::startpos();
+        position
+            .make_move(BoardMove::from_uci("e2e4").unwrap())
+            .unwrap();
+        let repaired_state = stores.states.insert(position.snapshot()).unwrap();
+        position
+            .make_move(BoardMove::from_uci("e7e5").unwrap())
+            .unwrap();
+        let counter_state = stores.states.insert(position.snapshot()).unwrap();
+        let mut repaired = marker.clone();
+        repaired.state = repaired_state;
+        repaired.line = None;
+        repaired.model_value_identity = Some(identity.clone());
+        repaired.model_value_input = Some([8; 32]);
+        repaired.score = RawScore::ContextWdl {
+            win: 0.1,
+            draw: 0.2,
+            loss: 0.7,
+            perspective: Color::Black,
+            context_revision: 43,
+        };
+        let repaired_id = stores.observations.append(repaired).unwrap();
+        let mut counter = marker.clone();
+        counter.state = counter_state;
+        counter.line = None;
+        counter.model_value_identity = Some(identity);
+        counter.model_value_input = Some([9; 32]);
+        counter.score = RawScore::ContextWdl {
+            win: 0.2,
+            draw: 0.3,
+            loss: 0.5,
+            perspective: Color::White,
+            context_revision: 43,
+        };
+        let counter_id = stores.observations.append(counter).unwrap();
+        let mut conditional = marker.clone();
+        conditional.kind = ObservationKind::Refutation;
+        conditional.line = Some(c_line);
+        conditional.supersedes = Some(marker_id);
+        conditional.score = RawScore::ConditionalWdl {
+            expectation: 0.2 - 0.5,
+            perspective: Color::White,
+            repaired: repaired_id,
+            counter: counter_id,
+            context_revision: 43,
+        };
+        let conditional_id = stores.observations.append(conditional).unwrap();
+        let mut repair = marker.clone();
+        repair.kind = ObservationKind::Repair;
+        repair.line = Some(r_line);
+        repair.supersedes = Some(conditional_id);
+        repair.score = RawScore::ConditionalRepairWdl {
+            expectation: 0.7 - 0.1,
+            perspective: Color::White,
+            before: counter_id,
+            after: repaired_id,
+            context_revision: 43,
+        };
+        let repair_id = stores.observations.append(repair).unwrap();
+        let mut p = record(state, 1, RecordKind::Proposal, "e2e4 e7e5", None);
+        p.cpu_observation = Some(extra_cpu);
+        let bundle = index.publish(&stores, &p, Some(marker_id)).unwrap();
+        let c = record(
+            state,
+            2,
+            RecordKind::Counterexample,
+            "e2e4 e7e5 g1f3",
+            Some(1),
+        );
+        index.publish(&stores, &c, Some(conditional_id)).unwrap();
+        let mut r = record(state, 3, RecordKind::Repair, "e2e4 e7e5 b1c3", Some(2));
+        r.supersedes_revision = Some(2);
+        index.publish(&stores, &r, Some(repair_id)).unwrap();
+        let mut expected = vec![
+            extra_cpu,
+            marker_id,
+            conditional_id,
+            repair_id,
+            repaired_id,
+            counter_id,
+        ];
+        for revision in 4..=10 {
+            let mut cpu = record(
+                state,
+                revision,
+                RecordKind::CpuVerification,
+                "e2e4 e7e5",
+                Some(if revision == 4 { 1 } else { revision - 1 }),
+            );
+            cpu.supersedes_revision = (revision > 4).then_some(revision - 1);
+            let id = cpu_fixture_observation(&mut stores, state, revision);
+            cpu.cpu_observation = Some(id);
+            expected.push(id);
+            index.publish(&stores, &cpu, None).unwrap();
+        }
+        let policy = ReviewSelectionPolicy {
+            required_bundle: Some(bundle),
+            mode: ReviewAnchorMode::AnchoredCompact,
+            ..ReviewSelectionPolicy::default()
+        };
+        let canceled = AtomicBool::new(false);
+        let mut control = cpu7_capture::CaptureControl {
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+            canceled: &canceled,
+            limits: cpu7_capture::CaptureLimits {
+                max_observations: 32,
+                max_line_chunks: 16,
+                max_states: 8,
+                max_owned_bytes: 1 << 17,
+                max_retained_history_bytes: 1 << 20,
+            },
+        };
+        let (_, result) = index
+            .select_cohort_cpu7_with_raw_capture(
+                &stores,
+                state,
+                empty_query(),
+                policy,
+                Some(&control),
+            )
+            .unwrap();
+        let capture = result.unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(capture.observations_json()).unwrap();
+        let rows = raw.as_array().unwrap();
+        let actual: std::collections::BTreeSet<_> = rows
+            .iter()
+            .map(|row| row["id"].as_u64().unwrap() as usize)
+            .collect();
+        assert_eq!(actual, expected.iter().map(|id| id.0).collect());
+        let marker_wire = rows.iter().find(|row| row["id"] == marker_id.0).unwrap();
+        assert_eq!(marker_wire["score"]["kind"], "unknown");
+        assert!(marker_wire["model_value_identity"].is_null());
+        assert!(marker_wire["model_value_input"].is_null());
+        let conditional_wire = rows
+            .iter()
+            .find(|row| row["id"] == conditional_id.0)
+            .unwrap();
+        assert_eq!(conditional_wire["score"]["kind"], "conditional_wdl");
+        assert_eq!(conditional_wire["score"]["repaired"], repaired_id.0);
+        assert_eq!(conditional_wire["score"]["counter"], counter_id.0);
+        assert_eq!(conditional_wire["supersedes"], marker_id.0);
+        let repair_wire = rows.iter().find(|row| row["id"] == repair_id.0).unwrap();
+        assert_eq!(repair_wire["score"]["kind"], "conditional_repair_wdl");
+        assert_eq!(repair_wire["score"]["before"], counter_id.0);
+        assert_eq!(repair_wire["score"]["after"], repaired_id.0);
+        assert_eq!(repair_wire["supersedes"], conditional_id.0);
+        assert!(
+            rows.iter().find(|row| row["id"] == repaired_id.0).unwrap()["model_value_identity"]
+                .is_object()
+        );
+        assert_eq!(capture.states().len(), 3);
+        assert_eq!(capture.lines().len(), 4);
+        control.limits.max_observations = 7;
+        let (view, limited) = index
+            .select_cohort_cpu7_with_raw_capture(
+                &stores,
+                state,
+                empty_query(),
+                policy,
+                Some(&control),
+            )
+            .unwrap();
+        assert!(view.is_cohort_cpu7());
+        assert!(matches!(
+            limited,
+            Err(cpu7_capture::CaptureUnavailable::Capacity)
+        ));
+    }
+
+    #[test]
+    fn cohort_cpu_prefix_keeps_required_repair_and_excludes_other_bundle() {
+        let (mut stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::default();
+        let proposal = record(state, 1, RecordKind::Proposal, "e2e4 e7e5", None);
+        let bundle = index.publish(&stores, &proposal, None).unwrap();
+        index
+            .publish(
+                &stores,
+                &record(
+                    state,
+                    2,
+                    RecordKind::Counterexample,
+                    "e2e4 e7e5 g1f3",
+                    Some(1),
+                ),
+                None,
+            )
+            .unwrap();
+        index
+            .publish(
+                &stores,
+                &record(state, 3, RecordKind::Repair, "e2e4 e7e5 b1c3", Some(2)),
+                None,
+            )
+            .unwrap();
+        for revision in 4..=10 {
+            let mut cpu = record(
+                state,
+                revision,
+                RecordKind::CpuVerification,
+                "e2e4 e7e5",
+                Some(revision - 1),
+            );
+            if revision > 4 {
+                cpu.supersedes_revision = Some(revision - 1);
+            }
+            cpu.cpu_observation = Some(cpu_fixture_observation(&mut stores, state, revision));
+            index.publish(&stores, &cpu, None).unwrap();
+        }
+        index
+            .publish(
+                &stores,
+                &record(state, 11, RecordKind::Proposal, "d2d4", None),
+                None,
+            )
+            .unwrap();
+        let policy = ReviewSelectionPolicy {
+            required_bundle: Some(bundle),
+            mode: ReviewAnchorMode::AnchoredCompact,
+            ..ReviewSelectionPolicy::default()
+        };
+        let view = index
+            .select_cohort_cpu7(&stores, state, empty_query(), policy)
+            .unwrap();
+        assert_eq!(view.records().len(), 10);
+        assert_eq!(view.selection_policy().max_records, 10);
+        assert_eq!(view.records()[2].kind, RecordKind::Repair);
+        assert_eq!(view.records_metadata()[2].parent, Some(1));
+        assert!(
+            view.records()
+                .iter()
+                .all(|record| record.line.first() == Some(&BoardMove::from_uci("e2e4").unwrap()))
+        );
+    }
+
+    #[test]
+    fn cohort_cpu_prefix_rejects_kind_without_original_observation() {
+        let (stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::default();
+        let proposal = record(state, 1, RecordKind::Proposal, "e2e4", None);
+        let bundle = index.publish(&stores, &proposal, None).unwrap();
+        for revision in 2..=8 {
+            let cpu = record(
+                state,
+                revision,
+                RecordKind::CpuVerification,
+                "e2e4",
+                Some(revision - 1),
+            );
+            index.publish(&stores, &cpu, None).unwrap();
+        }
+        let policy = ReviewSelectionPolicy {
+            required_bundle: Some(bundle),
+            mode: ReviewAnchorMode::AnchoredCompact,
+            ..ReviewSelectionPolicy::default()
+        };
+        assert!(!index.cohort_cpu7_ready(&stores, policy));
+        assert!(matches!(
+            index.select_cohort_cpu7(&stores, state, empty_query(), policy),
+            Err(ReviewError::ViewCapacity)
+        ));
+    }
+
+    #[test]
+    fn cohort_cpu_prefix_does_not_count_rules_terminal_as_cpu_search() {
+        let root = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 w - - 0 1").unwrap();
+        let (mut stores, state) = stores(&root);
+        let mut terminal = root;
+        terminal.make_uci("f7g7").unwrap();
+        let exact = stores.append_rules_terminal(&terminal, 1, 1).unwrap();
+        let mut index = ReviewContextIndex::default();
+        let bundle = index
+            .publish(
+                &stores,
+                &record(state, 1, RecordKind::Proposal, "f7g7", None),
+                None,
+            )
+            .unwrap();
+        let mut first = record(state, 2, RecordKind::CpuVerification, "f7g7", Some(1));
+        first.cpu_observation = Some(exact);
+        index.publish(&stores, &first, None).unwrap();
+        for revision in 3..=8 {
+            let mut cpu = record(
+                state,
+                revision,
+                RecordKind::CpuVerification,
+                "f7g7",
+                Some(revision - 1),
+            );
+            cpu.cpu_observation = Some(cpu_fixture_observation(&mut stores, state, revision));
+            index.publish(&stores, &cpu, None).unwrap();
+        }
+        let policy = ReviewSelectionPolicy {
+            required_bundle: Some(bundle),
+            mode: ReviewAnchorMode::AnchoredCompact,
+            ..ReviewSelectionPolicy::default()
+        };
+        assert!(!index.cohort_cpu7_ready(&stores, policy));
+        assert!(matches!(
+            index.select_cohort_cpu7(&stores, state, empty_query(), policy),
+            Err(ReviewError::ViewCapacity)
+        ));
+    }
+
+    #[test]
     fn actual_history_is_rebase_proof_not_review_tokens() {
         let start = Position::startpos();
         let (mut stores, origin) = stores(&start);
@@ -1319,6 +2755,16 @@ mod tests {
         assert_eq!(view.records()[0].line, line("g1f3"));
         assert_eq!(view.token_count(), 1);
         assert_eq!(view.records_metadata()[0].source_line_offset, 2);
+        assert_eq!(view.source_snapshots().len(), view.records_metadata().len());
+        assert!(
+            stores
+                .states
+                .get(origin)
+                .unwrap()
+                .weak_position_identity()
+                .matches(&view.source_snapshots()[0])
+        );
+        assert!(!view.source_snapshots()[0].same_state(&actual.snapshot()));
         assert_eq!(
             view.records_metadata()[0].original_first_move,
             Some(BoardMove::from_uci("e2e4").unwrap())
@@ -1374,6 +2820,13 @@ mod tests {
         assert_eq!(view.anchors().len(), 2);
         assert_eq!(view.records_metadata()[0].anchor, 1);
         assert!(view.anchors()[1].snapshot.same_state(&actual.snapshot()));
+        assert_eq!(view.source_snapshots().len(), 1);
+        assert!(
+            actual
+                .snapshot()
+                .weak_position_identity()
+                .matches(&view.source_snapshots()[0])
+        );
     }
 
     #[test]
@@ -1395,6 +2848,60 @@ mod tests {
             checked_rebase_offset(&anchor, &other.snapshot(), &line("e2e4 e7e5")).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn frozen_queries_share_original_source_array_without_extra_source_pin_or_digest_features() {
+        let (stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::default();
+        index
+            .publish(
+                &stores,
+                &record(state, 1, RecordKind::Proposal, "e2e4 e7e5", None),
+                None,
+            )
+            .unwrap();
+        let first = index
+            .select(
+                &stores,
+                state,
+                empty_query(),
+                ReviewSelectionPolicy::default(),
+            )
+            .unwrap();
+        let second = index.fork_query(&stores, &first, empty_query()).unwrap();
+        assert!(Arc::ptr_eq(
+            first.source_snapshots(),
+            second.source_snapshots()
+        ));
+        assert_eq!(first.digest(), second.digest());
+        assert_eq!(first.record_scope_digest(), second.record_scope_digest());
+        assert_ne!(first.seal_digest(), second.seal_digest());
+        assert_eq!(stores.review_pin_count().unwrap(), 2);
+        let retained = Arc::clone(first.source_snapshots());
+        let history = retained[0].weak_position_identity();
+        drop(first);
+        drop(second);
+        assert_eq!(stores.review_pin_count().unwrap(), 0);
+        assert!(history.matches(&retained[0]));
+        assert!(retained[0].same_state(stores.states.get(state).unwrap()));
+    }
+
+    #[test]
+    fn empty_selected_view_retains_no_source_rows() {
+        let (stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::default();
+        let view = index
+            .select(
+                &stores,
+                state,
+                empty_query(),
+                ReviewSelectionPolicy::default(),
+            )
+            .unwrap();
+        assert!(view.records_metadata().is_empty());
+        assert!(view.source_snapshots().is_empty());
+        assert_eq!(stores.review_pin_count().unwrap(), 1);
     }
 
     #[test]
@@ -1611,6 +3118,100 @@ mod tests {
             .unwrap();
         assert_eq!(view.length_bucket(), 16);
         assert_eq!(view.token_count(), 9);
+    }
+
+    #[test]
+    fn full_bundle_keeps_original_records_and_live_view_without_widening_index_errors() {
+        let (stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::new(ReviewIndexLimits {
+            active_bundles: 2,
+            records_per_bundle: 4,
+        })
+        .unwrap();
+        let bundle = index
+            .publish(
+                &stores,
+                &record(state, 1, RecordKind::Proposal, "e2e4", None),
+                None,
+            )
+            .unwrap();
+        for revision in 2..=4 {
+            index
+                .publish(
+                    &stores,
+                    &record(
+                        state,
+                        revision,
+                        RecordKind::Counterexample,
+                        "e2e4 e7e5",
+                        Some(revision - 1),
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+        let view = index
+            .select(
+                &stores,
+                state,
+                empty_query(),
+                ReviewSelectionPolicy::default(),
+            )
+            .unwrap();
+        assert_eq!(view.records().len(), 4);
+        assert_eq!(stores.review_pin_count().unwrap(), 1);
+        assert_eq!(
+            index.publish(
+                &stores,
+                &record(state, 5, RecordKind::Repair, "e2e4 e7e5 g1f3", Some(4)),
+                None
+            ),
+            Err(ReviewError::BundleRecordCapacity),
+        );
+        assert_eq!(index.bundle(bundle).unwrap().revisions(), &[1, 2, 3, 4]);
+        assert_eq!(index.indexed_record_count(), 4);
+        assert!(!index.contains_revision(5));
+        assert!(view.validates(&stores));
+        let pins = index.archive_projection_pins(&stores).unwrap();
+        assert!(pins.states.contains(&state));
+        assert_eq!(index.bundle(bundle).unwrap().protected_consumptions(), 2);
+        let (foreign, _) = self::stores(&Position::startpos());
+        assert_eq!(
+            index.archive_projection_pins(&foreign),
+            Err(ReviewError::OwnerMismatch)
+        );
+        assert_eq!(stores.review_pin_count().unwrap(), 1);
+        // A protected second bundle makes the separate active-bundle cap
+        // unreclaimable. It must retain the original general error class.
+        index
+            .publish(
+                &stores,
+                &record(state, 6, RecordKind::Counterexample, "d2d4 d7d5", None),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            index.publish(
+                &stores,
+                &record(state, 7, RecordKind::Proposal, "c2c4", None),
+                None
+            ),
+            Err(ReviewError::IndexCapacity),
+        );
+        assert_eq!(
+            index.publish(
+                &stores,
+                &record(state, 8, RecordKind::Repair, "e2e4 e7e5 g1f3", Some(99)),
+                None
+            ),
+            Err(ReviewError::MissingRelation(99)),
+        );
+        assert_eq!(index.bundle(bundle).unwrap().revisions(), &[1, 2, 3, 4]);
+        assert_eq!(index.indexed_record_count(), 5);
+        index.consume(&view, &stores).unwrap();
+        assert_eq!(index.bundle(bundle).unwrap().protected_consumptions(), 1);
+        drop(view);
+        assert_eq!(stores.review_pin_count().unwrap(), 0);
     }
 
     #[test]

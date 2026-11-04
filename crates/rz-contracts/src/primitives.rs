@@ -328,6 +328,12 @@ impl CancelToken {
     pub fn is_canceled(&self) -> bool {
         self.canceled.load(Ordering::Acquire)
     }
+
+    /// 원래 취소 권한의 동일 소유 여부만 대조한다. 같은 취소 상태나 숫자 ID를
+    /// 권한으로 취급하지 않으며 물리 완료·buffer 해제를 입증하지 않는다.
+    pub fn shares_cancellation_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.canceled, &other.canceled)
+    }
 }
 
 impl Default for CancelToken {
@@ -534,11 +540,16 @@ mod tests {
     fn cancellation_is_shared_and_debug_exposes_only_state() {
         let original = CancelToken::default();
         let subscriber = original.clone();
+        let unrelated = CancelToken::new();
+        assert!(original.shares_cancellation_with(&subscriber));
+        assert!(!original.shares_cancellation_with(&unrelated));
         assert!(!subscriber.is_canceled());
         assert_eq!(format!("{original:?}"), "CancelToken { canceled: false }");
         let worker = std::thread::spawn(move || subscriber.cancel());
         worker.join().unwrap();
         assert!(original.is_canceled());
+        unrelated.cancel();
+        assert!(!original.shares_cancellation_with(&unrelated));
         original.cancel();
         assert!(original.is_canceled());
         assert_eq!(format!("{original:?}"), "CancelToken { canceled: true }");

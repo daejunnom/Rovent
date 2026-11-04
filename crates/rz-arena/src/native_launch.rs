@@ -40,14 +40,40 @@ static NATIVE_ADMISSION_CLOSED: AtomicBool = AtomicBool::new(false);
 #[doc(hidden)]
 pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 'static {
     fn input_sha256(&self) -> &str;
+    /// Optional policy provenance for preparation failures. Legacy formats
+    /// omit this field entirely, retaining their original serialized bytes.
+    fn preparation_policy_envelope(&self) -> Option<NativePreparationPolicyEnvelope> {
+        None
+    }
     fn view(&self) -> NativePairView<'_>;
     fn declared_inputs(&self) -> Vec<&ArtifactRef>;
+    /// Additional explicitly declared executable inputs, beyond the runner,
+    /// match executor and engine executables. Existing profiles add none.
+    fn additional_executable_input(&self, _artifact: &ArtifactRef) -> bool {
+        false
+    }
     fn unique_bytes(&self) -> Result<u64, rz_experiments::ManifestError>;
     fn engine_view(
         &self,
         role: rz_experiments::NativeEngineRole,
     ) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError>;
     fn provider_name(&self) -> &'static str;
+    /// V6 declarations explicitly select the host runtime for each endpoint.
+    /// Historical declarations return `None` and retain their original
+    /// CPU/bundle semantics.  This declaration is not evidence of provider
+    /// readiness, child mappings, or physical GPU completion.
+    fn runtime_source_v6(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+    ) -> Option<&rz_experiments::NativeRuntimeSourceV6> {
+        None
+    }
+    /// A system CUDA endpoint may be admitted only when its launcher consumes
+    /// the explicit V6 configuration and verifies the child-owned receipt.
+    /// Merely supplying a runtime source does not enable this capability.
+    fn verifies_system_runtime_receipt_v6(&self, _role: rz_experiments::NativeEngineRole) -> bool {
+        false
+    }
     /// V4 has independently typed model/resolver/recheck/stack selections.
     /// Historical declarations retain their original 32-token codec limit.
     fn argument_limit(&self) -> usize {
@@ -187,6 +213,48 @@ impl<'a> NativeEngineView<'a> {
         Ok(&first.artifact)
     }
 }
+
+/// Check the explicit V6 selection before creating any private snapshot or
+/// child.  A caller may not turn a system-runtime registration into another
+/// copy of the registered system libraries.
+#[cfg(target_os = "linux")]
+fn validate_v6_runtime_snapshot_boundary(
+    runtime: &rz_experiments::NativeRuntimeSourceV6,
+    has_bundle: bool,
+    has_external_launcher: bool,
+    verifies_child_receipt: bool,
+    inputs: &[&ArtifactRef],
+) -> Result<(), ArenaError> {
+    runtime.validate()?;
+    if has_bundle {
+        return Err(ArenaError::Invalid(
+            "V6 runtime selection cannot inherit a CUDA bundle".into(),
+        ));
+    }
+    if let rz_experiments::NativeRuntimeSourceV6::SystemCuda(system) = runtime {
+        if system.platform != rz_experiments::SystemPlatformV6::Linux {
+            return Err(ArenaError::Invalid(
+                "V6 system CUDA platform differs from the Linux launcher".into(),
+            ));
+        }
+        if !has_external_launcher || !verifies_child_receipt {
+            return Err(ArenaError::Invalid(
+                "V6 system CUDA requires an explicit child receipt consumer".into(),
+            ));
+        }
+        if inputs.iter().any(|artifact| {
+            system
+                .libraries
+                .iter()
+                .any(|library| artifact.bytes == library.bytes && artifact.sha256 == library.sha256)
+        }) {
+            return Err(ArenaError::Invalid(
+                "V6 system runtime libraries cannot be snapshotted as native inputs".into(),
+            ));
+        }
+    }
+    Ok(())
+}
 #[doc(hidden)]
 pub struct NativePairView<'a> {
     pub pair_id: &'a str,
@@ -256,7 +324,7 @@ impl Drop for NativeAdmissionLease {
 }
 impl NativeAdmissionLease {
     #[cfg(target_os = "linux")]
-    fn acquire() -> Result<Self, ArenaError> {
+    pub(crate) fn acquire() -> Result<Self, ArenaError> {
         if NATIVE_ADMISSION_CLOSED.load(Ordering::Acquire) {
             return Err(ArenaError::Invalid(
                 "native integration admission is closed".into(),
@@ -294,8 +362,18 @@ pub struct NativeSnapshotReceipt {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct NativePreparationPolicyEnvelope {
+    pub domain: String,
+    pub policy: String,
+    pub base_launch_sha256: String,
+    pub execution_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct NativePreparationReceipt {
     pub receipt_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_envelope: Option<NativePreparationPolicyEnvelope>,
     pub execution_ready: bool,
     pub input_sha256: String,
     pub output_directory: String,
@@ -429,7 +507,7 @@ pub(crate) fn prepare_native_launch_for<S: NativeLaunchDeclaration>(
     output_root: &Path,
     output_directory: &str,
 ) -> Result<NativeLaunchOwner<S>, Box<NativePreparationFailure>> {
-    let mut receipt=NativePreparationReceipt{receipt_version:1,execution_ready:false,input_sha256:spec.input_sha256().into(),
+    let mut receipt=NativePreparationReceipt{receipt_version:1,policy_envelope:spec.preparation_policy_envelope(),execution_ready:false,input_sha256:spec.input_sha256().into(),
         output_directory:if safe_output_basename(output_directory){output_directory.into()}else{"rejected-basename".into()},
         attempt_created:false,attempted_snapshot_relative_paths:Vec::new(),completed_snapshots:Vec::new(),child_spawned:false,writers_closed:true,input_pins_required:false,original_error:String::new(),
         subsequent_file_owner:"caller retains exclusively owned outside-Git attempt; all writers are closed and no child was spawned, so input handles may be released; retained historical files are not a process-lifetime aggregate quota".into(),automatic_retry:false};
@@ -494,7 +572,7 @@ pub(crate) fn prepare_native_launch_for<S: NativeLaunchDeclaration>(
         }))
     }
 }
-fn safe_output_basename(name: &str) -> bool {
+pub(crate) fn safe_output_basename(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && !name.starts_with('.')
@@ -714,7 +792,7 @@ pub(crate) mod linux {
     // cap_std's directory capability may use O_PATH. That descriptor can pin
     // cwd/path authority, but Linux fchmod rejects it with EBADF. Open a real
     // readable directory descriptor relative to the same capability instead.
-    fn readable_directory_pin(directory: &Dir) -> Result<File, ArenaError> {
+    pub(crate) fn readable_directory_pin(directory: &Dir) -> Result<File, ArenaError> {
         let mut options = OpenOptions::new();
         options
             .read(true)
@@ -754,7 +832,7 @@ pub(crate) mod linux {
         }
         Ok(PathBuf::from(relative))
     }
-    fn snapshot_parents(
+    pub(crate) fn snapshot_parents(
         names: &[String],
         max_depth: usize,
     ) -> Result<std::collections::BTreeSet<PathBuf>, ArenaError> {
@@ -851,7 +929,7 @@ pub(crate) mod linux {
             .ok_or_else(|| ArenaError::Integrity("native input has no direct copy name".into()))?;
         Ok((directory, name))
     }
-    fn outside_git(path: &Path) -> Result<PathBuf, ArenaError> {
+    pub(crate) fn outside_git(path: &Path) -> Result<PathBuf, ArenaError> {
         let metadata =
             std::fs::symlink_metadata(path).map_err(|_| io("native output root unavailable"))?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -875,7 +953,7 @@ pub(crate) mod linux {
         }
         Ok(path)
     }
-    pub(super) fn save_preparation_failure(
+    pub(crate) fn save_preparation_failure(
         directory: Option<&Dir>,
         receipt: &NativePreparationReceipt,
         provider: &str,
@@ -1063,6 +1141,16 @@ pub(crate) mod linux {
             ));
         }
         spec.validate_execution()?;
+        // Historical bundle declarations remain readable, but new executions
+        // must use the system runtime rather than snapshot CUDA libraries.
+        for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+            if spec.engine_view(role)?.cuda_bundle.is_some() {
+                return Err(ArenaError::Invalid(
+                    "legacy CUDA bundle execution is disabled; use a system CUDA runtime profile"
+                        .into(),
+                ));
+            }
+        }
         let input = spec.view();
         let metadata_cap = spec.pair_metadata_cap();
         let stream_cap = pair_stream_cap(input.budget.max_output_bytes, metadata_cap)?;
@@ -1098,8 +1186,21 @@ pub(crate) mod linux {
                 ));
             }
         }
+        let declared_inputs = spec.declared_inputs();
+        for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+            if let Some(runtime) = spec.runtime_source_v6(role) {
+                let engine = spec.engine_view(role)?;
+                validate_v6_runtime_snapshot_boundary(
+                    runtime,
+                    engine.cuda_bundle.is_some(),
+                    engine.external.is_some(),
+                    spec.verifies_system_runtime_receipt_v6(role),
+                    &declared_inputs,
+                )?;
+            }
+        }
         let mut unique = BTreeMap::new();
-        for artifact in spec.declared_inputs() {
+        for artifact in declared_inputs {
             if let Some(prior) = unique.insert(artifact.path.clone(), artifact.clone())
                 && prior != *artifact
             {
@@ -1155,13 +1256,17 @@ pub(crate) mod linux {
         let root_path = outside_git(output_root)?;
         let root = Dir::open_ambient_dir(&root_path, cap_std::ambient_authority())
             .map_err(|_| io("cannot pin native output root"))?;
-        crate::native_retention::admit(
-            &root,
-            total
-                .checked_add(input.budget.max_output_bytes)
-                .and_then(|n| n.checked_add(metadata_cap))
-                .ok_or_else(|| io("native retention reservation overflow"))?,
-        )?;
+        // Keep this attempt's explicit input/output bounds and overflow check.
+        // When configured, the separately supervised advisory observer reports
+        // total retained storage within its scope; absent, failed or partial
+        // observations are not a claim about this root. Unrelated existing
+        // outputs must not block this launch or force another recursive scan on
+        // its critical path. Legacy profiles with their own registered strict
+        // budget check it separately.
+        let _attempt_reservation = total
+            .checked_add(input.budget.max_output_bytes)
+            .and_then(|n| n.checked_add(metadata_cap))
+            .ok_or_else(|| io("native retention reservation overflow"))?;
         root.create_dir(label).map_err(|_| {
             io("cannot create exclusive native attempt; existing outputs preserved")
         })?;
@@ -1221,6 +1326,7 @@ pub(crate) mod linux {
                 .attempted_snapshot_relative_paths
                 .push(format!("inputs/{name}"));
             let executable = artifact == &input.runner.binary
+                || spec.additional_executable_input(artifact)
                 || spec
                     .match_execution()
                     .is_some_and(|e| &e.executor == artifact)
@@ -1470,6 +1576,23 @@ pub(crate) mod linux {
         cwd: &Path,
         roots: &[PathBuf; 2],
     ) -> Result<FastchessInvocation, ArenaError> {
+        build_invocation_with_v6_overrides(spec, pins, cwd, roots, None)
+    }
+
+    /// Already verified pins and finite arguments belonging to the same V6
+    /// owner. This is an invocation projection, never a running-process proof.
+    pub(crate) struct V6EngineInvocation<'a> {
+        pub binary: &'a InputPin,
+        pub arguments: Vec<OsString>,
+    }
+
+    pub(crate) fn build_invocation_with_v6_overrides<S: NativeLaunchDeclaration>(
+        spec: &S,
+        pins: &[InputPin],
+        cwd: &Path,
+        roots: &[PathBuf; 2],
+        overrides: Option<&[V6EngineInvocation<'_>; 2]>,
+    ) -> Result<FastchessInvocation, ArenaError> {
         let input = spec.view();
         validate_native_runner(input.runner, input.clock)?;
         let prefix = u32::try_from(input.opening.moves.len())
@@ -1498,13 +1621,24 @@ pub(crate) mod linux {
                     NativeEngineRole::Baseline => 0,
                     NativeEngineRole::Candidate => 1,
                 }];
-                let tokens = external_arguments(
-                    spec,
-                    role,
-                    external,
-                    pins,
-                    ExternalArgumentMode::Runtime(root),
-                )?;
+                let (binary, tokens) = if let Some(overrides) = overrides {
+                    let selected = &overrides[match role {
+                        NativeEngineRole::Baseline => 0,
+                        NativeEngineRole::Candidate => 1,
+                    }];
+                    (selected.binary, selected.arguments.clone())
+                } else {
+                    (
+                        binary,
+                        external_arguments(
+                            spec,
+                            role,
+                            external,
+                            pins,
+                            ExternalArgumentMode::Runtime(root),
+                        )?,
+                    )
+                };
                 let variables = external
                     .environment
                     .as_ref()
@@ -1550,6 +1684,11 @@ pub(crate) mod linux {
                     args.push(format!("option.{name}={value}").into());
                 }
                 continue;
+            }
+            if overrides.is_some() {
+                return Err(ArenaError::Invalid(
+                    "V6 override requires an external engine declaration".into(),
+                ));
             }
             let root = &roots[match role {
                 NativeEngineRole::Baseline => 0,
@@ -1763,6 +1902,100 @@ pub(crate) mod linux {
         use super::*;
 
         #[test]
+        fn v6_system_runtime_needs_child_receipt_and_never_snapshots_libraries() {
+            use rz_experiments::{
+                NativeRuntimeSourceV6, SystemLibrarySpecV6, SystemPlatformV6, SystemRuntimeSpecV6,
+            };
+            let library = |role: &str, inode: u64, hash: char| SystemLibrarySpecV6 {
+                role: role.into(),
+                requested_path: format!("/system/{role}.so"),
+                canonical_path: format!("/system/{role}.so"),
+                version: None,
+                sha256: hash.to_string().repeat(64),
+                bytes: 100 + inode,
+                device: 1,
+                inode,
+                required_mapping: true,
+            };
+            let source = NativeRuntimeSourceV6::SystemCuda(SystemRuntimeSpecV6 {
+                platform: SystemPlatformV6::Linux,
+                libraries: vec![
+                    library("ort-core", 1, 'a'),
+                    library("ort-provider-cuda", 2, 'b'),
+                ],
+                system_identity_sha256: "c".repeat(64),
+                cuda_device_id: 0,
+                cuda_arena_bytes: 1024,
+                startup_ms: 100,
+                drain_ms: 100,
+                capture_max_libraries: 2,
+                capture_max_file_bytes: 1024,
+                capture_max_total_bytes: 2048,
+                capture_timeout_ms: 100,
+            });
+            let model = ArtifactRef {
+                path: "model.onnx".into(),
+                sha256: "d".repeat(64),
+                bytes: 900,
+                source: "fixture".into(),
+                license: "fixture".into(),
+            };
+            let copied_provider = ArtifactRef {
+                path: "copied-provider.so".into(),
+                sha256: "b".repeat(64),
+                bytes: 102,
+                source: "fixture".into(),
+                license: "fixture".into(),
+            };
+            assert!(
+                validate_v6_runtime_snapshot_boundary(&source, false, true, true, &[&model])
+                    .is_ok()
+            );
+            assert!(
+                validate_v6_runtime_snapshot_boundary(&source, true, true, true, &[&model])
+                    .is_err()
+            );
+            assert!(
+                validate_v6_runtime_snapshot_boundary(&source, false, false, true, &[&model])
+                    .is_err()
+            );
+            assert!(
+                validate_v6_runtime_snapshot_boundary(&source, false, true, false, &[&model])
+                    .is_err()
+            );
+            assert!(
+                validate_v6_runtime_snapshot_boundary(
+                    &source,
+                    false,
+                    true,
+                    true,
+                    &[&model, &copied_provider]
+                )
+                .is_err()
+            );
+            assert!(
+                validate_v6_runtime_snapshot_boundary(
+                    &NativeRuntimeSourceV6::Cpu,
+                    false,
+                    false,
+                    false,
+                    &[&model]
+                )
+                .is_ok()
+            );
+            assert!(
+                validate_v6_runtime_snapshot_boundary(
+                    &NativeRuntimeSourceV6::Cpu,
+                    true,
+                    false,
+                    false,
+                    &[&model]
+                )
+                .is_err()
+            );
+        }
+
+        #[test]
         fn native_runner_registration_preserves_clean_movetime_and_pairs_reap_pins() {
             use crate::pals_launch::{
                 PALS_CLOCK_REAP_COLAB_RUNNER_BYTES, PALS_CLOCK_REAP_COLAB_RUNNER_SHA256,
@@ -1935,6 +2168,141 @@ pub(crate) mod linux {
             ) -> Result<(Self::Audit, u32), ArenaError> {
                 panic!("rejected admission must never inspect provider records")
             }
+        }
+
+        #[test]
+        fn preparation_failure_policy_envelope_is_saved_and_legacy_bytes_stay_identical() {
+            use serde::Serialize;
+            #[derive(Clone, Debug)]
+            struct PreparationFixture {
+                input: String,
+                policy: Option<NativePreparationPolicyEnvelope>,
+            }
+            impl sealed::Sealed for PreparationFixture {}
+            impl NativeLaunchDeclaration for PreparationFixture {
+                fn input_sha256(&self) -> &str {
+                    &self.input
+                }
+                fn preparation_policy_envelope(&self) -> Option<NativePreparationPolicyEnvelope> {
+                    self.policy.clone()
+                }
+                fn view(&self) -> NativePairView<'_> {
+                    panic!("rejected basename has no pair")
+                }
+                fn declared_inputs(&self) -> Vec<&ArtifactRef> {
+                    Vec::new()
+                }
+                fn unique_bytes(&self) -> Result<u64, rz_experiments::ManifestError> {
+                    Ok(0)
+                }
+                fn engine_view(
+                    &self,
+                    _: NativeEngineRole,
+                ) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError> {
+                    panic!("rejected basename has no engine")
+                }
+                fn provider_name(&self) -> &'static str {
+                    "fixture"
+                }
+            }
+            // This explicit legacy representation is the pre-envelope wire
+            // format and compares actual serialized bytes, including field order.
+            #[derive(Serialize)]
+            struct LegacyPreparation<'a> {
+                receipt_version: u32,
+                execution_ready: bool,
+                input_sha256: &'a str,
+                output_directory: &'a str,
+                attempt_created: bool,
+                attempted_snapshot_relative_paths: &'a [String],
+                completed_snapshots: &'a [NativeSnapshotReceipt],
+                child_spawned: bool,
+                writers_closed: bool,
+                input_pins_required: bool,
+                original_error: &'a str,
+                subsequent_file_owner: &'a str,
+                automatic_retry: bool,
+            }
+            let base_sha = "a".repeat(64);
+            let execution_sha = "b".repeat(64);
+            let strict = PreparationFixture {
+                input: base_sha.clone(),
+                policy: None,
+            };
+            let advisory = PreparationFixture {
+                input: execution_sha.clone(),
+                policy: Some(NativePreparationPolicyEnvelope {
+                    domain: "rz-pals-preparation-storage-advisory-v1/1".into(),
+                    policy: "advisory".into(),
+                    base_launch_sha256: base_sha.clone(),
+                    execution_sha256: execution_sha.clone(),
+                }),
+            };
+            let fail = |fixture: &PreparationFixture| {
+                prepare_native_launch_for(fixture, Path::new("/"), Path::new("/"), "../invalid")
+                    .err()
+                    .expect("invalid basename cannot start a child")
+            };
+            let strict_failure = fail(&strict);
+            let advisory_failure = fail(&advisory);
+            assert!(
+                !strict_failure.receipt.child_spawned && !advisory_failure.receipt.child_spawned
+            );
+            let r = &strict_failure.receipt;
+            assert!(r.policy_envelope.is_none());
+            let old = LegacyPreparation {
+                receipt_version: r.receipt_version,
+                execution_ready: r.execution_ready,
+                input_sha256: &r.input_sha256,
+                output_directory: &r.output_directory,
+                attempt_created: r.attempt_created,
+                attempted_snapshot_relative_paths: &r.attempted_snapshot_relative_paths,
+                completed_snapshots: &r.completed_snapshots,
+                child_spawned: r.child_spawned,
+                writers_closed: r.writers_closed,
+                input_pins_required: r.input_pins_required,
+                original_error: &r.original_error,
+                subsequent_file_owner: &r.subsequent_file_owner,
+                automatic_retry: r.automatic_retry,
+            };
+            assert_eq!(
+                serde_json::to_vec(&r).unwrap(),
+                serde_json::to_vec(&old).unwrap()
+            );
+            let policy = advisory_failure.receipt.policy_envelope.as_ref().unwrap();
+            assert_eq!(policy.domain, "rz-pals-preparation-storage-advisory-v1/1");
+            assert_eq!(policy.base_launch_sha256, base_sha);
+            assert_eq!(policy.execution_sha256, execution_sha);
+            assert_eq!(advisory_failure.receipt.input_sha256, execution_sha);
+
+            struct OwnedFixture(std::path::PathBuf);
+            impl Drop for OwnedFixture {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(self.0.join("native-preparation-failure.v1.json"));
+                    let _ = std::fs::remove_dir(&self.0);
+                }
+            }
+            let root = OwnedFixture(std::env::temp_dir().join(format!(
+                    "rz-preparation-policy-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos(),
+                )));
+            std::fs::create_dir(&root.0).unwrap();
+            let directory = Dir::open_ambient_dir(&root.0, cap_std::ambient_authority()).unwrap();
+            let artifact =
+                save_preparation_failure(Some(&directory), &advisory_failure.receipt, "fixture")
+                    .unwrap()
+                    .expect("fixture directory permits evidence saving");
+            let bytes = std::fs::read(root.0.join("native-preparation-failure.v1.json")).unwrap();
+            assert_eq!(
+                bytes,
+                serde_json::to_vec_pretty(&advisory_failure.receipt).unwrap()
+            );
+            assert_eq!(artifact.bytes, bytes.len() as u64);
+            assert_eq!(artifact.sha256, format!("{:x}", Sha256::digest(&bytes)));
         }
 
         #[test]

@@ -1,6 +1,11 @@
 //! Separate, opt-in conversion with the same pinned CUDA/FP32/Level1 path.
 //! Neither a throughput benchmark nor independent numerical acceptance.
 #[cfg(target_os = "linux")]
+fn admit_legacy_cuda_bundle() -> Result<(), Box<dyn std::error::Error>> {
+    Err("legacy CUDA bundle execution is disabled; use a system CUDA runtime".into())
+}
+
+#[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use rz_eval::{
         asset::{self, MaiaAsset},
@@ -13,6 +18,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.len() != 7 || args.iter().any(|a| !Path::new(a).is_absolute()) {
         return Err("usage: ort_export SOURCE ONNX EXPORT CUDA_CORE CUDA_BUNDLE NEW_ORT NEW_MANIFEST (absolute; outputs outside Git)".into());
     }
+    // Reject the retired profile before reserving either output file.
+    admit_legacy_cuda_bundle()?;
     let root = Path::new(&args[5])
         .parent()
         .ok_or("output parent missing")?

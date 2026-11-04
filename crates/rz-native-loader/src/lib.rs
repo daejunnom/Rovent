@@ -14,6 +14,30 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// System-installed library observation without copying native assets.
+#[cfg(target_os = "linux")]
+pub mod system;
+
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU8, Ordering};
+
+// A process may use only one native ownership regime, including after failure.
+// 0: unclaimed, 1: historical bundled owner, 2: system-library owner.
+#[cfg(target_os = "linux")]
+static NATIVE_OWNERSHIP_MODE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(target_os = "linux")]
+fn claim_native_mode(mode: u8) -> Result<(), LoadError> {
+    match NATIVE_OWNERSHIP_MODE.compare_exchange(0, mode, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Ok(()),
+        Err(existing) if existing == mode => Ok(()),
+        Err(_) => Err(LoadError::new(
+            LoadErrorKind::DifferentBundle,
+            "native ownership regime differs from the existing process owner",
+        )),
+    }
+}
+
 #[cfg(feature = "ort-bindings")]
 pub mod ort_binding;
 
@@ -65,8 +89,12 @@ impl NativeLoadingProfile {
     /// unchanged binary bundle digest. Indices refer to NVIDIA_LOAD_ORDER.
     pub const fn canonical_descriptor(self) -> &'static str {
         match self {
-            Self::EagerCuda12Cudnn9V1 => "rz-native-loading-profile/1;eager-cuda12-cudnn9-v1;declared-nvidia=16;declared-ort=3;rtld=now-global;eager=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15;deferred=none;resident=exact-pins",
-            Self::CuDnnShimLazyV1 => "rz-native-loading-profile/1;experimental-cudnn-shim-lazy-v1;declared-nvidia=16;declared-ort=3;rtld=now-global;eager=0,1,2,3,4,5,6,7,15;deferred=8,9,10,11,12,13,14;resident=exact-pins",
+            Self::EagerCuda12Cudnn9V1 => {
+                "rz-native-loading-profile/1;eager-cuda12-cudnn9-v1;declared-nvidia=16;declared-ort=3;rtld=now-global;eager=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15;deferred=none;resident=exact-pins"
+            }
+            Self::CuDnnShimLazyV1 => {
+                "rz-native-loading-profile/1;experimental-cudnn-shim-lazy-v1;declared-nvidia=16;declared-ort=3;rtld=now-global;eager=0,1,2,3,4,5,6,7,15;deferred=8,9,10,11,12,13,14;resident=exact-pins"
+            }
         }
     }
 
@@ -299,6 +327,9 @@ pub enum LoadErrorKind {
     FileIdentity,
     FileAccess,
     InvalidMaps,
+    /// System mapping observation could not be read or interpreted. This is
+    /// evidence unavailable, not proof of a conflicting native mapping.
+    ObservationUnavailable,
     ForeignMapping,
     MissingMapping,
     MappingIdentity,
@@ -357,6 +388,7 @@ impl LoadError {
             LoadErrorKind::FileIdentity => "native.file_identity",
             LoadErrorKind::FileAccess => "native.file_access",
             LoadErrorKind::InvalidMaps => "native.invalid_maps",
+            LoadErrorKind::ObservationUnavailable => "native.observation_unavailable",
             LoadErrorKind::ForeignMapping => "native.foreign_mapping",
             LoadErrorKind::MissingMapping => "native.missing_mapping",
             LoadErrorKind::MappingIdentity => "native.mapping_identity",
@@ -967,6 +999,11 @@ mod linux {
         reject_ambient()?;
         reject_resident(&read_maps()?)?;
         preflight(pin)?;
+        // Only a process that is actually about to execute a vendor native
+        // constructor acquires the legacy regime. Invalid inputs do not prevent
+        // the separate system-regime preflight from being used afterwards.
+        // This atomic claim arbitrates concurrent legacy/system bootstrap.
+        claim_native_mode(1)?;
         let mut required = Vec::with_capacity(pin.profile.eager_indices().len());
         for &index in pin.profile.eager_indices() {
             // SAFETY: 원래 bootstrap가 신뢰한 고정 NVIDIA profile만 admission한다.
@@ -1172,12 +1209,12 @@ mod linux {
     }
 
     #[derive(Debug)]
-    struct MapEntry {
-        dev_major: u64,
-        dev_minor: u64,
-        inode: u64,
-        path: Option<PathBuf>,
-        deleted: bool,
+    pub(super) struct MapEntry {
+        pub(super) dev_major: u64,
+        pub(super) dev_minor: u64,
+        pub(super) inode: u64,
+        pub(super) path: Option<PathBuf>,
+        pub(super) deleted: bool,
     }
 
     fn invalid_maps() -> LoadError {
@@ -1203,7 +1240,7 @@ mod linux {
         Ok(result)
     }
 
-    fn read_maps() -> Result<Vec<MapEntry>, LoadError> {
+    pub(super) fn read_maps() -> Result<Vec<MapEntry>, LoadError> {
         parse_maps(&read_bounded(Path::new("/proc/self/maps"), MAX_MAPS_BYTES)?)
     }
 
@@ -1271,7 +1308,7 @@ mod linux {
         Ok(entries)
     }
 
-    fn is_nvidia_runtime(name: &str) -> bool {
+    pub(super) fn is_nvidia_runtime(name: &str) -> bool {
         [
             "libcudnn",
             "libcublas",
@@ -1310,7 +1347,7 @@ mod linux {
         Ok(())
     }
 
-    fn device_parts(device: u64) -> (u64, u64) {
+    pub(super) fn device_parts(device: u64) -> (u64, u64) {
         (
             ((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000),
             (device & 0xff) | ((device >> 12) & 0xffff_ff00),
@@ -1879,6 +1916,29 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejected_legacy_preflight_does_not_claim_system_regime() {
+        const CHILD: &str = "RZ_SYSTEM_MODE_PREFLIGHT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // An empty bundle fails before any native constructor can run.
+            assert!(LibrarySet::load(Vec::new()).is_err());
+            assert_eq!(NATIVE_OWNERSHIP_MODE.load(Ordering::Acquire), 0);
+            assert!(claim_native_mode(2).is_ok());
+            return;
+        }
+        // Isolate the process-global native latch from unrelated test cases.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::rejected_legacy_preflight_does_not_claim_system_regime",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn native_diagnostic_is_bounded_and_not_in_default_formatting() {

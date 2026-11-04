@@ -4,6 +4,9 @@ use rz_contracts::pals_adaptive::{
     CpuJobEnvelope, CpuJobId, CpuWorkerId, ExternalCpuJobEnvelope, ExternalSliceGrant,
     ReviewViewSeal, RoleTicketEnvelope, SliceGrant,
 };
+use rz_contracts::rovent::{
+    ExecutionMode, QuestionEnvelope, ReciprocalQuestionId, SearchRecipient,
+};
 use rz_contracts::{ClockDomain, Deadline, Digest, MonotonicTick, RequestId};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -13,6 +16,8 @@ pub const MAX_REPAIR_PER_FIRST_MOVE: u8 = 3;
 const MAX_REPAIR_QUESTION_HISTORY: usize = 256 * MAX_REPAIR_PER_FIRST_MOVE as usize;
 pub const MAX_FRAME_GENEALOGY: usize = 1024;
 pub const MAX_STEP_BINDING_HISTORY: usize = 65_536;
+pub const MAX_RECIPROCAL_QUESTION_HISTORY: usize = MAX_FRAME_GENEALOGY;
+pub const MAX_RECIPROCAL_QUESTION_DEPTH: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CoordinatorHistoryUsage {
@@ -245,6 +250,10 @@ pub enum StepExecution {
         job: CpuJobId,
         execution: rz_contracts::ExecutionId,
     },
+    ProfiledExternal {
+        question: ReciprocalQuestionId,
+        execution: rz_contracts::ExecutionId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -323,6 +332,22 @@ pub struct CoordinatorWork<V, Q> {
     /// fresh allowance and cloning the work never refills it.
     pub budget: FrameBudget,
     pub input: FrameInput<V, Q>,
+}
+
+/// The original machine's move-only Ready custody for an opt-in intervention.
+/// Public Work metadata, equal authority numbers or cloned view Arcs cannot
+/// recreate the private machine owner. This cap alone grants no execution.
+pub struct UtilityInterventionReadySource<Q> {
+    owner: Arc<()>,
+    work: CoordinatorWork<crate::pals::review_context::ReviewView, Q>,
+}
+impl<Q> UtilityInterventionReadySource<Q> {
+    pub fn work(&self) -> &CoordinatorWork<crate::pals::review_context::ReviewView, Q> {
+        &self.work
+    }
+    pub(crate) fn matches_owner(&self, owner: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.owner, owner)
+    }
 }
 impl<V, Q> Clone for CoordinatorWork<V, Q> {
     fn clone(&self) -> Self {
@@ -445,6 +470,42 @@ pub struct ClosedFrame {
     pub completion_scope: Option<FrameCompletionScope>,
 }
 
+/// A dependent question reuses the real frame/ticket/CPU owner path. Joining
+/// existing work does not submit another role call or allocate more credit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependentFrameAdmission {
+    Admitted(FrameId),
+    Joined(FrameId),
+}
+
+/// Completion of one dependent question, not a terminal chess proof or a
+/// completed legacy PALS refinement workflow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependentFrameResponse {
+    pub frame: FrameId,
+    pub question: Digest,
+    pub view: ReviewViewSeal,
+    pub evidence: Digest,
+    pub execution: StepExecution,
+}
+
+#[derive(Clone, Copy)]
+struct FrameDependency {
+    waiter: FrameId,
+    dependency: FrameId,
+    question: ReciprocalQuestionId,
+    origin_seal: Option<Digest>,
+}
+
+struct ReciprocalRoot {
+    mode: ExecutionMode,
+    root_budget: Digest,
+    // Tombstones remain until root retirement: closing a question is not
+    // permission to resubmit the same unchanged work under a fresh sequence.
+    questions: Vec<(QuestionEnvelope, FrameId)>,
+    accepted_origins: HashMap<(FrameId, Digest), super::AcceptedRoleOrigin>,
+}
+
 /// Finite continuation state with no worker calls and no hidden blocking.
 /// Frames can progress independently; only this owner mutates their authority.
 pub struct RefinementMachine<V, Q> {
@@ -454,6 +515,10 @@ pub struct RefinementMachine<V, Q> {
     next_sequence: u64,
     admission_open: bool,
     frames: VecDeque<CoordinatorFrame<V, Q>>,
+    // One opt-in intervention may replace an exact unexecuted source frame.
+    // Its original evidence and view owners stay here until actual worker join.
+    intervention_sources: Vec<CoordinatorFrame<V, Q>>,
+    intervention_owner: Option<Arc<()>>,
     repair_counts: Vec<(Move16, u8)>,
     repair_questions: VecDeque<(Move16, Digest, Digest)>,
     frame_genealogy: Vec<(FrameId, Move16)>,
@@ -466,6 +531,13 @@ pub struct RefinementMachine<V, Q> {
     validator_actions: HashSet<(RequestId, u8)>,
     validator_history_peak: ValidatorActionHistoryUsage,
     history_peak: CoordinatorHistoryUsage,
+    // Each live frame may await at most one other frame. This is a logical
+    // wait; a suspended R frame retains its original private CPU owner.
+    dependencies: Vec<FrameDependency>,
+    // Only the allocating parent receives unused role credit. Joined waiters
+    // paid no second reservation and therefore receive no refund.
+    dependent_credit_owners: Vec<(FrameId, FrameId)>,
+    reciprocal: Option<ReciprocalRoot>,
 }
 impl<V, Q> RefinementMachine<V, Q> {
     pub fn new(
@@ -485,6 +557,8 @@ impl<V, Q> RefinementMachine<V, Q> {
             next_sequence: 1,
             admission_open: true,
             frames: VecDeque::with_capacity(MAX_COORDINATOR_FRAMES),
+            intervention_sources: Vec::new(),
+            intervention_owner: None,
             repair_counts: Vec::with_capacity(256),
             repair_questions: VecDeque::with_capacity(MAX_COORDINATOR_FRAMES),
             frame_genealogy: Vec::with_capacity(MAX_FRAME_GENEALOGY),
@@ -497,6 +571,9 @@ impl<V, Q> RefinementMachine<V, Q> {
             validator_actions: HashSet::new(),
             validator_history_peak: ValidatorActionHistoryUsage::default(),
             history_peak: CoordinatorHistoryUsage::default(),
+            dependencies: Vec::with_capacity(MAX_COORDINATOR_FRAMES),
+            dependent_credit_owners: Vec::with_capacity(MAX_COORDINATOR_FRAMES),
+            reciprocal: None,
         })
     }
     pub fn frames(&self) -> impl Iterator<Item = &CoordinatorFrame<V, Q>> {
@@ -504,6 +581,9 @@ impl<V, Q> RefinementMachine<V, Q> {
     }
     pub fn frame(&self, id: FrameId) -> Option<&CoordinatorFrame<V, Q>> {
         self.frames.iter().find(|frame| frame.id == id)
+    }
+    pub fn intervention_source_count(&self) -> usize {
+        self.intervention_sources.len()
     }
     pub fn history_usage(&self) -> CoordinatorHistoryUsage {
         CoordinatorHistoryUsage {
@@ -596,7 +676,7 @@ impl<V, Q> RefinementMachine<V, Q> {
             .view_seal
             .validate(self.authority, self.token_budget)?;
         first_move.decode()?;
-        if self.frames.len() == MAX_COORDINATOR_FRAMES {
+        if self.frames.len() + self.intervention_sources.len() >= MAX_COORDINATOR_FRAMES {
             return Err(CoordinatorError::Capacity("pending coordinator frames"));
         }
         if self.frame_genealogy.len() == MAX_FRAME_GENEALOGY {
@@ -644,6 +724,7 @@ impl<V, Q> RefinementMachine<V, Q> {
         now: MonotonicTick,
     ) -> Result<CoordinatorWork<V, Q>, CoordinatorError> {
         self.check_control(clock, now)?;
+        self.check_not_waiting(id)?;
         let frame = self.frame(id).ok_or(CoordinatorError::UnknownRequest)?;
         if frame.phase != FramePhase::Ready {
             return Err(CoordinatorError::InvalidTransition("frame is not ready"));
@@ -689,6 +770,7 @@ impl<V, Q> RefinementMachine<V, Q> {
         now: MonotonicTick,
     ) -> Result<(), CoordinatorError> {
         self.check_control(clock, now)?;
+        self.check_not_waiting(id)?;
         ticket.validate(clock, now, self.token_budget)?;
         if self.used_role_requests.contains(&ticket.id) {
             return Err(CoordinatorError::Duplicate);
@@ -759,6 +841,7 @@ impl<V, Q> RefinementMachine<V, Q> {
         now: MonotonicTick,
     ) -> Result<(), CoordinatorError> {
         self.check_control(clock, now)?;
+        self.check_not_waiting(id)?;
         grant.validate(job, clock, now)?;
         if self.used_cpu_executions.contains(&grant.execution) {
             return Err(CoordinatorError::Duplicate);
@@ -807,6 +890,7 @@ impl<V, Q> RefinementMachine<V, Q> {
         now: MonotonicTick,
     ) -> Result<(), CoordinatorError> {
         self.check_control(clock, now)?;
+        self.check_not_waiting(id)?;
         grant.validate(job, clock, now)?;
         if self.used_cpu_executions.contains(&grant.execution) {
             return Err(CoordinatorError::Duplicate);
@@ -903,8 +987,9 @@ impl<V, Q> RefinementMachine<V, Q> {
         )
     }
 
-    /// Only an attested worker completion or checked Rules endpoint may enter
-    /// this commit boundary. The latter never invents a StepExecution.
+    /// Only an attested worker completion, checked Rules endpoint, or opaque
+    /// same-owner goal endpoint may enter this commit boundary. The endpoint
+    /// paths never invent a StepExecution; Fresh still needs a real ticket.
     fn commit_transition(
         &mut self,
         frame_id: FrameId,
@@ -912,6 +997,34 @@ impl<V, Q> RefinementMachine<V, Q> {
         transition: FrameTransition<V, Q>,
         rules_pair: Option<RulesTerminalPairSeal>,
     ) -> Result<Option<ClosedFrame>, CoordinatorError> {
+        self.check_not_waiting(frame_id)?;
+        let is_dependent = self
+            .dependent_credit_owners
+            .iter()
+            .any(|(child, _)| *child == frame_id);
+        if is_dependent && !matches!(&transition, FrameTransition::Unknown { .. }) {
+            return Err(CoordinatorError::InvalidTransition(
+                "dependent question requires its exact reciprocal response",
+            ));
+        }
+        if is_dependent
+            && matches!(&transition, FrameTransition::Unknown { .. })
+            && self.frame(frame_id).is_some_and(|frame| {
+                matches!(
+                    frame.last_execution,
+                    Some(
+                        StepExecution::Cpu { .. }
+                            | StepExecution::ExternalCpu { .. }
+                            | StepExecution::ProfiledExternal { .. }
+                    )
+                )
+            })
+        {
+            return Err(CoordinatorError::MissingEvidence);
+        }
+        if !matches!(&transition, FrameTransition::Continue(_)) {
+            self.check_dependent_retirement(frame_id)?;
+        }
         let token_budget = self.token_budget;
         let authority = self.authority;
         let current = self
@@ -1142,7 +1255,9 @@ impl<V, Q> RefinementMachine<V, Q> {
                     unknown,
                     completion_scope,
                 };
+                let remaining_roles = frame.budget.role_submissions_remaining;
                 self.frames.retain(|held| held.id != closed.id);
+                self.retire_dependencies(closed.id, remaining_roles);
                 if let Some(seal) = queued_recheck {
                     self.queued_rechecks
                         .entry(queue_key)
@@ -1312,6 +1427,7 @@ impl<V, Q> RefinementMachine<V, Q> {
         if !self.admission_open {
             return Err(CoordinatorError::AdmissionClosed);
         }
+        self.check_not_waiting(id)?;
         let frame = self.match_frame_mut(id)?;
         if frame.phase != FramePhase::Suspended || frame.zero_work_yields >= 3 {
             return Err(CoordinatorError::InvalidTransition(
@@ -1333,10 +1449,58 @@ impl<V, Q> RefinementMachine<V, Q> {
         evidence: Digest,
         reason: &'static str,
     ) -> Result<ClosedFrame, CoordinatorError> {
+        self.retire_cpu_owner(id, termination, None, evidence, reason)
+    }
+    /// A canceled paused owner can retire before its already-queued Resume
+    /// returns a definite no-work rejection. Only the ledger's opaque settled
+    /// receipt for that newer bound grant permits closing the waiting frame.
+    /// Neither receipt alone refunds credit or accepts a search value.
+    pub fn retire_rejected_cpu_resume(
+        &mut self,
+        id: FrameId,
+        termination: &crate::cpu_worker::CpuJobTermination,
+        rejected: &crate::cpu_worker::SettledCpuSlice,
+        evidence: Digest,
+        reason: &'static str,
+    ) -> Result<ClosedFrame, CoordinatorError> {
+        self.retire_cpu_owner(id, termination, Some(rejected), evidence, reason)
+    }
+    fn retire_cpu_owner(
+        &mut self,
+        id: FrameId,
+        termination: &crate::cpu_worker::CpuJobTermination,
+        rejected: Option<&crate::cpu_worker::SettledCpuSlice>,
+        evidence: Digest,
+        reason: &'static str,
+    ) -> Result<ClosedFrame, CoordinatorError> {
+        let execution = match rejected {
+            Some(settled) => {
+                let grant = settled.grant();
+                if settled.terminated_owner_receipt() != Some(termination)
+                    || !settled.admission_rejected()
+                    || settled.terminal()
+                    || settled.actual_work() != crate::cpu::CpuWork::default()
+                    || grant.job != termination.job
+                    || grant.owner != termination.owner
+                    || grant.execution.epoch != termination.last_execution.epoch
+                    || grant.execution.sequence <= termination.last_execution.sequence
+                {
+                    return Err(CoordinatorError::IdentityMismatch(
+                        "terminated CPU owner and settled rejected Resume",
+                    ));
+                }
+                grant.execution
+            }
+            None => termination.last_execution,
+        };
+        // A real terminal owner receipt may retire a cancelled parent even
+        // while its child is still running. Joined waiters retain that child;
+        // an orphan remains visible for manager cancellation/physical drain.
+        self.check_dependent_credit_return(id)?;
         let frame = self.match_frame_mut(id)?;
         let expected = StepExecution::Cpu {
             job: termination.job,
-            execution: termination.last_execution,
+            execution,
         };
         if !(matches!(frame.phase, FramePhase::Suspended | FramePhase::Ready)
             || frame.phase == FramePhase::Waiting(expected))
@@ -1367,7 +1531,9 @@ impl<V, Q> RefinementMachine<V, Q> {
             unknown: Some(reason),
             completion_scope: None,
         };
+        let remaining_roles = frame.budget.role_submissions_remaining;
         self.frames.retain(|frame| frame.id != id);
+        self.retire_dependencies(id, remaining_roles);
         Ok(closed)
     }
     pub fn revoke(&mut self) -> Vec<StepExecution> {
@@ -1391,12 +1557,20 @@ impl<V, Q> RefinementMachine<V, Q> {
         // before dropping these query/view owners and issuing a receipt.
         self.admission_open = false;
         self.frames.clear();
+        self.intervention_sources.clear();
+        self.intervention_owner = None;
         self.frame_genealogy.clear();
         self.queued_rechecks.clear();
         self.ranking_fanouts.clear();
         self.ranking_request_sources.clear();
         self.validator_request_sources.clear();
         self.validator_actions.clear();
+        self.dependencies.clear();
+        self.dependent_credit_owners.clear();
+        if let Some(root) = self.reciprocal.as_mut() {
+            root.questions.clear();
+            root.accepted_origins.clear();
+        }
     }
     fn check_control(
         &self,
@@ -1433,6 +1607,186 @@ pub enum ValidatorActionAdmission {
 }
 
 impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
+    pub fn capture_intervention_source(
+        &mut self,
+        id: FrameId,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<UtilityInterventionReadySource<Q>, CoordinatorError> {
+        let work = self.ready_work(id, clock, now)?;
+        let source = self.frame(id).ok_or(CoordinatorError::UnknownRequest)?;
+        if !self.intervention_sources.is_empty()
+            || source.cpu_owner.is_some()
+            || source.fresh_pair.is_some()
+            || source.rules_terminal_pair.is_some()
+            || self
+                .dependencies
+                .iter()
+                .any(|edge| edge.waiter == id || edge.dependency == id)
+            || self
+                .dependent_credit_owners
+                .iter()
+                .any(|(child, parent)| *child == id || *parent == id)
+            || self.queued_rechecks.keys().any(|(parent, _)| *parent == id)
+        {
+            return Err(CoordinatorError::InvalidTransition(
+                "independent unstarted intervention source",
+            ));
+        }
+        let owner = Arc::clone(self.intervention_owner.get_or_insert_with(|| Arc::new(())));
+        Ok(UtilityInterventionReadySource { owner, work })
+    }
+    /// A separately declared experimental arm receives a real fresh frame.
+    /// It replaces, rather than dispatches, its exact Ready neutral source.
+    /// Credit is transferred unchanged; the source evidence is retained until
+    /// the root's existing physical fence/worker-join retirement.
+    #[allow(clippy::result_large_err)]
+    pub fn admit_intervention(
+        &mut self,
+        candidate: crate::pals::engine::adaptive_port::utility_route::UtilityInterventionCandidate<
+            Q,
+        >,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<
+        (
+            FrameId,
+            crate::pals::engine::adaptive_port::utility_route::UtilityInterventionAdmission<Q>,
+        ),
+        (
+            CoordinatorError,
+            crate::pals::engine::adaptive_port::utility_route::UtilityInterventionCandidate<Q>,
+        ),
+    > {
+        let checked = (|| {
+            self.check_control(clock, now)?;
+            if !self.intervention_sources.is_empty() {
+                return Err(CoordinatorError::Capacity("one intervention per root"));
+            }
+            let source_id = candidate.source_frame();
+            let work = self.ready_work(source_id, clock, now)?;
+            let source = self
+                .frame(source_id)
+                .ok_or(CoordinatorError::UnknownRequest)?;
+            if !candidate.validates_source(&work)
+                || self
+                    .intervention_owner
+                    .as_ref()
+                    .is_none_or(|owner| !candidate.matches_source_owner(owner))
+                || candidate.original_deadline() != self.hard_deadline
+                || source.cpu_owner.is_some()
+                || source.fresh_pair.is_some()
+                || source.rules_terminal_pair.is_some()
+                || self
+                    .dependencies
+                    .iter()
+                    .any(|edge| edge.waiter == source_id || edge.dependency == source_id)
+                || self
+                    .dependent_credit_owners
+                    .iter()
+                    .any(|(child, parent)| *child == source_id || *parent == source_id)
+                || self
+                    .queued_rechecks
+                    .keys()
+                    .any(|(parent, _)| *parent == source_id)
+            {
+                return Err(CoordinatorError::IdentityMismatch(
+                    "original independent Ready intervention source",
+                ));
+            }
+            candidate
+                .input()
+                .view_seal
+                .validate(self.authority, self.token_budget)?;
+            super::ranking::validate_actual_view(
+                &candidate.input().view,
+                candidate.input().view_seal,
+            )?;
+            candidate.first_move().decode()?;
+            let ranking_source = source.ranking_source;
+            self.intervention_sources
+                .try_reserve_exact(1)
+                .map_err(|_| CoordinatorError::Capacity("retained intervention source"))?;
+            Ok(ranking_source)
+        })();
+        let ranking_source = match checked {
+            Ok(source) => source,
+            Err(error) => return Err((error, candidate)),
+        };
+        let frame = match self.admit_internal(
+            candidate.first_move(),
+            candidate.input().clone(),
+            candidate.budget(),
+            FrameLineage::default(),
+            clock,
+            now,
+        ) {
+            Ok(frame) => frame,
+            Err(error) => return Err((error, candidate)),
+        };
+        self.match_frame_mut(frame)
+            .expect("new intervention frame")
+            .ranking_source = ranking_source;
+        let source_index = self
+            .frames
+            .iter()
+            .position(|source| source.id == candidate.source_frame())
+            .expect("checked original source remains until this single-writer transaction");
+        let source = self
+            .frames
+            .remove(source_index)
+            .expect("checked intervention source");
+        self.intervention_sources.push(source);
+        Ok((frame, candidate.admitted(frame)))
+    }
+
+    /// The opaque port binding retains the actual single-limit question and
+    /// source. It never constructs a CpuJobId or reserves native credit.
+    pub fn bind_profiled_external_cpu(
+        &mut self,
+        id: FrameId,
+        proof: &super::CheckedProfiledExternalBinding,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), CoordinatorError> {
+        self.check_control(clock, now)?;
+        self.check_not_waiting(id)?;
+        if self.used_cpu_executions.contains(&proof.execution) {
+            return Err(CoordinatorError::Duplicate);
+        }
+        if self.used_cpu_executions.len() == MAX_STEP_BINDING_HISTORY {
+            return Err(CoordinatorError::Capacity(
+                "external execution binding history",
+            ));
+        }
+        let frame = self.match_frame_mut(id)?;
+        super::ranking::validate_actual_view(&frame.input.view, frame.input.view_seal)?;
+        if proof.frame != id
+            || proof.question.question_digest != frame.input.question_digest
+            || proof.view != frame.input.view_seal
+            || proof.public_context != frame.input.public_context
+            || proof.input_digest != Digest(frame.input.view.digest())
+            || frame.phase != FramePhase::Ready
+            || frame.input.stage.role().is_some()
+            || proof.question.id.authority != id.authority
+            || proof.question.original_deadline != frame.original_deadline
+            || frame.cpu_owner.is_some()
+        {
+            return Err(CoordinatorError::IdentityMismatch(
+                "profiled external original frame binding",
+            ));
+        }
+        let execution = StepExecution::ProfiledExternal {
+            question: proof.question.id,
+            execution: proof.execution,
+        };
+        frame.phase = FramePhase::Waiting(execution);
+        frame.last_execution = Some(execution);
+        self.used_cpu_executions.insert(proof.execution);
+        self.observe_history_peak();
+        Ok(())
+    }
+
     /// Register an actual Repair's queued question while its original bound
     /// step, or unsubmitted exact Rules-terminal question, still exists. A
     /// parent may then continue several other counters;
@@ -1762,6 +2116,7 @@ impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
             output_digest: plan.source_output(),
             consumption_digest: plan.source_consumption(),
         };
+        self.check_not_waiting(plan.parent())?;
         let parent = self
             .frame(plan.parent())
             .ok_or(CoordinatorError::UnknownRequest)?;
@@ -1982,6 +2337,7 @@ impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
         now: MonotonicTick,
     ) -> Result<(), CoordinatorError> {
         self.check_control(clock, now)?;
+        self.check_not_waiting(id)?;
         grant.validate(job, clock, now)?;
         if self.used_cpu_executions.contains(&grant.execution) {
             return Err(CoordinatorError::Duplicate);
@@ -2016,6 +2372,44 @@ impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
         frame.last_execution = Some(execution);
         self.used_cpu_executions.insert(grant.execution);
         self.observe_history_peak();
+        Ok(())
+    }
+
+    /// The actual Search owner replaced an unsubmitted validation exactly at
+    /// its original go horizon with a Fresh question. This creates no R job,
+    /// completed role value or physical execution evidence. A public input
+    /// cannot authorize this path without the move-only original owner cap.
+    pub fn advance_original_goal_boundary(
+        &mut self,
+        id: FrameId,
+        boundary: crate::pals::engine::adaptive_port::AdaptiveGoalBoundary<Q>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), CoordinatorError> {
+        self.check_control(clock, now)?;
+        let frame = self.frame(id).ok_or(CoordinatorError::UnknownRequest)?;
+        if frame.phase != FramePhase::Ready
+            || frame.cpu_owner.is_some()
+            || frame.last_execution.is_some()
+        {
+            return Err(CoordinatorError::InvalidTransition(
+                "original goal boundary cannot replace active or paused work",
+            ));
+        }
+        let work = self.ready_work(id, clock, now)?;
+        boundary.validate(&work).map_err(|_| {
+            CoordinatorError::IdentityMismatch("actual original goal boundary owner")
+        })?;
+        let (evidence, next) = boundary.into_parts();
+        super::ranking::validate_actual_view(&next.view, next.view_seal)?;
+        if self
+            .commit_transition(id, evidence, FrameTransition::Continue(next), None)?
+            .is_some()
+        {
+            return Err(CoordinatorError::InvalidTransition(
+                "original goal boundary cannot close an unevaluated frame",
+            ));
+        }
         Ok(())
     }
 
@@ -2548,3 +2942,7 @@ impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
 #[cfg(test)]
 #[path = "machine_tests.rs"]
 mod tests;
+
+#[path = "reciprocal.rs"]
+mod reciprocal;
+pub use reciprocal::ReciprocalDependencyProof;

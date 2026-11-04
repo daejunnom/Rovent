@@ -385,9 +385,24 @@ def _registered_policy(raw, source):
 def _source_review(raws, source, policy_raw):
     pair, observation = _original_build_sources(raws, source)
     policy = _registered_policy(policy_raw, source)
-    review, detached = _reviewed_source_pair(pair)
-    return {"build_observation": observation, "policy_registration": policy,
+    closure = None
+    try:
+        review, detached = _reviewed_source_pair(pair)
+    except UnsupportedNativeRecheck as historical_error:
+        from .native_source_review import review_transition_sources, UnsupportedTransitionSource
+        try:
+            closure = review_transition_sources(pair=pair, manifest=_parse(raws["source_manifest"]),
+                source=source, lane="legacy_single_reply")
+        except UnsupportedTransitionSource as error:
+            if str(error) == "unreviewed_transition_source_closure":
+                raise historical_error
+            raise UnsupportedNativeRecheck(str(error)) from error
+        review, detached = closure["review_id"], copy.deepcopy(pair)
+    result = {"build_observation": observation, "policy_registration": policy,
             "source_review_profile": review, "reviewed_transition_sources": detached}
+    if closure is not None:
+        result["reviewed_transition_closure"] = closure
+    return result
 
 
 def _recheck_identity(value):

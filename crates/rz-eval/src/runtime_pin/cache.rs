@@ -187,9 +187,8 @@ impl RuntimeCache {
         read(RuntimeStorageOrigin::CacheCreated)
     }
 
-    /// The canonical bundle digest binds all 19 filenames, roles, sizes and
-    /// hashes. V2 aliases use a separate key namespace; a V1 entry is never
-    /// repaired or extended. Every hit rechecks the directory, pins and aliases.
+    /// Reject historical CUDA bundle cache execution before reading the cache
+    /// or source. Bundle metadata can still be parsed independently.
     pub fn cuda_bundle(
         &self,
         source_root: &Path,
@@ -204,6 +203,7 @@ impl RuntimeCache {
         spec: &CudaRuntimeBundleSpec,
         checkpoint: &mut dyn FnMut(u64) -> Result<(), BackendError>,
     ) -> Result<RuntimeLibraryPin, BackendError> {
+        refuse_legacy_cuda_bundle()?;
         checkpoint(0)?;
         check_directory(&self.root, false)?;
         let key = spec.digest()?;

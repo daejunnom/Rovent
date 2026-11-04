@@ -16,6 +16,8 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::sync::Arc;
 
+pub mod nnuec;
+
 pub const CPU_VALUE_SCHEMA: &str = "rz-cpu-float-value-v2";
 pub const CPU_VALUE_ARCHITECTURE: &str = "piece-square-metadata-exact192-acc256-hidden32-fp32-v1";
 pub const CPU_ACCUMULATOR_WIDTH: usize = 256;
@@ -286,6 +288,9 @@ pub enum CpuValueError {
     Io(String),
     Json(String),
     StateMismatch,
+    /// The original immutable NNUEC Bound revoked this invocation. This is
+    /// distinct from an accumulator, namespace, numerical or owner failure.
+    AuthorityRevoked(CpuValueAuthorityRevocation),
     NonFiniteForward,
     ScoreOutsideFrontierNamespace,
     AccumulatorOverflow,
@@ -301,6 +306,9 @@ impl std::fmt::Display for CpuValueError {
             Self::StateMismatch => {
                 f.write_str("CPU accumulator does not match exact Rules state or value namespace")
             }
+            Self::AuthorityRevoked(reason) => {
+                write!(f, "original CPU NNUEC authority revoked: {reason:?}")
+            }
             Self::NonFiniteForward => f.write_str("CPU FP32 forward produced a non-finite value"),
             Self::ScoreOutsideFrontierNamespace => {
                 f.write_str("CPU nonterminal evaluator score entered the Rules mate namespace")
@@ -312,18 +320,66 @@ impl std::fmt::Display for CpuValueError {
 
 impl std::error::Error for CpuValueError {}
 
+/// Original evaluator control observation, not a cleanup or resume capability.
+/// Hard owner/context revocations cannot be relabeled as cancellation/expiry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CpuValueAuthorityRevocation {
+    Cancelled,
+    Expired,
+    ActorStopped,
+    Invalidated,
+}
+
 /// Immutable weights for an entire admitted CPU task. Changing weights or
 /// semantics requires a new evaluator/engine; implementations must not update
 /// them underneath an active task or retain opponent/private PALS state.
 pub trait CpuValueEvaluator: Send + Sync {
     fn identity(&self) -> &CpuValueIdentity;
     fn provenance(&self) -> &'static str;
+    /// Immutable task registration for a context-bound evaluator. Legacy
+    /// values retain their original namespace bytes. A revoked binding is an
+    /// error, never None or permission to fall back to a model-only namespace.
+    fn job_binding_digest(&self) -> Result<Option<rz_contracts::Digest>, CpuValueError> {
+        Ok(None)
+    }
+    /// Cleanup custody only. It cannot revive a revoked score/resume scope.
+    fn nnuec_retirement_owner(&self) -> Option<nnuec::v2::retirement::NnuecValueRetirementOwner> {
+        None
+    }
     fn initialize(&self, position: &Position) -> Result<CpuAccumulator, CpuValueError>;
+    /// Exact context of a position-dependent value. NNUEC additionally seals
+    /// the frozen C owner and L anchor; a model/weights identity alone is not a
+    /// sufficient TT key for a path-conditioned evaluator.
+    fn cache_context(
+        &self,
+        accumulator: &CpuAccumulator,
+        position: &Position,
+    ) -> Result<CpuValueCacheContext, CpuValueError> {
+        if accumulator.identity != position.position_identity()
+            || accumulator.namespace.as_ref() != self.identity()
+            || accumulator.nnuec.is_some()
+        {
+            return Err(CpuValueError::StateMismatch);
+        }
+        Ok(CpuValueCacheContext::default())
+    }
     fn score(
         &self,
         accumulator: &CpuAccumulator,
         position: &Position,
     ) -> Result<i32, CpuValueError>;
+    /// Explicit collection only. Legacy evaluators retain their same score
+    /// call and report unsupported capture rather than fabricating an input.
+    fn score_with_capture(
+        &self,
+        accumulator: &CpuAccumulator,
+        position: &Position,
+        capture: &nnuec::v2::capture::NnuecActiveCapture,
+    ) -> Result<i32, CpuValueError> {
+        let score = self.score(accumulator, position)?;
+        capture.unsupported();
+        Ok(score)
+    }
     /// Transactional update: failure leaves accumulator unchanged.
     fn apply_delta(
         &self,
@@ -345,11 +401,49 @@ pub trait CpuValueEvaluator: Send + Sync {
         {
             return Err(CpuValueError::StateMismatch);
         }
-        if undo.changes.is_some() {
+        if undo.changes.is_some() || undo.nnuec.is_some() || accumulator.nnuec.is_some() {
             return Err(CpuValueError::StateMismatch);
         }
         accumulator.identity = undo.before;
         Ok(())
+    }
+}
+
+/// Opaque, cheap exact cache context. The authority pins only a small seal,
+/// never an old C view or all of its archived lines. Rules identity supplies
+/// exact current history; the local anchor then determines the full suffix.
+#[derive(Clone, Debug, Default)]
+pub struct CpuValueCacheContext {
+    contextual: Option<ContextualCacheContext>,
+}
+
+#[derive(Clone, Debug)]
+struct ContextualCacheContext {
+    authority: Arc<()>,
+    local_anchor: PositionIdentity,
+}
+
+impl PartialEq for CpuValueCacheContext {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.contextual, &other.contextual) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                Arc::ptr_eq(&a.authority, &b.authority) && a.local_anchor == b.local_anchor
+            }
+            _ => false,
+        }
+    }
+}
+impl Eq for CpuValueCacheContext {}
+
+impl CpuValueCacheContext {
+    fn contextual(authority: &Arc<()>, local_anchor: &PositionIdentity) -> Self {
+        Self {
+            contextual: Some(ContextualCacheContext {
+                authority: Arc::clone(authority),
+                local_anchor: local_anchor.clone(),
+            }),
+        }
     }
 }
 
@@ -359,11 +453,23 @@ pub struct CpuAccumulator {
     identity: PositionIdentity,
     namespace: Arc<CpuValueIdentity>,
     exact: Option<Box<ExactValues>>,
+    nnuec: Option<Box<nnuec::NnuecNativeAccumulator>>,
 }
 
 impl CpuAccumulator {
     pub fn values(&self) -> &[[f32; CPU_ACCUMULATOR_WIDTH]; 2] {
         &self.values
+    }
+    /// Conservative inline + owned backing charge. Frozen model/C and shared
+    /// Rules history are retained by their existing owner, not copied here.
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.exact
+                    .as_ref()
+                    .map_or(0, |_| std::mem::size_of::<ExactValues>()),
+            )
+            .saturating_add(self.nnuec.as_ref().map_or(0, |v| v.retained_bytes()))
     }
 }
 
@@ -372,6 +478,14 @@ pub struct CpuAccumulatorUndo {
     before: PositionIdentity,
     after: PositionIdentity,
     namespace: Arc<CpuValueIdentity>,
+    nnuec: Option<Box<nnuec::NnuecNativeUndo>>,
+}
+
+impl CpuAccumulatorUndo {
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.nnuec.as_ref().map_or(0, |v| v.retained_bytes()))
+    }
 }
 
 pub struct BootstrapCpuValue {
@@ -405,6 +519,7 @@ impl CpuValueEvaluator for BootstrapCpuValue {
             identity: position.position_identity(),
             namespace: Arc::clone(&self.identity),
             exact: None,
+            nnuec: None,
         })
     }
 
@@ -436,6 +551,7 @@ impl CpuValueEvaluator for BootstrapCpuValue {
             before: accumulator.identity.clone(),
             after: delta.after.position_identity(),
             namespace: Arc::clone(&self.identity),
+            nnuec: None,
         };
         accumulator.identity = undo.after.clone();
         Ok(undo)
@@ -705,6 +821,7 @@ impl CpuValueEvaluator for CpuFloatValue {
             identity: position.position_identity(),
             namespace: Arc::clone(&self.identity),
             exact: Some(exact),
+            nnuec: None,
         })
     }
 
@@ -777,6 +894,7 @@ impl CpuValueEvaluator for CpuFloatValue {
             before: accumulator.identity.clone(),
             after: delta.after.position_identity(),
             namespace: Arc::clone(&self.identity),
+            nnuec: None,
         };
         accumulator.values = rounded_values(exact);
         accumulator.identity = undo.after.clone();

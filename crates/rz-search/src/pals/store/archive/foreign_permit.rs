@@ -5,6 +5,9 @@
 use super::*;
 use crate::external_cpu::ExternalGoIssue;
 use crate::external_cpu::worker::{ExternalWorkerReport, ExternalWorkerScope};
+use crate::external_cpu::{
+    ProfiledExternalCompletion, ProfiledExternalDispatch, ProfiledExternalRootSource,
+};
 use rz_contracts::pals_adaptive::ExternalCpuJobEnvelope;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -40,6 +43,7 @@ impl ForeignGoIssuedProof {
                 "foreign issued proof lacks raw report",
             ))?;
         if worker.go_issue != ExternalGoIssue::Issued
+            || !matches!(observation.scope, EvidenceScope::ExternalUci { .. })
             || worker.scope.job != worker.job.id
             || worker.grant.job != worker.job.id
             || worker.scope.execution != worker.grant.execution
@@ -90,8 +94,13 @@ impl ForeignGoIssuedProof {
 /// By-value consumption burns it even if the one hot allocation fails.
 #[derive(Debug)]
 pub struct ForeignAppendPermit {
-    observation: Observation,
     issued: ForeignGoIssuedProof,
+    prepared: PreparedForeignAppend,
+}
+
+#[derive(Debug)]
+struct PreparedForeignAppend {
+    observation: Observation,
     owner: StoreReadOwner,
     observations_owner: Weak<()>,
     store_generation: u64,
@@ -104,7 +113,7 @@ pub struct ForeignAppendPermit {
 
 impl ForeignAppendPermit {
     pub(crate) fn observation(&self) -> &Observation {
-        &self.observation
+        &self.prepared.observation
     }
     pub fn observation_digest(&self) -> [u8; 32] {
         self.issued.observation_digest
@@ -119,7 +128,124 @@ impl ForeignAppendPermit {
         self.issued.job.id
     }
     pub fn nonce(&self) -> u64 {
-        self.nonce
+        self.prepared.nonce
+    }
+}
+
+/// Actual profiled owner provenance. No legacy CpuJob or native credit is
+/// manufactured for an external question that requested no depth/node limit.
+#[derive(Debug)]
+pub struct ProfiledForeignGoIssuedProof {
+    source: ProfiledExternalRootSource,
+    scope: crate::external_cpu::profiled_worker::ProfiledExternalScope,
+    request_id: u64,
+    observation_digest: [u8; 32],
+    retain_until: Instant,
+}
+
+impl ProfiledForeignGoIssuedProof {
+    pub fn retain_until(&self) -> Instant {
+        self.retain_until
+    }
+
+    pub(crate) fn checked_worker_report(
+        completion: &ProfiledExternalCompletion,
+        dispatch: &ProfiledExternalDispatch,
+        source: &ProfiledExternalRootSource,
+        observation: &Observation,
+        retain_until: Instant,
+    ) -> Result<Self, StoreError> {
+        source
+            .validate_current()
+            .map_err(|_| StoreError::InvalidEvidence("profiled source is not current"))?;
+        let question = dispatch.question();
+        let clock = source.clock();
+        let original_deadline = clock
+            .origin
+            .checked_add(std::time::Duration::from_nanos(
+                question.original_deadline.at.0,
+            ))
+            .ok_or(StoreError::ArchiveDeadline)?;
+        if !completion.matches_submission(dispatch)
+            || completion.go_issue() != ExternalGoIssue::Issued
+            || !completion.controls().terminal
+            || dispatch.scope().question != question.id
+            || question.id.authority != source.authority()
+            || question.recipient != rz_contracts::rovent::SearchRecipient::Researcher
+            || dispatch.scope().owner != source.owner()
+            || dispatch.scope().execution.epoch != source.authority().epoch
+            || dispatch.scope().execution.sequence == 0
+            || dispatch.process_identity() != source.process_identity()
+            || completion.process_identity() != Some(source.process_identity())
+            || question.original_deadline.clock != clock.domain
+            || retain_until != original_deadline
+        {
+            return Err(StoreError::InvalidEvidence(
+                "profiled go was not exactly issued",
+            ));
+        }
+        let outcome = completion.result().as_ref().map_err(|_| {
+            StoreError::InvalidEvidence("profiled failed packet lacks retained issued constraint")
+        })?;
+        let raw = observation
+            .external_report
+            .as_deref()
+            .ok_or(StoreError::InvalidEvidence(
+                "profiled issued proof lacks raw report",
+            ))?;
+        let profiled = &outcome.report;
+        if profiled.profile != source.profile()
+            || profiled.purpose != source.purpose()
+            || profiled.requested != dispatch.constraint()
+            || profiled.strict_native_nodes.is_some()
+            || &profiled.raw != raw
+            || raw.request_id == 0
+            || !matches!(observation.scope, EvidenceScope::ProfiledExternalUci { requested, issued, .. }
+                if requested == ProfiledExternalConstraint::from(profiled.requested)
+                    && issued == ProfiledExternalConstraint::from(profiled.issued))
+        {
+            return Err(StoreError::InvalidEvidence(
+                "profiled issued proof has another raw report",
+            ));
+        }
+        if Instant::now() >= retain_until {
+            return Err(StoreError::ArchiveDeadline);
+        }
+        observation.validate()?;
+        Ok(Self {
+            source: source.clone(),
+            scope: completion.scope(),
+            request_id: raw.request_id,
+            observation_digest: profiled_observation_digest(observation)?,
+            retain_until,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct ProfiledForeignAppendPermit {
+    issued: ProfiledForeignGoIssuedProof,
+    prepared: PreparedForeignAppend,
+}
+
+impl ProfiledForeignAppendPermit {
+    pub(crate) fn observation(&self) -> &Observation {
+        &self.prepared.observation
+    }
+    pub fn observation_digest(&self) -> [u8; 32] {
+        self.issued.observation_digest
+    }
+    pub fn request_id(&self) -> u64 {
+        self.issued.request_id
+    }
+    pub fn native_execution(&self) -> rz_contracts::ExecutionId {
+        self.issued.scope.execution
+    }
+    pub fn question(&self) -> rz_contracts::rovent::ReciprocalQuestionId {
+        self.issued.scope.question
+    }
+    pub fn nonce(&self) -> u64 {
+        self.prepared.nonce
     }
 }
 
@@ -133,9 +259,51 @@ impl PalsStores {
         issued: ForeignGoIssuedProof,
         budget: &mut ArchiveIoBudget,
     ) -> Result<ForeignAppendPermit, StoreError> {
+        let prepared = self.prepare_foreign_append_inner(
+            observation,
+            issued.request_id,
+            issued.observation_digest,
+            issued.retain_until,
+            budget,
+            b"rz-pals-foreign-exact-append-permit/1\0",
+        )?;
+        Ok(ForeignAppendPermit { issued, prepared })
+    }
+
+    pub fn prepare_profiled_foreign_append_permit(
+        &mut self,
+        observation: Observation,
+        issued: ProfiledForeignGoIssuedProof,
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<ProfiledForeignAppendPermit, StoreError> {
+        issued
+            .source
+            .validate_current()
+            .map_err(|_| StoreError::InvalidEvidence("profiled source is not current"))?;
+        let prepared = self.prepare_foreign_append_inner(
+            observation,
+            issued.request_id,
+            issued.observation_digest,
+            issued.retain_until,
+            budget,
+            b"rz-pals-profiled-foreign-exact-append-permit/1\0",
+        )?;
+        Ok(ProfiledForeignAppendPermit { issued, prepared })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_foreign_append_inner(
+        &mut self,
+        observation: Observation,
+        request_id: u64,
+        expected_digest: [u8; 32],
+        retain_until: Instant,
+        budget: &mut ArchiveIoBudget,
+        domain: &[u8],
+    ) -> Result<PreparedForeignAppend, StoreError> {
         self.reject_archive_allocation_scope()?;
         budget.check()?;
-        if budget.deadline > issued.retain_until || Instant::now() >= issued.retain_until {
+        if budget.deadline > retain_until || Instant::now() >= retain_until {
             return Err(StoreError::ArchiveDeadline);
         }
         let raw = observation
@@ -144,8 +312,8 @@ impl PalsStores {
             .ok_or(StoreError::InvalidEvidence(
                 "foreign append permit lacks raw report",
             ))?;
-        if raw.request_id != issued.request_id
-            || observation_digest(&observation)? != issued.observation_digest
+        if raw.request_id != request_id
+            || observation_digest_with_domain(&observation, domain)? != expected_digest
         {
             return Err(StoreError::InvalidEvidence(
                 "foreign append permit payload differs",
@@ -179,9 +347,8 @@ impl PalsStores {
                 previous.checked_add(1)
             })
             .map_err(|_| StoreError::RevisionExhausted)?;
-        Ok(ForeignAppendPermit {
+        Ok(PreparedForeignAppend {
             observation,
-            issued,
             owner,
             observations_owner,
             store_generation,
@@ -200,6 +367,26 @@ impl PalsStores {
         &mut self,
         permit: ForeignAppendPermit,
     ) -> Result<ObservationId, StoreError> {
+        self.hot_append_foreign_inner(permit.prepared, permit.issued.retain_until)
+    }
+
+    pub fn hot_append_profiled_foreign_permitted(
+        &mut self,
+        permit: ProfiledForeignAppendPermit,
+    ) -> Result<ObservationId, StoreError> {
+        permit
+            .issued
+            .source
+            .validate_current()
+            .map_err(|_| StoreError::InvalidEvidence("profiled source is not current"))?;
+        self.hot_append_foreign_inner(permit.prepared, permit.issued.retain_until)
+    }
+
+    fn hot_append_foreign_inner(
+        &mut self,
+        permit: PreparedForeignAppend,
+        retain_until: Instant,
+    ) -> Result<ObservationId, StoreError> {
         self.reject_archive_allocation_scope()?;
         if !permit.owner.matches(self)
             || !permit
@@ -211,7 +398,7 @@ impl PalsStores {
         {
             return Err(StoreError::ForeignPermitStale);
         }
-        if Instant::now() >= permit.deadline || Instant::now() >= permit.issued.retain_until {
+        if Instant::now() >= permit.deadline || Instant::now() >= retain_until {
             return Err(StoreError::ArchiveDeadline);
         }
         // Exact bytes cannot change: the opaque permit owns the Observation.
@@ -246,6 +433,20 @@ fn archive_seal_matches(
 /// Canonical existing archive encoding, hashed by a streaming writer rather
 /// than a second serialized raw-report buffer. This only runs on preparation.
 fn observation_digest(observation: &Observation) -> Result<[u8; 32], StoreError> {
+    observation_digest_with_domain(observation, b"rz-pals-foreign-exact-append-permit/1\0")
+}
+
+fn profiled_observation_digest(observation: &Observation) -> Result<[u8; 32], StoreError> {
+    observation_digest_with_domain(
+        observation,
+        b"rz-pals-profiled-foreign-exact-append-permit/1\0",
+    )
+}
+
+fn observation_digest_with_domain(
+    observation: &Observation,
+    domain: &[u8],
+) -> Result<[u8; 32], StoreError> {
     struct HashWriter(Sha256);
     impl Write for HashWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -258,7 +459,7 @@ fn observation_digest(observation: &Observation) -> Result<[u8; 32], StoreError>
     }
     let wire = ObservationWire::encode(observation)?;
     let mut writer = HashWriter(Sha256::new());
-    writer.0.update(b"rz-pals-foreign-exact-append-permit/1\0");
+    writer.0.update(domain);
     serde_json::to_writer(&mut writer, &wire)
         .map_err(|_| StoreError::InvalidEvidence("foreign permit observation encoding"))?;
     Ok(writer.0.finalize().into())

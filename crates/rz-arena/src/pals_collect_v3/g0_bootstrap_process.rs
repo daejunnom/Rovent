@@ -729,6 +729,9 @@ pub(super) mod linux {
         let raw = common::hold_input(r.native_recipe.clone(), true, held, &mut credit)?;
         let native: G0NativeCaptureRecipeV5 = common::decode(&raw)?;
         validate_native_recipe(&native, &intent, &r)?;
+        if native.cuda_bundle.is_some() {
+            return Err(super::super::g0_cuda_artifact_tree::legacy_cuda_execution_disabled());
+        }
         common::retain_directory(native.runtime_cache.clone(), held)?;
         for input in [
             &r.rules_profile,

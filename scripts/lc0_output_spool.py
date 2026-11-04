@@ -1,0 +1,144 @@
+"""Bounded raw-output custody for a future Linux LC0 parent.
+
+This component only records bytes and their I/O status.  It does not own a
+process, authenticate a peer, decide whether a session may exit, or prove GPU
+completion.  The caller owns the managed output directory and the original
+stream descriptor; this object retains its own descriptor until explicitly
+closed or handed off together with any pending bytes.
+"""
+from __future__ import annotations
+
+import os
+import stat
+
+
+class OutputSpoolInitError(Exception):
+    """Retain both initialization and uncertain descriptor-close failures."""
+
+    def __init__(self, original_error: BaseException, close_error: BaseException):
+        super().__init__("output spool initialization failed and descriptor close is unknown")
+        self.original_error = original_error
+        self.close_error = close_error
+
+
+class OutputSpool:
+    """Keep a bounded prefix, including bytes awaiting a failed write.
+
+    The descriptor must name a new empty regular file whose contents are not
+    concurrently modified by the caller or another actor.  Descriptor and size
+    checks do not prove that ownership or detect same-size external overwrites.
+    Writes use a positional offset so changes to the caller's file position do
+    not reorder the captured stream.  Written bytes mean OS-accepted writes,
+    not fsync or durable-storage evidence.  A disk error is sticky evidence,
+    not a claim of EOF; retrying only retries the retained bytes.
+    """
+
+    def __init__(self, fd: int, max_bytes: int):
+        if type(max_bytes) is not int or max_bytes <= 0:
+            raise ValueError("output spool requires a positive byte bound")
+        self._fd = os.dup(fd)
+        try:
+            info = os.fstat(self._fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size != 0:
+                raise ValueError("output spool requires a new empty regular file")
+            self._identity = (info.st_dev, info.st_ino)
+        except BaseException as original_error:
+            try:
+                os.close(self._fd)
+            except BaseException as close_error:
+                # A close error does not prove whether the OS released this
+                # descriptor. Never retry it by number after that ambiguity.
+                raise OutputSpoolInitError(original_error, close_error) from original_error
+            self._fd = None
+            raise
+        self.max_bytes = max_bytes
+        self.bytes_seen = 0
+        self.bytes_written = 0
+        self.bytes_truncated = 0
+        self._pending = bytearray()
+        self._first_write_error = None
+        self._write_blocked = False
+        self._read_error = None
+        self._eof = False
+
+    def accept(self, data: bytes) -> None:
+        if self._fd is None or self._eof or self._read_error is not None:
+            raise ValueError("output stream no longer accepts bytes")
+        if not isinstance(data, bytes):
+            raise TypeError("output data must be bytes")
+        self.bytes_seen += len(data)
+        remaining = self.max_bytes - self.bytes_written - len(self._pending)
+        retained = data[:remaining]
+        self._pending.extend(retained)
+        self.bytes_truncated += len(data) - len(retained)
+        if not self._write_blocked:
+            self._write_pending()
+
+    def _write_pending(self) -> None:
+        while self._pending:
+            try:
+                current = os.fstat(self._fd)
+                if ((current.st_dev, current.st_ino) != self._identity
+                        or current.st_size != self.bytes_written):
+                    raise OSError("output file identity or size changed")
+                count = os.pwrite(self._fd, self._pending, self.bytes_written)
+                if count <= 0 or count > len(self._pending):
+                    raise OSError("output file write did not advance")
+                self.bytes_written += count
+                del self._pending[:count]
+            except OSError as error:
+                if self._first_write_error is None:
+                    self._first_write_error = error
+                self._write_blocked = True
+                break
+        else:
+            self._write_blocked = False
+
+    def retry_pending(self) -> None:
+        """Retry only the original retained bytes; keep the first error record."""
+        if self._fd is None:
+            raise ValueError("output spool is closed")
+        self._write_pending()
+
+    def observe_eof(self) -> None:
+        if self._fd is None:
+            raise ValueError("output spool is closed")
+        self._eof = True
+
+    def observe_read_error(self, error: OSError) -> None:
+        if self._fd is None or self._eof:
+            raise ValueError("output stream is already closed")
+        if self._read_error is None:
+            self._read_error = error
+
+    def observation(self) -> dict[str, object]:
+        return {
+            "bytes_seen": self.bytes_seen,
+            "bytes_written": self.bytes_written,
+            "bytes_pending": len(self._pending),
+            "bytes_truncated": self.bytes_truncated,
+            "first_write_error": (type(self._first_write_error).__name__
+                                  if self._first_write_error is not None else None),
+            "first_write_errno": (self._first_write_error.errno
+                                  if self._first_write_error is not None else None),
+            "write_blocked": self._write_blocked,
+            "read_error": (type(self._read_error).__name__ if self._read_error is not None else None),
+            "read_errno": (self._read_error.errno if self._read_error is not None else None),
+            "eof_observed": self._eof,
+        }
+
+    def original_errors(self) -> tuple[OSError | None, OSError | None]:
+        """Expose the original read/write errors for same-owner recovery."""
+        return self._read_error, self._first_write_error
+
+    def close(self) -> None:
+        """Release this descriptor only; this is not output acceptance.
+
+        The caller must separately inspect EOF, read and write errors,
+        truncation, pending data, and any required durability evidence.
+        """
+        if self._pending:
+            raise RuntimeError("output bytes remain owned by the spool")
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None

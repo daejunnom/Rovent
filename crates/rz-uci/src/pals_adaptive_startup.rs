@@ -17,6 +17,22 @@ use std::{
 
 mod search_settings;
 pub use search_settings::*;
+mod system_v6;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+pub(crate) use system_v6::open_held_root_parent_stream_bounded;
+pub(crate) use system_v6::verify_root_identity;
+mod system_v6_deadline_wire;
+mod system_v6_execution;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+pub(crate) use system_v6::open_system_proxy_binary_until;
+pub use system_v6::*;
+pub use system_v6_deadline_wire::{
+    PALS_SYSTEM_V6_DEADLINE_WIRE_SOURCE_COMPONENT,
+    compiled_pals_system_v6_deadline_wire_source_digest,
+};
+pub use system_v6_execution::{
+    PALS_SYSTEM_V6_EXECUTION_SOURCE_COMPONENT, compiled_pals_system_v6_execution_source_digest,
+};
 
 const CONTROL_BYTES_MAX: u64 = 4 * 1024 * 1024;
 const ASSET_BYTES_MAX: u64 = 18 * 1024 * 1024 * 1024;
@@ -220,7 +236,7 @@ impl PinnedPalsStartupV5 {
     }
 }
 
-fn absolute_control_path(value: &str) -> Result<PathBuf, ManifestError> {
+pub(crate) fn absolute_control_path(value: &str) -> Result<PathBuf, ManifestError> {
     let path = PathBuf::from(value);
     if !path.is_absolute()
         || value.len() > 2048
@@ -245,7 +261,7 @@ fn absolute_control_path(value: &str) -> Result<PathBuf, ManifestError> {
     }
     Ok(path)
 }
-fn relative_control_path(path: &Path, root: &Path) -> Result<String, ManifestError> {
+pub(crate) fn relative_control_path(path: &Path, root: &Path) -> Result<String, ManifestError> {
     let relative = path
         .strip_prefix(root)
         .map_err(|_| invalid("control file is outside the private startup cwd"))?;
@@ -260,7 +276,16 @@ fn relative_control_path(path: &Path, root: &Path) -> Result<String, ManifestErr
     }
     Ok(name)
 }
-fn read_control(root: &Dir, path: &str) -> Result<Vec<u8>, ManifestError> {
+pub(crate) fn read_control(root: &Dir, path: &str) -> Result<Vec<u8>, ManifestError> {
+    read_control_owned(root, path).map(|(_, bytes, _)| bytes)
+}
+
+/// Preserve the original no-follow descriptor for callers that need a pinned
+/// control owner. This does not prevent writes through another descriptor.
+pub(crate) fn read_control_owned(
+    root: &Dir,
+    path: &str,
+) -> Result<(File, Vec<u8>, std::fs::Metadata), ManifestError> {
     let (file, parents) = path
         .rsplit_once('/')
         .ok_or_else(|| invalid("missing control parent"))?;
@@ -288,24 +313,41 @@ fn read_control(root: &Dir, path: &str) -> Result<Vec<u8>, ManifestError> {
         use cap_std::fs::OpenOptionsExt;
         options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW);
     }
-    let file = directory
+    let mut file = directory
         .open_with(filename, &options)
-        .map_err(|_| invalid("control file cannot be pinned"))?;
-    let size = file
+        .map_err(|_| invalid("control file cannot be pinned"))?
+        .into_std();
+    let before = file
         .metadata()
-        .map_err(|_| invalid("control metadata unavailable"))?
-        .len();
+        .map_err(|_| invalid("control metadata unavailable"))?;
+    let size = before.len();
     if !(1..=CONTROL_BYTES_MAX).contains(&size) {
         return Err(invalid("control input size exceeds bound"));
     }
     let mut raw = Vec::with_capacity(size as usize);
-    file.take(CONTROL_BYTES_MAX + 1)
+    (&mut file)
+        .take(CONTROL_BYTES_MAX + 1)
         .read_to_end(&mut raw)
         .map_err(|_| invalid("control input read failed"))?;
     if raw.len() as u64 != size {
         return Err(invalid("control input changed or exceeded bound"));
     }
-    Ok(raw)
+    let after = file
+        .metadata()
+        .map_err(|_| invalid("control metadata unavailable after read"))?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.len() != after.len()
+            || (before.mtime(), before.mtime_nsec()) != (after.mtime(), after.mtime_nsec())
+            || (before.ctime(), before.ctime_nsec()) != (after.ctime(), after.ctime_nsec())
+        {
+            return Err(invalid("control input changed during read"));
+        }
+    }
+    Ok((file, raw, after))
 }
 fn sha256(value: &str) -> bool {
     value.len() == 64

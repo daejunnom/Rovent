@@ -1,5 +1,10 @@
 # rz-eval — C 평가 구현
 
+> **현재 CUDA 실행 경계:** 아래의 bundle 기반 실행·복사 설명은 과거 기록이다.
+> 신규 bundle 기반 제품 실행과 bundle 복사 API는 명시적으로 거절하며,
+> V1/V5 기록·metadata 읽기는 보존한다. 시스템 CUDA는 별도 V3/V6 경로로
+> 준비 중이고 실제 GPU 인수는 별도로 확인해야 한다.
+
 담당: TASK-C01/C02/C03. 기준 규약은 저장소의
 [구현 지시서](../../docs/IMPLEMENTATION-DIRECTIVES.md),
 [계약](../../docs/CONTRACTS.md), [선정 기록](../../docs/WEIGHT-SELECTION.md)이다.

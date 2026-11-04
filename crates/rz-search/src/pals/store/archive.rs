@@ -12,9 +12,17 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 mod codec;
+mod cpu7_historical;
 mod foreign_permit;
+mod review_projection;
 use codec::{Bundle, LineWire, ObservationWire, RoleRecordWire, StateWire};
-pub use foreign_permit::{ForeignAppendPermit, ForeignGoIssuedProof};
+pub use cpu7_historical::{
+    Cpu7DiagnosticExpected, HistoricalCpu7Observation, inspect_cpu7_diagnostic_ack,
+};
+pub use foreign_permit::{
+    ForeignAppendPermit, ForeignGoIssuedProof, ProfiledForeignAppendPermit,
+    ProfiledForeignGoIssuedProof,
+};
 const MAGIC: &[u8; 8] = b"RZPALS01";
 const HEADER: u64 = 56;
 pub const GAME_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
@@ -216,7 +224,15 @@ impl ArchiveRootCapability {
         Ok(capability)
     }
 
-    fn verify_named_root(&self) -> Result<(), StoreError> {
+    pub(in crate::pals) fn root_path(&self) -> &Path {
+        &self.root
+    }
+
+    pub(in crate::pals) fn held_directory(&self) -> &Dir {
+        &self.directory
+    }
+
+    pub(in crate::pals) fn verify_named_root(&self) -> Result<(), StoreError> {
         for ancestor in self.root.ancestors() {
             no_link(ancestor)?;
         }
@@ -279,6 +295,449 @@ impl StorePins {
             + self.situations.len()
             + self.executions.len()
     }
+}
+
+/// The optional retirement bound applies before allocating a new unique pin.
+/// Legacy archive expansion uses the same graph traversal without a new bound.
+type PinClosureCheck<'a> = Option<&'a mut dyn FnMut() -> Result<(), StoreError>>;
+
+// Shared by the production closure and the deliberately incomplete test-only
+// worklist below. Keep ordering identical to the original line/observation walk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClosureEdge {
+    State(StateId),
+    Line(LineId),
+    Observation(ObservationId),
+    Execution(ExecutionId),
+    Situation(SituationId),
+}
+
+fn situation_closure_header(situation: &Situation) -> [ClosureEdge; 2] {
+    [
+        ClosureEdge::State(situation.state),
+        ClosureEdge::Line(situation.focus),
+    ]
+}
+fn situation_conclusion_edges(
+    line: LineId,
+    conclusion: &ContinuationConclusion,
+) -> [Option<ClosureEdge>; 3] {
+    [
+        Some(ClosureEdge::Line(line)),
+        conclusion.evidence.map(ClosureEdge::Observation),
+        match conclusion.status {
+            ContinuationStatus::RepairedBy(line) => Some(ClosureEdge::Line(line)),
+            _ => None,
+        },
+    ]
+}
+fn execution_closure_header(task: &TaskRecord) -> [Option<ClosureEdge>; 3] {
+    [
+        Some(ClosureEdge::State(task.key.state)),
+        task.key.line.map(ClosureEdge::Line),
+        task.resumed_from.map(ClosureEdge::Execution),
+    ]
+}
+fn execution_consumer_edge(situation: SituationId) -> ClosureEdge {
+    ClosureEdge::Situation(situation)
+}
+fn execution_status_edge(status: TaskStatus) -> Option<ClosureEdge> {
+    match status {
+        TaskStatus::Completed(observation) => Some(ClosureEdge::Observation(observation)),
+        TaskStatus::Paused { evidence, .. } | TaskStatus::RetiredPaused { evidence, .. } => {
+            evidence.map(ClosureEdge::Observation)
+        }
+        _ => None,
+    }
+}
+fn reverse_dependency_edge(observation: ObservationId, retained: bool) -> Option<ClosureEdge> {
+    retained.then_some(ClosureEdge::Observation(observation))
+}
+
+fn line_closure_edges(line: &LineChunk) -> [Option<ClosureEdge>; 2] {
+    [
+        Some(ClosureEdge::State(line.start_state)),
+        line.parent.map(ClosureEdge::Line),
+    ]
+}
+
+fn observation_closure_edges(observation: &Observation) -> [(Option<ClosureEdge>, bool); 7] {
+    let model = observation.score.model_dependencies();
+    [
+        (Some(ClosureEdge::State(observation.state)), false),
+        (observation.line.map(ClosureEdge::Line), true),
+        (observation.cpu_pv.map(ClosureEdge::Line), true),
+        (observation.supersedes.map(ClosureEdge::Observation), true),
+        (model.map(|ids| ClosureEdge::Observation(ids[0])), true),
+        (model.map(|ids| ClosureEdge::Observation(ids[1])), true),
+        (observation.execution.map(ClosureEdge::Execution), false),
+    ]
+}
+
+fn insert_closure_edge(
+    pins: &mut StorePins,
+    edge: ClosureEdge,
+    count: &mut usize,
+    maximum: Option<usize>,
+    check: &mut PinClosureCheck<'_>,
+) -> Result<(), StoreError> {
+    match edge {
+        ClosureEdge::State(id) => insert_closure_pin(&mut pins.states, id, count, maximum, check),
+        ClosureEdge::Line(id) => insert_closure_pin(&mut pins.lines, id, count, maximum, check),
+        ClosureEdge::Observation(id) => {
+            insert_closure_pin(&mut pins.observations, id, count, maximum, check)
+        }
+        ClosureEdge::Execution(id) => {
+            insert_closure_pin(&mut pins.executions, id, count, maximum, check)
+        }
+        ClosureEdge::Situation(id) => {
+            insert_closure_pin(&mut pins.situations, id, count, maximum, check)
+        }
+    }
+}
+
+/// Test-only experimental worklist. It has no mutation/owner gate and is not a
+/// complete snapshot, production cursor, or selection-time attestation.
+#[cfg(test)]
+mod partial_closure_cursor {
+    use super::*;
+
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum Error {
+        Unsupported,
+        Store(StoreError),
+    }
+    impl From<StoreError> for Error {
+        fn from(value: StoreError) -> Self {
+            Self::Store(value)
+        }
+    }
+
+    pub(super) struct Cursor {
+        completed: StorePins,
+        states: BTreeSet<StateId>,
+        lines: BTreeSet<LineId>,
+        observations: BTreeSet<ObservationId>,
+        situations: BTreeSet<SituationId>,
+        executions: BTreeSet<ExecutionId>,
+        active: Option<Active>,
+        allow_complex: bool,
+        include_task_consumers: bool,
+        count: usize,
+        maximum: usize,
+        failed: bool,
+    }
+    enum Active {
+        Conclusions {
+            situation: SituationId,
+            after: Option<LineId>,
+        },
+        Dependencies {
+            situation: SituationId,
+            after: Option<ObservationId>,
+        },
+        Consumers {
+            execution: ExecutionId,
+            index: usize,
+        },
+        ExecutionStatus {
+            execution: ExecutionId,
+        },
+    }
+    impl Cursor {
+        pub(super) fn new(seed: StorePins, maximum: usize) -> Result<Self, Error> {
+            if !seed.situations.is_empty() || !seed.executions.is_empty() {
+                return Err(Error::Unsupported);
+            }
+            Self::new_inner(seed, maximum, false, false)
+        }
+        pub(super) fn new_complex(
+            seed: StorePins,
+            maximum: usize,
+            include_task_consumers: bool,
+        ) -> Result<Self, Error> {
+            Self::new_inner(seed, maximum, true, include_task_consumers)
+        }
+        fn new_inner(
+            mut seed: StorePins,
+            maximum: usize,
+            allow_complex: bool,
+            include_task_consumers: bool,
+        ) -> Result<Self, Error> {
+            let count = seed.count();
+            if count > maximum {
+                return Err(StoreError::Capacity("retirement dependency closure").into());
+            }
+            Ok(Self {
+                states: std::mem::take(&mut seed.states),
+                lines: std::mem::take(&mut seed.lines),
+                observations: std::mem::take(&mut seed.observations),
+                situations: std::mem::take(&mut seed.situations),
+                executions: std::mem::take(&mut seed.executions),
+                active: None,
+                allow_complex,
+                include_task_consumers,
+                completed: seed,
+                count,
+                maximum,
+                failed: false,
+            })
+        }
+        fn add(&mut self, edge: ClosureEdge) -> Result<(), Error> {
+            let fresh = match edge {
+                ClosureEdge::State(id) => {
+                    !self.completed.states.contains(&id) && !self.states.contains(&id)
+                }
+                ClosureEdge::Line(id) => {
+                    !self.completed.lines.contains(&id) && !self.lines.contains(&id)
+                }
+                ClosureEdge::Observation(id) => {
+                    !self.completed.observations.contains(&id) && !self.observations.contains(&id)
+                }
+                ClosureEdge::Execution(id) if self.allow_complex => {
+                    !self.completed.executions.contains(&id) && !self.executions.contains(&id)
+                }
+                ClosureEdge::Situation(id) if self.allow_complex => {
+                    !self.completed.situations.contains(&id) && !self.situations.contains(&id)
+                }
+                ClosureEdge::Execution(_) | ClosureEdge::Situation(_) => {
+                    return Err(Error::Unsupported);
+                }
+            };
+            if !fresh {
+                return Ok(());
+            }
+            self.count = self
+                .count
+                .checked_add(1)
+                .filter(|n| *n <= self.maximum)
+                .ok_or(StoreError::Capacity("retirement dependency closure"))?;
+            match edge {
+                ClosureEdge::State(id) => {
+                    self.states.insert(id);
+                }
+                ClosureEdge::Line(id) => {
+                    self.lines.insert(id);
+                }
+                ClosureEdge::Observation(id) => {
+                    self.observations.insert(id);
+                }
+                ClosureEdge::Execution(id) => {
+                    self.executions.insert(id);
+                }
+                ClosureEdge::Situation(id) => {
+                    self.situations.insert(id);
+                }
+            }
+            Ok(())
+        }
+        /// At most one state, line, or observation is visited; line and
+        /// observation emit at most two and seven fixed-size edges respectively.
+        pub(super) fn step(
+            &mut self,
+            stores: &PalsStores,
+            check: &mut dyn FnMut() -> Result<(), StoreError>,
+        ) -> Result<bool, Error> {
+            if self.failed {
+                return Err(Error::Unsupported);
+            }
+            let result = self.step_inner(stores, check);
+            if result.is_err() {
+                self.failed = true;
+            }
+            result
+        }
+        fn step_inner(
+            &mut self,
+            stores: &PalsStores,
+            check: &mut dyn FnMut() -> Result<(), StoreError>,
+        ) -> Result<bool, Error> {
+            check()?;
+            if let Some(active) = self.active.take() {
+                use std::ops::Bound::{Excluded, Unbounded};
+                match active {
+                    Active::Conclusions { situation, after } => {
+                        let entries = &stores.situations.get(situation)?.conclusions.continuations;
+                        let next = match after {
+                            Some(id) => entries.range((Excluded(id), Unbounded)).next(),
+                            None => entries.iter().next(),
+                        }
+                        .map(|(id, conclusion)| (*id, *conclusion));
+                        if let Some((line, conclusion)) = next {
+                            for edge in situation_conclusion_edges(line, &conclusion)
+                                .into_iter()
+                                .flatten()
+                            {
+                                check()?;
+                                self.add(edge)?;
+                            }
+                            self.active = Some(Active::Conclusions {
+                                situation,
+                                after: Some(line),
+                            });
+                        } else {
+                            self.active = Some(Active::Dependencies {
+                                situation,
+                                after: None,
+                            });
+                        }
+                    }
+                    Active::Dependencies { situation, after } => {
+                        let entries = &stores.dependencies.dependents;
+                        let next = match after {
+                            Some(id) => entries.range((Excluded(id), Unbounded)).next(),
+                            None => entries.iter().next(),
+                        }
+                        .map(|(id, values)| (*id, values.contains(&situation)));
+                        if let Some((observation, retained)) = next {
+                            if let Some(edge) = reverse_dependency_edge(observation, retained) {
+                                check()?;
+                                self.add(edge)?;
+                            }
+                            self.active = Some(Active::Dependencies {
+                                situation,
+                                after: Some(observation),
+                            });
+                        }
+                    }
+                    Active::Consumers { execution, index } => {
+                        let task = stores.tasks.get(execution)?;
+                        if self.include_task_consumers && index < task.consumers.len() {
+                            let edge =
+                                execution_consumer_edge(task.consumers[index].consumer.situation);
+                            check()?;
+                            self.add(edge)?;
+                            self.active = Some(Active::Consumers {
+                                execution,
+                                index: index + 1,
+                            });
+                        } else {
+                            self.active = Some(Active::ExecutionStatus { execution });
+                        }
+                    }
+                    Active::ExecutionStatus { execution } => {
+                        if let Some(edge) =
+                            execution_status_edge(stores.tasks.get(execution)?.status)
+                        {
+                            check()?;
+                            self.add(edge)?;
+                        }
+                    }
+                }
+            } else if let Some(id) = self.states.pop_first() {
+                stores.states.get(id)?;
+                self.completed.states.insert(id);
+            } else if let Some(id) = self.lines.pop_first() {
+                let edges = line_closure_edges(stores.lines.get(id)?);
+                self.completed.lines.insert(id);
+                for edge in edges.into_iter().flatten() {
+                    check()?;
+                    self.add(edge)?;
+                }
+            } else if let Some(id) = self.observations.pop_first() {
+                let edges = observation_closure_edges(stores.observations.get(id)?);
+                self.completed.observations.insert(id);
+                for (edge, _) in edges {
+                    if let Some(edge) = edge {
+                        check()?;
+                        self.add(edge)?;
+                    }
+                }
+            } else if let Some(id) = self.situations.pop_first() {
+                let edges = situation_closure_header(stores.situations.get(id)?);
+                self.completed.situations.insert(id);
+                for edge in edges {
+                    check()?;
+                    self.add(edge)?;
+                }
+                self.active = Some(Active::Conclusions {
+                    situation: id,
+                    after: None,
+                });
+            } else if let Some(id) = self.executions.pop_first() {
+                let edges = execution_closure_header(stores.tasks.get(id)?);
+                self.completed.executions.insert(id);
+                for edge in edges.into_iter().flatten() {
+                    check()?;
+                    self.add(edge)?;
+                }
+                self.active = Some(Active::Consumers {
+                    execution: id,
+                    index: 0,
+                });
+            } else {
+                check()?;
+                return Ok(true);
+            }
+            check()?;
+            Ok(false)
+        }
+        pub(super) fn into_completed(self) -> Result<StorePins, Error> {
+            if !self.failed
+                && self.states.is_empty()
+                && self.lines.is_empty()
+                && self.observations.is_empty()
+                && self.situations.is_empty()
+                && self.executions.is_empty()
+                && self.active.is_none()
+            {
+                Ok(self.completed)
+            } else {
+                Err(Error::Unsupported)
+            }
+        }
+    }
+}
+
+fn check_pin_closure(check: &mut PinClosureCheck<'_>) -> Result<(), StoreError> {
+    match check {
+        Some(check) => check(),
+        None => Ok(()),
+    }
+}
+
+fn clone_closure_set<T: Ord + Copy>(
+    source: &BTreeSet<T>,
+    check: &mut PinClosureCheck<'_>,
+) -> Result<BTreeSet<T>, StoreError> {
+    check_pin_closure(check)?;
+    let copied = if check.is_none() {
+        source.clone()
+    } else {
+        let mut copied = BTreeSet::new();
+        for id in source {
+            check_pin_closure(check)?;
+            copied.insert(*id);
+            check_pin_closure(check)?;
+        }
+        copied
+    };
+    check_pin_closure(check)?;
+    Ok(copied)
+}
+
+fn insert_closure_pin<T: Ord>(
+    set: &mut BTreeSet<T>,
+    value: T,
+    count: &mut usize,
+    maximum: Option<usize>,
+    check: &mut PinClosureCheck<'_>,
+) -> Result<(), StoreError> {
+    check_pin_closure(check)?;
+    if let Some(maximum) = maximum {
+        if set.contains(&value) {
+            return check_pin_closure(check);
+        }
+        let next = count
+            .checked_add(1)
+            .filter(|next| *next <= maximum)
+            .ok_or(StoreError::Capacity("retirement dependency closure"))?;
+        set.insert(value);
+        *count = next;
+    } else {
+        set.insert(value);
+    }
+    check_pin_closure(check)
 }
 
 /// A handle proves the live archive owner and committed segment generation.
@@ -409,6 +868,42 @@ pub struct EngineArchiveReceipt {
 impl EngineArchiveReceipt {
     pub(crate) fn actual_root(&self) -> Option<(SituationId, StateId, u64)> {
         self.actual_root
+    }
+
+    /// Diagnostic metadata only: this weak identity cannot load or pin data.
+    #[cfg(feature = "archive-origin-diagnostics")]
+    pub(crate) fn diagnostic_origin(&self) -> (Weak<()>, u64, [u8; 32]) {
+        (
+            self.archive.owner.clone(),
+            self.archive.generation,
+            self.archive.checksum,
+        )
+    }
+
+    /// Fingerprint the original record in the same format as the archive.
+    /// This is not a fingerprint of the observation/dependency closure.
+    #[cfg(feature = "archive-origin-diagnostics")]
+    pub(crate) fn diagnostic_record_digest(
+        record: &crate::pals::engine::RoleRecord,
+    ) -> Option<[u8; 32]> {
+        if record.line.len() > 256 {
+            return None;
+        }
+        let wire = RoleRecordWire::encode(record).ok()?;
+        let bytes = serde_json::to_vec(&wire).ok()?;
+        let mut hash = Sha256::new();
+        hash.update(b"rz-pals-archive-origin-record-v1\0");
+        hash.update(bytes);
+        Some(hash.finalize().into())
+    }
+}
+
+#[cfg(feature = "archive-origin-diagnostics")]
+impl PalsStores {
+    pub(crate) fn diagnostic_archive_owner_matches(&self, owner: &Weak<()>) -> bool {
+        self.archive.as_ref().is_some_and(|archive| {
+            owner.strong_count() > 0 && owner.ptr_eq(&Arc::downgrade(&archive.identity))
+        })
     }
 }
 
@@ -1922,6 +2417,22 @@ impl PalsStores {
     ) -> Result<(), StoreError> {
         self.enable_archive_inner(config, Some(capability))
     }
+    pub(in crate::pals) fn validate_unused_archive_setup(&self) -> Result<(), StoreError> {
+        if self.generation != 0
+            || self.root.is_some()
+            || self.hot_stats() != ArchiveStats::default()
+            || !self.derived.entries.is_empty()
+            || !self.checked_cpu_pvs.is_empty()
+            || self.review_pin_count()? != 0
+            || self.archive.is_some()
+            || self.archive_write_ledger.is_some()
+        {
+            return Err(StoreError::InvalidConditions(
+                "archive setup needs unused Store",
+            ));
+        }
+        Ok(())
+    }
     fn enable_archive_inner(
         &mut self,
         config: ArchiveConfig,
@@ -2136,12 +2647,34 @@ impl PalsStores {
             return Err(error);
         }
         let manager = self.archive.take().expect("checked archive owner");
-        manager.note(|meter| {
-            meter.admission_closed = true;
-            meter.cleanup_complete = true;
-            meter.lifecycle = ArchiveOwnerLifecycle::Closed;
-        });
-        let snapshot = manager.snapshot();
+        // The original capability must survive an unwind in telemetry.  Do
+        // not manufacture a replacement owner or infer physical completion.
+        let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            manager.note(|meter| {
+                meter.admission_closed = true;
+                meter.cleanup_complete = true;
+                meter.lifecycle = ArchiveOwnerLifecycle::Closed;
+            });
+            manager.snapshot()
+        }));
+        let snapshot = match observed {
+            Ok(snapshot) => snapshot,
+            Err(payload) => {
+                // The capability still exists; a partially written close
+                // observation is not evidence that it was released.
+                let mut meter = manager
+                    .telemetry
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                meter.admission_closed = false;
+                meter.cleanup_complete = false;
+                meter.lifecycle = ArchiveOwnerLifecycle::Failed;
+                meter.complete = false;
+                drop(meter);
+                self.archive = Some(manager);
+                std::panic::resume_unwind(payload);
+            }
+        };
         drop(manager); // Expire the actual Arc; copied telemetry is not authority.
         Ok(Some(snapshot))
     }
@@ -2448,7 +2981,128 @@ impl PalsStores {
         }
         Ok(())
     }
+    pub(crate) fn write_retirement_state<W: Write + ?Sized>(
+        &self,
+        id: StateId,
+        writer: &mut W,
+    ) -> Result<(), StoreError> {
+        codec::write_retirement_wire(writer, &StateWire::encode(id, self.states.get(id)?)?)
+    }
+
+    /// Serialize the retirement owner's retained source, including an original
+    /// snapshot that is no longer a current hot lookup. This grants no StateId.
+    pub(crate) fn write_retirement_snapshot<W: Write + ?Sized>(
+        &self,
+        id: StateId,
+        snapshot: &PositionSnapshot,
+        writer: &mut W,
+    ) -> Result<(), StoreError> {
+        codec::write_retirement_wire(writer, &StateWire::encode(id, snapshot)?)
+    }
+
+    pub(crate) fn write_retirement_line<W: Write + ?Sized>(
+        &self,
+        id: LineId,
+        writer: &mut W,
+    ) -> Result<(), StoreError> {
+        codec::write_retirement_wire(writer, &LineWire::encode(id, self.lines.get(id)?))
+    }
+
+    pub(crate) fn write_retirement_observation<W: Write + ?Sized>(
+        &self,
+        id: ObservationId,
+        writer: &mut W,
+    ) -> Result<(), StoreError> {
+        codec::write_retirement_wire(
+            writer,
+            &ObservationWire::encode(self.observations.get(id)?)?,
+        )
+    }
+
+    /// Unpublished failure evidence remains unpublished; the sink binds this
+    /// exact value to its original retirement custody rather than a new lookup.
+    pub(crate) fn write_retirement_observation_value<W: Write + ?Sized>(
+        &self,
+        value: &Observation,
+        writer: &mut W,
+    ) -> Result<(), StoreError> {
+        codec::write_retirement_wire(writer, &ObservationWire::encode(value)?)
+    }
+
+    pub(crate) fn write_retirement_role_record<W: Write + ?Sized>(
+        &self,
+        record: &crate::pals::engine::RoleRecord,
+        writer: &mut W,
+    ) -> Result<(), StoreError> {
+        codec::write_retirement_wire(writer, &RoleRecordWire::encode(record)?)
+    }
+
+    pub(crate) fn write_retirement_external_report<W: Write + ?Sized>(
+        &self,
+        report: &ExternalCheckerReport,
+        writer: &mut W,
+    ) -> Result<(), StoreError> {
+        codec::write_retirement_external_report(report, writer)
+    }
+
+    // Authored equivalence fixtures retain the uncontrolled form; actual
+    // retirement serialization must use the original controlled window below.
+    #[cfg(test)]
+    pub(crate) fn retirement_dependency_closure(
+        &self,
+        pins: &StorePins,
+        max_records: usize,
+    ) -> Result<StorePins, StoreError> {
+        if pins.count() > max_records {
+            return Err(StoreError::Capacity("retirement dependency closure"));
+        }
+        self.expand_pins_inner(pins.clone(), Some(max_records), true, None)
+    }
+
+    /// Actual retirement traversal uses the original finite-window/cancel
+    /// check during cloning and graph walks, before any stream footer exists.
+    pub(crate) fn retirement_dependency_closure_controlled(
+        &self,
+        pins: &StorePins,
+        max_records: usize,
+        check: &mut dyn FnMut() -> Result<(), StoreError>,
+    ) -> Result<StorePins, StoreError> {
+        check()?;
+        if pins.count() > max_records {
+            return Err(StoreError::Capacity("retirement dependency closure"));
+        }
+        let mut check = Some(check);
+        check_pin_closure(&mut check)?;
+        let copied = StorePins {
+            states: clone_closure_set(&pins.states, &mut check)?,
+            lines: clone_closure_set(&pins.lines, &mut check)?,
+            observations: clone_closure_set(&pins.observations, &mut check)?,
+            situations: clone_closure_set(&pins.situations, &mut check)?,
+            executions: clone_closure_set(&pins.executions, &mut check)?,
+        };
+        check_pin_closure(&mut check)?;
+        self.expand_pins_inner(copied, Some(max_records), true, check)
+    }
+
+    pub(crate) fn retirement_dependency_edges(
+        &self,
+    ) -> impl Iterator<Item = (ObservationId, &BTreeSet<SituationId>)> {
+        self.dependencies
+            .dependents
+            .iter()
+            .map(|(observation, situations)| (*observation, situations))
+    }
+
     fn validate_pins(&self, pins: &StorePins) -> Result<(), StoreError> {
+        self.validate_pins_inner(pins, &mut None)
+    }
+
+    fn validate_pins_inner(
+        &self,
+        pins: &StorePins,
+        check: &mut PinClosureCheck<'_>,
+    ) -> Result<(), StoreError> {
+        check_pin_closure(check)?;
         if pins.states.len() > self.limits.states
             || pins.lines.len() > self.limits.line_chunks
             || pins.situations.len() > self.limits.situations
@@ -2458,82 +3112,134 @@ impl PalsStores {
             return Err(StoreError::PinSaturated("pin index"));
         }
         for id in &pins.states {
+            check_pin_closure(check)?;
             self.states.get(*id)?;
+            check_pin_closure(check)?;
         }
         for id in &pins.lines {
+            check_pin_closure(check)?;
             self.lines.get(*id)?;
+            check_pin_closure(check)?;
         }
         for id in &pins.observations {
+            check_pin_closure(check)?;
             self.observations.get(*id)?;
+            check_pin_closure(check)?;
         }
         for id in &pins.situations {
+            check_pin_closure(check)?;
             self.situations.get(*id)?;
+            check_pin_closure(check)?;
         }
         for id in &pins.executions {
+            check_pin_closure(check)?;
             self.tasks.get(*id)?;
+            check_pin_closure(check)?;
         }
-        Ok(())
+        check_pin_closure(check)
     }
-    fn expand_pins(&self, mut pins: StorePins) -> Result<StorePins, StoreError> {
+    fn expand_pins(&self, pins: StorePins) -> Result<StorePins, StoreError> {
+        self.expand_pins_inner(pins, None, false, None)
+    }
+
+    fn expand_pins_inner(
+        &self,
+        mut pins: StorePins,
+        maximum: Option<usize>,
+        include_task_consumers: bool,
+        mut check: PinClosureCheck<'_>,
+    ) -> Result<StorePins, StoreError> {
+        check_pin_closure(&mut check)?;
+        let mut count = pins.count();
         loop {
+            check_pin_closure(&mut check)?;
             let before = pins.count();
-            for id in pins.situations.clone() {
+            for id in clone_closure_set(&pins.situations, &mut check)? {
+                check_pin_closure(&mut check)?;
                 let s = self.situations.get(id)?;
-                pins.states.insert(s.state);
-                pins.lines.insert(s.focus);
+                for edge in situation_closure_header(s) {
+                    insert_closure_edge(&mut pins, edge, &mut count, maximum, &mut check)?;
+                }
                 for (line, conclusion) in s.conclusions.iter() {
-                    pins.lines.insert(*line);
-                    if let Some(o) = conclusion.evidence {
-                        pins.observations.insert(o);
+                    check_pin_closure(&mut check)?;
+                    for edge in situation_conclusion_edges(*line, conclusion)
+                        .into_iter()
+                        .flatten()
+                    {
+                        insert_closure_edge(&mut pins, edge, &mut count, maximum, &mut check)?;
                     }
-                    if let ContinuationStatus::RepairedBy(line) = conclusion.status {
-                        pins.lines.insert(line);
-                    }
+                    check_pin_closure(&mut check)?;
                 }
+                check_pin_closure(&mut check)?;
             }
-            for id in pins.lines.clone() {
+            for id in clone_closure_set(&pins.lines, &mut check)? {
+                check_pin_closure(&mut check)?;
                 let line = self.lines.get(id)?;
-                pins.states.insert(line.start_state);
-                if let Some(parent) = line.parent {
-                    pins.lines.insert(parent);
+                for edge in line_closure_edges(line).into_iter().flatten() {
+                    insert_closure_edge(&mut pins, edge, &mut count, maximum, &mut check)?;
                 }
+                check_pin_closure(&mut check)?;
             }
-            for id in pins.observations.clone() {
+            for id in clone_closure_set(&pins.observations, &mut check)? {
+                check_pin_closure(&mut check)?;
                 let o = self.observations.get(id)?;
-                pins.states.insert(o.state);
-                pins.lines.extend(o.line);
-                pins.lines.extend(o.cpu_pv);
-                pins.observations.extend(o.supersedes);
-                pins.observations
-                    .extend(o.score.model_dependencies().into_iter().flatten());
-                pins.executions.extend(o.execution);
-            }
-            for id in pins.executions.clone() {
-                let task = self.tasks.get(id)?;
-                pins.states.insert(task.key.state);
-                pins.lines.extend(task.key.line);
-                pins.executions.extend(task.resumed_from);
-                match task.status {
-                    TaskStatus::Completed(o) => {
-                        pins.observations.insert(o);
+                for (edge, additional_check) in observation_closure_edges(o) {
+                    if let Some(edge) = edge {
+                        if additional_check {
+                            check_pin_closure(&mut check)?;
+                        }
+                        insert_closure_edge(&mut pins, edge, &mut count, maximum, &mut check)?;
                     }
-                    TaskStatus::Paused { evidence, .. }
-                    | TaskStatus::RetiredPaused { evidence, .. } => {
-                        pins.observations.extend(evidence);
-                    }
-                    _ => {}
                 }
+                check_pin_closure(&mut check)?;
+            }
+            for id in clone_closure_set(&pins.executions, &mut check)? {
+                check_pin_closure(&mut check)?;
+                let task = self.tasks.get(id)?;
+                for edge in execution_closure_header(task).into_iter().flatten() {
+                    insert_closure_edge(&mut pins, edge, &mut count, maximum, &mut check)?;
+                }
+                if include_task_consumers {
+                    for consumer in &task.consumers {
+                        check_pin_closure(&mut check)?;
+                        insert_closure_edge(
+                            &mut pins,
+                            execution_consumer_edge(consumer.consumer.situation),
+                            &mut count,
+                            maximum,
+                            &mut check,
+                        )?;
+                        check_pin_closure(&mut check)?;
+                    }
+                }
+                if let Some(edge) = execution_status_edge(task.status) {
+                    insert_closure_edge(&mut pins, edge, &mut count, maximum, &mut check)?;
+                }
+                check_pin_closure(&mut check)?;
             }
             for (observation, situations) in &self.dependencies.dependents {
-                if situations.iter().any(|s| pins.situations.contains(s)) {
-                    pins.observations.insert(*observation);
+                check_pin_closure(&mut check)?;
+                let mut retained = false;
+                for situation in situations {
+                    check_pin_closure(&mut check)?;
+                    if pins.situations.contains(situation) {
+                        retained = true;
+                        break;
+                    }
+                    check_pin_closure(&mut check)?;
                 }
+                if let Some(edge) = reverse_dependency_edge(*observation, retained) {
+                    insert_closure_edge(&mut pins, edge, &mut count, maximum, &mut check)?;
+                }
+                check_pin_closure(&mut check)?;
             }
+            check_pin_closure(&mut check)?;
             if pins.count() == before {
                 break;
             }
         }
-        self.validate_pins(&pins)?;
+        self.validate_pins_inner(&pins, &mut check)?;
+        check_pin_closure(&mut check)?;
         Ok(pins)
     }
     fn protected_pins(&self, manager: &ArchiveManager) -> Result<StorePins, StoreError> {
@@ -2933,6 +3639,52 @@ impl PalsStores {
         }
         self.archive = Some(manager);
         result
+    }
+    /// Final idle-game checkpoint, including raw cancelled/unconsumed facts.
+    /// This changes no task status, acceptance, consumption or hot ownership.
+    /// The concrete caller owns the physical fence; this guard checks only the
+    /// original Store's logical work and private IDs before the existing codec.
+    pub(crate) fn archive_all_hot_engine_records_with_budget(
+        &mut self,
+        records: &[crate::pals::engine::RoleRecord],
+        nodes: &[EngineArchiveNode],
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<EngineArchiveReceipt, StoreError> {
+        self.reject_archive_allocation_scope()?;
+        budget.check()?;
+        if self.review_pin_count()? != 0 || self.tasks.active_states().next().is_some() {
+            return Err(StoreError::InvalidConditions(
+                "final archive checkpoint still owns logical work",
+            ));
+        }
+        let selection = StorePins {
+            states: self
+                .states
+                .snapshots
+                .entries()
+                .map(|(id, _)| StateId(id))
+                .collect(),
+            lines: self
+                .lines
+                .chunks
+                .entries()
+                .map(|(id, _)| LineId(id))
+                .collect(),
+            observations: self
+                .observations
+                .observations
+                .entries()
+                .map(|(id, _)| ObservationId(id))
+                .collect(),
+            situations: self.situations.iter().map(|(id, _)| id).collect(),
+            executions: self
+                .tasks
+                .tasks
+                .entries()
+                .map(|(id, _)| ExecutionId(id))
+                .collect(),
+        };
+        self.archive_engine_records_with_pins_and_budget(records, nodes, selection, budget)
     }
     pub fn lookup_cold_state(
         &self,
@@ -3820,6 +4572,13 @@ impl PalsStores {
                     return Err(StoreError::InvalidHandle("cold execution serial"));
                 }
                 if self.tasks.tasks.get(id.0).is_none() {
+                    if matches!(task.key.question, TaskQuestion::ProfiledExternal { .. })
+                        && task.status != TaskStatus::Failed
+                    {
+                        return Err(StoreError::ArchiveIntegrity(
+                            "profiled external task was not raw terminal feedback",
+                        ));
+                    }
                     // Serde Vec growth is an allocation detail, not part of the
                     // retained exact task key. Admit its bounded ordered data.
                     task.key.root_moves = task.key.root_moves.into_boxed_slice().into_vec();
@@ -3902,6 +4661,21 @@ impl PalsStores {
                     .get(&execution)
                     .or_else(|| self.tasks.tasks.get(execution.0))
                     .ok_or(StoreError::InvalidHandle("cold observation execution"))?;
+                match (task.key.question, o.scope) {
+                    (
+                        TaskQuestion::ProfiledExternal {
+                            requested: question,
+                        },
+                        EvidenceScope::ProfiledExternalUci { requested, .. },
+                    ) if question == requested => {}
+                    (TaskQuestion::ProfiledExternal { .. }, _)
+                    | (_, EvidenceScope::ProfiledExternalUci { .. }) => {
+                        return Err(StoreError::ArchiveIntegrity(
+                            "profiled observation task constraint",
+                        ));
+                    }
+                    _ => {}
+                }
                 if task.key.state != o.state
                     || task.key.line != o.line
                     || task.key.value_identity != o.value_identity

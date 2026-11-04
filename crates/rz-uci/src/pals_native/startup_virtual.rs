@@ -618,7 +618,7 @@ fn parse_loading_profile(value: Option<&str>) -> Result<NativeLoadingProfile, Ba
         )
     })
 }
-fn graph_purpose(role: &str) -> Result<Purpose, BackendError> {
+pub(crate) fn graph_purpose(role: &str) -> Result<Purpose, BackendError> {
     match role {
         "public" => Ok(Purpose::PublicGraph),
         "shared_pc" | "shared_warm" => Ok(Purpose::SharedPcGraph),

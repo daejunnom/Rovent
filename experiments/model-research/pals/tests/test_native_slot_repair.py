@@ -2,16 +2,18 @@
 
 The real strict parent/D/Repair/semantic factories are used. Build, launch,
 physical heads and Rules descriptors are explicitly synthetic caller facts.
-The two tracked Rust sources are read only to exercise the closed static
-review profile; no compiler, process, Rules replay, model or training runs.
+Static twenty-path byte-custody inputs exercise a scoped synthetic profile;
+the live checkout is not read. No compiler, process, Rules replay, model or
+training runs. Historical literal review banks and allow-lists remain unchanged.
 Known is conditional fixture coverage only. The usual engine path observes
 publication at the next D, which stays not_examined. These bytes do not prove
 execution of the narrow ordinary branch/role-limit path that can be known.
+New closure-consumer cases use only static fixture text and a scoped synthetic
+review registry; no production source pin or enrollment is changed.
 """
 import copy
 import hashlib
 import json
-from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -26,10 +28,18 @@ from test_native_divergence import NativeDivergenceFixture
 from test_repair_context import RepairFixture
 from test_semantic_verifier import SemanticFixture, tokens
 import test_training as fixtures
+from native_source_review_fixture import (
+    SYNTHETIC_CUSTODY_SOURCE_ID as FIXTURE_SOURCE_ID,
+    SYNTHETIC_CUSTODY_TRANSITION_PINS as FIXTURE_TRANSITION_PINS,
+    SYNTHETIC_CUSTODY_COMPILED_FACT as FIXTURE_COMPILED_FACT,
+    synthetic_custody_fixture_manifest as fixture_manifest,
+    synthetic_custody_fixture_review_scope as fixture_review_scope,
+    synthetic_custody_fixture_sources,
+)
 
 
-# Independent live-fixture pins, deliberately separate from historical table
-# preservation and from production enrollment. Unknown successors still fail.
+# Historical literal banks exercise table preservation and unknown-successor
+# rejection. Ordinary custody fixtures below do not match a checkout to them.
 REVIEWED_PRE_LINT_SOURCE_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
         "bytes": 374235, "sha256": "b86af1f0e55f55add0d4cca277772f8d1c8edf3b3d93d147629c4ab6f881103a"},
@@ -58,7 +68,7 @@ REVIEWED_CONTROLLED_FALLBACK_SOURCE_PINS = {
         "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
 }
 
-# Independently pinned final live-binding pair; not copied from a consumer table.
+# Independently pinned historical live-binding pair; not a current-run pin.
 REVIEWED_LIVE_BINDING_SOURCE_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
         "bytes": 396086, "sha256": "004db31f9be5133bd1925b373e6df60e97da3d50979a7eb5a031b1dad4ca397b"},
@@ -128,7 +138,21 @@ class SlotFixture(RepairFixture):
     """
     def __init__(self, directory):
         self.ready = False
-        super().__init__(directory)
+        original_bytes = fixtures.frozen_fixture_bytes
+
+        def with_synthetic_compiled_fact(value):
+            # Bind this declaration before the seed source's FIRST raw bytes,
+            # producer registration and receipt are created. Mutating only
+            # self.source later would leave the retained checked-source wire
+            # without the fact used by the real divergence/slot factories.
+            if (type(value) is list and len(value) == 2
+                    and value[0] == training.CHECKED_SOURCE_DOMAIN
+                    and type(value[1]) is dict and type(value[1].get("native")) is dict):
+                value[1]["native"]["search_implementation_sha256"] = FIXTURE_COMPILED_FACT
+            return original_bytes(value)
+
+        with patch.object(fixtures, "frozen_fixture_bytes", side_effect=with_synthetic_compiled_fact):
+            super().__init__(directory)
         seed_dir = self.root / "synthetic-slot-auxiliary"
         seed_dir.mkdir()
         seed = NativeDivergenceFixture(seed_dir)
@@ -177,19 +201,10 @@ class SlotFixture(RepairFixture):
             "origin_rules_state_sha256": None, "origin_rules_identity_observation": "unknown", "kind": "Repair",
             "line": self.lineages[1]["counterexample"], "value": None, "completed_depth": 0, "scope": "Unknown",
             "white_score_perspective": True, "critical": False, "source_cpu_profile_sha256": self.source["cpu_profile_sha256"]}
-        repo = Path(__file__).resolve().parents[4]
-        source_raws = []
-        for path in slot_witness._SOURCE_PATHS:
-            expected = REVIEWED_CURRENT_SOURCE_PINS[path]
-            with (repo / path).open("rb") as stream:
-                actual = stream.read(expected["bytes"] + 1)
-            if semantic.byte_pin(actual) != expected:
-                raise AssertionError("reviewed Rust fixture source pin changed: " + path)
-            source_raws.append(actual)
-        self.engine_raw, self.native_raw = source_raws
-        self.manifest = {"source_commit": "a" * 40, "files": [{"path": path, **semantic.byte_pin(value)}
-            for path, value in zip(slot_witness._SOURCE_PATHS, (self.engine_raw, self.native_raw))]}
-        self.build = {"schema": slot_witness.BUILD_SCHEMA, "source_commit": "a" * 40,
+        source_raws = synthetic_custody_fixture_sources()
+        self.engine_raw, self.native_raw = (source_raws[path] for path in slot_witness._SOURCE_PATHS)
+        self.manifest = fixture_manifest()
+        self.build = {"schema": slot_witness.BUILD_SCHEMA, "source_commit": FIXTURE_SOURCE_ID,
             "actual_build_exit_code": 0, "source_verified_before_and_after_build": True,
             "binary": {"bytes": 32, "sha256": self.source["implementation_sha256"]},
             "compiler_artifact": {"reason": "compiler-artifact", "target": {"name": "pals_collect"},
@@ -408,13 +423,251 @@ class SlotFixture(RepairFixture):
         return slot_witness.admit_native_slot_repair(**self.slot_arguments())
 
 
+class NativeSlotClosureConsumerTests(unittest.TestCase):
+    def fixture(self, lane="default_disabled"):
+        from test_native_recheck_witness import SyntheticClosureBuild
+        return SyntheticClosureBuild(lane)
+
+    def review(self, fixture):
+        values = {"work_summary": b"", **fixture.raws}
+        return slot_witness._source_review(values, fixture.source)
+
+    def test_new_disabled_pair_requires_explicit_full_closure_and_keeps_metadata_detached(self):
+        from rz_pals_model import native_source_review as reviewed
+        fixture = self.fixture()
+        old_profiles = copy.deepcopy(slot_witness._SOURCE_REVIEW_PROFILES)
+        with patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", ()):
+            with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
+                self.review(fixture)
+        registered = copy.deepcopy(fixture.profile)
+        with patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", (registered,)):
+            result = self.review(fixture)
+            proof = result["reviewed_transition_closure"]
+            self.assertEqual(set(proof), {"schema", "review_id", "lane", "transition_sources", "component_pins",
+                "compiled_search_implementation_sha256", "closure_sha256", "unreviewed_manifest_files",
+                "historical_metadata_only", "execution_authorized", "original_native_authority_reissued",
+                "rules_proof_authorized", "training_target_authorized"})
+            self.assertEqual(proof["lane"], "default_disabled")
+            self.assertEqual(proof["component_pins"], fixture.profile["component_pins"])
+            self.assertEqual(result["reviewed_transition_sources"], fixture.profile["transition_sources"])
+            self.assertIs(proof["historical_metadata_only"], True)
+            for key in ("execution_authorized", "original_native_authority_reissued", "rules_proof_authorized", "training_target_authorized"):
+                self.assertIs(proof[key], False)
+            original_bytes = semantic.canonical(result)
+            proof["component_pins"][slot_witness._SOURCE_PATHS[0]]["sha256"] = "0" * 64
+            self.assertEqual(semantic.canonical(self.review(fixture)), original_bytes)
+            self.assertEqual(registered, fixture.profile)
+        self.assertEqual(slot_witness._SOURCE_REVIEW_PROFILES, old_profiles)
+
+    def test_required_helpers_compiled_fact_and_lane_cannot_be_replaced_or_omitted(self):
+        from rz_pals_model import native_source_review as reviewed
+        helper = "crates/rz-search/src/pals/engine/semantic_state.rs"
+        for change in ("replacement", "missing_helper", "profile_omission", "compiled_mismatch", "compiled_missing", "wrong_lane"):
+            fixture = self.fixture()
+            registered = copy.deepcopy(fixture.profile)
+            if change == "replacement":
+                next(row for row in fixture.manifest["files"] if row["path"] == helper).update(semantic.byte_pin(b"changed helper fixture\n"))
+            elif change == "missing_helper":
+                fixture.manifest["files"] = [row for row in fixture.manifest["files"] if row["path"] != helper]
+            elif change == "profile_omission":
+                del registered["component_pins"][helper]
+                registered["closure_sha256"] = semantic.digest("rz-pals-native-reviewed-transition-closure/1", registered["component_pins"])
+            elif change == "compiled_mismatch":
+                fixture.source["native"]["search_implementation_sha256"] = "e" * 64
+            elif change == "compiled_missing":
+                del fixture.source["native"]["search_implementation_sha256"]
+            else:
+                registered["lane"] = "legacy_single_reply"
+            fixture.reseal()
+            boundary = {"replacement": "helper closure differs", "missing_helper": "helper closure differs",
+                "profile_omission": "omits a required source helper", "compiled_mismatch": "compiled search closure differs",
+                "compiled_missing": "original_compiled_search_closure_fact_missing", "wrong_lane": "unreviewed_collector_transition_source_pair"}[change]
+            with self.subTest(change=change), patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", (registered,)):
+                error_type = slot_witness._Unsupported if change in ("compiled_missing", "wrong_lane") else ValueError
+                with self.assertRaisesRegex(error_type, boundary):
+                    self.review(fixture)
+
+    def test_actual_build_binary_and_source_binding_fail_before_closure_lookup(self):
+        from rz_pals_model import native_source_review as reviewed
+        for change in ("exit", "verified", "binary", "unbound_component"):
+            fixture = self.fixture()
+            if change == "exit":
+                fixture.build["actual_build_exit_code"] = False
+            elif change == "verified":
+                fixture.build["source_verified_before_and_after_build"] = False
+            elif change == "binary":
+                fixture.build["binary"]["sha256"] = "e" * 64
+            else:
+                fixture.raws["engine_source"] += b"// absent from original manifest\n"
+            fixture.reseal()
+            boundary = "actual transition source bytes absent" if change == "unbound_component" else (
+                "build binary differs" if change == "binary" else "successful pre/post collector build observation")
+            with self.subTest(change=change), patch.object(reviewed, "review_transition_sources",
+                    side_effect=AssertionError("closure lookup cannot mask original build failure")) as lookup:
+                with self.assertRaisesRegex(ValueError, boundary):
+                    self.review(fixture)
+                lookup.assert_not_called()
+
+    def test_new_closure_does_not_allow_active_policy_or_a_one_component_hybrid(self):
+        from rz_pals_model import native_source_review as reviewed
+        for name, path in zip(("engine_source", "native_source"), slot_witness._SOURCE_PATHS):
+            fixture = self.fixture()
+            fixture.raws[name] += b"// separately bound successor fixture\n"
+            next(row for row in fixture.manifest["files"] if row["path"] == path).update(semantic.byte_pin(fixture.raws[name]))
+            fixture.reseal()
+            with self.subTest(component=name), patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", (copy.deepcopy(fixture.profile),)):
+                with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
+                    self.review(fixture)
+        for owner in ("source", "native", "search_configuration", "independent_registry"):
+            fixture = self.fixture()
+            target = fixture.source if owner == "source" else fixture.source["native"] if owner == "native" else fixture.source["native"].setdefault(owner, {})
+            target["pals_search_policy"] = "same_repaired_line_once_v1"
+            with self.subTest(owner=owner), patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", (copy.deepcopy(fixture.profile),)):
+                with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_refinement_policy"):
+                    self.review(fixture)
+
+    def test_historical_literal_lookup_keeps_old_bytes_without_closure_enrollment(self):
+        from rz_pals_model import native_source_review as reviewed
+        expected = dict(zip(slot_witness._SOURCE_PATHS, (
+            {"bytes": 260542, "sha256": "4469f9d8721264c2053380fd8900ef00b23602d42220adb99b8199cef8b62afb"},
+            {"bytes": 73365, "sha256": "564d2b29d873df1c7b0424bfcee0b52a8f314cbfd88fa68ef35f4fda99a600d5"})))
+        before = semantic.canonical(expected)
+        with patch.object(reviewed, "review_transition_sources", side_effect=AssertionError("historical lookup stays independent")) as lookup:
+            retained = slot_witness._reviewed_source_pair(expected)
+            retained[slot_witness._SOURCE_PATHS[0]]["sha256"] = "0" * 64
+            self.assertEqual(semantic.canonical(slot_witness._reviewed_source_pair(expected)), before)
+            lookup.assert_not_called()
+
+
+class ReviewedFixtureSuccessorTests(unittest.TestCase):
+    def test_bundle_capacity_bank_preserves_three_prior_banks_and_has_one_reviewed_change(self):
+        import native_source_review_fixture as banks
+        from rz_pals_model import native_source_review as reviewed
+        old_factories = (banks.fixture_profile, banks.successor_fixture_profile, banks.pc_shared_fixture_profile)
+        prior = [factory("default_disabled") for factory in old_factories]
+        current = banks.bundle_capacity_fixture_profile("default_disabled")
+        engine = slot_witness._SOURCE_PATHS[0]
+        self.assertEqual(banks.bundle_capacity_fixture_manifest()["source_commit"],
+                         "f1b82eae0f08241b53e885ed2e6e6d573221d54a")
+        self.assertEqual(current["component_pins"][engine], {"bytes": 423275,
+            "sha256": "7f1322ba591aef3c5f1f566c30f4f8184b9a736c935136fa4fed2c96273635e4"})
+        self.assertEqual(len(current["component_pins"]), 14)
+        self.assertEqual([path for path in prior[-1]["component_pins"]
+            if prior[-1]["component_pins"][path] != current["component_pins"][path]], [engine])
+        self.assertEqual(len({profile["review_id"] for profile in [*prior, current]}), 4)
+        before = copy.deepcopy(reviewed.REVIEWED_CLOSURE_PROFILES)
+        for lane in ("default_disabled", "legacy_single_reply"):
+            with banks.bundle_capacity_fixture_review_scope(lane) as profile:
+                manifest = banks.bundle_capacity_fixture_manifest()
+                proof = reviewed.review_transition_sources(pair=profile["transition_sources"], manifest=manifest,
+                    source={"native": {"search_implementation_sha256": banks.BUNDLE_CAPACITY_SYNTHETIC_COMPILED_FACT}}, lane=lane)
+                self.assertEqual(proof["closure_sha256"], banks.BUNDLE_CAPACITY_REVIEWED_CLOSURE_SHA256)
+                self.assertIs(proof["historical_metadata_only"], True)
+                for name in ("execution_authorized", "original_native_authority_reissued",
+                             "rules_proof_authorized", "training_target_authorized"):
+                    self.assertIs(proof[name], False)
+                for old in prior:
+                    with self.assertRaisesRegex(ValueError, "compiled search closure differs"):
+                        reviewed.review_transition_sources(pair=profile["transition_sources"], manifest=manifest,
+                            source={"native": {"search_implementation_sha256": old["compiled_search_implementation_sha256"]}}, lane=lane)
+            self.assertEqual(reviewed.REVIEWED_CLOSURE_PROFILES, before)
+        self.assertEqual([factory("default_disabled") for factory in old_factories], prior)
+
+    def test_pc_shared_bank_preserves_both_earlier_banks_and_requires_its_own_fact(self):
+        import native_source_review_fixture as banks
+        from rz_pals_model import native_source_review as reviewed
+        prior = banks.fixture_profile("default_disabled")
+        successor = banks.successor_fixture_profile("default_disabled")
+        pc_shared = banks.pc_shared_fixture_profile("default_disabled")
+        engine = slot_witness._SOURCE_PATHS[0]
+        self.assertEqual(banks.pc_shared_fixture_manifest()["source_commit"],
+                         "47b602087de810dbe77c1489a7459202de3dfc9f")
+        self.assertEqual(pc_shared["component_pins"][engine], {"bytes": 423219,
+            "sha256": "6f89838c7e95ff067bac86432c36ee221cf29acc334fe16d0f4f2b96c2d825d7"})
+        self.assertEqual(len(pc_shared["component_pins"]), 14)
+        self.assertEqual([path for path in successor["component_pins"]
+            if successor["component_pins"][path] != pc_shared["component_pins"][path]], [engine])
+        self.assertEqual(pc_shared["component_pins"][engine]["bytes"]
+                         - successor["component_pins"][engine]["bytes"], 306)
+        self.assertEqual(len({prior["review_id"], successor["review_id"], pc_shared["review_id"]}), 3)
+        before = copy.deepcopy(reviewed.REVIEWED_CLOSURE_PROFILES)
+        for lane in ("default_disabled", "legacy_single_reply"):
+            with banks.pc_shared_fixture_review_scope(lane) as profile:
+                source = {"native": {"search_implementation_sha256": banks.PC_SHARED_SYNTHETIC_COMPILED_FACT}}
+                proof = reviewed.review_transition_sources(pair=profile["transition_sources"],
+                    manifest=banks.pc_shared_fixture_manifest(), source=source, lane=lane)
+                self.assertEqual(proof["closure_sha256"], banks.PC_SHARED_REVIEWED_CLOSURE_SHA256)
+                self.assertIs(proof["historical_metadata_only"], True)
+                for name in ("execution_authorized", "original_native_authority_reissued",
+                             "rules_proof_authorized", "training_target_authorized"):
+                    self.assertIs(proof[name], False)
+                for old_fact in (banks.SYNTHETIC_COMPILED_FACT, banks.SUCCESSOR_SYNTHETIC_COMPILED_FACT):
+                    with self.assertRaisesRegex(ValueError, "compiled search closure differs"):
+                        reviewed.review_transition_sources(pair=profile["transition_sources"],
+                            manifest=banks.pc_shared_fixture_manifest(),
+                            source={"native": {"search_implementation_sha256": old_fact}}, lane=lane)
+            self.assertEqual(reviewed.REVIEWED_CLOSURE_PROFILES, before)
+        self.assertEqual(banks.fixture_profile("default_disabled"), prior)
+        self.assertEqual(banks.successor_fixture_profile("default_disabled"), successor)
+
+    def test_original_6ca_review_and_api_remain_distinct_from_explicit_successor(self):
+        import native_source_review_fixture as banks
+        old = banks.fixture_profile("default_disabled")
+        current = banks.successor_fixture_profile("default_disabled")
+        engine = slot_witness._SOURCE_PATHS[0]
+        self.assertEqual(banks.REVIEWED_SOURCE_COMMIT, "6ca5946bceb9394d27575b8c3dc7df2ed9a48cb2")
+        self.assertEqual(banks.fixture_manifest()["source_commit"], banks.REVIEWED_SOURCE_COMMIT)
+        self.assertEqual(banks.successor_fixture_manifest()["source_commit"],
+                         "932d7ae7006803dbb655249f7fa10e13483bdc12")
+        self.assertEqual(old["component_pins"][engine], {"bytes": 422725,
+            "sha256": "a86c61bc22dea02d505bc6526d482acc7dc197433b46229d6a3deed5d605e5ed"})
+        self.assertEqual(current["component_pins"][engine], {"bytes": 422913,
+            "sha256": "2729ef10909bdf21182d26b2edc4555f5cad7c17f55ac322111e7d867d8cbf53"})
+        self.assertEqual(len(old["component_pins"]), 14)
+        self.assertEqual(len(current["component_pins"]), 14)
+        self.assertEqual([path for path in old["component_pins"]
+            if old["component_pins"][path] != current["component_pins"][path]], [engine])
+        self.assertNotEqual(old["review_id"], current["review_id"])
+        self.assertNotEqual(old["closure_sha256"], current["closure_sha256"])
+        current["component_pins"][engine]["bytes"] = 1
+        self.assertEqual(banks.fixture_profile("default_disabled"), old)
+        self.assertEqual(banks.successor_fixture_profile("default_disabled")["component_pins"][engine]["bytes"], 422913)
+
+    def test_successor_scope_is_temporary_metadata_only_and_does_not_retag_prior_source(self):
+        import native_source_review_fixture as banks
+        from rz_pals_model import native_source_review as reviewed
+        before = copy.deepcopy(reviewed.REVIEWED_CLOSURE_PROFILES)
+        for lane in ("default_disabled", "legacy_single_reply"):
+            with banks.successor_fixture_review_scope(lane) as profile:
+                proof = reviewed.review_transition_sources(pair=profile["transition_sources"],
+                    manifest=banks.successor_fixture_manifest(),
+                    source={"native": {"search_implementation_sha256": banks.SUCCESSOR_SYNTHETIC_COMPILED_FACT}}, lane=lane)
+                self.assertEqual(proof["review_id"], profile["review_id"])
+                self.assertIs(proof["historical_metadata_only"], True)
+                for name in ("execution_authorized", "original_native_authority_reissued",
+                             "rules_proof_authorized", "training_target_authorized"):
+                    self.assertIs(proof[name], False)
+            self.assertEqual(reviewed.REVIEWED_CLOSURE_PROFILES, before)
+        with banks.fixture_review_scope("default_disabled") as prior:
+            with self.assertRaisesRegex(ValueError, "compiled search closure differs"):
+                reviewed.review_transition_sources(pair=prior["transition_sources"],
+                    manifest=banks.fixture_manifest(),
+                    source={"native": {"search_implementation_sha256": banks.SUCCESSOR_SYNTHETIC_COMPILED_FACT}},
+                    lane="default_disabled")
+        self.assertEqual(reviewed.REVIEWED_CLOSURE_PROFILES, before)
+
+
 class NativeSlotRepairTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(fixture_review_scope("default_disabled"))
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.fixture = SlotFixture(self.temp.name)
 
     def test_known_unique_chain_is_factual_conditional_and_all_targets_false(self):
+        original_source = json.loads(self.fixture.source_raw)[1]
+        self.assertEqual(original_source["native"]["search_implementation_sha256"], FIXTURE_COMPILED_FACT)
+        self.assertEqual(original_source, self.fixture.source)
         checked = self.fixture.admit_slot()
         self.assertEqual(checked.status, "known")
         self.assertIs(checked.require_witness(), checked)
@@ -425,7 +678,7 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.assertEqual(body["initial_repair_native_request"], [1, 4])
         self.assertEqual(body["publication_native_request"], [1, 5])
         self.assertEqual(body["captured_input_revision"], 2)
-        self.assertEqual(body["transition_profile"]["reviewed_transition_sources"], REVIEWED_CURRENT_SOURCE_PINS)
+        self.assertEqual(body["transition_profile"]["reviewed_transition_sources"], FIXTURE_TRANSITION_PINS)
         self.assertEqual(admission["scope"], "conditional_unique_prepared_lineage")
         self.assertFalse(body["direct_causal_ids_present"])
         self.assertFalse(body["before_dispatch_witness_claimed"])
@@ -555,11 +808,51 @@ class NativeSlotRepairTests(unittest.TestCase):
                 with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
                     slot_witness._source_review(values, self.fixture.source)
 
-    def test_current_review_is_one_literal_pair_and_rejects_historical_hybrids(self):
+    def test_synthetic_custody_profile_is_scoped_and_rejects_historical_hybrids(self):
+        from native_source_review_fixture import IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT
+        self.assertNotEqual(FIXTURE_SOURCE_ID, IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT)
         observed = {path: semantic.byte_pin(value) for path, value in zip(slot_witness._SOURCE_PATHS,
             (self.fixture.engine_raw, self.fixture.native_raw))}
-        self.assertEqual(observed, REVIEWED_CURRENT_SOURCE_PINS)
-        self.assertEqual(slot_witness._reviewed_source_pair(observed), observed)
+        self.assertEqual(observed, FIXTURE_TRANSITION_PINS)
+        # This new synthetic bank does not extend the product's historical
+        # two-file allow-list. Its complete helper profile is scoped to this
+        # test and remains necessary on every verify() call.
+        with self.assertRaises(slot_witness._Unsupported):
+            slot_witness._reviewed_source_pair(observed)
+        from rz_pals_model import native_source_review as reviewed
+        with patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", ()):
+            with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
+                slot_witness._source_review(source_review_raws(self.fixture), self.fixture.source)
+        proof = slot_witness._source_review(source_review_raws(self.fixture), self.fixture.source)["reviewed_transition_closure"]
+        expected_components = {
+            "crates/rz-search/src/pals/engine.rs",
+            "crates/rz-arena/src/pals_collect/native.rs",
+            "crates/rz-search/src/pals/engine/semantic_state.rs",
+            "crates/rz-search/src/pals/engine/researcher_admission.rs",
+            "crates/rz-search/src/pals/engine/researcher_profile.rs",
+            "crates/rz-search/src/pals/engine/review_lifecycle.rs",
+            "crates/rz-search/src/pals/engine/cpu_lifecycle.rs",
+            "crates/rz-search/src/pals/engine/followup_execution.rs",
+            "crates/rz-search/src/pals/engine/archive_lifecycle.rs",
+            "crates/rz-arena/src/pals_collect.rs",
+            "crates/rz-arena/src/pals_collect/full_line.rs",
+            "crates/rz-arena/src/pals_collect/divergence.rs",
+            "crates/rz-arena/src/pals_collect/continuation.rs",
+            "crates/rz-arena/src/pals_collect/producer.rs",
+            "crates/rz-search/src/pals/engine/idle_archive.rs",
+            "crates/rz-search/src/pals/engine/adaptive_port/archive_worker.rs",
+            "crates/rz-search/src/pals/engine/preparing_root.rs",
+            "crates/rz-search/src/pals/review_context.rs",
+            "crates/rz-search/src/pals/engine/adaptive_root.rs",
+            "crates/rz-search/src/pals/store/archive.rs",
+        }
+        self.assertEqual(set(proof["component_pins"]), expected_components)
+        self.assertEqual(proof["component_pins"], {
+            row["path"]: {name: row[name] for name in ("bytes", "sha256")}
+            for row in self.fixture.manifest["files"]})
+        self.assertEqual(proof["compiled_search_implementation_sha256"], FIXTURE_COMPILED_FACT)
+        self.assertIs(proof["execution_authorized"], False)
+        self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_CURRENT_SOURCE_PINS), REVIEWED_CURRENT_SOURCE_PINS)
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_PRE_LINT_SOURCE_PINS), REVIEWED_PRE_LINT_SOURCE_PINS)
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_LINT_SOURCE_PINS), REVIEWED_LINT_SOURCE_PINS)
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_CONTROLLED_SOURCE_PINS), REVIEWED_CONTROLLED_SOURCE_PINS)

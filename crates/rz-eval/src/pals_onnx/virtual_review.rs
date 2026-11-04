@@ -13,11 +13,16 @@ use sha2::{Digest as _, Sha256};
 mod binding;
 mod legacy_manifest;
 mod manifest;
+#[cfg(feature = "native-validation-diagnostics")]
+pub mod native_validation_diagnostics;
 mod owned_sources;
 pub use legacy_manifest::{
     validate_pals_legacy_export_manifest, LegacyPalsExportManifestSummary, LegacyPalsGraphPin,
 };
-pub use owned_sources::{VirtualReviewOwnedSources, VirtualReviewProfileDirectory};
+pub use owned_sources::{
+    VirtualReviewHeldFileSources, VirtualReviewHeldGraph, VirtualReviewOwnedSources,
+    VirtualReviewProfileDirectory,
+};
 mod tickets;
 use rz_contracts::pals_adaptive::RoleTicketEnvelope;
 pub use tickets::VirtualReviewCompletion;
@@ -25,6 +30,116 @@ pub use tickets::VirtualReviewCompletion;
 pub const PUBLIC_LAYOUT: &str = "virtual_review_public_v1";
 pub const SHARED_LAYOUT: &str = "virtual_review_shared_pc_if_v1";
 pub const WARM_LAYOUT: &str = "virtual_review_shared_pc_if_approx_warm_v1";
+
+/// Best-effort host phase evidence only. This owns no native resource and never
+/// grants a provider fence, numerical result, memory measurement or retry.
+/// The explicit environment switch is read once per backend load, not per Run.
+struct VirtualReviewPhaseTrace {
+    origin: Option<std::time::Instant>,
+    provider: &'static str,
+    emitted: u8,
+    first_run_graphs: u8,
+}
+impl VirtualReviewPhaseTrace {
+    fn new(provider: Provider) -> Self {
+        let enabled = std::env::var_os("RZ_PALS_VIRTUAL_REVIEW_PHASE_TRACE")
+            .is_some_and(|value| value == "1");
+        Self {
+            origin: enabled.then(std::time::Instant::now),
+            provider: match provider {
+                Provider::Cpu => "cpu",
+                Provider::Cuda { .. } => "cuda",
+            },
+            emitted: 0,
+            first_run_graphs: 0,
+        }
+    }
+    fn role(role: &str) -> &'static str {
+        match role {
+            "public" => "public",
+            "shared_pc" => "shared_pc",
+            "shared_warm" => "shared_warm",
+            "validator" => "validator",
+            _ => "other",
+        }
+    }
+    fn record(&mut self, phase: &'static str, role: &'static str, serialized_bytes: Option<usize>) {
+        use std::io::Write;
+        let Some(origin) = self.origin else {
+            return;
+        };
+        if self.emitted >= 32 {
+            return;
+        }
+        self.emitted += 1;
+        // Fixed identifiers and scalar metadata only. No asset path, model,
+        // tensor, error payload or new output file is retained by this channel.
+        #[derive(Serialize)]
+        struct Record {
+            schema: &'static str,
+            ordinal: u8,
+            phase: &'static str,
+            graph_role: &'static str,
+            configured_backend_provider: &'static str,
+            elapsed_ns: u128,
+            serialized_bytes: Option<usize>,
+            physical_completion: &'static str,
+            performance_evidence_eligible: bool,
+        }
+        let record = Record {
+            schema: "rz-pals-virtual-review-host-phases/1",
+            ordinal: self.emitted,
+            phase,
+            graph_role: role,
+            configured_backend_provider: self.provider,
+            elapsed_ns: origin.elapsed().as_nanos(),
+            serialized_bytes,
+            physical_completion: "unknown",
+            performance_evidence_eligible: false,
+        };
+        // This distinct stderr prefix cannot become the stdout numeric status.
+        // A missing/partial line is missing evidence, never a backend failure.
+        let mut stderr = std::io::stderr().lock();
+        if write!(stderr, "RZ_PALS_VIRTUAL_REVIEW_PHASE_JSON=").is_ok()
+            && serde_json::to_writer(&mut stderr, &record).is_ok()
+        {
+            let _ = writeln!(stderr);
+        }
+        let _ = stderr.flush();
+    }
+    fn first_run_entered(&mut self, role: &'static str) -> bool {
+        if self.origin.is_none() {
+            return false;
+        }
+        let bit = match role {
+            "public" => 1,
+            "shared_pc" => 2,
+            "validator" => 4,
+            "shared_warm" => 8,
+            _ => return false,
+        };
+        if self.first_run_graphs & bit != 0 {
+            return false;
+        }
+        self.first_run_graphs |= bit;
+        self.record("first_run_entered", role, None);
+        true
+    }
+    fn first_run_returned(&mut self, first: bool, role: &'static str, ok: bool) {
+        if first {
+            // An API return is not a physical GPU completion/fence claim.
+            self.record(
+                if ok {
+                    "first_run_returned_ok"
+                } else {
+                    "first_run_returned_error"
+                },
+                role,
+                None,
+            );
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VirtualReviewExecutionMode {
@@ -274,11 +389,64 @@ pub struct VirtualReviewOwnerSnapshot {
     pub vram_peak_bytes: Option<u64>,
 }
 
+/// Per-owner shutdown observation, not provider execution or a GPU fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeMappingObservation {
+    NonCuda,
+    Observed,
+    Unknown,
+}
+
+/// Whether system-specific placement can be requested. Ready is not itself a
+/// placement witness, a completed inference, or a physical GPU fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemPlacementPrerequisites {
+    NotApplicable,
+    Incomplete,
+    Ready,
+}
+
+/// Strict system placement evidence is separate from physical completion.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SystemPlacementObservation {
+    Verified(Box<SystemVirtualReviewCudaPlacementWitness>),
+    MappingUnavailable,
+    UnregisteredOrPreexistingMappings,
+}
+
+fn system_placement_roles_complete(
+    proposer_seen: bool,
+    critic_seen: bool,
+    validator_required: bool,
+    validator_seen: bool,
+    warm_required: bool,
+    warm_seen: bool,
+) -> bool {
+    proposer_seen
+        && critic_seen
+        && (!validator_required || validator_seen)
+        && (!warm_required || warm_seen)
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum VirtualReviewNativeCommand {
     Evaluate(VirtualReviewInvocation),
     EvaluateTicket {
         ticket: RoleTicketEnvelope,
+        invocation: VirtualReviewInvocation,
+    },
+    /// Actual production ticket and physical execution identity. The legacy
+    /// unscoped variant remains readable for existing consumers.
+    EvaluateTicketScoped {
+        ticket: RoleTicketEnvelope,
+        execution: rz_contracts::ExecutionId,
+        invocation: VirtualReviewInvocation,
+    },
+    #[cfg(feature = "native-validation-diagnostics")]
+    EvaluateTicketForValidation {
+        ticket: RoleTicketEnvelope,
+        execution: rz_contracts::ExecutionId,
         invocation: VirtualReviewInvocation,
     },
     AcceptTicket {
@@ -293,9 +461,49 @@ pub enum VirtualReviewNativeCommand {
     NewGame,
     SnapshotStats,
     SnapshotOwner,
+    /// Observe without promoting absent mapping evidence to an engine failure.
+    ObserveRuntimeMapping,
     VerifyRuntime,
     VerifyCudaPlacement,
     VerifyVirtualCudaPlacement,
+    /// System CUDA uses a separate witness; historical bundle evidence is not reused.
+    #[cfg(target_os = "linux")]
+    VerifySystemVirtualCudaPlacement,
+    /// Typed observation; unavailable is not a placement witness.
+    #[cfg(target_os = "linux")]
+    ObserveSystemVirtualCudaPlacement,
+}
+
+impl crate::worker::PhysicalScopedInput for VirtualReviewNativeCommand {
+    fn physical_work_scope(&self) -> Result<crate::worker::PhysicalWorkScope, BackendError> {
+        let (ticket, execution) = match self {
+            Self::EvaluateTicketScoped {
+                ticket, execution, ..
+            } => (ticket, execution),
+            #[cfg(feature = "native-validation-diagnostics")]
+            Self::EvaluateTicketForValidation {
+                ticket, execution, ..
+            } => (ticket, execution),
+            _ => {
+                return Err(fail(
+                    K::InvalidInput,
+                    S::Admission,
+                    "unscoped control or legacy command has no ticket work identity",
+                ));
+            }
+        };
+        if ticket.id.epoch != execution.epoch || ticket.authority.epoch != ticket.id.epoch {
+            return Err(fail(
+                K::IdentityMismatch,
+                S::Admission,
+                "ticket and physical execution epochs differ",
+            ));
+        }
+        Ok(crate::worker::PhysicalWorkScope::Ticket {
+            ticket: *ticket,
+            execution: *execution,
+        })
+    }
 }
 /// The immutable view's exact history comes from Rules/ticket authority. It is
 /// deliberately outside numerical model features and must not be synthesized
@@ -446,9 +654,17 @@ pub enum VirtualReviewNativeResult {
     NewGame,
     Stats(PalsBackendStats),
     Owner(VirtualReviewOwnerSnapshot),
+    RuntimeMappingObserved {
+        mapping: RuntimeMappingObservation,
+        system_placement: SystemPlacementPrerequisites,
+    },
     RuntimeVerified,
     CudaPlacementVerified(Box<PalsCudaPlacementWitness>),
     VirtualCudaPlacementVerified(Box<VirtualReviewCudaPlacementWitness>),
+    #[cfg(target_os = "linux")]
+    SystemVirtualCudaPlacementVerified(Box<SystemVirtualReviewCudaPlacementWitness>),
+    #[cfg(target_os = "linux")]
+    SystemVirtualCudaPlacementObserved(SystemPlacementObservation),
 }
 
 /// V3 evidence is owned separately from the legacy P/C-only witness domain.
@@ -464,13 +680,320 @@ struct VirtualControlAudit {
     validator_seen: bool,
     warm_seed_seen: bool,
     witness: Option<VirtualReviewCudaPlacementWitness>,
+    #[cfg(target_os = "linux")]
+    system_witness: Option<SystemVirtualReviewCudaPlacementWitness>,
+    // Once profile finalization starts it must never be repeated on these sessions.
+    #[cfg(target_os = "linux")]
+    system_profiles: Option<BTreeMap<String, Vec<u8>>>,
     rejected: Option<BackendError>,
 }
 
-pub struct PalsVirtualReviewOnnxBackend {
+#[derive(Default)]
+struct VirtualSessionBank {
     public: Option<Session>,
     shared_pc: Option<Session>,
     validator: Option<Session>,
+}
+
+impl VirtualSessionBank {
+    fn slot(&mut self, role: &str) -> Result<&mut Option<Session>, BackendError> {
+        let slot = match role {
+            "public" => &mut self.public,
+            "shared_pc" | "shared_warm" => &mut self.shared_pc,
+            "validator" => &mut self.validator,
+            _ => return Err(fail(K::UnsupportedModel, S::Asset, "unknown V3 graph role")),
+        };
+        if slot.is_some() {
+            return Err(fail(
+                K::IdentityMismatch,
+                S::Asset,
+                "duplicate V3 graph role",
+            ));
+        }
+        Ok(slot)
+    }
+    fn len(&self) -> usize {
+        usize::from(self.public.is_some())
+            + usize::from(self.shared_pc.is_some())
+            + usize::from(self.validator.is_some())
+    }
+}
+
+/// The original factory retains this owner before any native runtime call.
+/// Its contents are not a physical completion witness or authority to reuse
+/// a device. A caller must preserve it on error or panic until a real fence.
+pub struct VirtualReviewStartupCustody {
+    // Established before native startup and shared only with this backend.
+    synchronous_owner_identity: Arc<()>,
+    native_entry_started: Arc<std::sync::atomic::AtomicBool>,
+    sources: Arc<dyn VirtualReviewOwnedSources>,
+    runtime: Option<OrtRuntime>,
+    profile_directory: Option<VirtualReviewProfileDirectory>,
+    sessions: VirtualSessionBank,
+    serialized: Option<Vec<u8>>,
+    session_load_failure: Option<VirtualSessionLoadFailureObservation>,
+    backend: Option<PalsVirtualReviewOnnxBackend>,
+}
+
+/// Local graph-constructor observation only. `BeforeProvider` does not rule
+/// out an earlier runtime/provider call for this startup or an earlier graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VirtualSessionLoadFailureObservation {
+    BeforeProvider,
+    ProviderEntered { returned_session: bool },
+    SessionInterfaceRejected,
+}
+
+/// The result of one capture owner's checked ORT load. A rejected deadline
+/// means this owner did not enter native code in that attempt; it is not a
+/// process-wide or device-wide completion claim.
+#[cfg(target_os = "linux")]
+pub enum SystemCudaCaptureLoadFailure {
+    RejectedBeforeNative(BackendError),
+    PhysicalStateUnknown(BackendError),
+}
+
+/// Mark every unclassified return or unwind as an attempted native entry.
+/// The shared flag is monotonic: an older no-native proof can never revive.
+#[cfg(target_os = "linux")]
+struct CaptureEntryAttempt {
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    callback_rejection_confirmed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CaptureEntryAttempt {
+    fn drop(&mut self) {
+        if !self.callback_rejection_confirmed {
+            self.entered
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+impl VirtualReviewStartupCustody {
+    pub fn new(
+        sources: Arc<dyn VirtualReviewOwnedSources>,
+        profile_directory: Option<VirtualReviewProfileDirectory>,
+    ) -> Self {
+        Self::construct(sources, profile_directory, true)
+    }
+
+    /// Dedicated capture owner. The no-native evidence covers only native work
+    /// submitted through this owner, never unrelated native work or a device.
+    #[cfg(target_os = "linux")]
+    pub fn new_for_system_cuda_capture(
+        sources: VirtualReviewHeldFileSources,
+        profile_directory: Option<VirtualReviewProfileDirectory>,
+    ) -> Self {
+        Self::construct(Arc::new(sources), profile_directory, false)
+    }
+
+    fn construct(
+        sources: Arc<dyn VirtualReviewOwnedSources>,
+        profile_directory: Option<VirtualReviewProfileDirectory>,
+        native_entry_started: bool,
+    ) -> Self {
+        Self {
+            synchronous_owner_identity: Arc::new(()),
+            native_entry_started: Arc::new(std::sync::atomic::AtomicBool::new(
+                native_entry_started,
+            )),
+            sources,
+            runtime: None,
+            profile_directory,
+            sessions: VirtualSessionBank::default(),
+            serialized: None,
+            session_load_failure: None,
+            backend: None,
+        }
+    }
+    /// Install the actual runtime returned by the native loader; this method
+    /// does not itself establish whether native initialization completed.
+    #[allow(clippy::result_large_err)]
+    pub fn install_runtime(
+        &mut self,
+        runtime: OrtRuntime,
+    ) -> Result<(), (BackendError, OrtRuntime)> {
+        // An externally created runtime necessarily crossed a native boundary,
+        // regardless of whether installation is accepted.
+        self.mark_native_entry();
+        if self.runtime.is_some() || self.backend.is_some() || self.sessions.len() != 0 {
+            return Err((
+                fail(
+                    K::InvalidInput,
+                    S::Admission,
+                    "V3 startup runtime already installed",
+                ),
+                runtime,
+            ));
+        }
+        self.runtime = Some(runtime);
+        Ok(())
+    }
+    pub fn backend(&self) -> Option<&PalsVirtualReviewOnnxBackend> {
+        self.backend.as_ref()
+    }
+    /// Record entry immediately before any native loader call for this owner.
+    /// Once set, it can never be cleared or interpreted as completed work.
+    fn mark_native_entry(&mut self) {
+        self.native_entry_started
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The same owner marks entry before invoking the native loader, including
+    /// reuse and checked-callback failure. Callers cannot reset that mark.
+    #[cfg(target_os = "linux")]
+    pub fn load_system_cuda_for_capture(
+        &mut self,
+        runtime: &crate::onnx::SystemRuntime,
+        before_native: impl FnOnce() -> Result<(), BackendError>,
+    ) -> Result<OrtRuntime, BackendError> {
+        self.mark_native_entry();
+        OrtRuntime::load_system_cuda_with_checked_entry(runtime, before_native)
+    }
+
+    /// Capture-only first-entry path. Its callback is exclusively this pure
+    /// deadline check: callers cannot substitute a callback with side effects.
+    /// A confirmed rejection can release only this still-unentered owner.
+    /// Latch reuse, callback panic/non-invocation and all other failures remain
+    /// unknown, even if some of them happened before the native call.
+    #[cfg(target_os = "linux")]
+    pub fn load_system_cuda_for_capture_until(
+        &mut self,
+        runtime: &crate::onnx::SystemRuntime,
+        until: Instant,
+    ) -> Result<OrtRuntime, SystemCudaCaptureLoadFailure> {
+        let previously_unentered = !self
+            .native_entry_started
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.runtime.is_none()
+            && self.backend.is_none()
+            && self.sessions.len() == 0
+            && self.serialized.is_none()
+            && self.session_load_failure.is_none();
+        let entered = Arc::clone(&self.native_entry_started);
+        let mut attempt = CaptureEntryAttempt {
+            entered: Arc::clone(&entered),
+            callback_rejection_confirmed: false,
+        };
+        let result = OrtRuntime::load_system_cuda_with_checked_entry_observed(runtime, || {
+            if Instant::now() >= until {
+                return Err(fail(
+                    K::BackendUnavailable,
+                    S::Admission,
+                    "system capture expired immediately before ORT entry",
+                ));
+            }
+            // This mark is immediately before the loader's native entry and
+            // never reverts, invalidating every earlier no-native proof.
+            entered.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        });
+        match result {
+            Ok(runtime) => Ok(runtime),
+            Err(crate::onnx::CheckedSystemCudaLoadFailure::CallbackRejected(error))
+                if previously_unentered && !entered.load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                attempt.callback_rejection_confirmed = true;
+                Err(SystemCudaCaptureLoadFailure::RejectedBeforeNative(error))
+            }
+            Err(crate::onnx::CheckedSystemCudaLoadFailure::CallbackRejected(error))
+            | Err(crate::onnx::CheckedSystemCudaLoadFailure::Unknown(error)) => {
+                Err(SystemCudaCaptureLoadFailure::PhysicalStateUnknown(error))
+            }
+        }
+    }
+    pub fn session_load_failure(&self) -> Option<VirtualSessionLoadFailureObservation> {
+        self.session_load_failure
+    }
+    /// The caller must guard transfer and return this same backend on failure.
+    pub fn backend_slot_mut(&mut self) -> &mut Option<PalsVirtualReviewOnnxBackend> {
+        // Exposing mutable native state forfeits the unopened-owner proof.
+        self.mark_native_entry();
+        &mut self.backend
+    }
+
+    /// Proof for this owner only after successful startup and idle synchronous
+    /// work. A failed or partial session remains unproven in this custody.
+    /// This does not attest another worker, process, or the entire device.
+    pub fn synchronous_shutdown_proof(&self) -> Option<crate::worker::SynchronousOwnerProof> {
+        if !self
+            .native_entry_started
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.runtime.is_none()
+            && self.backend.is_none()
+            && self.sessions.len() == 0
+            && self.serialized.is_none()
+            && self.session_load_failure.is_none()
+        {
+            return Some(crate::worker::SynchronousOwnerProof::no_native(
+                Arc::clone(&self.synchronous_owner_identity),
+                Arc::clone(&self.native_entry_started),
+            ));
+        }
+        if self.session_load_failure.is_some()
+            || self.serialized.is_some()
+            || self.sessions.len() != 0
+        {
+            return None;
+        }
+        let backend = self.backend.as_ref()?;
+        if !Arc::ptr_eq(
+            &self.synchronous_owner_identity,
+            &backend.synchronous_owner_identity,
+        ) {
+            return None;
+        }
+        backend.synchronous_shutdown_proof()
+    }
+}
+
+impl crate::worker::synchronous_owner_sealed::Sealed for VirtualReviewStartupCustody {}
+impl crate::worker::SynchronousPhysicalOwner for VirtualReviewStartupCustody {
+    fn synchronous_owner_identity(&self) -> Arc<()> {
+        Arc::clone(&self.synchronous_owner_identity)
+    }
+}
+
+/// Tracks native Run entry and successful return, independently of output
+/// acceptance and later logical/diagnostic failures. An unwind leaves dirty.
+struct SynchronousRunTracker {
+    clean: bool,
+    completed_synchronous_runs: u64,
+}
+impl SynchronousRunTracker {
+    fn new() -> Self {
+        Self {
+            clean: true,
+            completed_synchronous_runs: 0,
+        }
+    }
+    fn enter(&mut self) -> bool {
+        std::mem::replace(&mut self.clean, false)
+    }
+    fn returned(&mut self, was_clean: bool, ok: bool) {
+        let next = if ok {
+            self.completed_synchronous_runs.checked_add(1)
+        } else {
+            None
+        };
+        if let Some(count) = next {
+            self.completed_synchronous_runs = count;
+        }
+        self.clean = was_clean && next.is_some();
+    }
+    fn permits_shutdown(&self) -> bool {
+        self.clean
+    }
+}
+
+pub struct PalsVirtualReviewOnnxBackend {
+    sessions: VirtualSessionBank,
+    // This identity belongs to the actual backend, never to its reconstructed
+    // metadata. A failed or unwinding native Run permanently taints proof.
+    synchronous_owner_identity: Arc<()>,
+    synchronous_runs: SynchronousRunTracker,
     applied_session_settings: Arc<[PalsAppliedSessionSettings]>,
     runtime: Option<OrtRuntime>,
     config: PalsOnnxConfig,
@@ -498,6 +1021,9 @@ pub struct PalsVirtualReviewOnnxBackend {
     // A CUDA unknown-completion path must retain this Arc, not just tensors.
     sources: Option<Arc<dyn VirtualReviewOwnedSources>>,
     initialization: Arc<[PalsGraphPlacement]>,
+    phase_trace: VirtualReviewPhaseTrace,
+    #[cfg(feature = "native-validation-diagnostics")]
+    validation_trace: Option<native_validation_diagnostics::GpuLifecycleTrace>,
 }
 impl PalsVirtualReviewOnnxBackend {
     pub fn load(
@@ -679,7 +1205,7 @@ impl PalsVirtualReviewOnnxBackend {
                 "owned V3 control requires explicit CUDA and host public memory",
             ));
         }
-        config.validate_execution_selection(runtime.native_loading_profile(), control.is_some())?;
+        config.validate_for_runtime(&runtime, control.is_some())?;
         let audit = control
             .map(|(policy, path)| {
                 Ok::<_, BackendError>((policy, cuda_control::owned_profile_root(&path)?))
@@ -727,7 +1253,7 @@ impl PalsVirtualReviewOnnxBackend {
                 "owned V3 profile capability requires explicit CUDA and host public memory",
             ));
         }
-        config.validate_execution_selection(runtime.native_loading_profile(), control.is_some())?;
+        config.validate_for_runtime(&runtime, control.is_some())?;
         let (audit, profile_directory) = match control {
             Some((policy, directory)) => {
                 directory.validate_live()?;
@@ -758,7 +1284,147 @@ impl PalsVirtualReviewOnnxBackend {
         warm: bool,
         profile_directory: Option<VirtualReviewProfileDirectory>,
     ) -> Result<Self, BackendError> {
-        config.validate_execution_selection(runtime.native_loading_profile(), audit.is_some())?;
+        let mut custody = VirtualReviewStartupCustody::new(sources, profile_directory);
+        custody
+            .install_runtime(runtime)
+            .map_err(|(error, _)| error)?;
+        Self::load_sources_into_custody(
+            &mut custody,
+            expected_sha256,
+            config,
+            audit,
+            mode,
+            warm,
+            &mut || Ok(()),
+        )?;
+        custody.backend.take().ok_or_else(|| {
+            fail(
+                K::BackendFailure,
+                S::Backend,
+                "V3 startup backend is missing",
+            )
+        })
+    }
+
+    /// Load using a caller-owned original startup scope. The caller must keep
+    /// that exact scope on every error, timeout, or unwind; the returned error
+    /// is a diagnostic, never physical-completion evidence. `before_native`
+    /// is called after pure slot checks, immediately before each native
+    /// Session builder. It supplies neither a device reservation nor a fence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_owned_sources_with_profile_into(
+        custody: &mut VirtualReviewStartupCustody,
+        expected_sha256: &str,
+        config: PalsOnnxConfig,
+        mode: VirtualReviewExecutionMode,
+        kind: VirtualReviewArtifactKind,
+        policy: Option<PalsCudaControlPolicy>,
+        before_native: &mut impl FnMut(),
+    ) -> Result<(), BackendError> {
+        Self::load_owned_sources_with_profile_into_checked(
+            custody,
+            expected_sha256,
+            config,
+            mode,
+            kind,
+            policy,
+            &mut || {
+                before_native();
+                Ok(())
+            },
+        )
+    }
+
+    /// As above, but the original owner may reject each individual Session
+    /// constructor at its final pre-native boundary. A rejection returns its
+    /// exact error, preserves the serialized bytes and all earlier sessions in
+    /// `custody`, and does not prove physical completion of earlier work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_owned_sources_with_profile_into_checked(
+        custody: &mut VirtualReviewStartupCustody,
+        expected_sha256: &str,
+        config: PalsOnnxConfig,
+        mode: VirtualReviewExecutionMode,
+        kind: VirtualReviewArtifactKind,
+        policy: Option<PalsCudaControlPolicy>,
+        before_native: &mut impl FnMut() -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        if kind == VirtualReviewArtifactKind::ApproxWarm
+            && mode != VirtualReviewExecutionMode::Deployment
+        {
+            return Err(fail(
+                K::UnsupportedModel,
+                S::Admission,
+                "registered V3 ApproxWarm is a PC-only Deployment artifact; Collection is unsupported",
+            ));
+        }
+        if policy.is_some()
+            && (!matches!(config.provider, Provider::Cuda { .. }) || config.device_public_memory)
+        {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Admission,
+                "owned V3 profile capability requires explicit CUDA and host public memory",
+            ));
+        }
+        let audit = match (policy, custody.profile_directory.as_ref()) {
+            (Some(policy), Some(directory)) => {
+                directory.validate_live()?;
+                Some((policy, directory.path().to_owned()))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(fail(
+                    K::InvalidInput,
+                    S::Admission,
+                    "V3 profile and policy must share one original owner",
+                ));
+            }
+        };
+        Self::load_sources_into_custody(
+            custody,
+            expected_sha256,
+            config,
+            audit,
+            mode,
+            kind == VirtualReviewArtifactKind::ApproxWarm,
+            before_native,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_sources_into_custody(
+        custody: &mut VirtualReviewStartupCustody,
+        expected_sha256: &str,
+        config: PalsOnnxConfig,
+        audit: Option<(PalsCudaControlPolicy, std::path::PathBuf)>,
+        mode: VirtualReviewExecutionMode,
+        warm: bool,
+        before_native: &mut impl FnMut() -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        if custody.backend.is_some()
+            || custody.sessions.len() != 0
+            || custody.serialized.is_some()
+            || custody.session_load_failure.is_some()
+        {
+            return Err(fail(
+                K::InvalidInput,
+                S::Admission,
+                "V3 startup owner cannot be reused after a previous attempt",
+            ));
+        }
+        let sources = Arc::clone(&custody.sources);
+        let runtime = custody.runtime.clone().ok_or_else(|| {
+            fail(
+                K::InvalidInput,
+                S::Admission,
+                "V3 startup runtime has not been installed",
+            )
+        })?;
+        let profile_directory = custody.profile_directory.clone();
+        let mut phase_trace = VirtualReviewPhaseTrace::new(config.provider);
+        phase_trace.record("backend_load_entered", "other", None);
+        config.validate_for_runtime(&runtime, audit.is_some())?;
         #[cfg(not(feature = "experimental-io-binding"))]
         if warm && matches!(config.provider, Provider::Cuda { .. }) {
             return Err(fail(
@@ -835,18 +1501,20 @@ impl PalsVirtualReviewOnnxBackend {
         let seeds = tickets::TicketSeeds::new()?;
         let epoch = manifest.epoch()?;
         let rules_semantics = parse_sha256(&manifest.rules_input_semantic_sha256)?;
-        match (config.provider, runtime.bundle_digest()) {
+        match (config.provider, runtime.cuda_runtime_identity()) {
             (Provider::Cpu, Some(_)) | (Provider::Cuda { .. }, None) => {
                 return Err(fail(
                     K::IdentityMismatch,
                     S::Backend,
-                    "selected-review provider and native bundle differ",
+                    "selected-review provider and native runtime identity differ",
                 ));
             }
             (Provider::Cuda { .. }, Some(_)) => runtime.verify_cuda_dependencies()?,
             _ => {}
         }
-        let mut sessions = BTreeMap::new();
+        // Construct the fallible host bank before creating any native session.
+        // A bank admission failure must not drop already-created CUDA sessions.
+        let memory = MemoryBank::new(1, MAX_PUBLIC_BYTES).map_err(public_bank_error)?;
         let mut applied_session_settings = Vec::with_capacity(manifest.graphs.len());
         let mut placements = Vec::new();
         let mut identities = Vec::new();
@@ -879,20 +1547,82 @@ impl PalsVirtualReviewOnnxBackend {
                 sha256: digest,
                 serialized_bytes: data.len() as u64,
             });
-            let (session, placement, applied) = load_session(
-                data,
+            let role = VirtualReviewPhaseTrace::role(&graph.role);
+            let serialized_bytes = data.len();
+            phase_trace.record("session_load_entered", role, Some(serialized_bytes));
+            // Install both original native inputs and the return slot in the
+            // caller-owned custody before entering ORT. A failure or unwind
+            // cannot drop earlier graph sessions or the current input.
+            custody.serialized = Some(data);
+            let slot = custody.sessions.slot(&graph.role)?;
+            let loaded = load_session_retaining_failure(
+                &mut custody.serialized,
                 config,
                 &graph.role,
                 graph_audit.map(|(p, r)| (p, r.as_path())),
-            )?;
-            manifest.validate_session(&session, graph)?;
+                slot,
+                true,
+                &mut *before_native,
+            );
+            // The retaining loader releases serialized bytes only after ORT
+            // returned a session. On failure the original bytes stay in the
+            // caller's custody and are not described as released.
+            if custody.serialized.is_none() {
+                phase_trace.record(
+                    "serialized_vec_released_after_loader_return",
+                    role,
+                    Some(serialized_bytes),
+                );
+            }
+            let (placement, applied) = match loaded {
+                Ok(value) => {
+                    phase_trace.record("session_load_returned_ok", role, None);
+                    value
+                }
+                Err(error) => {
+                    phase_trace.record("session_load_returned_error", role, None);
+                    let error = match error {
+                        SessionLoadFailure::BeforeProvider(error) => {
+                            custody.session_load_failure =
+                                Some(VirtualSessionLoadFailureObservation::BeforeProvider);
+                            error
+                        }
+                        SessionLoadFailure::ProviderEntered {
+                            error,
+                            returned_session,
+                        } => {
+                            custody.session_load_failure =
+                                Some(VirtualSessionLoadFailureObservation::ProviderEntered {
+                                    returned_session,
+                                });
+                            error
+                        }
+                    };
+                    return Err(error);
+                }
+            };
+            let session = slot.as_ref().ok_or_else(|| {
+                fail(
+                    K::BackendFailure,
+                    S::Backend,
+                    "V3 session loader returned without the original owner",
+                )
+            })?;
+            if let Err(error) = manifest.validate_session(session, graph) {
+                phase_trace.record("session_interface_returned_error", role, None);
+                custody.session_load_failure =
+                    Some(VirtualSessionLoadFailureObservation::SessionInterfaceRejected);
+                return Err(error);
+            }
+            // Actual Session settings and the existing initialization/interface
+            // gates returned successfully. No kernel/placement/fence is inferred.
+            phase_trace.record("session_settings_and_interface_validated", role, None);
             applied_session_settings.push(applied);
             if let Some(placement) = placement {
                 placements.push(placement);
             }
-            sessions.insert(graph.role.clone(), session);
         }
-        let session_count = sessions.len();
+        let session_count = custody.sessions.len();
         let initialization: Arc<[PalsGraphPlacement]> = placements.into();
         let backend_digest = execution_backend_digest(
             &runtime,
@@ -900,11 +1630,38 @@ impl PalsVirtualReviewOnnxBackend {
             audit.as_ref().map(|(p, _)| p.inventory),
             warm,
         );
-        Ok(Self {
-            public: sessions.remove("public"),
-            shared_pc: sessions.remove(if warm { "shared_warm" } else { "shared_pc" }),
-            validator: sessions.remove("validator"),
-            applied_session_settings: applied_session_settings.into(),
+        // Finish all potentially fallible preparation before transferring the
+        // complete bank in one move to a backend installed in this same owner.
+        let applied_session_settings = applied_session_settings.into();
+        let backend_audit = audit.map(|(policy, profile_root)| VirtualControlAudit {
+            policy,
+            profile_root,
+            profile_directory,
+            initialization: initialization.clone(),
+            proposer_seen: false,
+            critic_seen: false,
+            validator_seen: false,
+            warm_seed_seen: false,
+            witness: None,
+            #[cfg(target_os = "linux")]
+            system_witness: None,
+            #[cfg(target_os = "linux")]
+            system_profiles: None,
+            rejected: None,
+        });
+        let residency = PalsSessionResidency {
+            graphs: identities,
+            native_sessions: session_count,
+            layout: if warm { WARM_LAYOUT } else { SHARED_LAYOUT }.into(),
+            reader_initializer_bank: None,
+            role_reader_weights_shared: None,
+            native_resident_parameter_bytes: None,
+            vram_peak_bytes: None,
+        };
+        custody.backend = Some(Self {
+            synchronous_owner_identity: Arc::clone(&custody.synchronous_owner_identity),
+            synchronous_runs: SynchronousRunTracker::new(),
+            applied_session_settings,
             runtime: Some(runtime),
             config,
             model_config: manifest.config,
@@ -913,7 +1670,7 @@ impl PalsVirtualReviewOnnxBackend {
             trained: manifest.trained,
             rules_semantics,
             backend_digest,
-            memory: Some(MemoryBank::new(1, MAX_PUBLIC_BYTES).map_err(public_bank_error)?),
+            memory: Some(memory),
             active_memory: None,
             active: None,
             #[cfg(feature = "experimental-io-binding")]
@@ -922,33 +1679,55 @@ impl PalsVirtualReviewOnnxBackend {
             generation: 0,
             mapping: RefCell::default(),
             initialization: initialization.clone(),
-            audit: audit.map(|(policy, profile_root)| VirtualControlAudit {
-                policy,
-                profile_root,
-                profile_directory,
-                initialization,
-                proposer_seen: false,
-                critic_seen: false,
-                validator_seen: false,
-                warm_seed_seen: false,
-                witness: None,
-                rejected: None,
-            }),
+            audit: backend_audit,
             quarantine: None,
-            residency: PalsSessionResidency {
-                graphs: identities,
-                native_sessions: session_count,
-                layout: if warm { WARM_LAYOUT } else { SHARED_LAYOUT }.into(),
-                reader_initializer_bank: None,
-                role_reader_weights_shared: None,
-                native_resident_parameter_bytes: None,
-                vram_peak_bytes: None,
-            },
+            residency,
             mode,
             warm,
             seeds,
             sources: Some(sources),
-        })
+            phase_trace,
+            #[cfg(feature = "native-validation-diagnostics")]
+            validation_trace: None,
+            sessions: std::mem::take(&mut custody.sessions),
+        });
+        Ok(())
+    }
+    /// Explicit diagnostic admission only; cannot change normal model/runtime policy.
+    #[cfg(feature = "native-validation-diagnostics")]
+    pub fn enable_gpu_lifecycle_validation(
+        &mut self,
+        trace: native_validation_diagnostics::GpuLifecycleTrace,
+    ) -> Result<(), BackendError> {
+        if self.validation_trace.is_some()
+            || self.warm
+            || self.validator_present()
+            || self.config.cache_public_memory
+            || !matches!(self.config.provider, Provider::Cuda { .. })
+            || !self.virtual_cuda_placement_required()
+            || self.stats.admitted_role_requests != 0
+            || self.stats.completed_nn_inputs != 0
+        {
+            return Err(BackendError::new(
+                crate::error::FailureKind::InvalidInput,
+                crate::error::FailureStage::Admission,
+                "unused V-free Fresh CUDA owner with public cache off required for explicit validation",
+            ));
+        }
+        trace.bind_actual_cuda_owner(
+            self.model_epoch(),
+            self.backend_digest(),
+            self.manifest_digest(),
+            self.runtime_binary_digest(),
+        );
+        self.validation_trace = Some(trace);
+        Ok(())
+    }
+    #[cfg(feature = "native-validation-diagnostics")]
+    pub fn gpu_lifecycle_validation_trace(
+        &self,
+    ) -> Option<native_validation_diagnostics::GpuLifecycleTrace> {
+        self.validation_trace.clone()
     }
     pub fn model_epoch(&self) -> [u8; 32] {
         self.epoch
@@ -1011,7 +1790,7 @@ impl PalsVirtualReviewOnnxBackend {
         self.mode
     }
     pub fn validator_present(&self) -> bool {
-        self.validator.is_some()
+        self.sessions.validator.is_some()
     }
     pub fn approximate_warm_capable(&self) -> bool {
         self.warm
@@ -1030,6 +1809,36 @@ impl PalsVirtualReviewOnnxBackend {
     }
     pub fn quarantine_cause(&self) -> Option<&BackendError> {
         self.quarantine.as_ref()
+    }
+    /// Identity of this exact backend. It is meaningful only when paired with
+    /// a proof produced by this same owner; cloning it is not itself a fence.
+    pub fn synchronous_owner_identity(&self) -> Arc<()> {
+        Arc::clone(&self.synchronous_owner_identity)
+    }
+    /// Same-owner normal-shutdown proof. Successful graph construction is known
+    /// because this backend is installed only after every required session is
+    /// returned and validated. Any entered Run error or unwind stays tainted.
+    /// This path uses default provider stream and synchronization options: no user stream
+    /// or disable-synchronize Run option is supplied. Warm binding additionally
+    /// requires its input and output synchronization calls to have succeeded.
+    /// The sealed count is of successful synchronous native Runs only; zero is
+    /// valid for an unused session release and never certifies a GPU Run or a
+    /// device-wide fence. The proof says nothing about another owner or process.
+    pub fn synchronous_shutdown_proof(&self) -> Option<crate::worker::SynchronousOwnerProof> {
+        if !self.synchronous_runs.permits_shutdown()
+            || self.runtime.is_none()
+            || self.sessions.public.is_none()
+            || self.sessions.shared_pc.is_none()
+            || (self.mode == VirtualReviewExecutionMode::Collection
+                && self.sessions.validator.is_none())
+            || self.idle().is_err()
+        {
+            return None;
+        }
+        Some(crate::worker::SynchronousOwnerProof::new(
+            Arc::clone(&self.synchronous_owner_identity),
+            self.synchronous_runs.completed_synchronous_runs,
+        ))
     }
     fn idle(&self) -> Result<(), BackendError> {
         if let Some(cause) = &self.quarantine {
@@ -1154,14 +1963,75 @@ impl PalsVirtualReviewOnnxBackend {
     pub fn verify_runtime(&self) -> Result<(), BackendError> {
         self.idle()?;
         if matches!(self.config.provider, Provider::Cuda { .. }) {
-            self.mapping.borrow_mut().final_audit(|| {
+            self.mapping.borrow_mut().final_audit_observed(|| {
                 self.runtime
                     .as_ref()
                     .expect("runtime owned")
-                    .verify_cuda_runtime_mappings()
+                    .observe_cuda_runtime_mappings()
             })?;
         }
         Ok(())
+    }
+    /// Observe current mapping evidence while preserving strict verification
+    /// for explicit placement/acceptance requests.
+    pub fn observe_runtime_mapping(&self) -> Result<RuntimeMappingObservation, BackendError> {
+        self.idle()?;
+        if !matches!(self.config.provider, Provider::Cuda { .. }) {
+            return Ok(RuntimeMappingObservation::NonCuda);
+        }
+        let observed = self.mapping.borrow_mut().observe_final_audit(|| {
+            self.runtime
+                .as_ref()
+                .expect("runtime owned")
+                .observe_cuda_runtime_mappings()
+        })?;
+        Ok(match observed {
+            CudaRuntimeMappingEvidence::Observed => RuntimeMappingObservation::Observed,
+            CudaRuntimeMappingEvidence::Unknown => RuntimeMappingObservation::Unknown,
+        })
+    }
+
+    /// Derive the runtime kind from this backend's actual retained owner.
+    pub fn system_cuda_runtime_selected(&self) -> bool {
+        self.runtime
+            .as_ref()
+            .is_some_and(OrtRuntime::is_system_cuda)
+    }
+
+    fn system_placement_prerequisites(&self) -> Result<SystemPlacementPrerequisites, BackendError> {
+        if !self.system_cuda_runtime_selected() {
+            return Ok(SystemPlacementPrerequisites::NotApplicable);
+        }
+        if !matches!(self.config.provider, Provider::Cuda { .. }) {
+            return Err(fail(
+                K::IdentityMismatch,
+                S::Backend,
+                "system CUDA owner does not match the configured provider",
+            ));
+        }
+        let Some(audit) = self.audit.as_ref() else {
+            return Ok(SystemPlacementPrerequisites::Incomplete);
+        };
+        if let Some(cause) = &audit.rejected {
+            return Err(cause.clone());
+        }
+        #[cfg(target_os = "linux")]
+        if audit.system_witness.is_some() {
+            return Ok(SystemPlacementPrerequisites::Ready);
+        }
+        let ready = system_placement_roles_complete(
+            audit.proposer_seen,
+            audit.critic_seen,
+            self.sessions.validator.is_some(),
+            audit.validator_seen,
+            self.warm,
+            audit.warm_seed_seen,
+        );
+        Ok(if ready {
+            SystemPlacementPrerequisites::Ready
+        } else {
+            SystemPlacementPrerequisites::Incomplete
+        })
     }
     pub fn verify_cuda_placement(&mut self) -> Result<PalsCudaPlacementWitness, BackendError> {
         // This compatibility method never re-labels V3 evidence as the legacy
@@ -1177,6 +2047,18 @@ impl PalsVirtualReviewOnnxBackend {
         &mut self,
     ) -> Result<VirtualReviewCudaPlacementWitness, BackendError> {
         self.idle()?;
+        if self
+            .runtime
+            .as_ref()
+            .expect("runtime owned")
+            .is_system_cuda()
+        {
+            return Err(fail(
+                K::UnsupportedModel,
+                S::Backend,
+                "system CUDA requires the separate system placement witness",
+            ));
+        }
         self.verify_runtime()?;
         let audit = self.audit.as_mut().ok_or_else(|| {
             fail(
@@ -1194,11 +2076,14 @@ impl PalsVirtualReviewOnnxBackend {
         // Missing role execution is a typed lack of evidence; keep profiles
         // open so a later actual role may supply evidence. Never warm up an NN
         // merely to manufacture an acceptance witness.
-        if !audit.proposer_seen
-            || !audit.critic_seen
-            || (self.validator.is_some() && !audit.validator_seen)
-            || (self.warm && !audit.warm_seed_seen)
-        {
+        if !system_placement_roles_complete(
+            audit.proposer_seen,
+            audit.critic_seen,
+            self.sessions.validator.is_some(),
+            audit.validator_seen,
+            self.warm,
+            audit.warm_seed_seen,
+        ) {
             return Err(fail(
                 K::BackendUnavailable,
                 S::Backend,
@@ -1217,16 +2102,16 @@ impl PalsVirtualReviewOnnxBackend {
                         .finish_virtual_profile(session, &audit.profile_root, role)
                 }
             };
-            let public = finish(self.public.as_mut().expect("public"), "public")?;
+            let public = finish(self.sessions.public.as_mut().expect("public"), "public")?;
             let private_role = if self.warm {
                 "shared_warm"
             } else {
                 "shared_pc"
             };
-            let pc = finish(self.shared_pc.as_mut().expect("P/C"), private_role)?;
+            let pc = finish(self.sessions.shared_pc.as_mut().expect("P/C"), private_role)?;
             let mut profiles =
                 BTreeMap::from([("public".into(), public), (private_role.into(), pc)]);
-            if let Some(validator) = &mut self.validator {
+            if let Some(validator) = &mut self.sessions.validator {
                 profiles.insert("validator".into(), finish(validator, "validator")?);
             }
             let runtime = self.runtime.as_ref().expect("runtime owned");
@@ -1250,6 +2135,131 @@ impl PalsVirtualReviewOnnxBackend {
             }
         }
     }
+
+    /// A separate witness for a system-owned runtime. The physical worker must
+    /// be idle; this profile/mapping witness does not infer physical completion.
+    #[cfg(target_os = "linux")]
+    pub fn verify_system_virtual_cuda_placement(
+        &mut self,
+    ) -> Result<SystemVirtualReviewCudaPlacementWitness, BackendError> {
+        match self.observe_system_virtual_cuda_placement()? {
+            SystemPlacementObservation::Verified(witness) => Ok(*witness),
+            _ => Err(fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "system CUDA placement evidence is unavailable",
+            )),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn observe_system_virtual_cuda_placement(
+        &mut self,
+    ) -> Result<SystemPlacementObservation, BackendError> {
+        self.idle()?;
+        let runtime = self.runtime.as_ref().expect("runtime owned");
+        if !runtime.is_system_cuda() {
+            return Err(fail(
+                K::UnsupportedModel,
+                S::Backend,
+                "system placement witness requires a system CUDA runtime",
+            ));
+        }
+        let device_id = match self.config.provider {
+            Provider::Cuda { device_id, .. } => device_id,
+            Provider::Cpu => {
+                return Err(fail(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "system CUDA witness requires the declared CUDA provider",
+                ));
+            }
+        };
+        let audit = self.audit.as_ref().ok_or_else(|| {
+            fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "system V3 has no explicit CUDA control policy",
+            )
+        })?;
+        if let Some(cause) = &audit.rejected {
+            return Err(cause.clone());
+        }
+        // Even a previously verified witness cannot attest today's mapping.
+        // Reuse only the retained profile bytes, then recheck mappings below.
+        if !system_placement_roles_complete(
+            audit.proposer_seen,
+            audit.critic_seen,
+            self.sessions.validator.is_some(),
+            audit.validator_seen,
+            self.warm,
+            audit.warm_seed_seen,
+        ) {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "system V3 placement lacks validated execution for every registered private role",
+            ));
+        }
+        if self.observe_runtime_mapping()? == RuntimeMappingObservation::Unknown {
+            return Ok(SystemPlacementObservation::MappingUnavailable);
+        }
+        let audit = self.audit.as_mut().expect("control policy checked");
+        if audit.system_profiles.is_none() {
+            let collected = (|| {
+                let finish = |session: &mut Session, role: &str| {
+                    if let Some(directory) = &audit.profile_directory {
+                        audit
+                            .policy
+                            .finish_virtual_profile_owned(session, directory, role)
+                    } else {
+                        audit
+                            .policy
+                            .finish_virtual_profile(session, &audit.profile_root, role)
+                    }
+                };
+                let public = finish(self.sessions.public.as_mut().expect("public"), "public")?;
+                let private_role = if self.warm {
+                    "shared_warm"
+                } else {
+                    "shared_pc"
+                };
+                let pc = finish(self.sessions.shared_pc.as_mut().expect("P/C"), private_role)?;
+                let mut profiles =
+                    BTreeMap::from([("public".into(), public), (private_role.into(), pc)]);
+                if let Some(validator) = &mut self.sessions.validator {
+                    profiles.insert("validator".into(), finish(validator, "validator")?);
+                }
+                Ok::<_, BackendError>(profiles)
+            })();
+            match collected {
+                Ok(profiles) => audit.system_profiles = Some(profiles),
+                Err(error) => {
+                    audit.rejected = Some(error.clone());
+                    return Err(error);
+                }
+            }
+        }
+        let checked = audit.policy.observe_system_virtual_profiles(
+            audit.system_profiles.as_ref().expect("profiles retained"),
+            audit.initialization.to_vec(),
+            runtime,
+            device_id,
+        );
+        match checked {
+            Ok(observation) => {
+                if let SystemPlacementObservation::Verified(witness) = &observation {
+                    audit.system_witness = Some((**witness).clone());
+                }
+                Ok(observation)
+            }
+            Err(error) => {
+                audit.rejected = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
     pub fn validate_identity(
         &self,
         identity: &ReviewExecutionIdentity,
@@ -1348,7 +2358,7 @@ impl PalsVirtualReviewOnnxBackend {
                 "V3 exact histories must align with ordered anchors and current root",
             ));
         }
-        if input.role == PalsRole::Validator && self.validator.is_none() {
+        if input.role == PalsRole::Validator && self.sessions.validator.is_none() {
             return Err(fail(
                 K::UnsupportedModel,
                 S::Admission,
@@ -1379,14 +2389,15 @@ impl PalsVirtualReviewOnnxBackend {
             self.active = None;
         }
         if self.quarantine.is_none() && matches!(self.config.provider, Provider::Cuda { .. }) {
-            self.mapping
-                .borrow_mut()
-                .after_run(self.stats.completed_nn_inputs > before, || {
+            self.mapping.borrow_mut().after_run_observed(
+                self.stats.completed_nn_inputs > before,
+                || {
                     self.runtime
                         .as_ref()
                         .expect("runtime owned")
-                        .verify_cuda_runtime_mappings()
-                })?;
+                        .observe_cuda_runtime_mappings()
+                },
+            )?;
         }
         if result.is_ok() {
             if let Some(audit) = &mut self.audit {
@@ -1424,7 +2435,23 @@ impl PalsVirtualReviewOnnxBackend {
             self.stats.public_nn_runs_attempted =
                 self.stats.public_nn_runs_attempted.saturating_add(1);
             let a = self.active.as_ref().expect("input owned");
-            let result=self.public.as_mut().expect("public").run(ort::inputs!["anchor_board"=>&a.anchor_board,"anchor_metadata"=>&a.anchor_metadata,"anchor_mask"=>&a.anchor_mask,"records"=>&a.records,"record_anchor"=>&a.record_anchor,"record_line_tokens"=>&a.record_line_tokens,"record_line_mask"=>&a.record_line_mask,"record_mask"=>&a.record_mask]);
+            #[cfg(feature = "native-validation-diagnostics")]
+            let validation_run = self
+                .validation_trace
+                .as_ref()
+                .and_then(|trace| trace.enter_ort(native_validation_diagnostics::RunGraph::Public));
+            let values = ort::inputs!["anchor_board"=>&a.anchor_board,"anchor_metadata"=>&a.anchor_metadata,"anchor_mask"=>&a.anchor_mask,"records"=>&a.records,"record_anchor"=>&a.record_anchor,"record_line_tokens"=>&a.record_line_tokens,"record_line_mask"=>&a.record_line_mask,"record_mask"=>&a.record_mask];
+            let first_phase_run = self.phase_trace.first_run_entered("public");
+            let previously_clean = self.synchronous_runs.enter();
+            let result = self.sessions.public.as_mut().expect("public").run(values);
+            self.synchronous_runs
+                .returned(previously_clean, result.is_ok());
+            self.phase_trace
+                .first_run_returned(first_phase_run, "public", result.is_ok());
+            #[cfg(feature = "native-validation-diagnostics")]
+            if let Some(span) = validation_run {
+                span.returned(result.is_ok());
+            }
             let outputs = match result {
                 Ok(o) => o,
                 Err(e) => {
@@ -1498,6 +2525,8 @@ impl PalsVirtualReviewOnnxBackend {
         }
         #[cfg(feature = "experimental-io-binding")]
         if self.warm && matches!(self.config.provider, Provider::Cuda { .. }) {
+            // CUDA Warm uses its separate I/O binding path, without this direct
+            // Session.run trace. Missing phase rows imply neither no Run nor failure.
             return self.run_bound_warm(input);
         }
         let a = self.active.as_ref().expect("input owned");
@@ -1512,12 +2541,34 @@ impl PalsVirtualReviewOnnxBackend {
             );
         }
         self.stats.role_nn_runs_attempted = self.stats.role_nn_runs_attempted.saturating_add(1);
-        let session = if input.role == PalsRole::Validator {
-            self.validator.as_mut().expect("V admitted")
+        #[cfg(feature = "native-validation-diagnostics")]
+        let validation_run = self
+            .validation_trace
+            .as_ref()
+            .and_then(|trace| trace.enter_ort(native_validation_diagnostics::RunGraph::Private));
+        let phase_role = if input.role == PalsRole::Validator {
+            "validator"
+        } else if self.warm {
+            "shared_warm"
         } else {
-            self.shared_pc.as_mut().expect("P/C")
+            "shared_pc"
+        };
+        let first_phase_run = self.phase_trace.first_run_entered(phase_role);
+        let previously_clean = self.synchronous_runs.enter();
+        let session = if input.role == PalsRole::Validator {
+            self.sessions.validator.as_mut().expect("V admitted")
+        } else {
+            self.sessions.shared_pc.as_mut().expect("P/C")
         };
         let result = session.run(values);
+        self.synchronous_runs
+            .returned(previously_clean, result.is_ok());
+        self.phase_trace
+            .first_run_returned(first_phase_run, phase_role, result.is_ok());
+        #[cfg(feature = "native-validation-diagnostics")]
+        if let Some(span) = validation_run {
+            span.returned(result.is_ok());
+        }
         let outputs = match result {
             Ok(o) => o,
             Err(e) => {
@@ -1553,9 +2604,10 @@ impl PalsVirtualReviewOnnxBackend {
         }
         // Construction binds only owned CPU output aliases. Install the owner
         // before the first input bind can enqueue a CUDA transfer.
+        let previously_clean = self.synchronous_runs.enter();
         self.active_binding = Some(
             binding::Binding::new(
-                self.shared_pc.as_ref().expect("P/C"),
+                self.sessions.shared_pc.as_ref().expect("P/C"),
                 input.candidates.len().max(1),
                 input.divergences.len().max(1),
                 input.role == PalsRole::Critic,
@@ -1574,10 +2626,12 @@ impl PalsVirtualReviewOnnxBackend {
             .as_mut()
             .expect("binding installed")
             .run(
-                self.shared_pc.as_mut().expect("P/C"),
+                self.sessions.shared_pc.as_mut().expect("P/C"),
                 self.active.as_ref().expect("input owned"),
                 self.active_memory.as_ref().expect("public pinned"),
             );
+        self.synchronous_runs
+            .returned(previously_clean, result.is_ok());
         if let Err(e) = result {
             let error = native(CauseCode::OrtRun, "V3 Warm binding Run/fence failed", e);
             self.quarantine = Some(error.clone());
@@ -1593,88 +2647,195 @@ impl PalsVirtualReviewOnnxBackend {
         self.stats.validated_role_outputs = self.stats.validated_role_outputs.saturating_add(1);
         Ok(output)
     }
+    /// Execute on the actual physical owner; this does not create a fence or
+    /// grant caller authority to release inputs or native resources.
+    pub fn execute_owned_command(
+        &mut self,
+        command: &VirtualReviewNativeCommand,
+    ) -> PhysicalRun<Result<VirtualReviewNativeResult, BackendError>> {
+        let result = match command {
+            VirtualReviewNativeCommand::Evaluate(invocation) => self
+                .run(&invocation.input, &invocation.identity)
+                .map(VirtualReviewNativeResult::Evaluation),
+            VirtualReviewNativeCommand::EvaluateTicket { ticket, invocation }
+            | VirtualReviewNativeCommand::EvaluateTicketScoped {
+                ticket, invocation, ..
+            } => {
+                let before = self.stats.clone();
+                let outcome = self.run_for_ticket(ticket, invocation);
+                let evidence =
+                    PalsNNInputEvidence::between(&before, &self.stats, self.quarantine.is_none());
+                let owner_accounting = VirtualReviewTicketOwnerAccounting::between(
+                    &before,
+                    &self.stats,
+                    invocation.input.role,
+                    self.quarantine.is_none(),
+                );
+                Ok(VirtualReviewNativeResult::TicketEvaluationWithEvidence {
+                    outcome,
+                    actual_completed_nn_inputs_delta: evidence.actual_completed_nn_inputs_delta,
+                    complete: evidence.complete,
+                    owner_accounting,
+                })
+            }
+            #[cfg(feature = "native-validation-diagnostics")]
+            VirtualReviewNativeCommand::EvaluateTicketForValidation {
+                ticket,
+                execution,
+                invocation,
+            } => {
+                let _validation_ticket = self
+                    .validation_trace
+                    .as_ref()
+                    .map(|trace| trace.enter_ticket(*ticket, *execution));
+                let before = self.stats.clone();
+                let outcome = self.run_for_ticket(ticket, invocation);
+                let evidence =
+                    PalsNNInputEvidence::between(&before, &self.stats, self.quarantine.is_none());
+                let owner_accounting = VirtualReviewTicketOwnerAccounting::between(
+                    &before,
+                    &self.stats,
+                    invocation.input.role,
+                    self.quarantine.is_none(),
+                );
+                Ok(VirtualReviewNativeResult::TicketEvaluationWithEvidence {
+                    outcome,
+                    actual_completed_nn_inputs_delta: evidence.actual_completed_nn_inputs_delta,
+                    complete: evidence.complete,
+                    owner_accounting,
+                })
+            }
+            VirtualReviewNativeCommand::AcceptTicket {
+                ticket,
+                invocation,
+                completion,
+            } => self
+                .accept_completed_ticket(ticket, invocation, completion)
+                .map(|()| VirtualReviewNativeResult::TicketAccepted),
+            VirtualReviewNativeCommand::DiscardTicket(ticket) => self
+                .discard_completed_ticket(ticket)
+                .map(|()| VirtualReviewNativeResult::TicketDiscarded),
+            VirtualReviewNativeCommand::QuiesceRoot => {
+                self.quiesce_root()
+                    .map(|()| VirtualReviewNativeResult::RootQuiesced {
+                        game_generation: self.generation,
+                    })
+            }
+            VirtualReviewNativeCommand::ResetTo(generation) => {
+                self.reset_to(*generation)
+                    .map(|()| VirtualReviewNativeResult::ResetTo {
+                        game_generation: *generation,
+                    })
+            }
+            VirtualReviewNativeCommand::NewGame => {
+                self.new_game().map(|()| VirtualReviewNativeResult::NewGame)
+            }
+            VirtualReviewNativeCommand::SnapshotStats => {
+                self.snapshot_stats().map(VirtualReviewNativeResult::Stats)
+            }
+            VirtualReviewNativeCommand::SnapshotOwner => self
+                .idle()
+                .map(|()| VirtualReviewNativeResult::Owner(self.owner_snapshot())),
+            VirtualReviewNativeCommand::ObserveRuntimeMapping => {
+                self.observe_runtime_mapping().and_then(|mapping| {
+                    self.system_placement_prerequisites()
+                        .map(
+                            |system_placement| VirtualReviewNativeResult::RuntimeMappingObserved {
+                                mapping,
+                                system_placement,
+                            },
+                        )
+                })
+            }
+            VirtualReviewNativeCommand::VerifyRuntime => self
+                .verify_runtime()
+                .map(|()| VirtualReviewNativeResult::RuntimeVerified),
+            VirtualReviewNativeCommand::VerifyCudaPlacement => self
+                .verify_cuda_placement()
+                .map(|w| VirtualReviewNativeResult::CudaPlacementVerified(Box::new(w))),
+            VirtualReviewNativeCommand::VerifyVirtualCudaPlacement => self
+                .verify_virtual_cuda_placement()
+                .map(|w| VirtualReviewNativeResult::VirtualCudaPlacementVerified(Box::new(w))),
+            #[cfg(target_os = "linux")]
+            VirtualReviewNativeCommand::ObserveSystemVirtualCudaPlacement => self
+                .observe_system_virtual_cuda_placement()
+                .map(VirtualReviewNativeResult::SystemVirtualCudaPlacementObserved),
+            #[cfg(target_os = "linux")]
+            VirtualReviewNativeCommand::VerifySystemVirtualCudaPlacement => {
+                self.verify_system_virtual_cuda_placement().map(|w| {
+                    VirtualReviewNativeResult::SystemVirtualCudaPlacementVerified(Box::new(w))
+                })
+            }
+        };
+        match &self.quarantine {
+            Some(cause) => PhysicalRun::Quarantined(cause.clone()),
+            None => PhysicalRun::Complete(result),
+        }
+    }
     pub fn into_worker(
         mut self,
     ) -> Result<
         SingleWorker<VirtualReviewNativeCommand, Result<VirtualReviewNativeResult, BackendError>>,
         BackendError,
     > {
-        SingleWorker::spawn_with_outcome(move |command| {
-            let result = match command {
-                VirtualReviewNativeCommand::Evaluate(invocation) => self
-                    .run(&invocation.input, &invocation.identity)
-                    .map(VirtualReviewNativeResult::Evaluation),
-                VirtualReviewNativeCommand::EvaluateTicket { ticket, invocation } => {
-                    let before = self.stats.clone();
-                    let outcome = self.run_for_ticket(ticket, invocation);
-                    let evidence = PalsNNInputEvidence::between(
-                        &before,
-                        &self.stats,
-                        self.quarantine.is_none(),
-                    );
-                    let owner_accounting = VirtualReviewTicketOwnerAccounting::between(
-                        &before,
-                        &self.stats,
-                        invocation.input.role,
-                        self.quarantine.is_none(),
-                    );
-                    Ok(VirtualReviewNativeResult::TicketEvaluationWithEvidence {
-                        outcome,
-                        actual_completed_nn_inputs_delta: evidence.actual_completed_nn_inputs_delta,
-                        complete: evidence.complete,
-                        owner_accounting,
-                    })
-                }
-                VirtualReviewNativeCommand::AcceptTicket {
-                    ticket,
-                    invocation,
-                    completion,
-                } => self
-                    .accept_completed_ticket(ticket, invocation, completion)
-                    .map(|()| VirtualReviewNativeResult::TicketAccepted),
-                VirtualReviewNativeCommand::DiscardTicket(ticket) => self
-                    .discard_completed_ticket(ticket)
-                    .map(|()| VirtualReviewNativeResult::TicketDiscarded),
-                VirtualReviewNativeCommand::QuiesceRoot => {
-                    self.quiesce_root()
-                        .map(|()| VirtualReviewNativeResult::RootQuiesced {
-                            game_generation: self.generation,
-                        })
-                }
-                VirtualReviewNativeCommand::ResetTo(generation) => {
-                    self.reset_to(*generation)
-                        .map(|()| VirtualReviewNativeResult::ResetTo {
-                            game_generation: *generation,
-                        })
-                }
-                VirtualReviewNativeCommand::NewGame => {
-                    self.new_game().map(|()| VirtualReviewNativeResult::NewGame)
-                }
-                VirtualReviewNativeCommand::SnapshotStats => {
-                    self.snapshot_stats().map(VirtualReviewNativeResult::Stats)
-                }
-                VirtualReviewNativeCommand::SnapshotOwner => self
-                    .idle()
-                    .map(|()| VirtualReviewNativeResult::Owner(self.owner_snapshot())),
-                VirtualReviewNativeCommand::VerifyRuntime => self
-                    .verify_runtime()
-                    .map(|()| VirtualReviewNativeResult::RuntimeVerified),
-                VirtualReviewNativeCommand::VerifyCudaPlacement => self
-                    .verify_cuda_placement()
-                    .map(|w| VirtualReviewNativeResult::CudaPlacementVerified(Box::new(w))),
-                VirtualReviewNativeCommand::VerifyVirtualCudaPlacement => self
-                    .verify_virtual_cuda_placement()
-                    .map(|w| VirtualReviewNativeResult::VirtualCudaPlacementVerified(Box::new(w))),
-            };
-            match &self.quarantine {
-                Some(cause) => PhysicalRun::Quarantined(cause.clone()),
-                None => PhysicalRun::Complete(result),
-            }
-        })
+        SingleWorker::spawn_with_outcome(move |command| self.execute_owned_command(command))
+    }
+}
+impl crate::worker::synchronous_owner_sealed::Sealed for PalsVirtualReviewOnnxBackend {}
+impl crate::worker::SynchronousPhysicalOwner for PalsVirtualReviewOnnxBackend {
+    fn synchronous_owner_identity(&self) -> Arc<()> {
+        PalsVirtualReviewOnnxBackend::synchronous_owner_identity(self)
     }
 }
 fn execution_backend_digest(
     runtime: &OrtRuntime,
+    config: PalsOnnxConfig,
+    control: Option<[u8; 32]>,
+    warm: bool,
+) -> [u8; 32] {
+    let legacy_digest = virtual_review_backend_digest_from_metadata(
+        runtime.binary_digest(),
+        runtime.native_loading_profile_digest(),
+        runtime.bundle_digest(),
+        config,
+        control,
+        warm,
+    );
+    if runtime.is_system_cuda() {
+        // System identity is not a legacy bundle digest. Preserve the old
+        // metadata codec and place system executions in a separate cache domain.
+        virtual_review_system_backend_digest_from_legacy(
+            legacy_digest,
+            runtime
+                .cuda_runtime_identity()
+                .expect("system runtime identity"),
+        )
+    } else {
+        legacy_digest
+    }
+}
+
+/// Domain-separate a system-CUDA backend from historical bundle backends.
+/// This pure codec never validates or loads the named system runtime.
+pub fn virtual_review_system_backend_digest_from_legacy(
+    legacy_digest: [u8; 32],
+    system_runtime_identity: [u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"rz-pals-virtual-review-system-cuda-backend/1");
+    digest.update(legacy_digest);
+    digest.update(system_runtime_identity);
+    digest.finalize().into()
+}
+
+/// Predict the unchanged backend identity from explicitly registered inputs.
+/// This shared byte codec never loads ORT, checks a provider, creates a session
+/// or grants execution authority. The actual backend passes its independently
+/// observed runtime identities through the same codec above.
+pub fn virtual_review_backend_digest_from_metadata(
+    runtime_binary: [u8; 32],
+    native_loading_profile: Option<[u8; 32]>,
+    runtime_bundle: Option<[u8; 32]>,
     config: PalsOnnxConfig,
     control: Option<[u8; 32]>,
     warm: bool,
@@ -1686,8 +2847,8 @@ fn execution_backend_digest(
     } else {
         SHARED_LAYOUT.as_bytes()
     });
-    h.update(runtime.binary_digest());
-    if let Some(profile) = runtime.native_loading_profile_digest() {
+    h.update(runtime_binary);
+    if let Some(profile) = native_loading_profile {
         h.update([1]);
         h.update(profile);
     } else {
@@ -1704,7 +2865,7 @@ fn execution_backend_digest(
         PalsCuDnnConvSearch::ExperimentalDefault => 1,
         PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm => 2,
     }]);
-    match runtime.bundle_digest() {
+    match runtime_bundle {
         Some(d) => {
             h.update([1]);
             h.update(d);
@@ -1734,9 +2895,9 @@ impl Drop for PalsVirtualReviewOnnxBackend {
                 std::mem::forget(binding);
             }
             for session in [
-                self.public.take(),
-                self.shared_pc.take(),
-                self.validator.take(),
+                self.sessions.public.take(),
+                self.sessions.shared_pc.take(),
+                self.sessions.validator.take(),
             ]
             .into_iter()
             .flatten()
@@ -1773,9 +2934,9 @@ impl Drop for PalsVirtualReviewOnnxBackend {
             self.active_memory.take();
             self.active.take();
             self.memory.take();
-            self.validator.take();
-            self.shared_pc.take();
-            self.public.take();
+            self.sessions.validator.take();
+            self.sessions.shared_pc.take();
+            self.sessions.public.take();
             self.runtime.take();
             self.sources.take();
             if let Some(audit) = self.audit.as_mut() {
@@ -1882,11 +3043,211 @@ fn extract_role_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn startup_custody_no_native_proof_disappears_after_entry() {
+        use crate::worker::SynchronousPhysicalOwner;
+
+        let source: Arc<dyn VirtualReviewOwnedSources> =
+            Arc::new(owned_sources::PathSources::new(Path::new("/unused")));
+        let legacy = VirtualReviewStartupCustody::new(Arc::clone(&source), None);
+        assert!(legacy.synchronous_shutdown_proof().is_none());
+        let source = VirtualReviewHeldFileSources::new(
+            std::fs::File::open(std::env::current_exe().unwrap()).unwrap(),
+            Vec::new(),
+        );
+        let mut custody = VirtualReviewStartupCustody::new_for_system_cuda_capture(source, None);
+        let original = custody.synchronous_owner_identity();
+        assert!(Arc::ptr_eq(
+            &original,
+            &custody.synchronous_owner_identity()
+        ));
+        assert!(custody.synchronous_shutdown_proof().is_some());
+        custody.mark_native_entry();
+        assert!(custody.synchronous_shutdown_proof().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_entry_attempt_only_preserves_proof_for_confirmed_rejection() {
+
+        let source = VirtualReviewHeldFileSources::new(
+            std::fs::File::open(std::env::current_exe().unwrap()).unwrap(),
+            Vec::new(),
+        );
+        let custody = VirtualReviewStartupCustody::new_for_system_cuda_capture(source, None);
+        let flag = Arc::clone(&custody.native_entry_started);
+        {
+            let mut attempt = CaptureEntryAttempt {
+                entered: Arc::clone(&flag),
+                callback_rejection_confirmed: false,
+            };
+            attempt.callback_rejection_confirmed = true;
+        }
+        assert!(custody.synchronous_shutdown_proof().is_some());
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _attempt = CaptureEntryAttempt {
+                entered: Arc::clone(&flag),
+                callback_rejection_confirmed: false,
+            };
+            panic!("unclassified attempt");
+        }));
+        assert!(unwound.is_err());
+        assert!(custody.synchronous_shutdown_proof().is_none());
+        {
+            let mut later = CaptureEntryAttempt {
+                entered: Arc::clone(&flag),
+                callback_rejection_confirmed: false,
+            };
+            later.callback_rejection_confirmed = true;
+        }
+        assert!(custody.synchronous_shutdown_proof().is_none());
+    }
+
+    #[test]
+    fn placement_prerequisites_require_only_registered_roles_and_warm_seed() {
+        assert!(system_placement_roles_complete(
+            true, true, false, false, false, false
+        ));
+        assert!(!system_placement_roles_complete(
+            false, true, false, false, false, false
+        ));
+        assert!(!system_placement_roles_complete(
+            true, false, false, false, false, false
+        ));
+        assert!(!system_placement_roles_complete(
+            true, true, true, false, false, false
+        ));
+        assert!(!system_placement_roles_complete(
+            true, true, false, false, true, false
+        ));
+        assert!(system_placement_roles_complete(
+            true, true, true, true, true, true
+        ));
+    }
     use crate::pals_model::PalsCandidateToken;
     use model::{
         ReviewAnchorInput, ReviewQueryInput, ReviewQueryPurpose, ReviewRecordInput,
         ReviewRecordKind, INPUT_SCHEMA,
     };
+    #[test]
+    fn synchronous_tracker_requires_only_entered_runs_to_complete() {
+        let mut tracker = SynchronousRunTracker::new();
+        // A successfully constructed, unused session needs no manufactured Run.
+        assert!(tracker.permits_shutdown());
+        assert_eq!(tracker.completed_synchronous_runs, 0);
+        let prior = tracker.enter();
+        assert!(!tracker.permits_shutdown());
+        tracker.returned(prior, true);
+        assert!(tracker.permits_shutdown());
+        assert_eq!(tracker.completed_synchronous_runs, 1);
+        let prior = tracker.enter();
+        tracker.returned(prior, true);
+        assert!(tracker.permits_shutdown());
+        assert_eq!(tracker.completed_synchronous_runs, 2);
+        let prior = tracker.enter();
+        tracker.returned(prior, true);
+        assert!(tracker.permits_shutdown());
+        assert_eq!(tracker.completed_synchronous_runs, 3);
+    }
+    #[test]
+    fn synchronous_tracker_failure_and_unfinished_entry_remain_dirty() {
+        let mut tracker = SynchronousRunTracker::new();
+        let prior = tracker.enter();
+        tracker.returned(prior, true);
+        let prior = tracker.enter();
+        tracker.returned(prior, false);
+        assert_eq!(tracker.completed_synchronous_runs, 1);
+        let prior = tracker.enter();
+        tracker.returned(prior, true);
+        assert!(!tracker.permits_shutdown());
+
+        let mut unwound = SynchronousRunTracker::new();
+        let _ = unwound.enter(); // Models an unwind before native return.
+        assert!(!unwound.permits_shutdown());
+    }
+    #[test]
+    fn synchronous_tracker_overflow_permanently_rejects_proof() {
+        let mut tracker = SynchronousRunTracker::new();
+        tracker.completed_synchronous_runs = u64::MAX;
+        let prior = tracker.enter();
+        tracker.returned(prior, true);
+        assert_eq!(tracker.completed_synchronous_runs, u64::MAX);
+        assert!(!tracker.permits_shutdown());
+        let prior = tracker.enter();
+        tracker.returned(prior, false);
+        assert!(!tracker.permits_shutdown());
+    }
+    #[test]
+    fn expected_backend_codec_preserves_original_cpu_bytes_and_distinguishes_inputs() {
+        let config = PalsOnnxConfig::cpu();
+        let runtime = [7; 32];
+        // Original byte framing, independent of the production shared helper.
+        let mut original = Sha256::new();
+        original.update(b"rz-pals-virtual-review-actual-backend-fp32/1");
+        original.update(SHARED_LAYOUT.as_bytes());
+        original.update(runtime);
+        original.update([0, 0, 0, 0, 0]); // loading/control/cuDNN/bundle/CPU
+        original.update((config.intra_threads as u64).to_le_bytes());
+        original.update(b"inter1;spinningoff;tf32off;B1");
+        let expected: [u8; 32] = original.finalize().into();
+        assert_eq!(
+            virtual_review_backend_digest_from_metadata(runtime, None, None, config, None, false),
+            expected
+        );
+        for changed in [
+            virtual_review_backend_digest_from_metadata([8; 32], None, None, config, None, false),
+            virtual_review_backend_digest_from_metadata(
+                runtime,
+                Some([1; 32]),
+                None,
+                config,
+                None,
+                false,
+            ),
+            virtual_review_backend_digest_from_metadata(
+                runtime,
+                None,
+                Some([1; 32]),
+                config,
+                None,
+                false,
+            ),
+            virtual_review_backend_digest_from_metadata(
+                runtime,
+                None,
+                None,
+                config,
+                Some([1; 32]),
+                false,
+            ),
+            virtual_review_backend_digest_from_metadata(runtime, None, None, config, None, true),
+        ] {
+            assert_ne!(changed, expected);
+        }
+    }
+    #[test]
+    fn system_runtime_identity_uses_a_distinct_backend_cache_domain() {
+        let legacy = virtual_review_backend_digest_from_metadata(
+            [7; 32],
+            None,
+            None,
+            PalsOnnxConfig::cpu(),
+            None,
+            false,
+        );
+        let system = virtual_review_system_backend_digest_from_legacy(legacy, [1; 32]);
+        assert_ne!(system, legacy);
+        assert_ne!(
+            system,
+            virtual_review_system_backend_digest_from_legacy(legacy, [2; 32])
+        );
+        assert_ne!(
+            system,
+            virtual_review_system_backend_digest_from_legacy([9; 32], [1; 32])
+        );
+    }
     fn accounting_stats() -> PalsBackendStats {
         PalsBackendStats {
             admitted_role_requests: 0,

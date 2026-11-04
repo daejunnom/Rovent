@@ -845,6 +845,7 @@ def main(argv=None):
     parser.add_argument("--phase", choices=("pc", "v"), required=True)
     parser.add_argument("--frozen-pc-sha256")
     parser.add_argument("--model-epoch", type=int)
+    parser.add_argument("--dataset-manifest-sha256", help="externally registered semantic manifest digest, required for V chunks")
     args = parser.parse_args(actual)
     def read(path):
         target = Path(path)
@@ -857,19 +858,25 @@ def main(argv=None):
         return strict_json(raw.decode("utf-8", "strict"))
     spec, bundle = read(args.spec), read(args.dataset)
     if type(bundle) is dict and bundle.get("schema") == MANIFEST_DOMAIN:
-        # CLI stays validation-only. P/C manifest is pinned by --spec; V needs
-        # the existing separate native caller with its independently registered
-        # collection pin instead of an implicit self-declared manifest pin.
-        if args.phase != "pc":
-            raise ValueError("V chunk validation requires separately pinned native collection API")
+        # CLI stays validation-only. P/C keeps its original spec pin; V is
+        # collected after P/C freeze and requires a separately supplied pin.
+        if args.phase == "v":
+            if args.dataset_manifest_sha256 is None:
+                raise ValueError("V chunk validation requires an externally registered manifest digest")
+            sha(args.dataset_manifest_sha256)
+        elif args.dataset_manifest_sha256 is not None:
+            raise ValueError("P/C chunk validation uses the dataset pin in the spec")
         if os.name == "nt":
             parent = Path(os.environ["APPDATA"]) / "RoveZero" / "tmp"
         else:
             parent = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "rovezero" / "generation-index"
         parent.mkdir(parents=True, exist_ok=True)
         result = validate_generation_chunks(spec, bundle, args.phase, corpus_root=Path(args.dataset).resolve().parent,
-                                            index_root=parent, frozen_pc_sha256=args.frozen_pc_sha256, model_epoch=args.model_epoch)
+                                            index_root=parent, frozen_pc_sha256=args.frozen_pc_sha256, model_epoch=args.model_epoch,
+                                            expected_manifest_sha256=args.dataset_manifest_sha256)
     else:
+        if args.dataset_manifest_sha256 is not None:
+            raise ValueError("a manifest digest applies only to chunk datasets")
         result = validate_generation_bundle(spec, bundle, args.phase,
                                            frozen_pc_sha256=args.frozen_pc_sha256, model_epoch=args.model_epoch)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))

@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 import tempfile
@@ -130,6 +131,46 @@ class ChunkTests(SourceOnlyTests):
     def opened(self, manifest, **kwargs):
         return chunks.ChunkGenerationDataset(self.corpus, manifest, expected_manifest_sha256=chunks.validate_manifest(manifest),
                                               index_root=self.index_root, **kwargs)
+
+    def test_v_cli_requires_external_manifest_pin_and_keeps_admission_gate(self):
+        # A tiny schema fixture is deliberately insufficient for V admission.
+        # It exercises real chunk hashing and joins; it is not training data.
+        splits = {"o1": "train"}
+        splits.update({f"train-{i}": "train" for i in range(47)})
+        splits.update({f"validation-{i}": "validation" for i in range(8)})
+        splits.update({f"holdout-{i}": "holdout" for i in range(8)})
+        manifest = write_corpus(self.corpus, [record()], splits=splits)
+        registered = chunks.validate_manifest(manifest)
+        spec = train.generation_spec(generation_id="g0", source_sha256="1" * 64,
+                                     dataset_sha256="2" * 64,
+                                     split_sha256=data.digest("rz-pals-opening-split/1", splits),
+                                     model_sha256="4" * 64, runtime_sha256="5" * 64)
+        spec_path, manifest_path = self.root / "spec.json", self.corpus / "manifest.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        args = ["--spec", str(spec_path), "--dataset", str(manifest_path), "--phase", "v",
+                "--frozen-pc-sha256", "4" * 64, "--model-epoch", "1"]
+        with mock.patch.dict(os.environ, {"APPDATA": str(self.root), "XDG_CACHE_HOME": str(self.root)}):
+            with self.assertRaisesRegex(ValueError, "externally registered"):
+                train.main(args)
+            with self.assertRaises(ValueError):
+                train.main(args + ["--dataset-manifest-sha256", "not-a-digest"])
+            with self.assertRaisesRegex(ValueError, "externally"):
+                train.main(args + ["--dataset-manifest-sha256", "f" * 64])
+            # The correct external seal reaches the real quota gate. A fixture
+            # with no valid V targets must never be accepted as a real dataset.
+            with self.assertRaisesRegex(ValueError, "InsufficientValidTargets"):
+                train.main(args + ["--dataset-manifest-sha256", registered])
+
+            changed = copy.deepcopy(manifest)
+            changed["producer"]["source_sha256"] = "9" * 64
+            manifest_path.write_text(json.dumps(changed), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "externally"):
+                train.main(args + ["--dataset-manifest-sha256", registered])
+
+            with self.assertRaisesRegex(ValueError, "P/C chunk validation uses"):
+                train.main(["--spec", str(spec_path), "--dataset", str(manifest_path), "--phase", "pc",
+                            "--dataset-manifest-sha256", registered])
 
     def test_lazy_rows_and_role_sampler_preserve_checkpoint_without_nn(self):
         records = [record("g1", distinct_state=True), record("g2", distinct_state=True)]

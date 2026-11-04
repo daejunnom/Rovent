@@ -35,12 +35,14 @@ fn main() -> ExitCode {
 fn run()
 -> Result<rz_arena::pals_adaptive_launch::PalsEvaluationSeriesV5, Box<dyn std::error::Error>> {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
-    if arguments.len() != 5
+    if !matches!(arguments.len(), 5 | 7)
         || arguments[0] != "--execute"
         || arguments[1] != "--declaration"
         || arguments[3] != "--declaration-sha256"
+        || (arguments.len() == 7
+            && (arguments[5] != "--storage-policy" || arguments[6] != "advisory"))
     {
-        return Err("usage: rz-pals-generation-pipeline --execute --declaration /absolute/prepared-declaration.json --declaration-sha256 <sha256>; execution requires all three explicit flags".into());
+        return Err("usage: rz-pals-generation-pipeline --execute --declaration /absolute/prepared-declaration.json --declaration-sha256 <sha256> [--storage-policy advisory]; execution requires all three explicit flags".into());
     }
     if !std::path::Path::new(&arguments[2]).is_absolute()
         || arguments[4].len() != 64
@@ -71,12 +73,19 @@ fn run()
             }
         }
 
-        let result = rz_arena::pals_collect_v3::run_generation_and_evaluation_owned_v3(
-            Path::new(&arguments[2]),
-            &arguments[4],
-            Arc::clone(&cancel),
-        )
-        .map_err(Into::into);
+        let storage_policy = if arguments.len() == 7 {
+            rz_arena::pals_adaptive_launch::PalsOwnedStoragePolicy::AdvisoryV1
+        } else {
+            rz_arena::pals_adaptive_launch::PalsOwnedStoragePolicy::StrictV5
+        };
+        let result =
+            rz_arena::pals_collect_v3::run_generation_and_evaluation_owned_with_storage_policy_v3(
+                Path::new(&arguments[2]),
+                &arguments[4],
+                Arc::clone(&cancel),
+                storage_policy,
+            )
+            .map_err(Into::into);
 
         for id in hooks {
             signal_hook::low_level::unregister(id);

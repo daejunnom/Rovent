@@ -1,9 +1,10 @@
 //! Strict bridge from registered V5 startup options to existing search types.
 //! It does not alter persisted V5 parsing or legacy CLI defaults. Actual startup
 //! calls this before constructing a checker, allocating a TT or creating workers.
+use super::PalsSystemSourceObservationV6;
 use rz_experiments::{
     PalsAdaptiveStartupConfigV5, PalsComponentV3, PalsCpuSelectionV5, PalsEngineModeV5,
-    compiled_source_components_v5,
+    PalsSystemSourcePolicyV6, PalsSystemStartupConfigV6, compiled_source_components_v5,
 };
 use rz_search::{
     cpu::{BOOTSTRAP_SCORE_VERSION, CpuConfig, CpuOrderingPolicy, CpuProfile, CpuResumePolicy},
@@ -109,6 +110,128 @@ pub struct PalsSearchSettingsV5 {
     pub resume: CpuResumePolicy,
     pub value_semantics: &'static str,
     pub paused_side_scope: bool,
+}
+
+/// Comparison of one declared search component with the current binary's
+/// registered source. Values are observations, not search execution evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PalsSearchComponentSourceV6 {
+    pub component: &'static str,
+    pub declared_implementation_sha256: String,
+    pub declared_component_sha256: Option<String>,
+    pub compiled_component_sha256: Option<String>,
+    pub observation: PalsSystemSourceObservationV6,
+}
+
+/// Exact V5 search semantics parsed for a V6 caller. Source comparison must
+/// remain visible to the actual owner; this value alone grants no GPU, worker,
+/// physical-completion, or model numerical acceptance authority.
+#[derive(Clone, Debug)]
+#[must_use]
+pub struct PalsSearchSettingsV6 {
+    pub settings: PalsSearchSettingsV5,
+    pub coordinator_source: PalsSearchComponentSourceV6,
+    pub own_cpu_source: PalsSearchComponentSourceV6,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PalsSearchSettingsErrorV6 {
+    Options(PalsSearchSettingsErrorV5),
+    SourceRegistry,
+    SourceMismatch { component: &'static str },
+}
+impl fmt::Display for PalsSearchSettingsErrorV6 {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Options(error) => write!(out, "V6 shared search options: {error}"),
+            Self::SourceRegistry => out.write_str("V6 compiled search source registry unavailable"),
+            Self::SourceMismatch { component } => write!(
+                out,
+                "V6 {component} source not verified under strict policy"
+            ),
+        }
+    }
+}
+impl std::error::Error for PalsSearchSettingsErrorV6 {}
+
+/// Parse the same registered search/CPU option semantics and preserve the
+/// caller's original deadline. Strict requires both actual component hashes;
+/// Observe retains missing or mismatched provenance without granting it trust.
+pub fn parse_pals_search_settings_v6(
+    config: &PalsSystemStartupConfigV6,
+    original_hard_deadline: Instant,
+) -> Result<PalsSearchSettingsV6, PalsSearchSettingsErrorV6> {
+    let checker = match config.endpoint.mode {
+        PalsEngineModeV5::Collection => config.endpoint.cpu.cpu_t,
+        PalsEngineModeV5::Deployment => config.endpoint.cpu.cpu_r,
+    };
+    let compiled = compiled_source_components_v5();
+    if config.source_policy == PalsSystemSourcePolicyV6::Strict && compiled.is_err() {
+        return Err(PalsSearchSettingsErrorV6::SourceRegistry);
+    }
+    parse_v6_components(
+        &config.endpoint.search,
+        &config.endpoint.cpu.own,
+        checker,
+        config.source_policy,
+        &config.source_components,
+        compiled.as_ref().ok(),
+        original_hard_deadline,
+    )
+}
+
+fn observe_v6_component(
+    name: &'static str,
+    component: &PalsComponentV3,
+    declared: &BTreeMap<String, String>,
+    compiled: Option<&BTreeMap<String, String>>,
+) -> PalsSearchComponentSourceV6 {
+    let declared_component_sha256 = declared.get(name).cloned();
+    let compiled_component_sha256 = compiled.and_then(|map| map.get(name)).cloned();
+    let observation = match (&compiled_component_sha256, &declared_component_sha256) {
+        (Some(actual), _) if &component.implementation_sha256 != actual => {
+            PalsSystemSourceObservationV6::Mismatch
+        }
+        (Some(actual), Some(pin)) if actual == pin => PalsSystemSourceObservationV6::Verified,
+        (Some(_), Some(_)) => PalsSystemSourceObservationV6::Mismatch,
+        _ => PalsSystemSourceObservationV6::Missing,
+    };
+    PalsSearchComponentSourceV6 {
+        component: name,
+        declared_implementation_sha256: component.implementation_sha256.clone(),
+        declared_component_sha256,
+        compiled_component_sha256,
+        observation,
+    }
+}
+
+fn parse_v6_components(
+    search: &PalsComponentV3,
+    own: &PalsComponentV3,
+    checker: PalsCpuSelectionV5,
+    source_policy: PalsSystemSourcePolicyV6,
+    declared: &BTreeMap<String, String>,
+    compiled: Option<&BTreeMap<String, String>>,
+    deadline: Instant,
+) -> Result<PalsSearchSettingsV6, PalsSearchSettingsErrorV6> {
+    let coordinator_source = observe_v6_component("coordinator", search, declared, compiled);
+    let own_cpu_source = observe_v6_component("cpu_search", own, declared, compiled);
+    if source_policy == PalsSystemSourcePolicyV6::Strict {
+        for source in [&coordinator_source, &own_cpu_source] {
+            if source.observation != PalsSystemSourceObservationV6::Verified {
+                return Err(PalsSearchSettingsErrorV6::SourceMismatch {
+                    component: source.component,
+                });
+            }
+        }
+    }
+    let settings = parse_option_maps(&search.options, &own.options, checker, deadline)
+        .map_err(PalsSearchSettingsErrorV6::Options)?;
+    Ok(PalsSearchSettingsV6 {
+        settings,
+        coordinator_source,
+        own_cpu_source,
+    })
 }
 
 /// Parse only at the actual runtime entry. The deadline is the caller's original

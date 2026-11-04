@@ -294,6 +294,7 @@ struct Pending<P: ContractPosition> {
     selection: SelectionId,
     request: Arc<EvalRequest<P::State>>,
     leaf: P,
+    root_leaf: bool,
 }
 
 pub struct ContractSearch<P: ContractPosition, S: SelectionPolicy = Puct> {
@@ -301,6 +302,8 @@ pub struct ContractSearch<P: ContractPosition, S: SelectionPolicy = Puct> {
     config: ContractSearchConfig,
     tree: Tree<Move, S>,
     fallback: Option<Move>,
+    /// Indices into the unchanged full Rules/NN root legal array.
+    root_projection: Option<Vec<usize>>,
     status: ContractSearchStatus,
     pending: Option<Pending<P>>,
     #[cfg(feature = "experimental-batch")]
@@ -362,6 +365,7 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             config,
             tree,
             fallback,
+            root_projection: None,
             status,
             pending: None,
             #[cfg(feature = "experimental-batch")]
@@ -407,6 +411,65 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
         self.tree
             .set_final_move_policy(policy)
             .map_err(tree_boundary)
+    }
+
+    /// Seal root choices before any selection. Requests, input identity and raw
+    /// NN policy retain the complete Rules legal order. Only root tree edges
+    /// are projected and renormalized. Zero mass on the allowed subset uses a
+    /// uniform prior on that subset; it never restores an excluded root move.
+    pub fn set_root_moves(&mut self, requested: &[Move]) -> Result<(), ContractError> {
+        if self.tree.counters().selections != 0
+            || self.pending_count() != 0
+            || self.root_projection.is_some()
+        {
+            return Err(boundary(
+                ErrorCode::UnsupportedContract,
+                Stage::Admission,
+                "root restriction is immutable and must precede first selection",
+            ));
+        }
+        if requested.is_empty() || requested.len() > self.config.tree_limits.max_legal_moves {
+            return Err(boundary(
+                ErrorCode::InvalidInput,
+                Stage::Admission,
+                "root restriction must be nonempty and within the tree move bound",
+            ));
+        }
+        let requested_set: HashSet<_> = requested.iter().copied().collect();
+        if requested_set.len() != requested.len()
+            || requested
+                .iter()
+                .any(|movement| !self.root.legal().moves().contains(movement))
+        {
+            return Err(boundary(
+                ErrorCode::InvalidInput,
+                Stage::Admission,
+                "root restriction contains a duplicate or nonlegal move",
+            ));
+        }
+        let mut projection = Vec::new();
+        projection.try_reserve_exact(requested.len()).map_err(|_| {
+            boundary(
+                ErrorCode::ResourceExhausted,
+                Stage::Admission,
+                "root restriction allocation failed",
+            )
+        })?;
+        projection.extend(
+            self.root
+                .legal()
+                .moves()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, movement)| requested_set.contains(movement).then_some(index)),
+        );
+        let fallback = self.root.legal().moves()[projection[0]];
+        self.root.play(&fallback)?.validate_authority()?;
+        if matches!(self.status, ContractSearchStatus::Running) {
+            self.fallback = Some(fallback);
+        }
+        self.root_projection = Some(projection);
+        Ok(())
     }
 
     pub fn take_terminal_observation(&mut self) -> Option<TerminalBackupObservation> {
@@ -941,6 +1004,7 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             selection: selection_id,
             request,
             leaf,
+            root_leaf: selection.moves.is_empty(),
         });
         ContractPumpEvent::Submitted {
             request: request_id,
@@ -1068,14 +1132,31 @@ impl<P: ContractPosition, S: SelectionPolicy> ContractSearch<P, S> {
             }
         };
         // Explicit common-contract conversion; validated raw heads remain in output.
-        let priors = output.policy.normalized();
+        let mut priors = output.policy.normalized();
+        let moves =
+            if let Some(projection) = self.root_projection.as_ref().filter(|_| pending.root_leaf) {
+                priors = projection.iter().map(|&index| priors[index]).collect();
+                let mass: f64 = priors.iter().sum();
+                if mass > 0.0 {
+                    priors.iter_mut().for_each(|prior| *prior /= mass);
+                } else {
+                    let uniform = 1.0 / priors.len() as f64;
+                    priors.fill(uniform);
+                }
+                projection
+                    .iter()
+                    .map(|&index| pending.request.legal().moves()[index])
+                    .collect()
+            } else {
+                pending.request.legal().moves().to_vec()
+            };
         let wdl = output.wdl.normalized();
         let value = wdl[0] - wdl[2];
         let mut guard_error = None;
         let backup_started = self.source_trace.as_ref().map(|_| Instant::now());
         let completion = self.tree.accept_evaluation_with_guard(
             &pending.ticket,
-            pending.request.legal().moves().to_vec(),
+            moves,
             &priors,
             value,
             Instant::now(),

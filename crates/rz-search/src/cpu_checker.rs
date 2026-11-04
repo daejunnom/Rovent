@@ -363,6 +363,11 @@ pub trait CpuChecker: Send {
     fn identity(&self) -> &CheckerIdentity;
     fn conditions(&self) -> &str;
     fn capabilities(&self) -> CheckerCapabilities;
+    /// Read-only identity captured from an actual private worker's engine.
+    /// This number alone grants no Ready, Bound, execution or Store authority.
+    fn registered_worker_stack_owner_id(&self) -> Option<u64> {
+        None
+    }
     /// Actual successful UCI handshake identity, not the declared profile name.
     /// Own checkers and failed/partial startup observations remain None.
     fn startup_uci(&self) -> Option<ExternalUciIdentity> {

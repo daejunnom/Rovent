@@ -564,6 +564,12 @@ fn capture_report(
                 ));
             }
             CpuCompletion::QuiescenceLimit => SearchCompletion::QuiescenceLimit,
+            CpuCompletion::AwaitReciprocal => {
+                return Err(ContinuationError::new(
+                    "unsupported_completion",
+                    "reciprocal CPU wait requires the Rovent question receipt",
+                ));
+            }
             CpuCompletion::Terminal(_) => SearchCompletion::RulesTerminal,
         },
         completed_depth: native.completed_depth,

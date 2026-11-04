@@ -340,13 +340,25 @@ fn cpu_numerical_scope_cannot_claim_cuda_assets_or_control_inventory() {
 }
 
 #[test]
-fn pre_acceptance_bounds_the_entire_post_prepare_asset_roster() {
+fn pre_acceptance_checks_asset_total_overflow_without_a_storage_threshold() {
     let original = scope();
     let mut oversized = original.clone();
-    oversized.assets[1].artifact.bytes = 18 * 1024 * 1024 * 1024;
-    assert!(oversized.validate_pre_acceptance().is_err());
+    oversized
+        .assets
+        .iter_mut()
+        .find(|asset| asset.purpose == Purpose::ExportManifest)
+        .unwrap()
+        .artifact
+        .bytes = 18 * 1024 * 1024 * 1024;
+    assert!(oversized.validate_pre_acceptance().is_ok());
     let mut overflowing = original;
-    overflowing.assets[1].artifact.bytes = u64::MAX;
+    overflowing
+        .assets
+        .iter_mut()
+        .find(|asset| asset.purpose == Purpose::ExportManifest)
+        .unwrap()
+        .artifact
+        .bytes = u64::MAX;
     assert!(overflowing.validate_pre_acceptance().is_err());
 }
 

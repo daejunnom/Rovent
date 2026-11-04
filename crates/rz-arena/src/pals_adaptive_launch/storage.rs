@@ -42,6 +42,35 @@ pub struct PalsOwnedStorageAuditV5 {
     pub external_serialization_observed: bool,
     pub limitations: Vec<String>,
 }
+/// Selects the storage policy for a newly started execution. Historical V5
+/// declarations and receipts remain strict; the advisory policy is registered
+/// separately as an execution-time envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum PalsOwnedStoragePolicy {
+    StrictV5,
+    AdvisoryV1,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PalsOwnedStorageAdvisoryV1 {
+    pub domain: String,
+    pub owner_id: String,
+    pub marker_sha256: String,
+    pub threshold_bytes: u64,
+    pub measured_root_bytes: Option<u64>,
+    pub threshold_exceeded: Option<bool>,
+    pub observation_status: String,
+    pub observation_error: Option<String>,
+    pub external_serialization_observed: bool,
+    pub scope: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum PalsStorageAdmission {
+    Strict(PalsOwnedStorageAuditV5),
+    Advisory(PalsOwnedStorageAdvisoryV1),
+}
+
 /// Held across snapshots, child execution, failure recovery and quarantine.
 /// The descriptor is not serializable and cannot be recovered from a receipt.
 #[derive(Debug)]
@@ -57,12 +86,12 @@ pub struct PalsOwnedStorageLeaseV5 {
 /// Re-admit another serial pair under the exact still-held marker flock. This
 /// never constructs a guard from metadata, unlocks it, or deletes old evidence.
 #[cfg(target_os = "linux")]
-pub(crate) fn readmit_pals_owned_storage_v5(
+fn readmit_pals_owned_storage_lease<T>(
     plan: &PalsOwnedStoragePlanV5,
     root: &Path,
-    reservation: u64,
     lease: &PalsOwnedStorageLeaseV5,
-) -> Result<PalsOwnedStorageAuditV5, ArenaError> {
+    observe: impl FnOnce(&cap_std::fs::Dir) -> Result<T, ArenaError>,
+) -> Result<T, ArenaError> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
     use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
     use std::os::unix::fs::{FileExt, MetadataExt};
@@ -153,7 +182,7 @@ pub(crate) fn readmit_pals_owned_storage_v5(
             && marker.purpose == "staging_and_cache",
         "continued marker owner/profile differs",
     )?;
-    crate::native_retention::admit_bounded(&directory, reservation, plan.byte_limit)?;
+    let observation = observe(&directory)?;
     let final_named = directory
         .open_with(&plan.marker.path, &opts)
         .map_err(|_| invalid("continued marker changed during quota check"))?
@@ -183,6 +212,19 @@ pub(crate) fn readmit_pals_owned_storage_v5(
         (old_root.dev(), old_root.ino()) == (final_root_metadata.dev(), final_root_metadata.ino()),
         "continued root replaced during quota/marker admission",
     )?;
+    Ok(observation)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn readmit_pals_owned_storage_v5(
+    plan: &PalsOwnedStoragePlanV5,
+    root: &Path,
+    reservation: u64,
+    lease: &PalsOwnedStorageLeaseV5,
+) -> Result<PalsOwnedStorageAuditV5, ArenaError> {
+    readmit_pals_owned_storage_lease(plan, root, lease, |directory| {
+        crate::native_retention::admit_bounded(directory, reservation, plan.byte_limit)
+    })?;
     Ok(PalsOwnedStorageAuditV5 {
         domain: "rz-pals-storage-admission-v5/1".into(),
         owner_id: plan.owner_id.clone(), marker_sha256: plan.marker.sha256.clone(),
@@ -192,17 +234,34 @@ pub(crate) fn readmit_pals_owned_storage_v5(
     })
 }
 
+/// Acquire the original pinned root and marker lock, and keep both alive while
+/// the caller performs its storage-policy observation. The callback must not
+/// claim that a byte scan completed unless it actually performed one. A failed
+/// callback or final marker check drops the lock without publishing an owner.
 #[cfg(target_os = "linux")]
-pub fn acquire_pals_owned_storage_v5(
-    plan: &PalsOwnedStoragePlanV5,
+pub(crate) fn acquire_pals_owned_storage_lease<T>(
+    marker_artifact: &ArtifactRef,
+    owner_id: &str,
+    marker_domain: &str,
+    marker_purpose: &str,
     root: &Path,
-    reservation: u64,
-) -> Result<(PalsOwnedStorageAuditV5, PalsOwnedStorageLeaseV5), ArenaError> {
+    observe: impl FnOnce(&cap_std::fs::Dir) -> Result<T, ArenaError>,
+) -> Result<(T, PalsOwnedStorageLeaseV5), ArenaError> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
     use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
     use nix::fcntl::{Flock, FlockArg};
     use std::{io::Read, os::unix::fs::MetadataExt};
-    plan.validate()?;
+    marker_artifact.validate()?;
+    let mut marker_components = Path::new(&marker_artifact.path).components();
+    require(
+        marker_artifact.bytes <= 4096
+            && matches!(
+                marker_components.next(),
+                Some(std::path::Component::Normal(_))
+            )
+            && marker_components.next().is_none(),
+        "storage marker must be a bounded file directly inside the owned root",
+    )?;
     require(
         root.is_absolute()
             && root
@@ -233,14 +292,14 @@ pub fn acquire_pals_owned_storage_v5(
         .follow(FollowSymlinks::No)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let marker = directory
-        .open_with(&plan.marker.path, &opts)
+        .open_with(&marker_artifact.path, &opts)
         .map_err(|_| invalid("storage ownership marker unavailable"))?
         .into_std();
     let held = marker
         .metadata()
         .map_err(|_| invalid("storage marker metadata unavailable"))?;
     require(
-        held.is_file() && held.nlink() == 1 && held.len() == plan.marker.bytes,
+        held.is_file() && held.nlink() == 1 && held.len() == marker_artifact.bytes,
         "storage marker is not a single bounded regular owner file",
     )?;
     // The owned guard retains the bounded regular marker and its exclusive lock
@@ -255,8 +314,8 @@ pub fn acquire_pals_owned_storage_v5(
         .read_to_end(&mut bytes)
         .map_err(|_| invalid("storage marker read failed"))?;
     require(
-        bytes.len() == plan.marker.bytes as usize
-            && format!("{:x}", Sha256::digest(&bytes)) == plan.marker.sha256,
+        bytes.len() == marker_artifact.bytes as usize
+            && format!("{:x}", Sha256::digest(&bytes)) == marker_artifact.sha256,
         "storage ownership marker content changed",
     )?;
     #[derive(Deserialize)]
@@ -270,9 +329,9 @@ pub fn acquire_pals_owned_storage_v5(
         std::str::from_utf8(&bytes).map_err(|_| invalid("storage owner marker not UTF8"))?,
     )?;
     require(
-        parsed.domain == "rz-pals-owned-storage-v5/1"
-            && parsed.owner_id == plan.owner_id
-            && parsed.purpose == "staging_and_cache",
+        parsed.domain == marker_domain
+            && parsed.owner_id == owner_id
+            && parsed.purpose == marker_purpose,
         "storage marker does not name the registered owner/purpose",
     )?;
     // Reject source checkout roots without traversing them, then reuse the
@@ -281,9 +340,9 @@ pub fn acquire_pals_owned_storage_v5(
         directory.symlink_metadata(".git").is_err(),
         "source checkout cannot be an owned staging/cache root",
     )?;
-    crate::native_retention::admit_bounded(&directory, reservation, plan.byte_limit)?;
+    let observation = observe(&directory)?;
     let named = directory
-        .open_with(&plan.marker.path, &opts)
+        .open_with(&marker_artifact.path, &opts)
         .map_err(|_| invalid("storage marker pathname changed"))?
         .into_std();
     let now = named
@@ -293,15 +352,76 @@ pub fn acquire_pals_owned_storage_v5(
         (held.dev(), held.ino(), held.len()) == (now.dev(), now.ino(), now.len()),
         "storage ownership marker was replaced during admission",
     )?;
-    let audit=PalsOwnedStorageAuditV5{domain:"rz-pals-storage-admission-v5/1".into(),owner_id:plan.owner_id.clone(),marker_sha256:plan.marker.sha256.clone(),byte_limit:plan.byte_limit,reserved_attempt_bytes:reservation,no_follow_byte_scan_completed:true,external_serialization_observed:true,limitations:vec!["exclusive ownership-marker flock serializes participating launch/cache writers; this is not a kernel disk quota or protection against uncooperative same-UID writers".into(),"existing reports, PGN, failed attempts and shared runtime contents are preserved; no automatic eviction was performed".into()]};
     Ok((
-        audit,
+        observation,
         PalsOwnedStorageLeaseV5 {
             _marker: marker,
             _root: root_pin,
         },
     ))
 }
+
+#[cfg(target_os = "linux")]
+pub fn acquire_pals_owned_storage_v5(
+    plan: &PalsOwnedStoragePlanV5,
+    root: &Path,
+    reservation: u64,
+) -> Result<(PalsOwnedStorageAuditV5, PalsOwnedStorageLeaseV5), ArenaError> {
+    plan.validate()?;
+    let ((), lease) = acquire_pals_owned_storage_lease(
+        &plan.marker,
+        &plan.owner_id,
+        "rz-pals-owned-storage-v5/1",
+        "staging_and_cache",
+        root,
+        |directory| crate::native_retention::admit_bounded(directory, reservation, plan.byte_limit),
+    )?;
+    let audit=PalsOwnedStorageAuditV5{domain:"rz-pals-storage-admission-v5/1".into(),owner_id:plan.owner_id.clone(),marker_sha256:plan.marker.sha256.clone(),byte_limit:plan.byte_limit,reserved_attempt_bytes:reservation,no_follow_byte_scan_completed:true,external_serialization_observed:true,limitations:vec!["exclusive ownership-marker flock serializes participating launch/cache writers; this is not a kernel disk quota or protection against uncooperative same-UID writers".into(),"existing reports, PGN, failed attempts and shared runtime contents are preserved; no automatic eviction was performed".into()]};
+    Ok((audit, lease))
+}
+#[cfg(target_os = "linux")]
+fn advisory_without_scan(plan: &PalsOwnedStoragePlanV5) -> PalsOwnedStorageAdvisoryV1 {
+    PalsOwnedStorageAdvisoryV1 {
+        domain: "rz-pals-storage-advisory-v1/1".into(),
+        owner_id: plan.owner_id.clone(),
+        marker_sha256: plan.marker.sha256.clone(),
+        threshold_bytes: PALS_STAGING_BYTES_V5,
+        measured_root_bytes: None,
+        threshold_exceeded: None,
+        observation_status: "not_measured".into(),
+        observation_error: None,
+        external_serialization_observed: true,
+        scope: "output-root usage not measured here; this record is not overall storage or physical disk usage".into(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn acquire_pals_owned_storage_advisory(
+    plan: &PalsOwnedStoragePlanV5,
+    root: &Path,
+) -> Result<(PalsOwnedStorageAdvisoryV1, PalsOwnedStorageLeaseV5), ArenaError> {
+    plan.validate()?;
+    acquire_pals_owned_storage_lease(
+        &plan.marker,
+        &plan.owner_id,
+        "rz-pals-owned-storage-v5/1",
+        "staging_and_cache",
+        root,
+        |_directory| Ok(advisory_without_scan(plan)),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn readmit_pals_owned_storage_advisory(
+    plan: &PalsOwnedStoragePlanV5,
+    root: &Path,
+    lease: &PalsOwnedStorageLeaseV5,
+) -> Result<PalsOwnedStorageAdvisoryV1, ArenaError> {
+    readmit_pals_owned_storage_lease(plan, root, lease, |_directory| {
+        Ok(advisory_without_scan(plan))
+    })
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn acquire_pals_owned_storage_v5(
     _plan: &PalsOwnedStoragePlanV5,

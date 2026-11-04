@@ -1,6 +1,6 @@
 use crate::CompletionSignal;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -47,7 +47,9 @@ struct Controls<S> {
     cancel_ack: AtomicU64,
     yield_ack: AtomicU64,
     publish_ack: AtomicU64,
-    terminal: AtomicBool,
+    // u64::MAX is never an admissible control sequence. It represents an
+    // unsealed terminal snapshot, not an acknowledged cancellation.
+    terminal_cancel_ack: AtomicU64,
     signal: CompletionSignal,
 }
 
@@ -74,7 +76,7 @@ impl<S> ControlMailbox<S> {
             cancel_ack: AtomicU64::new(0),
             yield_ack: AtomicU64::new(0),
             publish_ack: AtomicU64::new(0),
-            terminal: AtomicBool::new(false),
+            terminal_cancel_ack: AtomicU64::new(u64::MAX),
             signal,
         }))
     }
@@ -85,14 +87,20 @@ impl<S> ControlMailbox<S> {
         self.0.signal.clone()
     }
     pub fn snapshot(&self) -> ControlSnapshot {
+        let live_cancel_ack = self.0.cancel_ack.load(Ordering::Acquire);
+        let sealed_cancel_ack = self.0.terminal_cancel_ack.load(Ordering::Acquire);
         ControlSnapshot {
             cancel_sequence: self.0.cancel.load(Ordering::Acquire),
             yield_sequence: self.0.yield_request.load(Ordering::Acquire),
             publish_sequence: self.0.publish.load(Ordering::Acquire),
-            cancel_ack: self.0.cancel_ack.load(Ordering::Acquire),
+            cancel_ack: if sealed_cancel_ack == u64::MAX {
+                live_cancel_ack
+            } else {
+                sealed_cancel_ack
+            },
             yield_ack: self.0.yield_ack.load(Ordering::Acquire),
             publish_ack: self.0.publish_ack.load(Ordering::Acquire),
-            terminal: self.0.terminal.load(Ordering::Acquire),
+            terminal: sealed_cancel_ack != u64::MAX,
         }
     }
     fn request(
@@ -102,7 +110,17 @@ impl<S> ControlMailbox<S> {
         ack: &AtomicU64,
         cancellation: bool,
     ) -> Result<(), ControlError> {
-        if self.0.terminal.load(Ordering::Acquire) {
+        self.request_with_publish_hook(sequence, request, ack, cancellation, || {})
+    }
+    fn request_with_publish_hook(
+        &self,
+        sequence: u64,
+        request: &AtomicU64,
+        ack: &AtomicU64,
+        cancellation: bool,
+        after_publish: impl FnOnce(),
+    ) -> Result<(), ControlError> {
+        if self.0.terminal_cancel_ack.load(Ordering::Acquire) != u64::MAX {
             return Err(ControlError::Closed);
         }
         if sequence == u64::MAX {
@@ -130,8 +148,17 @@ impl<S> ControlMailbox<S> {
             .compare_exchange(previous, sequence, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| ControlError::StaleSequence)?;
         request.store(sequence, Ordering::Release);
+        after_publish();
         self.0.signal.notify();
-        if self.0.terminal.load(Ordering::Acquire) {
+        let terminal_cancel_ack = self.0.terminal_cancel_ack.load(Ordering::Acquire);
+        if terminal_cancel_ack != u64::MAX {
+            // A fast owner may acknowledge this cancellation and seal the
+            // job before the coordinator returns. Only the acknowledgement
+            // captured at terminal sealing proves that this request was seen;
+            // an acknowledgement racing after sealing is not sufficient.
+            if cancellation && terminal_cancel_ack == sequence {
+                return Ok(());
+            }
             return Err(ControlError::Closed);
         }
         Ok(())
@@ -171,12 +198,31 @@ impl<S> ControlMailbox<S> {
     pub fn acknowledge_publish_progress(&self, sequence: u64) -> Result<(), ControlError> {
         self.acknowledge(sequence, &self.0.publish, &self.0.publish_ack)
     }
+    /// Records observation of the current cancel request. `Ok` after terminal
+    /// sealing does not change the sealed snapshot and does not prove the
+    /// completion cause or the release of any physical resources.
     pub fn acknowledge_cancel(&self, sequence: u64) -> Result<(), ControlError> {
         self.acknowledge(sequence, &self.0.cancel, &self.0.cancel_ack)
     }
-    /// Revokes further control admission. It does not free a GPU lease/token.
+    fn freeze_terminal_cancel_ack(&self) -> u64 {
+        let observed_ack = self.0.cancel_ack.load(Ordering::Acquire);
+        match self.0.terminal_cancel_ack.compare_exchange(
+            u64::MAX,
+            observed_ack,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => observed_ack,
+            Err(existing) => existing,
+        }
+    }
+    /// Revokes further control admission and freezes the first terminal cancel
+    /// acknowledgement. As with acknowledgement, the owning worker is the
+    /// single writer: it acknowledges before sealing. Later acknowledgements
+    /// cannot change that snapshot. This does not attest a completion cause
+    /// or free a GPU lease/token.
     pub fn seal_terminal(&self) -> ControlSnapshot {
-        self.0.terminal.store(true, Ordering::Release);
+        self.freeze_terminal_cancel_ack();
         self.0.signal.notify();
         self.snapshot()
     }
@@ -496,6 +542,119 @@ impl<C, E, P> WorkerMailbox<C, E, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancellation_acknowledged_before_return_is_not_rejected_as_closed() {
+        let mailbox = ControlMailbox::new("job", CompletionSignal::default());
+        let owner = mailbox.clone();
+        let result = mailbox.request_with_publish_hook(
+            1,
+            &mailbox.0.cancel,
+            &mailbox.0.cancel_ack,
+            true,
+            move || {
+                std::thread::spawn(move || {
+                    assert_eq!(owner.snapshot().cancel_sequence, 1);
+                    owner.acknowledge_cancel(1).unwrap();
+                    owner.seal_terminal();
+                })
+                .join()
+                .unwrap();
+            },
+        );
+        assert_eq!(result, Ok(()));
+        let snapshot = mailbox.snapshot();
+        assert!(snapshot.terminal);
+        assert_eq!((snapshot.cancel_sequence, snapshot.cancel_ack), (1, 1));
+
+        // An independently finished owner does not authorize claiming that
+        // this cancellation was processed, even if publication raced closure.
+        let naturally_finished = ControlMailbox::new("other", CompletionSignal::default());
+        let owner = naturally_finished.clone();
+        let result = naturally_finished.request_with_publish_hook(
+            1,
+            &naturally_finished.0.cancel,
+            &naturally_finished.0.cancel_ack,
+            true,
+            move || {
+                std::thread::spawn(move || {
+                    assert_eq!(owner.seal_terminal().cancel_ack, 0);
+                    // A public late ack cannot change what the owner sealed.
+                    owner.acknowledge_cancel(1).unwrap();
+                    assert_eq!(owner.seal_terminal().cancel_ack, 0);
+                    assert_eq!(owner.snapshot().cancel_ack, 0);
+                })
+                .join()
+                .unwrap();
+            },
+        );
+        assert_eq!(result, Err(ControlError::Closed));
+        assert_eq!(naturally_finished.0.cancel_ack.load(Ordering::Acquire), 1);
+        assert_eq!(naturally_finished.snapshot().cancel_ack, 0);
+
+        // The first seal CAS is the admission boundary even before the
+        // sealer has returned or sent its completion notification.
+        let staged = ControlMailbox::new("staged", CompletionSignal::default());
+        let owner = staged.clone();
+        let result = staged.request_with_publish_hook(
+            1,
+            &staged.0.cancel,
+            &staged.0.cancel_ack,
+            true,
+            move || {
+                std::thread::spawn(move || {
+                    assert_eq!(owner.freeze_terminal_cancel_ack(), 0);
+                    assert!(owner.snapshot().terminal);
+                })
+                .join()
+                .unwrap();
+            },
+        );
+        assert_eq!(result, Err(ControlError::Closed));
+        assert_eq!(staged.seal_terminal().cancel_ack, 0);
+
+        // An earlier acknowledged sequence does not accept a later request.
+        let prior = ControlMailbox::new("prior", CompletionSignal::default());
+        prior.request_cancel(1).unwrap();
+        prior.acknowledge_cancel(1).unwrap();
+        let owner = prior.clone();
+        let result = prior.request_with_publish_hook(
+            2,
+            &prior.0.cancel,
+            &prior.0.cancel_ack,
+            true,
+            move || {
+                std::thread::spawn(move || owner.seal_terminal())
+                    .join()
+                    .unwrap();
+            },
+        );
+        assert_eq!(result, Err(ControlError::Closed));
+        assert_eq!(prior.snapshot().cancel_ack, 1);
+    }
+    #[test]
+    fn concurrent_duplicate_terminal_seals_keep_one_acknowledgement() {
+        let mailbox = ControlMailbox::new("job", CompletionSignal::default());
+        mailbox.request_cancel(1).unwrap();
+        mailbox.acknowledge_cancel(1).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let owner = mailbox.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    owner.seal_terminal()
+                })
+            })
+            .collect();
+        barrier.wait();
+        for handle in handles {
+            let snapshot = handle.join().unwrap();
+            assert!(snapshot.terminal);
+            assert_eq!(snapshot.cancel_ack, 1);
+        }
+        assert_eq!(mailbox.snapshot().cancel_ack, 1);
+    }
     #[test]
     fn full_command_queue_cannot_block_yield_or_sticky_cancel() {
         let signal = CompletionSignal::default();

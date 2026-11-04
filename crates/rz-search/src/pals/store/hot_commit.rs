@@ -75,6 +75,78 @@ impl PalsStores {
         self.append_cpu_pv_once(position, moves)
     }
 
+    /// The exact retained prefix required by validate_external_pv. Reading the
+    /// original Store cap grants no Rules path, allocation or work allowance.
+    pub(crate) fn hot_external_pv_projection_plies(&self, reported_plies: usize) -> usize {
+        reported_plies.min(self.limits.line_plies)
+    }
+
+    /// Register only a suffix of the original controller's already-paid Rules
+    /// path. Immutable snapshots are compared; no second make/replay is done.
+    /// This authenticates historical path validity, never CPU work or a score.
+    pub(crate) fn hot_append_checked_cpu_pv(
+        &mut self,
+        position: &Position,
+        moves: &[BoardMove],
+        checked: &crate::pals::rovent_frontier::CheckedFrontierLine,
+    ) -> Result<LineId, StoreError> {
+        if moves.len() > self.limits.line_plies {
+            return Err(StoreError::Capacity("CPU PV plies"));
+        }
+        if !checked.matches_store(self) {
+            return Err(StoreError::InvalidEvidence(
+                "CPU PV checked source is not live for this Store",
+            ));
+        }
+        let prefix = checked.prefix();
+        let steps = checked.steps();
+        let offset = prefix
+            .len()
+            .checked_sub(moves.len())
+            .ok_or(StoreError::InvalidEvidence(
+                "CPU PV is not a checked path suffix",
+            ))?;
+        if steps.len() != prefix.len()
+            || &prefix[offset..] != moves
+            || steps
+                .iter()
+                .zip(prefix)
+                .any(|(step, movement)| step.movement() != *movement)
+        {
+            return Err(StoreError::InvalidEvidence(
+                "CPU PV is not a checked path suffix",
+            ));
+        }
+        let anchor = if offset == 0 {
+            checked.root_snapshot()
+        } else {
+            steps[offset - 1].snapshot()
+        };
+        let snapshot = position.snapshot();
+        if !anchor.same_state(&snapshot) {
+            return Err(StoreError::InvalidEvidence(
+                "CPU PV checked suffix has another exact anchor",
+            ));
+        }
+        let endpoint = steps
+            .last()
+            .map_or(checked.root_snapshot(), |step| step.snapshot());
+        if !endpoint.same_state(checked.endpoint_snapshot())
+            || (moves.is_empty() && !anchor.same_state(endpoint))
+        {
+            return Err(StoreError::InvalidEvidence(
+                "CPU PV checked endpoint differs",
+            ));
+        }
+        let state = self
+            .states
+            .find(&snapshot)
+            .ok_or(StoreError::InvalidEvidence(
+                "CPU PV starts at an unregistered exact state",
+            ))?;
+        self.append_validated_cpu_pv_once(state, moves)
+    }
+
     pub fn hot_append_observation(
         &mut self,
         observation: Observation,
@@ -542,6 +614,102 @@ impl PalsStores {
         )?;
         self.validate_foreign_feedback(execution, expected_key, observation)?;
         Ok(observation)
+    }
+
+    /// A profiled result remains one-use raw foreign guidance. Its task is
+    /// settled as Failed, never as completed native/depth work or cache reuse.
+    pub fn hot_consume_sealed_profiled_foreign_feedback(
+        &mut self,
+        execution: ExecutionId,
+        original: TaskConsumer,
+        expected_key: &TaskKey,
+        exact_state: &PositionSnapshot,
+        observation: ObservationId,
+        now_tick: u64,
+    ) -> Result<ObservationId, StoreError> {
+        self.validate_profiled_foreign_feedback(execution, expected_key, observation)?;
+        self.validate_sealed_feedback_consumer(
+            execution,
+            original,
+            expected_key,
+            exact_state,
+            now_tick,
+            false,
+        )?;
+        self.mark_sealed_feedback_consumed(execution, original.id);
+        Ok(observation)
+    }
+
+    /// Original consumer, exact state and raw receipt are rechecked without
+    /// another consumption, authority renewal or completed-depth promotion.
+    pub fn hot_validate_consumed_profiled_foreign_feedback(
+        &self,
+        execution: ExecutionId,
+        original: TaskConsumer,
+        expected_key: &TaskKey,
+        exact_state: &PositionSnapshot,
+        observation: ObservationId,
+        now_tick: u64,
+    ) -> Result<ObservationId, StoreError> {
+        self.validate_sealed_feedback_consumer(
+            execution,
+            original,
+            expected_key,
+            exact_state,
+            now_tick,
+            true,
+        )?;
+        self.validate_profiled_foreign_feedback(execution, expected_key, observation)?;
+        Ok(observation)
+    }
+
+    fn validate_profiled_foreign_feedback(
+        &self,
+        execution: ExecutionId,
+        expected_key: &TaskKey,
+        observation: ObservationId,
+    ) -> Result<(), StoreError> {
+        if self.tasks.get(execution)?.status != TaskStatus::Failed {
+            return Err(StoreError::InvalidConditions(
+                "profiled foreign feedback is not terminal failed",
+            ));
+        }
+        let TaskQuestion::ProfiledExternal { requested } = expected_key.question else {
+            return Err(StoreError::InvalidConditions(
+                "profiled foreign feedback needs original question",
+            ));
+        };
+        requested.validate()?;
+        let raw = self.observations.get(observation)?;
+        self.validate_sealed_feedback_raw(execution, expected_key, raw)?;
+        let report = raw
+            .external_report
+            .as_deref()
+            .ok_or(StoreError::InvalidEvidence(
+                "profiled foreign feedback lacks report",
+            ))?;
+        if expected_key.value_identity.is_some()
+            || !matches!(
+                expected_key.checker_identity,
+                Some(CheckerIdentity::ExternalUci(_))
+            )
+            || expected_key.requested_depth != requested.requested_depth().unwrap_or(0)
+            || expected_key.node_budget != requested.requested_nodes().unwrap_or(0)
+            || raw.kind != ObservationKind::ExternalCpuAnalysis
+            || report.request_id == 0
+            || report.requested_depth != expected_key.requested_depth
+            || !matches!(
+                report.completion,
+                ExternalCompletion::BestMove | ExternalCompletion::StoppedYield
+            )
+            || report.best_move.is_none()
+            || !matches!(raw.scope, EvidenceScope::ProfiledExternalUci { requested: actual, .. } if actual == requested)
+        {
+            return Err(StoreError::InvalidEvidence(
+                "profiled foreign feedback scope",
+            ));
+        }
+        self.validate_observation_handles(raw)
     }
 
     /// Recheck actual own CPU feedback without changing its consumer. A

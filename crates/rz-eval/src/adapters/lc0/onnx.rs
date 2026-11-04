@@ -19,6 +19,10 @@ use ort::tensor::TensorElementType;
 use ort::value::{Tensor, ValueType};
 use rz_encoding::classical::{EncodedInput, INPUT_VALUES};
 use rz_encoding::POLICY_SIZE;
+#[cfg(target_os = "linux")]
+pub use rz_native_loader::system::{
+    SystemCaptureLimits, SystemLibraryRequest, SystemMappingAvailability, SystemRuntime,
+};
 use rz_native_loader::{LibrarySet, LoadError, ProcessLibrarySet};
 pub use rz_native_loader::{
     NativeLoadingProfile, NativeMappingObservation, NVIDIA_LOAD_ORDER, ORT_LIBRARY_NAMES,
@@ -31,6 +35,15 @@ use std::time::Instant;
 #[path = "onnx_io.rs"]
 mod io;
 const MAX_BATCH: usize = 16;
+
+/// A successful normal-operation check may leave native mapping evidence
+/// unknown. Only `Observed` represents a complete mapping observation; neither
+/// variant is a CUDA completion fence or proof of a successful GPU Run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaRuntimeMappingEvidence {
+    Observed,
+    Unknown,
+}
 
 /// CPU wall-clock boundaries. Run includes kernels and synchronization;
 /// these are not GPU event times. None means that transfer is inside Run.
@@ -84,7 +97,10 @@ pub fn declared_backend_identity(
     bundle: Option<[u8; 32]>,
     config: &BackendConfig,
 ) -> [u8; 32] {
-    let mut profile=format!("rz-maia-ort-v1;ort=1.22.0;wrapper=2.0.0-rc.10;runtime={runtime:?};asset={asset_manifest:?};provider={:?};threads={};batch={};fp32;tf32=0;opt=1;sync;full=1;temp=1;sum=1e-5",config.provider,config.intra_threads,config.max_batch);
+    let mut profile = format!(
+        "rz-maia-ort-v1;ort=1.22.0;wrapper=2.0.0-rc.10;runtime={runtime:?};asset={asset_manifest:?};provider={:?};threads={};batch={};fp32;tf32=0;opt=1;sync;full=1;temp=1;sum=1e-5",
+        config.provider, config.intra_threads, config.max_batch
+    );
     if let Some(bundle) = bundle {
         profile.push_str(&format!(
             ";cuda-bundle-v1={bundle:?};loader=linux-exact-global-v1"
@@ -121,19 +137,73 @@ pub fn declared_backend_identity(
 
 #[derive(Clone)]
 pub struct OrtRuntime {
-    pin: RuntimeLibraryPin,
+    owner: RuntimeOwner,
     build_info: String,
     cuda_libraries: Option<ProcessLibrarySet>,
     ort_libraries: Option<Arc<Vec<rz_native_loader::OwnedLibrary>>>,
     loading_profile: Option<NativeLoadingProfile>,
 }
 
+#[derive(Clone)]
+enum RuntimeOwner {
+    Copy(RuntimeLibraryPin),
+    #[cfg(target_os = "linux")]
+    System {
+        runtime: SystemRuntime,
+        core_digest: [u8; 32],
+    },
+}
+
+impl RuntimeOwner {
+    fn same_copy(&self, pin: &RuntimeLibraryPin) -> bool {
+        match self {
+            Self::Copy(current) => {
+                current.path() == pin.path()
+                    && current.binary_digest() == pin.binary_digest()
+                    && current.bundle_digest() == pin.bundle_digest()
+            }
+            #[cfg(target_os = "linux")]
+            Self::System { .. } => false,
+        }
+    }
+
+    fn binary_digest(&self) -> [u8; 32] {
+        match self {
+            Self::Copy(pin) => pin.binary_digest(),
+            #[cfg(target_os = "linux")]
+            Self::System { core_digest, .. } => *core_digest,
+        }
+    }
+
+    fn legacy_bundle_digest(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Copy(pin) => pin.bundle_digest(),
+            #[cfg(target_os = "linux")]
+            Self::System { .. } => None,
+        }
+    }
+
+    fn same_owner(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Copy(left), Self::Copy(right)) => {
+                self.same_copy(right) && right.path() == left.path()
+            }
+            #[cfg(target_os = "linux")]
+            (Self::System { runtime: left, .. }, Self::System { runtime: right, .. }) => {
+                left.identity_sha256() == right.identity_sha256()
+            }
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+}
+
 impl std::fmt::Debug for OrtRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OrtRuntime")
-            .field("pin", &self.pin)
+            .field("runtime_binary_digest", &self.owner.binary_digest())
             .field("build_info", &self.build_info)
-            .field("cuda_bundle", &self.pin.bundle_digest())
+            .field("cuda_bundle", &self.owner.legacy_bundle_digest())
             .field("native_loading_profile", &self.loading_profile)
             .finish()
     }
@@ -142,12 +212,108 @@ impl std::fmt::Debug for OrtRuntime {
 struct RuntimeLatch {
     // ORT may retain the native library even if later initialization fails.
     // Preserve its bootstrap capability on both success and latched failure.
-    pin: RuntimeLibraryPin,
+    owner: RuntimeOwner,
     loading_profile: Option<NativeLoadingProfile>,
     result: Result<OrtRuntime, BackendError>,
 }
 
 static RUNTIME: Mutex<Option<RuntimeLatch>> = Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+fn system_runtime_unavailable() -> BackendError {
+    BackendError::new(
+        K::BackendUnavailable,
+        S::Backend,
+        "system ORT initialization failed; install compatible native dependencies",
+    )
+}
+
+/// Keep the callback adjacent to the actual native invocation. In particular,
+/// a non-UTF8 path rejects before notifying the original owner.
+#[cfg(target_os = "linux")]
+fn with_system_ort_entry<T>(
+    path: Option<&str>,
+    before_native: impl FnOnce(),
+    initialize: impl FnOnce(&str) -> Result<T, BackendError>,
+) -> Result<T, BackendError> {
+    let path = path.ok_or_else(system_runtime_unavailable)?;
+    before_native();
+    initialize(path)
+}
+
+#[cfg(target_os = "linux")]
+fn with_checked_system_ort_entry<T>(
+    path: Option<&str>,
+    before_native: impl FnOnce() -> Result<(), BackendError>,
+    entered: &std::cell::Cell<bool>,
+    initialize: impl FnOnce(&str) -> Result<T, BackendError>,
+) -> Result<T, BackendError> {
+    with_system_ort_entry(
+        path,
+        || {},
+        |path| {
+            before_native()?;
+            entered.set(true);
+            initialize(path)
+        },
+    )
+}
+
+/// Observe rejection only if the complete entry attempt returns normally.
+#[cfg(target_os = "linux")]
+fn catch_checked_system_ort_entry<T>(
+    path: Option<&str>,
+    before_native: impl FnOnce() -> Result<(), BackendError>,
+    entered: &std::cell::Cell<bool>,
+    initialize: impl FnOnce(&str) -> Result<T, BackendError>,
+) -> (Result<T, BackendError>, bool) {
+    let rejected = std::cell::Cell::new(false);
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_checked_system_ort_entry(
+            path,
+            || {
+                let outcome = before_native();
+                if outcome.is_err() {
+                    rejected.set(true);
+                }
+                outcome
+            },
+            entered,
+            initialize,
+        )
+    }));
+    match attempt {
+        Ok(result) => (result, rejected.get()),
+        Err(payload) => {
+            let unavailable = system_runtime_unavailable;
+            let error = if let Some(message) = payload.downcast_ref::<&str>() {
+                unavailable().with_external_cause(CauseCode::RuntimePanic, message)
+            } else if let Some(message) = payload.downcast_ref::<String>() {
+                unavailable().with_external_cause(CauseCode::RuntimePanic, message)
+            } else {
+                unavailable().with_external_cause(
+                    CauseCode::RuntimePanic,
+                    &"non-string native initialization panic",
+                )
+            };
+            (Err(error), false)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn should_latch_system_attempt(entered: bool, latch_before_entry_failure: bool) -> bool {
+    entered || latch_before_entry_failure
+}
+
+/// Local evidence from the checked loader, not a process or device fence.
+/// Only a normally returned error from the actual pre-entry callback can be
+/// classified as a rejection. Latch reuse and all other failures are unknown.
+#[cfg(target_os = "linux")]
+pub(crate) enum CheckedSystemCudaLoadFailure {
+    CallbackRejected(BackendError),
+    Unknown(BackendError),
+}
 
 impl OrtRuntime {
     /// Bootstrap must be the sole initializer of the process-global `ort`
@@ -180,10 +346,7 @@ impl OrtRuntime {
             unavailable().with_external_cause(CauseCode::RuntimeInitialize, &error)
         })?;
         if let Some(latch) = guard.as_mut() {
-            if latch.pin.path() != pin.path()
-                || latch.pin.binary_digest() != pin.binary_digest()
-                || latch.pin.bundle_digest() != pin.bundle_digest()
-            {
+            if !latch.owner.same_copy(pin) {
                 return Err(BackendError::new(
                     K::IdentityMismatch,
                     S::Backend,
@@ -202,9 +365,7 @@ impl OrtRuntime {
                 return Err(latch.result.as_ref().unwrap_err().clone());
             }
             let runtime = latch.result.as_ref().map_err(Clone::clone)?;
-            return if runtime.pin.binary_digest() == pin.binary_digest()
-                && runtime.pin.bundle_digest() == pin.bundle_digest()
-            {
+            return if runtime.owner.same_copy(pin) {
                 let runtime = runtime.clone();
                 drop(guard);
                 if runtime.bundle_digest().is_some() {
@@ -291,7 +452,7 @@ impl OrtRuntime {
                 ));
             }
             Ok(Self {
-                pin: pin.clone(),
+                owner: RuntimeOwner::Copy(pin.clone()),
                 build_info: info.to_owned(),
                 cuda_libraries,
                 ort_libraries,
@@ -310,22 +471,235 @@ impl OrtRuntime {
             Err(error)
         });
         *guard = Some(RuntimeLatch {
-            pin: pin.clone(),
+            owner: RuntimeOwner::Copy(pin.clone()),
             loading_profile,
             result: result.clone(),
         });
         result
     }
 
+    /// Initialize ORT from an explicitly captured system installation without
+    /// copying CUDA or ORT files into an engine-owned runtime directory.
+    ///
+    /// `ort-core` and `ort-provider-cuda` must be declared and required. The
+    /// provider and GPU are not considered operational until session creation,
+    /// a real CUDA Run and the existing physical-completion checks succeed.
+    /// ORT is loaded by its captured canonical system path so provider discovery
+    /// can use that installation's layout. A concurrent package replacement
+    /// can race native loading: the origin audit detects a mismatched mapping
+    /// afterwards but cannot undo native constructors that have already run.
+    /// Provider readiness and physical completion require separate real checks.
+    #[cfg(target_os = "linux")]
+    pub fn load_system_cuda(runtime: &SystemRuntime) -> Result<Self, BackendError> {
+        Self::load_system_cuda_with_entry(runtime, || {})
+    }
+
+    /// Reports this attempt's first ORT native entry to its original owner.
+    /// Pure admission failures and reuse of the process latch do not call the
+    /// callback. Neither callback nor latch reuse attests GPU completion or
+    /// says whether earlier work in the process has completed.
+    ///
+    /// The callback executes immediately before `ort::init_from` and within
+    /// the same unwind boundary as initialization. If it panics, initialization
+    /// is not attempted; the original owner and typed panic error remain in
+    /// the process latch. Callers must separately preserve their own custody.
+    #[cfg(target_os = "linux")]
+    pub fn load_system_cuda_with_entry(
+        runtime: &SystemRuntime,
+        before_native: impl FnOnce(),
+    ) -> Result<Self, BackendError> {
+        Self::load_system_cuda_with_entry_impl(
+            runtime,
+            || {
+                before_native();
+                Ok(())
+            },
+            true,
+            None,
+        )
+    }
+
+    /// Check the caller's live capability immediately before first native
+    /// initialization. Rejection or unwind before entry does not install a
+    /// process latch. On same-owner latch reuse this hook is not called: the
+    /// caller must independently recheck its parent and scope in that branch.
+    /// The check runs under the runtime mutex and must not reenter this loader.
+    #[cfg(target_os = "linux")]
+    pub fn load_system_cuda_with_checked_entry(
+        runtime: &SystemRuntime,
+        before_native: impl FnOnce() -> Result<(), BackendError>,
+    ) -> Result<Self, BackendError> {
+        Self::load_system_cuda_with_entry_impl(runtime, before_native, false, None)
+    }
+
+    /// Preserve a checked callback rejection from this exact loader call.
+    /// This does not attest previous work, a latch reuse, or a device fence.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn load_system_cuda_with_checked_entry_observed(
+        runtime: &SystemRuntime,
+        before_native: impl FnOnce() -> Result<(), BackendError>,
+    ) -> Result<Self, CheckedSystemCudaLoadFailure> {
+        let rejected = std::cell::Cell::new(false);
+        match Self::load_system_cuda_with_entry_impl(runtime, before_native, false, Some(&rejected))
+        {
+            Ok(runtime) => Ok(runtime),
+            Err(error) if rejected.get() => {
+                Err(CheckedSystemCudaLoadFailure::CallbackRejected(error))
+            }
+            Err(error) => Err(CheckedSystemCudaLoadFailure::Unknown(error)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn load_system_cuda_with_entry_impl(
+        runtime: &SystemRuntime,
+        before_native: impl FnOnce() -> Result<(), BackendError>,
+        latch_before_entry_failure: bool,
+        observed_callback_rejection: Option<&std::cell::Cell<bool>>,
+    ) -> Result<Self, BackendError> {
+        let unavailable = system_runtime_unavailable;
+        let libraries = runtime.libraries();
+        let core = libraries
+            .iter()
+            .find(|item| item.role == "ort-core" && item.required_mapping)
+            .ok_or_else(|| {
+                BackendError::new(
+                    K::InvalidInput,
+                    S::Admission,
+                    "system CUDA requires a required ort-core role",
+                )
+            })?;
+        if !libraries
+            .iter()
+            .any(|item| item.role == "ort-provider-cuda" && item.required_mapping)
+        {
+            return Err(BackendError::new(
+                K::InvalidInput,
+                S::Admission,
+                "system CUDA requires a required ort-provider-cuda role",
+            ));
+        }
+        let owner = RuntimeOwner::System {
+            runtime: runtime.clone(),
+            core_digest: core.sha256,
+        };
+        let mut guard = RUNTIME.lock().map_err(|error| {
+            unavailable().with_external_cause(CauseCode::RuntimeInitialize, &error)
+        })?;
+        if let Some(latch) = guard.as_ref() {
+            if !latch.owner.same_owner(&owner) || latch.loading_profile.is_some() {
+                return Err(BackendError::new(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "ORT process runtime owner cannot be changed",
+                ));
+            }
+            let result = latch.result.clone();
+            drop(guard);
+            let loaded = result?;
+            loaded.verify_cuda_mappings(false)?;
+            return Ok(loaded);
+        }
+        // This is a new load. A source-path encoding error precedes native
+        // entry and must not install a latch for an unattempted initialization.
+        // Existing latch reuse retains its historical validation order.
+        let core_path = core.canonical_path.to_str().ok_or_else(unavailable)?;
+        let entered = std::cell::Cell::new(false);
+        let (result, callback_rejected) =
+            catch_checked_system_ort_entry(Some(core_path), before_native, &entered, |path| {
+                if !ort::init_from(path)
+                    .with_name("RoveZero-C-system")
+                    .commit()
+                    .map_err(|error| {
+                        unavailable().with_ort_cause(CauseCode::RuntimeInitialize, error)
+                    })?
+                {
+                    return Err(BackendError::new(
+                        K::IdentityMismatch,
+                        S::Backend,
+                        "ORT was initialized outside bootstrap",
+                    ));
+                }
+                let info = ort::info();
+                // A build commit is an observation, not a compatibility gate.
+                let observation = runtime.observe_mappings().map_err(loader_error)?;
+                if observation.availability == SystemMappingAvailability::Observed
+                    && !observation
+                        .mapped_roles
+                        .iter()
+                        .any(|role| role == "ort-core")
+                {
+                    return Err(BackendError::new(
+                        K::IdentityMismatch,
+                        S::Backend,
+                        "system ORT core mapping does not match the captured runtime",
+                    ));
+                }
+                Ok(Self {
+                    owner: owner.clone(),
+                    build_info: info.to_owned(),
+                    cuda_libraries: None,
+                    ort_libraries: None,
+                    loading_profile: None,
+                })
+            });
+        if callback_rejected {
+            if let Some(observation) = observed_callback_rejection {
+                observation.set(true);
+            }
+        }
+        if !should_latch_system_attempt(entered.get(), latch_before_entry_failure) {
+            return result;
+        }
+        *guard = Some(RuntimeLatch {
+            owner,
+            loading_profile: None,
+            result: result.clone(),
+        });
+        result
+    }
+
     pub fn binary_digest(&self) -> [u8; 32] {
-        self.pin.binary_digest()
+        self.owner.binary_digest()
     }
     pub fn build_info(&self) -> &str {
         &self.build_info
     }
 
     pub fn bundle_digest(&self) -> Option<[u8; 32]> {
-        self.pin.bundle_digest()
+        self.owner.legacy_bundle_digest()
+    }
+
+    /// Actual CUDA runtime identity; system identity is never presented as a
+    /// historical bundle digest. This value alone does not prove a GPU Run.
+    pub fn cuda_runtime_identity(&self) -> Option<[u8; 32]> {
+        match &self.owner {
+            RuntimeOwner::Copy(pin) => pin.bundle_digest(),
+            #[cfg(target_os = "linux")]
+            RuntimeOwner::System { runtime, .. } => Some(runtime.identity_sha256()),
+        }
+    }
+
+    pub fn is_cuda(&self) -> bool {
+        self.cuda_runtime_identity().is_some()
+    }
+
+    pub fn is_system_cuda(&self) -> bool {
+        match &self.owner {
+            RuntimeOwner::Copy(_) => false,
+            #[cfg(target_os = "linux")]
+            RuntimeOwner::System { .. } => true,
+        }
+    }
+
+    /// Access the same pinned owner for the new system-specific observation
+    /// schema. Mapping observation remains separate from GPU completion.
+    #[cfg(target_os = "linux")]
+    pub fn system_runtime(&self) -> Option<&SystemRuntime> {
+        match &self.owner {
+            RuntimeOwner::System { runtime, .. } => Some(runtime),
+            RuntimeOwner::Copy(_) => None,
+        }
     }
 
     pub fn native_loading_profile(&self) -> Option<NativeLoadingProfile> {
@@ -344,19 +718,27 @@ impl OrtRuntime {
         &self,
         include_runtime: bool,
     ) -> Result<NativeMappingObservation, BackendError> {
-        self.audit_cuda_mappings(include_runtime, true)
-            .map(|observed| observed.expect("explicit origin observation was requested"))
+        self.audit_cuda_mappings(include_runtime, true, true)
+            .map(|(observed, _)| observed.expect("explicit origin observation was requested"))
     }
 
     /// Canonical descriptors of the actually retained runtime bundle. This is
     /// loaded pin metadata, not an unchecked bootstrap JSON declaration.
     pub fn bundle_files(&self) -> Option<&[crate::runtime_pin::RuntimeBundleFile]> {
-        self.pin.bundle_files()
+        match &self.owner {
+            RuntimeOwner::Copy(pin) => pin.bundle_files(),
+            #[cfg(target_os = "linux")]
+            RuntimeOwner::System { .. } => None,
+        }
     }
 
     /// Registered manifest semantics of the retained pins, including aliases.
     pub fn bundle_spec(&self) -> Option<crate::runtime_pin::CudaRuntimeBundleSpec> {
-        self.pin.bundle_spec()
+        match &self.owner {
+            RuntimeOwner::Copy(pin) => pin.bundle_spec(),
+            #[cfg(target_os = "linux")]
+            RuntimeOwner::System { .. } => None,
+        }
     }
 
     /// Audit the explicitly preloaded NVIDIA dependencies before constructing a
@@ -371,18 +753,32 @@ impl OrtRuntime {
     /// before accepting their final GPU report. This is an origin audit, not a
     /// completion fence, VRAM measurement or device-drain operation.
     pub fn verify_cuda_runtime_mappings(&self) -> Result<(), BackendError> {
-        self.verify_cuda_mappings(true)
+        self.audit_cuda_mappings(true, false, true).map(|_| ())
+    }
+
+    /// Check for observed CUDA mapping conflicts during normal execution.
+    /// Missing `/proc` evidence is explicitly `Unknown`; callers must not
+    /// promote that result to a strict mapping witness or physical completion.
+    pub fn observe_cuda_runtime_mappings(
+        &self,
+    ) -> Result<CudaRuntimeMappingEvidence, BackendError> {
+        self.audit_cuda_mappings(true, false, false)
+            .map(|(_, evidence)| evidence)
     }
 
     fn verify_cuda_mappings(&self, include_runtime: bool) -> Result<(), BackendError> {
-        self.audit_cuda_mappings(include_runtime, false).map(|_| ())
+        self.audit_cuda_mappings(include_runtime, false, false)
+            .map(|_| ())
     }
 
     fn audit_cuda_mappings(
         &self,
         include_runtime: bool,
         observe: bool,
-    ) -> Result<Option<NativeMappingObservation>, BackendError> {
+        strict: bool,
+    ) -> Result<(Option<NativeMappingObservation>, CudaRuntimeMappingEvidence), BackendError> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = strict;
         // Existing clones must observe the first latched failure too. A later
         // filesystem/map change cannot turn a poisoned process runtime into a
         // valid constructor input, or replace its original typed cause.
@@ -395,9 +791,7 @@ impl OrtRuntime {
             .with_external_cause(CauseCode::RuntimeInitialize, &error)
         })?;
         if let Some(latch) = guard.as_ref() {
-            if latch.pin.path() != self.pin.path()
-                || latch.pin.bundle_digest() != self.pin.bundle_digest()
-                || latch.loading_profile != self.loading_profile
+            if !latch.owner.same_owner(&self.owner) || latch.loading_profile != self.loading_profile
             {
                 return Err(BackendError::new(
                     K::IdentityMismatch,
@@ -406,6 +800,46 @@ impl OrtRuntime {
                 ));
             }
             latch.result.as_ref().map_err(Clone::clone)?;
+        }
+        #[cfg(target_os = "linux")]
+        if let RuntimeOwner::System { runtime, .. } = &self.owner {
+            // The legacy observation schema describes the fixed bundle and
+            // cannot truthfully represent a system installation.
+            if observe {
+                return Err(BackendError::new(
+                    K::UnsupportedModel,
+                    S::Backend,
+                    "legacy CUDA bundle observation does not represent system runtime mappings",
+                ));
+            }
+            let observed = if strict && include_runtime {
+                runtime.verify_mappings()
+            } else {
+                runtime.observe_mappings()
+            };
+            if let Err(error) = &observed {
+                if matches!(
+                    error.kind,
+                    rz_native_loader::LoadErrorKind::ObservationUnavailable
+                        | rz_native_loader::LoadErrorKind::ForeignMapping
+                ) {
+                    // Missing evidence or an extra unrelated dependency can
+                    // fail strict proof without poisoning normal execution.
+                    return Err(loader_error(error.clone()));
+                }
+            }
+            let result = observed.map_err(loader_error).and_then(|observation| {
+                classify_system_mapping(&observation, include_runtime)
+                    .map(|evidence| (None, evidence))
+            });
+            if let Err(failure) = &result {
+                if let Some(latch) = guard.as_mut() {
+                    if latch.owner.same_owner(&self.owner) && latch.result.is_ok() {
+                        latch.result = Err(failure.clone());
+                    }
+                }
+            }
+            return result;
         }
         let libraries = self.cuda_libraries.as_ref().ok_or_else(|| {
             BackendError::new(
@@ -443,8 +877,7 @@ impl OrtRuntime {
             // An origin audit cannot be retried into success with the same
             // process-global ORT session. Keep the first typed source and pins.
             if let Some(latch) = guard.as_mut() {
-                if latch.pin.path() == self.pin.path()
-                    && latch.pin.bundle_digest() == self.pin.bundle_digest()
+                if latch.owner.same_owner(&self.owner)
                     && latch.loading_profile == self.loading_profile
                     && latch.result.is_ok()
                 {
@@ -452,7 +885,91 @@ impl OrtRuntime {
                 }
             }
         }
-        verified
+        verified.map(|observation| (observation, CudaRuntimeMappingEvidence::Observed))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_system_mapping(
+    observation: &rz_native_loader::system::SystemMappingObservation,
+    include_runtime: bool,
+) -> Result<CudaRuntimeMappingEvidence, BackendError> {
+    // A missing required role is incomplete evidence, not an observed
+    // identity conflict. SystemRuntime::observe_mappings already reports
+    // actual path/inode/lifetime conflicts as errors before this projection.
+    if observation.availability == SystemMappingAvailability::Observed
+        && observation
+            .mapped_roles
+            .iter()
+            .any(|role| role == "ort-core")
+        && (!include_runtime || observation.missing_required_roles.is_empty())
+        && observation.preexisting_mapping_observed
+        && observation.preexisting_native_mappings.is_empty()
+        && observation.unregistered_native_mappings.is_empty()
+    {
+        Ok(CudaRuntimeMappingEvidence::Observed)
+    } else {
+        Ok(CudaRuntimeMappingEvidence::Unknown)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod system_mapping_evidence_tests {
+    use super::*;
+    use rz_native_loader::system::SystemMappingObservation;
+
+    #[test]
+    fn unavailable_and_missing_roles_remain_unknown() {
+        let mut observation = SystemMappingObservation {
+            identity_sha256: [0; 32],
+            availability: SystemMappingAvailability::Unavailable,
+            preexisting_mapping_observed: false,
+            preexisting_native_mappings: vec![],
+            mapped_roles: vec![],
+            missing_required_roles: vec![],
+            missing_optional_roles: vec![],
+            unregistered_native_mappings: vec![],
+            gpu_provider_verified: false,
+            gpu_completion_verified: false,
+        };
+        assert_eq!(
+            classify_system_mapping(&observation, true).unwrap(),
+            CudaRuntimeMappingEvidence::Unknown
+        );
+        observation.availability = SystemMappingAvailability::Observed;
+        // An observed map that does not yet show ORT core is incomplete; an
+        // identity conflict is reported separately by the system loader.
+        observation.preexisting_mapping_observed = true;
+        assert_eq!(
+            classify_system_mapping(&observation, false).unwrap(),
+            CudaRuntimeMappingEvidence::Unknown
+        );
+        observation.mapped_roles.push("ort-core".into());
+        observation.preexisting_mapping_observed = false;
+        assert_eq!(
+            classify_system_mapping(&observation, true).unwrap(),
+            CudaRuntimeMappingEvidence::Unknown
+        );
+        observation.preexisting_mapping_observed = true;
+        assert_eq!(
+            classify_system_mapping(&observation, true).unwrap(),
+            CudaRuntimeMappingEvidence::Observed
+        );
+        observation
+            .unregistered_native_mappings
+            .push("foreign.so".into());
+        assert_eq!(
+            classify_system_mapping(&observation, true).unwrap(),
+            CudaRuntimeMappingEvidence::Unknown
+        );
+        observation.unregistered_native_mappings.clear();
+        observation
+            .missing_required_roles
+            .push("ort-provider-cuda".into());
+        assert_eq!(
+            classify_system_mapping(&observation, true).unwrap(),
+            CudaRuntimeMappingEvidence::Unknown
+        );
     }
 }
 
@@ -476,6 +993,164 @@ fn cuda_loading_profile(
 #[cfg(test)]
 mod native_loading_profile_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn checked_capture_observation_requires_a_normal_callback_rejection() {
+        let entered = std::cell::Cell::new(false);
+        let called = std::cell::Cell::new(false);
+        let original = BackendError::new(K::InvalidInput, S::Admission, "deadline rejected");
+        let (result, rejected) = catch_checked_system_ort_entry(
+            Some("/not-opened"),
+            || Err(original.clone()),
+            &entered,
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err(), original);
+        assert!(rejected);
+        assert!(!entered.get());
+        assert!(!called.get());
+
+        let (result, rejected) = catch_checked_system_ort_entry::<()>(
+            None,
+            || {
+                called.set(true);
+                Ok(())
+            },
+            &entered,
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(!rejected);
+        assert!(!called.get());
+        assert!(!entered.get());
+
+        let (result, rejected) = catch_checked_system_ort_entry::<()>(
+            Some("/not-opened"),
+            || panic!("callback panic"),
+            &entered,
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(!rejected);
+        assert!(!entered.get());
+
+        let native_error = BackendError::new(K::InvalidInput, S::Backend, "native failure");
+        let (result, rejected) = catch_checked_system_ort_entry::<()>(
+            Some("/not-opened"),
+            || Ok(()),
+            &entered,
+            |_| Err(native_error.clone()),
+        );
+        assert_eq!(result.unwrap_err(), native_error);
+        assert!(!rejected);
+        assert!(entered.get());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn checked_system_entry_distinguishes_rejection_panic_and_entered_failure() {
+        let entered = std::cell::Cell::new(false);
+        let called = std::cell::Cell::new(false);
+        let rejected = with_checked_system_ort_entry(
+            Some("/not-opened"),
+            || Err(BackendError::new(K::InvalidInput, S::Admission, "denied")),
+            &entered,
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        );
+        assert!(rejected.is_err());
+        assert!(!entered.get() && !called.get());
+        assert!(!should_latch_system_attempt(entered.get(), false));
+        assert!(should_latch_system_attempt(entered.get(), true));
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_checked_system_ort_entry(
+                Some("/not-opened"),
+                || panic!("admission panic"),
+                &entered,
+                |_| {
+                    called.set(true);
+                    Ok(())
+                },
+            );
+        }));
+        assert!(panic.is_err());
+        assert!(!entered.get() && !called.get());
+        assert!(!should_latch_system_attempt(entered.get(), false));
+
+        let native_error = with_checked_system_ort_entry(
+            Some("/not-opened"),
+            || Ok(()),
+            &entered,
+            |_| {
+                Err::<(), _>(BackendError::new(
+                    K::BackendFailure,
+                    S::Backend,
+                    "native failure",
+                ))
+            },
+        );
+        assert!(native_error.is_err() && entered.get());
+        assert!(should_latch_system_attempt(entered.get(), false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_ort_entry_rejects_bad_path_before_native_callback() {
+        let entered = std::cell::Cell::new(false);
+        let called = std::cell::Cell::new(false);
+        let result = with_system_ort_entry(
+            None,
+            || entered.set(true),
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err().kind, K::BackendUnavailable);
+        assert!(!entered.get());
+        assert!(!called.get());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_ort_entry_runs_owner_hook_before_native_invocation() {
+        let entered = std::cell::Cell::new(false);
+        let output = with_system_ort_entry(
+            Some("/not-opened-in-this-test"),
+            || entered.set(true),
+            |path| {
+                assert!(entered.get());
+                Ok(path.len())
+            },
+        )
+        .unwrap();
+        assert_eq!(output, "/not-opened-in-this-test".len());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_ort_entry_hook_panic_does_not_call_initializer() {
+        let called = std::cell::Cell::new(false);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_system_ort_entry(
+                Some("/not-opened-in-this-test"),
+                || panic!("owner hook failure"),
+                |_| {
+                    called.set(true);
+                    Ok(())
+                },
+            );
+        }));
+        assert!(panic.is_err());
+        assert!(!called.get());
+    }
 
     #[test]
     fn cpu_bootstrap_keeps_no_native_profile_and_rejects_explicit_shim() {
@@ -715,6 +1390,167 @@ impl AsRef<[u8]> for VerifiedModel<'_> {
     }
 }
 
+/// Status of this exact opt-in startup, not a device-wide completion claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Lc0StartupState {
+    BeforeSessionEntry,
+    NativeEnteredUnknown,
+    Ready,
+    Transferred,
+}
+
+#[derive(Default)]
+struct Lc0StartupSlots {
+    session: Option<SessionStorage>,
+    backend: Option<OnnxBackend>,
+}
+
+fn enter_lc0_session(
+    state: &mut Lc0StartupState,
+    before_native: &mut impl FnMut() -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
+    before_native()?;
+    *state = Lc0StartupState::NativeEnteredUnknown;
+    Ok(())
+}
+
+fn take_ready_pair<A, B>(
+    state: &mut Lc0StartupState,
+    metadata: &mut Option<A>,
+    backend: &mut Option<B>,
+) -> Option<(A, B)> {
+    if *state != Lc0StartupState::Ready || metadata.is_none() || backend.is_none() {
+        return None;
+    }
+    let metadata = metadata.take().expect("checked metadata");
+    let backend = backend.take().expect("checked backend");
+    *state = Lc0StartupState::Transferred;
+    Some((metadata, backend))
+}
+
+/// Caller-owned custody for one LC0 startup attempt.  The original serialized
+/// model, runtime and any session/backend returned by ORT stay in this owner on
+/// errors and unwinds.  An entered but failed attempt is not a completion
+/// fence, including when ORT never returned a partial session to Rust.
+pub struct Lc0StartupCustody {
+    runtime: Option<OrtRuntime>,
+    metadata: Option<AssetMetadata>,
+    serialized: Option<Vec<u8>>,
+    slots: Lc0StartupSlots,
+    state: Lc0StartupState,
+    attempted: bool,
+}
+
+impl Lc0StartupCustody {
+    pub fn new(runtime: OrtRuntime, asset: MaiaAsset) -> Self {
+        let (metadata, bytes) = asset.into_parts();
+        Self {
+            runtime: Some(runtime),
+            metadata: Some(metadata),
+            serialized: Some(bytes),
+            slots: Lc0StartupSlots::default(),
+            state: Lc0StartupState::BeforeSessionEntry,
+            attempted: false,
+        }
+    }
+    pub fn state(&self) -> Lc0StartupState {
+        self.state
+    }
+    pub fn metadata(&self) -> Option<&AssetMetadata> {
+        self.metadata.as_ref()
+    }
+
+    /// Callback is invoked immediately before the first session-builder entry,
+    /// after admission. It must enforce the caller's original parent scope.
+    pub fn load(
+        &mut self,
+        config: BackendConfig,
+        mut before_native: impl FnMut() -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        if self.attempted {
+            return Err(BackendError::new(
+                K::InvalidInput,
+                S::Admission,
+                "LC0 startup owner has already been used",
+            ));
+        }
+        self.attempted = true;
+        let runtime = self.runtime.as_ref().expect("original runtime");
+        let bytes = self.serialized.as_deref().expect("original model");
+        let state = &mut self.state;
+        let mut entry = || enter_lc0_session(state, &mut before_native);
+        let backend = OnnxBackend::load_model(
+            runtime,
+            self.metadata.as_ref().expect("original metadata"),
+            VerifiedModel::BorrowedOnnx(bytes),
+            config,
+            &mut |_| {},
+            None,
+            Some(&mut self.slots),
+            Some(&mut entry),
+        )?;
+        self.slots.backend = Some(backend);
+        self.serialized = None;
+        self.state = Lc0StartupState::Ready;
+        Ok(())
+    }
+    pub fn take_backend(&mut self) -> Option<OnnxBackend> {
+        if self.state != Lc0StartupState::Ready {
+            return None;
+        }
+        let backend = self.slots.backend.take()?;
+        self.state = Lc0StartupState::Transferred;
+        Some(backend)
+    }
+
+    /// Transfer the exact original metadata and completed backend together.
+    /// A failed or incomplete startup leaves every custody field untouched.
+    pub fn take_ready(&mut self) -> Option<(AssetMetadata, OnnxBackend)> {
+        take_ready_pair(&mut self.state, &mut self.metadata, &mut self.slots.backend)
+    }
+}
+
+impl Drop for Lc0StartupCustody {
+    fn drop(&mut self) {
+        if self.state == Lc0StartupState::NativeEnteredUnknown {
+            // No destructor or owner disconnect can manufacture a fence.
+            std::mem::forget((
+                self.runtime.take(),
+                self.serialized.take(),
+                self.slots.session.take(),
+                self.slots.backend.take(),
+            ));
+        }
+    }
+}
+
+struct SynchronousRunTracker {
+    clean: bool,
+    completed: u64,
+}
+impl SynchronousRunTracker {
+    fn new() -> Self {
+        Self {
+            clean: true,
+            completed: 0,
+        }
+    }
+    fn enter(&mut self) -> bool {
+        std::mem::replace(&mut self.clean, false)
+    }
+    fn returned(&mut self, was_clean: bool, success: bool) {
+        let next = if success {
+            self.completed.checked_add(1)
+        } else {
+            None
+        };
+        if let Some(count) = next {
+            self.completed = count;
+        }
+        self.clean = was_clean && next.is_some();
+    }
+}
+
 pub struct OnnxBackend {
     session: Option<SessionStorage>,
     // Kept outside the Run stack so worker quarantine also pins tensor storage
@@ -738,6 +1574,9 @@ pub struct OnnxBackend {
     // The loaded CUDA session can re-audit its actual nineteen-library maps
     // without accepting a caller-selected runtime or private mutable pathname.
     cuda_runtime: Option<OrtRuntime>,
+    synchronous_identity: Arc<()>,
+    synchronous_runs: SynchronousRunTracker,
+    startup_complete: bool,
 }
 
 impl Drop for OnnxBackend {
@@ -768,6 +1607,8 @@ impl OnnxBackend {
             config,
             &mut |_| {},
             None,
+            None,
+            None,
         )
     }
 
@@ -797,6 +1638,8 @@ impl OnnxBackend {
             VerifiedModel::OwnedOnnx(bytes),
             config,
             &mut observe,
+            None,
+            None,
             None,
         )?;
         Ok((metadata, backend))
@@ -829,6 +1672,8 @@ impl OnnxBackend {
             },
             config,
             &mut observe,
+            None,
+            None,
             None,
         )?;
         Ok((asset.source, backend))
@@ -866,10 +1711,15 @@ impl OnnxBackend {
             config,
             &mut |_| {},
             Some(output),
+            None,
+            None,
         )?;
         Ok((metadata, backend))
     }
 
+    // The optional hooks carry distinct startup ownership and observation
+    // roles; keeping them explicit preserves the existing call boundaries.
+    #[allow(clippy::too_many_arguments)]
     fn load_model(
         runtime: &OrtRuntime,
         asset: &AssetMetadata,
@@ -877,6 +1727,8 @@ impl OnnxBackend {
         config: BackendConfig,
         observe: &mut impl FnMut(StartupPhase),
         export: Option<&std::fs::File>,
+        custody: Option<&mut Lc0StartupSlots>,
+        before_session: Option<&mut dyn FnMut() -> Result<(), BackendError>>,
     ) -> Result<Self, BackendError> {
         let setup_started = Instant::now();
         config.validate()?;
@@ -892,10 +1744,13 @@ impl OnnxBackend {
                 "model storage and explicit ORT mode differ",
             ));
         }
-        match (config.provider, runtime.bundle_digest()) {
+        match (config.provider, runtime.cuda_runtime_identity()) {
             (Provider::Cuda { .. }, None) => {
-                return Err(BackendError::new(K::IdentityMismatch, S::Backend,
-                    "CUDA requires the complete pinned runtime bundle; single-library pin is CPU only"));
+                return Err(BackendError::new(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "CUDA requires an explicitly captured CUDA runtime; CPU-only pin is not sufficient",
+                ));
             }
             (Provider::Cpu, Some(_)) => {
                 return Err(BackendError::new(
@@ -917,6 +1772,9 @@ impl OnnxBackend {
             )
             .with_ort_cause(code, error)
         };
+        if let Some(before_session) = before_session {
+            before_session()?;
+        }
         let mut builder = Session::builder()
             .map_err(|error| setup_error(CauseCode::SessionBuilder, error))?
             .with_no_environment_execution_providers()
@@ -1079,7 +1937,13 @@ impl OnnxBackend {
             ),
         };
         let model_commit = commit_started.elapsed();
-        validate_interface(&session, asset.profile())?;
+        let mut local_slots = Lc0StartupSlots::default();
+        let slots = custody.unwrap_or(&mut local_slots);
+        slots.session = Some(session);
+        validate_interface(
+            slots.session.as_ref().expect("returned session"),
+            asset.profile(),
+        )?;
         // This is a versioned C backend identity, not a new global wire codec.
         let mut identity = declared_backend_identity(
             runtime.binary_digest(),
@@ -1087,6 +1951,16 @@ impl OnnxBackend {
             runtime.bundle_digest(),
             &config,
         );
+        if runtime.is_system_cuda() {
+            let mut identified = b"rz-maia-system-runtime-backend-v1\0".to_vec();
+            identified.extend_from_slice(&identity);
+            identified.extend_from_slice(
+                &runtime
+                    .cuda_runtime_identity()
+                    .expect("system CUDA identity"),
+            );
+            identity = asset::sha256(&identified);
+        }
         if let Some(digest) = derived_manifest {
             let mut identified = b"rz-derived-ort-backend-v1\0".to_vec();
             identified.extend_from_slice(&identity);
@@ -1095,8 +1969,8 @@ impl OnnxBackend {
         }
         let cuda_runtime =
             matches!(config.provider, Provider::Cuda { .. }).then(|| runtime.clone());
-        let mut result = Self {
-            session: Some(session),
+        slots.backend = Some(Self {
+            session: slots.session.take(),
             active_input: None,
             #[cfg(feature = "experimental-io-buffers")]
             spare_input: None,
@@ -1117,7 +1991,11 @@ impl OnnxBackend {
             cuda_evidence: None,
             quarantine_cause: None,
             cuda_runtime,
-        };
+            synchronous_identity: Arc::new(()),
+            synchronous_runs: SynchronousRunTracker::new(),
+            startup_complete: false,
+        });
+        let result = slots.backend.as_mut().expect("installed LC0 backend");
         if matches!(result.config.provider, Provider::Cuda { .. }) {
             let probe_started = Instant::now();
             runtime.verify_cuda_mappings(false)?;
@@ -1211,7 +2089,8 @@ impl OnnxBackend {
             result.startup_timings.cuda_probe_validation = Some(probe_started.elapsed());
         }
         observe(StartupPhase::ProviderReady);
-        Ok(result)
+        result.startup_complete = true;
+        Ok(slots.backend.take().expect("completed LC0 backend"))
     }
 
     /// Owned model storage, not total ORT or GPU memory.
@@ -1238,6 +2117,28 @@ impl OnnxBackend {
         self.cuda_evidence.as_ref()
     }
 
+    /// Identity of this exact session owner; it is not a completion fence.
+    pub fn synchronous_owner_identity(&self) -> Arc<()> {
+        Arc::clone(&self.synchronous_identity)
+    }
+
+    /// Same-owner normal session release only. Zero completed Runs is not GPU
+    /// execution evidence, and this proof is not a device-wide fence.
+    pub fn synchronous_shutdown_proof(&self) -> Option<crate::worker::SynchronousOwnerProof> {
+        if !self.startup_complete
+            || !self.synchronous_runs.clean
+            || self.session.is_none()
+            || self.active_input.is_some()
+            || self.quarantine_cause.is_some()
+        {
+            return None;
+        }
+        Some(crate::worker::SynchronousOwnerProof::new(
+            Arc::clone(&self.synchronous_identity),
+            self.synchronous_runs.completed,
+        ))
+    }
+
     /// Actual loaded runtime metadata, not a caller-issued provider claim.
     /// CPU identity and its single-library loading path remain unchanged.
     pub fn runtime_bundle_digest(&self) -> Option<[u8; 32]> {
@@ -1246,19 +2147,19 @@ impl OnnxBackend {
             .and_then(OrtRuntime::bundle_digest)
     }
 
+    /// System-runtime identity, separate from historical bundled identity.
+    /// This is not a provider-ready or physical-completion witness.
+    pub fn system_cuda_runtime_identity(&self) -> Option<[u8; 32]> {
+        self.cuda_runtime
+            .as_ref()
+            .filter(|runtime| runtime.is_system_cuda())
+            .and_then(OrtRuntime::cuda_runtime_identity)
+    }
+
     /// Re-audits the complete CUDA bundle owned by this loaded session. An
     /// uncertain Run remains quarantined and never becomes a successful audit.
     pub fn verify_cuda_runtime_mappings(&self) -> Result<(), BackendError> {
-        if let Some(cause) = &self.quarantine_cause {
-            return Err(cause.clone());
-        }
-        if self.active_input.is_some() {
-            return Err(BackendError::new(
-                K::BackendUnavailable,
-                S::Backend,
-                "CUDA physical completion is unconfirmed; mapped-image audit cannot release it",
-            ));
-        }
+        self.check_cuda_mapping_lifetime()?;
         self.cuda_runtime
             .as_ref()
             .ok_or_else(|| {
@@ -1269,6 +2170,38 @@ impl OnnxBackend {
                 )
             })?
             .verify_cuda_runtime_mappings()
+    }
+
+    /// Check known mapping conflicts for ordinary system-runtime operation.
+    /// Unknown origin evidence remains distinct from a strict audit witness.
+    pub fn observe_cuda_runtime_mappings(
+        &self,
+    ) -> Result<CudaRuntimeMappingEvidence, BackendError> {
+        self.check_cuda_mapping_lifetime()?;
+        self.cuda_runtime
+            .as_ref()
+            .ok_or_else(|| {
+                BackendError::new(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "loaded session has no CUDA runtime bundle",
+                )
+            })?
+            .observe_cuda_runtime_mappings()
+    }
+
+    fn check_cuda_mapping_lifetime(&self) -> Result<(), BackendError> {
+        if let Some(cause) = &self.quarantine_cause {
+            return Err(cause.clone());
+        }
+        if self.active_input.is_some() {
+            return Err(BackendError::new(
+                K::BackendUnavailable,
+                S::Backend,
+                "CUDA physical completion is unconfirmed; mapped-image audit cannot release it",
+            ));
+        }
+        Ok(())
     }
 
     pub fn has_unconfirmed_physical_completion(&self) -> bool {
@@ -1488,12 +2421,17 @@ impl OnnxBackend {
                 };
                 self.bound = Some(buffers);
             }
+            let was_clean = self.synchronous_runs.enter();
             let result = self.bound.as_mut().expect("fixed binding").run(
                 self.session.as_mut().expect("loaded session"),
                 self.active_input.as_ref().expect("input pin"),
                 &mut self.raw_pool,
                 self.config.experiments.reuse_buffers,
                 self.timings.as_mut(),
+            );
+            self.synchronous_runs.returned(
+                was_clean,
+                matches!(&result, Ok(_) | Err(io::BoundFailure::Output(_))),
             );
             match result {
                 Ok(outputs) => {
@@ -1532,6 +2470,7 @@ impl OnnxBackend {
         {
             timing.preparation = Some((start, end));
         }
+        let was_clean = self.synchronous_runs.enter();
         let run_result = self
             .session
             .as_mut()
@@ -1540,6 +2479,8 @@ impl OnnxBackend {
             })?
             .run(ort::inputs![INPUT_NAME => self.active_input.as_ref()
             .ok_or(BackendError::new(K::BackendFailure, S::Backend, "input pin is missing"))?]);
+        self.synchronous_runs
+            .returned(was_clean, run_result.is_ok());
         if let (Some(timing), Some(started)) = (&mut self.timings, run_started) {
             timing.run = started.elapsed();
         }
@@ -1606,6 +2547,13 @@ impl OnnxBackend {
             timing.output = Some((start, Instant::now()));
         }
         result
+    }
+}
+
+impl crate::worker::synchronous_owner_sealed::Sealed for OnnxBackend {}
+impl crate::worker::SynchronousPhysicalOwner for OnnxBackend {
+    fn synchronous_owner_identity(&self) -> Arc<()> {
+        OnnxBackend::synchronous_owner_identity(self)
     }
 }
 
@@ -1750,6 +2698,82 @@ pub fn verify_cuda_profile(bytes: &[u8]) -> Result<usize, BackendError> {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+    #[test]
+    fn ready_pair_transfer_is_atomic_and_preserves_owner_values() {
+        let mut state = Lc0StartupState::NativeEnteredUnknown;
+        let mut metadata = Some(Box::new(7_u8));
+        let mut backend = Some(Box::new(9_u8));
+        let original_metadata = &**metadata.as_ref().unwrap() as *const u8;
+        let original_backend = &**backend.as_ref().unwrap() as *const u8;
+        assert!(take_ready_pair(&mut state, &mut metadata, &mut backend).is_none());
+        assert!(metadata.is_some() && backend.is_some());
+        state = Lc0StartupState::Ready;
+        let (moved_metadata, moved_backend) =
+            take_ready_pair(&mut state, &mut metadata, &mut backend).unwrap();
+        assert_eq!(&*moved_metadata as *const u8, original_metadata);
+        assert_eq!(&*moved_backend as *const u8, original_backend);
+        assert_eq!(state, Lc0StartupState::Transferred);
+        assert!(metadata.is_none() && backend.is_none());
+        assert!(take_ready_pair(&mut state, &mut metadata, &mut backend).is_none());
+
+        let mut state = Lc0StartupState::Ready;
+        let mut metadata = Some(7_u8);
+        let mut backend: Option<u8> = None;
+        assert!(take_ready_pair(&mut state, &mut metadata, &mut backend).is_none());
+        assert_eq!(state, Lc0StartupState::Ready);
+        assert_eq!(metadata, Some(7));
+    }
+    #[test]
+    fn rejected_or_unwound_admission_does_not_claim_native_entry() {
+        let mut state = Lc0StartupState::BeforeSessionEntry;
+        let result = enter_lc0_session(&mut state, &mut || {
+            Err(BackendError::new(K::InvalidInput, S::Admission, "rejected"))
+        });
+        assert!(result.is_err());
+        assert_eq!(state, Lc0StartupState::BeforeSessionEntry);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = enter_lc0_session(&mut state, &mut || panic!("admission panic"));
+        }));
+        assert!(result.is_err());
+        assert_eq!(state, Lc0StartupState::BeforeSessionEntry);
+
+        enter_lc0_session(&mut state, &mut || Ok(())).expect("admitted");
+        assert_eq!(state, Lc0StartupState::NativeEnteredUnknown);
+    }
+
+    #[test]
+    fn synchronous_tracker_requires_success_and_never_clears_taint() {
+        let mut tracker = SynchronousRunTracker::new();
+        assert!(tracker.clean);
+        let entry = tracker.enter();
+        assert!(!tracker.clean);
+        tracker.returned(entry, true);
+        assert!(tracker.clean);
+        assert_eq!(tracker.completed, 1);
+        let entry = tracker.enter();
+        tracker.returned(entry, false);
+        assert!(!tracker.clean);
+        let entry = tracker.enter();
+        tracker.returned(entry, true);
+        assert!(!tracker.clean);
+        assert_eq!(tracker.completed, 2);
+    }
+
+    #[test]
+    fn synchronous_tracker_unwind_and_count_overflow_remain_dirty() {
+        let mut tracker = SynchronousRunTracker::new();
+        let _ = tracker.enter(); // an unwind skips returned()
+        assert!(!tracker.clean);
+        let mut tracker = SynchronousRunTracker {
+            clean: true,
+            completed: u64::MAX,
+        };
+        let entry = tracker.enter();
+        tracker.returned(entry, true);
+        assert!(!tracker.clean);
+        assert_eq!(tracker.completed, u64::MAX);
+    }
     #[test]
     fn native_storage_drops_before_borrowed_model_on_success_error_and_unwind() {
         use std::sync::atomic::{AtomicBool, Ordering};

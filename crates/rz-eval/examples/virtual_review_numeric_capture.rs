@@ -1,24 +1,36 @@
 //! Actual Fresh B1 ORT raw capture; numerical admission is a separate reader.
 //! This executable does not label tensor fixtures as Rules/legal-game evidence.
-//! Every CUDA graph requires the explicit V3 source/placement policy. Failures
-//! leave pending output files for recovery and never publish completed receipts.
+//! Every CUDA graph requires the explicit V3 source/placement policy. Required
+//! capture failures preserve pending recovery files. A separate post-join policy
+//! reporter failure preserves published raw data but remains a partial command.
 use rz_eval::asset;
 use rz_eval::error::BackendError;
 use rz_eval::onnx::{NativeLoadingProfile, OrtRuntime, Provider};
+#[cfg(target_os = "linux")]
+use rz_eval::onnx::{SystemCaptureLimits, SystemLibraryRequest, SystemRuntime};
 use rz_eval::pals_model::virtual_review::{
     self as model, PalsVirtualReviewInput, ReviewExecutionIdentity,
 };
 use rz_eval::pals_model::{PalsCandidateToken, PalsModelProfile, PalsRawOutput, PalsRole};
+#[cfg(target_os = "linux")]
+use rz_eval::pals_onnx::virtual_review::SystemPlacementObservation;
 use rz_eval::pals_onnx::virtual_review::{
     validate_virtual_review_export_manifest, PalsVirtualReviewOnnxBackend,
     VirtualReviewExecutionMode, VirtualReviewInvocation, VirtualReviewNativeCommand as Command,
     VirtualReviewNativeResult as Outcome,
 };
+#[cfg(target_os = "linux")]
+use rz_eval::pals_onnx::virtual_review::{
+    VirtualReviewArtifactKind, VirtualReviewExportManifestSummary, VirtualReviewHeldFileSources,
+    VirtualReviewHeldGraph, VirtualReviewProfileDirectory, VirtualReviewStartupCustody,
+};
 use rz_eval::pals_onnx::{
     PalsBackendStats, PalsCuDnnConvSearch, PalsCudaControlPolicy, PalsOnnxConfig,
 };
-use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeCache};
+use rz_eval::runtime_pin::RuntimeCache;
 use rz_eval::worker::{PhysicalPoll, SingleWorker};
+#[cfg(target_os = "linux")]
+use rz_eval::worker::{PhysicalRecoveryKey, PhysicalRecoveryReservation, SessionReleased};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -31,10 +43,25 @@ use std::{
     task::Poll,
     time::{Duration, Instant},
 };
+#[cfg(target_os = "linux")]
+#[path = "virtual_review_numeric_capture/owned_worker.rs"]
+mod owned_worker;
 #[path = "virtual_review_numeric_capture/tensors.rs"]
 mod tensors;
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
-type Worker = SingleWorker<Command, std::result::Result<Outcome, BackendError>>;
+type LegacyWorker = SingleWorker<Command, std::result::Result<Outcome, BackendError>>;
+
+enum Worker {
+    Legacy(LegacyWorker),
+    #[cfg(target_os = "linux")]
+    System(SystemCaptureWorker),
+}
+
+enum PreparedRuntime {
+    Legacy(OrtRuntime),
+    #[cfg(target_os = "linux")]
+    System(SystemRuntime),
+}
 const LIMIT: usize = 4 * 1024 * 1024;
 const POLICY_LIMIT: usize = 16 * 1024;
 // This bound is the registered logical raw numerical payload total. The exact
@@ -119,7 +146,7 @@ fn decode_unique<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     Ok(serde_json::from_value(unique.0)?)
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Bindings {
     model_profile: String,
@@ -133,12 +160,57 @@ struct Bindings {
     export_manifest_sha256: String,
     graphs: BTreeMap<String, String>,
     runtime_library_sha256: String,
+    #[serde(default)]
     cuda_libraries: BTreeSet<String>,
     cuda_manifest_sha256: Option<String>,
+    #[serde(default)]
+    system_cuda_config_sha256: Option<String>,
+    #[serde(default)]
+    system_cuda_libraries: Option<Vec<SystemLibraryBinding>>,
     backend: String,
     precision: String,
     tf32: bool,
     source_components: BTreeMap<String, String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SystemLibraryBinding {
+    role: String,
+    sha256: String,
+    bytes: u64,
+    required_mapping: bool,
+}
+impl Serialize for Bindings {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("model_profile", &self.model_profile)?;
+        map.serialize_entry("model_schema", &self.model_schema)?;
+        map.serialize_entry("model_semantics", &self.model_semantics)?;
+        map.serialize_entry("encoding_schema", &self.encoding_schema)?;
+        map.serialize_entry("model_semantic_sha256", &self.model_semantic_sha256)?;
+        map.serialize_entry("encoding_sha256", &self.encoding_sha256)?;
+        map.serialize_entry("model_epoch", &self.model_epoch)?;
+        map.serialize_entry("weights_sha256", &self.weights_sha256)?;
+        map.serialize_entry("export_manifest_sha256", &self.export_manifest_sha256)?;
+        map.serialize_entry("graphs", &self.graphs)?;
+        map.serialize_entry("runtime_library_sha256", &self.runtime_library_sha256)?;
+        if self.backend == "ort_cuda_system" {
+            map.serialize_entry("system_cuda_config_sha256", &self.system_cuda_config_sha256)?;
+            map.serialize_entry("system_cuda_libraries", &self.system_cuda_libraries)?;
+        } else {
+            map.serialize_entry("cuda_libraries", &self.cuda_libraries)?;
+            map.serialize_entry("cuda_manifest_sha256", &self.cuda_manifest_sha256)?;
+        }
+        map.serialize_entry("backend", &self.backend)?;
+        map.serialize_entry("precision", &self.precision)?;
+        map.serialize_entry("tf32", &self.tf32)?;
+        map.serialize_entry("source_components", &self.source_components)?;
+        map.end()
+    }
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(
@@ -286,6 +358,67 @@ fn capture_output_root(
     }
 }
 
+/// Prepare the exact manifest, graph and optional profile directory owners
+/// before entering ORT. Native loading will re-check bytes from these FDs.
+#[cfg(target_os = "linux")]
+fn system_startup_custody(
+    manifest_path: &Path,
+    summary: &VirtualReviewExportManifestSummary,
+    output: &CaptureOutputRoot,
+    with_control: bool,
+) -> Result<VirtualReviewStartupCustody> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Component;
+
+    const O_NOFOLLOW: i32 = 0x20000;
+    const O_NONBLOCK: i32 = 0x800;
+    const O_DIRECTORY: i32 = 0x10000;
+
+    let open_file = |path: &Path| -> Result<fs::File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+            .open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err("system capture source is not a regular file".into());
+        }
+        Ok(file)
+    };
+    let manifest = open_file(manifest_path)?;
+    let parent = manifest_path.parent().ok_or("manifest parent absent")?;
+    let mut graphs = Vec::new();
+    graphs.try_reserve_exact(summary.graphs.len())?;
+    for graph in &summary.graphs {
+        let mut components = Path::new(&graph.file).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            return Err("registered graph path is not a single filename".into());
+        }
+        graphs.push(VirtualReviewHeldGraph {
+            role: graph.role.clone(),
+            registered_file: graph.file.clone(),
+            sha256: graph.sha256,
+            file: open_file(&parent.join(&graph.file))?,
+        });
+    }
+    let profile = if with_control {
+        output.verify()?;
+        let path = output.path.join("profiles");
+        fs::create_dir(&path)?;
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_DIRECTORY)
+            .open(&path)?;
+        output.verify()?;
+        Some(VirtualReviewProfileDirectory::from_owned_directory(dir)?)
+    } else {
+        None
+    };
+    let sources = VirtualReviewHeldFileSources::new(manifest, graphs);
+    Ok(VirtualReviewStartupCustody::new_for_system_cuda_capture(
+        sources, profile,
+    ))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -305,6 +438,17 @@ struct Config {
     cuda_bundle: Option<PathBuf>,
     cuda_inventory: Option<PathBuf>,
     cuda_inventory_sha256: Option<String>,
+    #[serde(default)]
+    system_cuda_config: Option<PathBuf>,
+    #[serde(default)]
+    system_cuda_config_sha256: Option<String>,
+    /// Separate, explicitly pinned V3 static graph inventory. Its presence
+    /// admits only the exact metadata/control CPU nodes checked at session
+    /// initialization; it is not a runtime or physical completion witness.
+    #[serde(default)]
+    system_cuda_inventory: Option<PathBuf>,
+    #[serde(default)]
+    system_cuda_inventory_sha256: Option<String>,
     gpu_device_id: i32,
     gpu_arena_bytes: usize,
     deadline_seconds: u64,
@@ -319,13 +463,14 @@ impl Config {
         selected.cache_public_memory = false;
         let profile = match self.provider.as_str() {
             "cpu" => None,
+            "cuda-system" => None,
             "cuda-control" => Some(NativeLoadingProfile::EagerCuda12Cudnn9V1),
             "cuda-control-shim" => Some(NativeLoadingProfile::CuDnnShimLazyV1),
             _ => {
                 return Err("explicit cpu/cuda-control/cuda-control-shim provider required".into());
             }
         };
-        if profile.is_some() {
+        if profile.is_some() || self.provider == "cuda-system" {
             selected.provider = Provider::Cuda {
                 device_id: self.gpu_device_id,
                 arena_bytes: self.gpu_arena_bytes,
@@ -349,9 +494,83 @@ impl Config {
                 .as_deref()
                 .ok_or("experimental DEFAULT requires explicit V3 inventory SHA")?)?;
         }
-        selected.validate_execution_selection(profile, profile.is_some())?;
+        if self.provider == "cuda-system" {
+            if self.cuda_bundle.is_some()
+                || self.cuda_inventory.is_some()
+                || self.cuda_inventory_sha256.is_some()
+                || self.system_cuda_config.is_none()
+                || self.system_cuda_config_sha256.is_none()
+            {
+                return Err(
+                    "system CUDA requires its own config and no legacy bundle/control".into(),
+                );
+            }
+            match (
+                &self.system_cuda_inventory,
+                &self.system_cuda_inventory_sha256,
+            ) {
+                (None, None) => {}
+                (Some(path), Some(digest)) if path.is_absolute() => {
+                    pin(digest)?;
+                }
+                _ => {
+                    return Err("system CUDA control requires an absolute inventory and SHA".into());
+                }
+            }
+            selected.validate_system_execution_selection()?;
+        } else {
+            if self.system_cuda_config.is_some()
+                || self.system_cuda_config_sha256.is_some()
+                || self.system_cuda_inventory.is_some()
+                || self.system_cuda_inventory_sha256.is_some()
+            {
+                return Err("system config is only supported by cuda-system".into());
+            }
+            selected.validate_execution_selection(profile, profile.is_some())?;
+        }
         Ok(selected)
     }
+}
+
+/// Mapping unavailability is a typed observation, not an inferred kernel
+/// result. A verified witness remains scoped to this owner and profile window.
+#[cfg(target_os = "linux")]
+fn system_placement_observation_json(
+    observation: &SystemPlacementObservation,
+) -> serde_json::Value {
+    match observation {
+        SystemPlacementObservation::Verified(witness) => serde_json::json!({
+            "status":"verified", "witness":witness,
+            "physical_completion":"requires_same_native_owner_completion"
+        }),
+        SystemPlacementObservation::MappingUnavailable => serde_json::json!({
+            "status":"mapping_unavailable", "gpu_kernel_placement":"unknown",
+            "physical_completion":"unknown"
+        }),
+        SystemPlacementObservation::UnregisteredOrPreexistingMappings => serde_json::json!({
+            "status":"unregistered_or_preexisting_mappings", "gpu_kernel_placement":"unknown",
+            "physical_completion":"unknown"
+        }),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SystemCudaConfig {
+    max_libraries: usize,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+    max_capture_ms: u64,
+    libraries: Vec<SystemCudaLibrary>,
+}
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SystemCudaLibrary {
+    role: String,
+    path: PathBuf,
+    required_mapping: bool,
 }
 
 #[derive(Serialize)]
@@ -395,6 +614,16 @@ struct JoinedPolicyObservation {
     performance_improvement_claim: bool,
     process_exit_evidence: &'static str,
     cuda_profiling_window: Option<CudaProfilingWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_system_session_release: Option<SystemSessionReleaseObservation>,
+}
+
+#[derive(Serialize)]
+struct SystemSessionReleaseObservation {
+    completed_synchronous_runs: u64,
+    scope: &'static str,
+    process_exit: &'static str,
+    device_wide_gpu_fence: &'static str,
 }
 
 #[derive(Serialize)]
@@ -421,7 +650,11 @@ fn loaded_policy_observation(
     explicit_control: bool,
 ) -> Result<LoadedPolicyObservation> {
     let config = backend.config();
-    config.validate_execution_selection(backend.native_loading_profile(), explicit_control)?;
+    if backend.system_cuda_runtime_selected() {
+        config.validate_system_execution_selection()?;
+    } else {
+        config.validate_execution_selection(backend.native_loading_profile(), explicit_control)?;
+    }
     if config.device_public_memory {
         return Err("raw capture requires the original host-public execution path".into());
     }
@@ -833,6 +1066,60 @@ fn write_exclusive_bounded(path: &Path, value: &impl Serialize, limit: usize) ->
     file.sync_all()?;
     Ok(bytes.len() as u64)
 }
+
+fn publish_system_placement_witness(
+    root: &Path,
+    name: &str,
+    observation: &serde_json::Value,
+) -> Result<Option<String>> {
+    if observation.get("status").and_then(|value| value.as_str()) != Some("verified") {
+        return Ok(None);
+    }
+    let witness = observation
+        .get("witness")
+        .ok_or("verified system V3 placement lacks its witness")?;
+    let bytes = serde_json::to_vec(witness)?;
+    // The placement witness can include exact approved transfer evidence and
+    // is not the small execution-policy sidecar. Use the same existing bound
+    // as other full placement evidence instead of the smaller sidecar limit.
+    write_exclusive_bounded(&root.join(name), witness, LIMIT)?;
+    Ok(Some(hex(asset::sha256(&bytes))))
+}
+
+/// Save the actual first P/C observation immediately as explicitly partial
+/// evidence. Later case failure or worker cleanup failure must not erase it.
+/// This file neither certifies the capture as complete nor proves GPU/process
+/// completion; the joined final observation uses a separate schema and path.
+fn publish_initial_system_placement_partial(
+    root: &Path,
+    plan_sha256: &str,
+    inventory_sha256: &str,
+    manifest_sha256: &str,
+    observation: &serde_json::Value,
+) -> Result<u64> {
+    let witness_sha = observation
+        .get("witness")
+        .map(serde_json::to_vec)
+        .transpose()?
+        .map(|bytes| hex(asset::sha256(&bytes)));
+    write_exclusive_bounded(
+        &root.join("initial-system-cuda-placement.partial.json"),
+        &serde_json::json!({
+            "schema":"rovezero.virtual-system-cuda-placement-partial.v1",
+            "status":"partial_observation",
+            "stage":"first_registered_role_coverage",
+            "plan_sha256":plan_sha256,
+            "inventory_sha256":inventory_sha256,
+            "manifest_sha256":manifest_sha256,
+            "observation":observation,
+            "embedded_witness_sha256":witness_sha,
+            "capture_completion":"not_established",
+            "physical_completion":"not_attested",
+            "process_exit":"not_observed"
+        }),
+        LIMIT,
+    )
+}
 fn write_pending(path: &Path, value: &impl Serialize, remaining: u64) -> Result<u64> {
     let bytes = serde_json::to_vec(value)?;
     if bytes.is_empty() || bytes.len() > LIMIT || bytes.len() as u64 > remaining {
@@ -867,7 +1154,802 @@ fn publish_pending(pending: &Path, final_path: &Path) -> Result<()> {
     fs::remove_file(pending)?;
     Ok(())
 }
+
+enum PostJoinCapturePublication {
+    Complete,
+    DiagnosticFailure(Box<dyn Error>),
+}
+
+/// Called only after the original runtime/placement checks and worker join.
+/// A separate policy reporter cannot prevent publishing the unchanged numerical
+/// payload. Its failure still makes this command partial, not fully successful.
+fn publish_joined_capture(
+    publish_raw: impl FnOnce() -> Result<()>,
+    publish_policy: impl FnOnce() -> Result<u64>,
+) -> Result<PostJoinCapturePublication> {
+    publish_raw()?;
+    Ok(match publish_policy() {
+        Ok(_) => PostJoinCapturePublication::Complete,
+        Err(error) => PostJoinCapturePublication::DiagnosticFailure(error),
+    })
+}
+
+#[cfg(target_os = "linux")]
+struct SystemCaptureWorker {
+    worker: Option<owned_worker::Worker>,
+    reservation: Option<PhysicalRecoveryReservation>,
+    recovery_key: Option<PhysicalRecoveryKey>,
+    pending: Option<owned_worker::Lease>,
+    late_completion: Option<std::result::Result<owned_worker::CaptureReply, BackendError>>,
+    release: Option<SessionReleased>,
+    no_native_entry: bool,
+    supervisor: std::os::unix::net::UnixDatagram,
+    quarantined: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn report_late_completion(result: &std::result::Result<owned_worker::CaptureReply, BackendError>) {
+    let observation = match result {
+        Ok(owned_worker::CaptureReply::Started(_)) => serde_json::json!({
+            "status":"late_success", "reply":"startup", "on_time_success":false
+        }),
+        Ok(owned_worker::CaptureReply::Native(_)) => serde_json::json!({
+            "status":"late_success", "reply":"native", "on_time_success":false
+        }),
+        Err(error) => serde_json::json!({
+            "status":"late_failure", "backend_error":format!("{error:?}"), "on_time_success":false
+        }),
+    };
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "RZ_CUSTODY_LATE_COMPLETION={observation}"
+    );
+}
+
+/// Duplicate only the explicitly inherited supervisor descriptor. Ownership of
+/// the original worker, its lease and its recovery key remains in this process.
+#[cfg(target_os = "linux")]
+fn system_supervisor_socket() -> Result<std::os::unix::net::UnixDatagram> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    extern "C" {
+        fn dup(fd: i32) -> i32;
+        fn getsockopt(
+            fd: i32,
+            level: i32,
+            option: i32,
+            value: *mut std::ffi::c_void,
+            length: *mut u32,
+        ) -> i32;
+    }
+    let raw = std::env::var("ROVEZERO_CUSTODY_FD")?.parse::<i32>()?;
+    if raw < 3 {
+        return Err("invalid inherited custody descriptor".into());
+    }
+    // SAFETY: dup validates the numeric descriptor and returns a new owned
+    // descriptor or -1. No Rust reference is created for an invalid input.
+    let duplicate = unsafe { dup(raw) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: a successful dup returns a new open descriptor owned here.
+    let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
+    let socket = std::os::unix::net::UnixDatagram::from(duplicate);
+    socket.local_addr()?;
+    socket.peer_addr()?;
+    let mut kind: i32 = 0;
+    let mut size = std::mem::size_of::<i32>() as u32;
+    // SAFETY: pointers refer to correctly sized writable values and the
+    // descriptor is an owned live socket. Linux SOL_SOCKET=1, SO_TYPE=3.
+    if unsafe {
+        getsockopt(
+            socket.as_raw_fd(),
+            1,
+            3,
+            (&mut kind as *mut i32).cast(),
+            &mut size,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if size != std::mem::size_of::<i32>() as u32 || kind != 5 {
+        return Err("custody transport must be a SOCK_SEQPACKET socket".into());
+    }
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
+#[cfg(target_os = "linux")]
+struct PreNativeSupervisor {
+    socket: std::os::unix::net::UnixDatagram,
+    // False as soon as reservation/worker custody may exist; it can only be
+    // restored after the exact unpublished reservation is explicitly retired.
+    no_native_and_no_reservation: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl PreNativeSupervisor {
+    fn notify(&self, packet: &[u8]) {
+        if let Err(error) = self.socket.send(packet) {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "RZ_CUSTODY_TRANSPORT_ERROR={error}"
+            );
+        }
+    }
+
+    fn admit_native(&self, until: Instant) -> Result<()> {
+        self.socket.send(b"NATIVE_READY")?;
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .map(|value| value.min(until))
+            .unwrap_or(until);
+        let mut packet = [0u8; 64];
+        loop {
+            if Instant::now() >= deadline {
+                return Err("supervisor native-entry grant deadline expired".into());
+            }
+            match self.socket.recv(&mut packet) {
+                Ok(length) if &packet[..length] == b"ALLOW_NATIVE" => return Ok(()),
+                Ok(_) => return Err("invalid supervisor native-entry grant".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+/// Check the parent's actual absolute deadline immediately before worker
+/// creation. Rust's Instant on Linux and CLOCK_MONOTONIC share the monotonic
+/// clock; computing remaining duration before reading the clock is deliberately
+/// conservative by the time spent reading it.
+#[cfg(target_os = "linux")]
+fn effective_cleanup_limit(
+    anchor: Instant,
+    now_ns: u128,
+    child_cap_ns: u128,
+    supervisor_ns: u128,
+    work_until: Instant,
+    original_limit: Instant,
+) -> Result<Instant> {
+    let effective_cap_ns = child_cap_ns.min(supervisor_ns);
+    let remaining_ns = effective_cap_ns
+        .checked_sub(now_ns)
+        .filter(|value| *value != 0)
+        .ok_or("child cleanup deadline elapsed before native admission")?;
+    let original_remaining_ns = original_limit
+        .checked_duration_since(anchor)
+        .ok_or("registered system cleanup deadline already elapsed")?
+        .as_nanos();
+    // A very distant child cap is harmless: clamp in nanoseconds before
+    // conversion so it cannot overflow an otherwise valid original window.
+    let remaining_ns = remaining_ns.min(original_remaining_ns);
+    let seconds = u64::try_from(remaining_ns / 1_000_000_000)
+        .map_err(|_| "child cleanup deadline duration overflows")?;
+    let nanos = (remaining_ns % 1_000_000_000) as u32;
+    let translated = anchor
+        .checked_add(Duration::new(seconds, nanos))
+        .ok_or("child cleanup deadline overflows Instant")?;
+    let effective = translated.min(original_limit);
+    if effective < work_until {
+        return Err("child cleanup deadline cannot contain the registered work window".into());
+    }
+    Ok(effective)
+}
+
+#[cfg(target_os = "linux")]
+fn check_supervisor_deadline(
+    work_until: Instant,
+    cleanup: Duration,
+    original_limit: Instant,
+) -> Result<Instant> {
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: std::os::raw::c_long,
+        tv_nsec: std::os::raw::c_long,
+    }
+    extern "C" {
+        fn clock_gettime(clock_id: std::os::raw::c_int, out: *mut Timespec) -> std::os::raw::c_int;
+    }
+    let supervisor_ns =
+        std::env::var("ROVEZERO_SUPERVISOR_DEADLINE_MONOTONIC_NS")?.parse::<u128>()?;
+    let child_cap_ns =
+        std::env::var("ROVEZERO_CHILD_CLEANUP_DEADLINE_MONOTONIC_NS")?.parse::<u128>()?;
+    let anchor = Instant::now();
+    let remaining = work_until
+        .checked_duration_since(anchor)
+        .ok_or("work deadline expired before supervisor admission")?;
+    let mut now = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: now points to a valid writable Linux timespec; clock id 1 is
+    // CLOCK_MONOTONIC. No resources or native model runtimes are entered.
+    if unsafe { clock_gettime(1, &mut now) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if now.tv_sec < 0 || !(0..1_000_000_000).contains(&now.tv_nsec) {
+        return Err("invalid monotonic clock reading".into());
+    }
+    let now_ns = (now.tv_sec as u128)
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(now.tv_nsec as u128))
+        .ok_or("supervisor monotonic reading overflows")?;
+    let required_ns = now_ns
+        .checked_add(remaining.as_nanos())
+        .and_then(|value| value.checked_add(cleanup.as_nanos()))
+        .ok_or("supervisor deadline conversion overflow")?;
+    if required_ns > supervisor_ns {
+        return Err(
+            "supervisor deadline cannot contain the original work and cleanup windows".into(),
+        );
+    }
+    let effective = effective_cleanup_limit(
+        anchor,
+        now_ns,
+        child_cap_ns,
+        supervisor_ns,
+        work_until,
+        original_limit,
+    )?;
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "RZ_NUMERIC_CLEANUP_WINDOW={}",
+        serde_json::json!({
+            "scope":"same_child_monotonic_deadlines_before_native",
+            "supervisor_deadline_monotonic_ns":supervisor_ns.to_string(),
+            "child_cleanup_deadline_monotonic_ns":child_cap_ns.to_string(),
+            "sample_monotonic_ns":now_ns.to_string(),
+            "registered_work_remaining_at_anchor_ns":remaining.as_nanos().to_string(),
+            "registered_cleanup_window_ns":cleanup.as_nanos().to_string(),
+            "effective_cleanup_remaining_at_anchor_ns":effective.duration_since(anchor).as_nanos().to_string(),
+            "child_or_supervisor_cap_shortened_cleanup":effective < original_limit,
+            "physical_completion":"not_inferred"
+        })
+    );
+    Ok(effective)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct SystemPhysicalUnknown {
+    detail: &'static str,
+    cause: Option<BackendError>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for SystemPhysicalUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.detail)?;
+        if let Some(cause) = &self.cause {
+            write!(formatter, ": {cause}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Error for SystemPhysicalUnknown {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.cause
+            .as_ref()
+            .map(|cause| cause as &(dyn Error + 'static))
+    }
+}
+
+// WIP: retained until an outer supervisor can take ownership of this error.
+// Returning it through the CLI main alone is not a physical recovery protocol.
+#[cfg(target_os = "linux")]
+struct UnpublishedReservationFailure {
+    primary: BackendError,
+    _reservation: PhysicalRecoveryReservation,
+    _recovery_key: PhysicalRecoveryKey,
+    detail: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for UnpublishedReservationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UnpublishedReservationFailure")
+            .field("primary", &self.primary)
+            .field("detail", &self.detail)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for UnpublishedReservationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.detail, self.primary)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Error for UnpublishedReservationFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct CaptureAndCleanupFailure {
+    primary_stage: &'static str,
+    primary: Box<dyn Error>,
+    cleanup: Box<dyn Error>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for CaptureAndCleanupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "system {} failed: {}; cleanup: {}",
+            self.primary_stage, self.primary, self.cleanup
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Error for CaptureAndCleanupFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct CapturePanicFailure {
+    stage: &'static str,
+    _original_payload: Box<dyn std::any::Any + Send>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for CapturePanicFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapturePanicFailure")
+            .field("stage", &self.stage)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for CapturePanicFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "system capture {} panicked; original panic payload retained",
+            self.stage
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Error for CapturePanicFailure {}
+
+#[cfg(target_os = "linux")]
+impl SystemCaptureWorker {
+    fn finish_preserving_owner(&mut self, work_until: Instant, cleanup_until: Instant) -> Result<()> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.finish_supervised(work_until, cleanup_until)
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                // Do not unwind through the original worker/lease after a
+                // cleanup panic. Its partially advanced state cannot safely be
+                // retried or reconstructed; retain both it and the payload.
+                let _original_panic_payload = payload;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "RZ_CUSTODY_QUARANTINE=cleanup_panic_original_owner_retained"
+                );
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+        }
+    }
+
+    fn send_supervisor(&self, packet: &[u8]) {
+        if let Err(error) = self.supervisor.send(packet) {
+            // A transport failure is evidence, never a substitute for the
+            // original native/cleanup error or for a physical completion.
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "RZ_CUSTODY_TRANSPORT_ERROR={error}"
+            );
+        }
+    }
+
+    fn report_recovery_control_failure(count: u32, first: &Option<String>) {
+        if count != 0 {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "RZ_CUSTODY_RECOVERY_CONTROL_FAILURE={}",
+                serde_json::json!({"count":count,"first":first})
+            );
+        }
+    }
+
+    fn wait(
+        &mut self,
+        mut lease: owned_worker::Lease,
+        until: Instant,
+    ) -> Result<owned_worker::CaptureReply> {
+        loop {
+            match lease.poll() {
+                PhysicalPoll::Ready(result) => return Ok(result?),
+                PhysicalPoll::Quarantined => {
+                    self.quarantined = true;
+                    let cause = match lease.quarantine_cause() {
+                        Ok(cause) => cause,
+                        Err(cause) => Some(cause),
+                    };
+                    self.pending = Some(lease);
+                    return Err(Box::new(SystemPhysicalUnknown {
+                        detail:
+                            "system capture physical completion unknown; original lease retained",
+                        cause,
+                    }));
+                }
+                PhysicalPoll::Consumed => {
+                    self.pending = Some(lease);
+                    return Err(Box::new(SystemPhysicalUnknown {
+                        detail: "system capture completion consumed twice; original lease retained",
+                        cause: None,
+                    }));
+                }
+                PhysicalPoll::Pending if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                PhysicalPoll::Pending => {
+                    self.pending = Some(lease);
+                    return Err(Box::new(SystemPhysicalUnknown {
+                        detail: "system capture deadline reached; original physical lease retained",
+                        cause: None,
+                    }));
+                }
+            }
+        }
+    }
+
+    fn start(&mut self, until: Instant) -> Result<owned_worker::Started> {
+        if Instant::now() >= until {
+            return Err("capture window expired before native startup dispatch".into());
+        }
+        let lease =
+            owned_worker::submit_start(self.worker.as_mut().ok_or("system worker absent")?)?;
+        match self.wait(lease, until)? {
+            owned_worker::CaptureReply::Started(started) => Ok(started),
+            owned_worker::CaptureReply::Native(_) => {
+                Err("system startup returned a native command result".into())
+            }
+        }
+    }
+
+    fn command(&mut self, request: Command, until: Instant) -> Result<Outcome> {
+        if self.pending.is_some() {
+            return Err("system capture has an unresolved original physical lease".into());
+        }
+        if Instant::now() >= until {
+            return Err("capture window expired before native dispatch".into());
+        }
+        let lease = owned_worker::submit_native(
+            self.worker.as_mut().ok_or("system worker absent")?,
+            request,
+        )?;
+        match self.wait(lease, until)? {
+            owned_worker::CaptureReply::Native(outcome) => Ok(outcome),
+            owned_worker::CaptureReply::Started(_) => {
+                Err("native command returned a startup result".into())
+            }
+        }
+    }
+
+    fn finish(&mut self, until: Instant) -> Result<()> {
+        loop {
+            if let Some(lease) = self.pending.as_mut() {
+                match lease.poll() {
+                    PhysicalPoll::Ready(result) => {
+                        // Preserve a late result separately; it does not turn
+                        // the earlier deadline or request error into success.
+                        report_late_completion(&result);
+                        self.late_completion = Some(result);
+                        self.pending.take();
+                    }
+                    PhysicalPoll::Quarantined => {
+                        self.quarantined = true;
+                        let cause = match lease.quarantine_cause() {
+                            Ok(cause) => cause,
+                            Err(cause) => Some(cause),
+                        };
+                        return Err(Box::new(SystemPhysicalUnknown {
+                            detail:
+                                "system capture is quarantined; original lease and owner retained",
+                            cause,
+                        }));
+                    }
+                    PhysicalPoll::Consumed => {
+                        return Err(Box::new(SystemPhysicalUnknown {
+                            detail: "system capture late completion was already consumed",
+                            cause: None,
+                        }));
+                    }
+                    PhysicalPoll::Pending => {}
+                }
+            }
+            let worker = self.worker.as_mut().ok_or("system worker absent")?;
+            match worker.try_shutdown() {
+                Poll::Ready(Ok(())) => {
+                    // Completion can race the poll above and become ready as
+                    // the original worker joins. Inspect the same lease again.
+                    if let Some(lease) = self.pending.as_mut() {
+                        match lease.poll() {
+                            PhysicalPoll::Ready(result) => {
+                                report_late_completion(&result);
+                                self.late_completion = Some(result);
+                                self.pending.take();
+                            }
+                            _ => {
+                                return Err(
+                                    "system worker joined while original lease remained unresolved"
+                                        .into(),
+                                )
+                            }
+                        }
+                    }
+                    if let Some(proof) = worker.session_release() {
+                        self.release = Some(proof);
+                    } else if worker.no_native_entry_release() {
+                        self.no_native_entry = true;
+                    } else {
+                        return Err(
+                            "system worker joined without original owner release proof".into()
+                        );
+                    }
+                    return Ok(());
+                }
+                Poll::Ready(Err(error)) => return Err(Box::new(error)),
+                Poll::Pending if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Poll::Pending => {
+                    return Err("system worker did not join within cleanup deadline; original owner retained".into());
+                }
+            }
+        }
+    }
+
+    /// Keep the original worker, lease and key owned by this process while the
+    /// parent requests bounded re-observations. No socket packet is a fence.
+    fn finish_supervised(&mut self, work_until: Instant, cleanup_until: Instant) -> Result<()> {
+        self.send_supervisor(b"PENDING");
+        let first_error = match self.finish(Instant::now()) {
+            Ok(()) => {
+                self.send_release_proof();
+                return Ok(());
+            }
+            Err(error) => error,
+        };
+        let mut unknown_sent = false;
+        let mut requests = 0u32;
+        let mut pending_observe = None;
+        let mut pending_release = None;
+        let mut released = false;
+        let mut quarantine_error = None;
+        let mut transport_readable = true;
+        let mut recovery_failures = 0u32;
+        let mut first_recovery_failure = None;
+        let mut retire_failed = false;
+        let mut quarantine_notified = false;
+        loop {
+            if !quarantine_notified && Instant::now() >= cleanup_until {
+                if !unknown_sent {
+                    self.send_supervisor(b"UNKNOWN");
+                    unknown_sent = true;
+                }
+                Self::report_recovery_control_failure(
+                    recovery_failures,
+                    &first_recovery_failure,
+                );
+                self.send_supervisor(b"UNRESOLVED");
+                quarantine_notified = true;
+            }
+            match self.finish(Instant::now()) {
+                Ok(()) => {
+                    Self::report_recovery_control_failure(
+                        recovery_failures,
+                        &first_recovery_failure,
+                    );
+                    self.send_release_proof();
+                    return if quarantine_notified { Err(first_error) } else { Ok(()) };
+                }
+                Err(error) if self.quarantined && quarantine_error.is_none() => {
+                    quarantine_error = Some(error);
+                }
+                Err(_) => {}
+            }
+            let quarantined = self.quarantined;
+            if !unknown_sent && (quarantined || Instant::now() >= work_until) {
+                self.send_supervisor(b"UNKNOWN");
+                unknown_sent = true;
+            }
+            let mut packet = [0u8; 64];
+            let incoming = if transport_readable {
+                Some(self.supervisor.recv(&mut packet))
+            } else {
+                None
+            };
+            match incoming {
+                Some(Ok(length)) if &packet[..length] == b"REOBSERVE" && requests < 32 => {
+                    requests += 1;
+                    if self.finish(Instant::now()).is_ok() {
+                        Self::report_recovery_control_failure(
+                            recovery_failures,
+                            &first_recovery_failure,
+                        );
+                        self.send_release_proof();
+                        return if quarantine_notified { Err(first_error) } else { Ok(()) };
+                    }
+                    if quarantined
+                        && !quarantine_notified
+                        && pending_observe.is_none()
+                        && pending_release.is_none()
+                        && !released
+                    {
+                        if let Some(key) = self.recovery_key.as_ref() {
+                            match key.begin_reobserve(cleanup_until) {
+                                Ok(pending) => pending_observe = Some(pending),
+                                Err(error) => {
+                                    recovery_failures = recovery_failures.saturating_add(1);
+                                    first_recovery_failure
+                                        .get_or_insert_with(|| format!("begin_reobserve: {error}"));
+                                }
+                            }
+                        } else {
+                            recovery_failures = recovery_failures.saturating_add(1);
+                            first_recovery_failure.get_or_insert_with(|| {
+                                "original recovery key unavailable".to_owned()
+                            });
+                        }
+                    }
+                    // A request already queued before the quarantine notice
+                    // must not move the supervisor back out of that state.
+                    if !quarantine_notified {
+                        self.send_supervisor(b"PENDING");
+                    }
+                }
+                Some(Ok(_)) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "RZ_CUSTODY_TRANSPORT_ERROR=invalid_packet_or_request_limit"
+                    );
+                    transport_readable = false;
+                }
+                Some(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Some(Err(error)) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "RZ_CUSTODY_TRANSPORT_ERROR={error}"
+                    );
+                    transport_readable = false;
+                }
+                None => {}
+            }
+            if let Some(observation) = pending_observe.as_mut() {
+                match observation.poll() {
+                    Poll::Ready(rz_eval::worker::PhysicalRecoveryObservation::Confirmed) => {
+                        pending_observe = None;
+                        if let Some(key) = self.recovery_key.as_ref() {
+                            if let Some(proof) = key.latest_confirmation() {
+                                match key.begin_release(&proof, cleanup_until) {
+                                    Ok(pending) => pending_release = Some(pending),
+                                    Err(error) => {
+                                        recovery_failures = recovery_failures.saturating_add(1);
+                                        first_recovery_failure.get_or_insert_with(|| {
+                                            format!("begin_release: {error}")
+                                        });
+                                    }
+                                }
+                            } else {
+                                recovery_failures = recovery_failures.saturating_add(1);
+                                first_recovery_failure.get_or_insert_with(|| {
+                                    "confirmed observation lacks original key proof".to_owned()
+                                });
+                            }
+                        } else {
+                            recovery_failures = recovery_failures.saturating_add(1);
+                            first_recovery_failure.get_or_insert_with(|| {
+                                "original recovery key unavailable".to_owned()
+                            });
+                        }
+                    }
+                    Poll::Ready(rz_eval::worker::PhysicalRecoveryObservation::Unknown) => {
+                        pending_observe = None
+                    }
+                    Poll::Pending => {}
+                }
+            }
+            if let Some(release) = pending_release.as_mut() {
+                match release.poll() {
+                    Poll::Ready(rz_eval::worker::PhysicalRecoveryObservation::Confirmed) => {
+                        pending_release = None;
+                        released = true;
+                    }
+                    Poll::Ready(rz_eval::worker::PhysicalRecoveryObservation::Unknown) => {
+                        pending_release = None
+                    }
+                    Poll::Pending => {}
+                }
+            }
+            let owner_retired = if released && !retire_failed {
+                match self.recovery_key.as_ref().map(|key| key.finish_confirmed()) {
+                    Some(Poll::Ready(Ok(()))) => true,
+                    Some(Poll::Ready(Err(error))) => {
+                        recovery_failures = recovery_failures.saturating_add(1);
+                        first_recovery_failure
+                            .get_or_insert_with(|| format!("finish_confirmed: {error}"));
+                        retire_failed = true;
+                        false
+                    }
+                    Some(Poll::Pending) => false,
+                    None => {
+                        recovery_failures = recovery_failures.saturating_add(1);
+                        first_recovery_failure
+                            .get_or_insert_with(|| "original recovery key unavailable".to_owned());
+                        retire_failed = true;
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if owner_retired {
+                Self::report_recovery_control_failure(recovery_failures, &first_recovery_failure);
+                self.send_supervisor(b"OWNER_RECOVERED");
+                // The capture error remains an error; this proves only this
+                // exact owner's release, not device-wide completion.
+                return Err(match quarantine_error {
+                    Some(error) => Box::new(CaptureAndCleanupFailure {
+                        primary_stage: "physical_quarantine",
+                        primary: error,
+                        cleanup: first_error,
+                    }),
+                    None => first_error,
+                });
+            }
+            // After the finite work/cleanup windows, retain this exact owner
+            // without retrying model work. Only an exceptional physical-
+            // unknown owner can stay alive here; normal joins return above.
+            std::thread::sleep(if quarantine_notified {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_millis(10)
+            });
+        }
+    }
+
+    fn send_release_proof(&self) {
+        if self.no_native_entry {
+            self.send_supervisor(b"NO_NATIVE_ENTRY");
+        } else if self.release.is_some() {
+            self.send_supervisor(b"SESSION_RELEASED");
+        }
+    }
+}
+
 fn command(worker: &mut Worker, command: Command, until: Instant) -> Result<Outcome> {
+    match worker {
+        Worker::Legacy(worker) => legacy_command(worker, command, until),
+        #[cfg(target_os = "linux")]
+        Worker::System(worker) => worker.command(command, until),
+    }
+}
+
+fn legacy_command(worker: &mut LegacyWorker, command: Command, until: Instant) -> Result<Outcome> {
     if Instant::now() >= until {
         return Err("capture window expired before native dispatch".into());
     }
@@ -897,7 +1979,15 @@ fn stats(worker: &mut Worker, until: Instant) -> Result<PalsBackendStats> {
         _ => Err("incorrect stats completion".into()),
     }
 }
-fn finish(worker: &mut Worker, until: Instant) -> Result<()> {
+fn finish(worker: &mut Worker, work_until: Instant, until: Instant) -> Result<()> {
+    match worker {
+        Worker::Legacy(worker) => finish_legacy(worker, until),
+        #[cfg(target_os = "linux")]
+        Worker::System(worker) => worker.finish_preserving_owner(work_until, until),
+    }
+}
+
+fn finish_legacy(worker: &mut LegacyWorker, until: Instant) -> Result<()> {
     loop {
         match worker.try_shutdown() {
             Poll::Ready(result) => return Ok(result?),
@@ -934,9 +2024,23 @@ fn identity(
         anchor_history_seals: anchors,
     })
 }
-fn execute(config: Config) -> Result<()> {
+fn execute(
+    config: Config,
+    #[cfg(target_os = "linux")] supervisor: &mut Option<PreNativeSupervisor>,
+) -> Result<()> {
     let selected = config.execution_config()?;
     let is_cuda = matches!(selected.provider, Provider::Cuda { .. });
+    let system_cuda = config.provider == "cuda-system";
+    // The supervisor handoff of the original physical owner is still WIP.
+    // Refuse before loading a runtime, reserving a slot, or entering native
+    // code: dropping an unresolved owner on CLI exit is not recovery.
+    if system_cuda {
+        return Err(
+            "system CUDA capture disabled: physical-owner supervisor handoff is not implemented"
+                .into(),
+        );
+    }
+    let system_control = system_cuda && config.system_cuda_inventory.is_some();
     for path in [
         &config.case_plan,
         &config.export_manifest,
@@ -947,6 +2051,8 @@ fn execute(config: Config) -> Result<()> {
     .into_iter()
     .chain(config.cuda_bundle.as_ref())
     .chain(config.cuda_inventory.as_ref())
+    .chain(config.system_cuda_config.as_ref())
+    .chain(config.system_cuda_inventory.as_ref())
     {
         if !path.is_absolute() {
             return Err("all configured capture asset/output paths must be absolute".into());
@@ -957,13 +2063,47 @@ fn execute(config: Config) -> Result<()> {
         return Err("capture requires registered finite execution/cleanup windows".into());
     }
     let until = Instant::now() + Duration::from_secs(config.deadline_seconds);
+    let mut system_cleanup_limit = if system_cuda {
+        Some(
+            until
+                .checked_add(Duration::from_secs(config.cleanup_seconds))
+                .ok_or("registered system cleanup deadline overflows")?,
+        )
+    } else {
+        None
+    };
     let plan_bytes = asset::read_bounded(&config.case_plan, LIMIT)?;
     if asset::sha256(&plan_bytes) != pin(&config.case_plan_sha256)? {
         return Err("actual case plan SHA differs".into());
     }
-    let plan: Plan = decode_unique(&plan_bytes)?;
-    if plan.domain != "rz-pals-numerical-case-plan-v5/1"
-        || plan.schema_version != 5
+    let raw_plan: serde_json::Value = decode_unique(&plan_bytes)?;
+    let binding_keys = raw_plan
+        .get("bindings")
+        .and_then(|v| v.as_object())
+        .ok_or("plan bindings missing")?;
+    if system_cuda {
+        if binding_keys.contains_key("cuda_manifest_sha256")
+            || binding_keys.contains_key("cuda_libraries")
+            || !binding_keys.contains_key("system_cuda_config_sha256")
+            || !binding_keys.contains_key("system_cuda_libraries")
+        {
+            return Err("system plan must use only system CUDA bindings".into());
+        }
+    } else if !binding_keys.contains_key("cuda_manifest_sha256")
+        || !binding_keys.contains_key("cuda_libraries")
+        || binding_keys.contains_key("system_cuda_config_sha256")
+        || binding_keys.contains_key("system_cuda_libraries")
+    {
+        return Err("V5 plan must retain legacy binding shape".into());
+    }
+    let plan: Plan = serde_json::from_value(raw_plan)?;
+    if plan.domain
+        != if system_cuda {
+            "rz-pals-numerical-case-plan-v6/1"
+        } else {
+            "rz-pals-numerical-case-plan-v5/1"
+        }
+        || plan.schema_version != if system_cuda { 6 } else { 5 }
         || plan.invocation != "fresh"
         || plan.batch != 1
         || plan.groups.is_empty()
@@ -1015,7 +2155,14 @@ fn execute(config: Config) -> Result<()> {
         || b.encoding_schema != model::ENCODING
         || b.precision != "fp32"
         || b.tf32
-        || b.backend != if is_cuda { "ort_cuda" } else { "ort_cpu" }
+        || b.backend
+            != if system_cuda {
+                "ort_cuda_system"
+            } else if is_cuda {
+                "ort_cuda"
+            } else {
+                "ort_cpu"
+            }
         || b.model_semantic_sha256
             != hex(PalsModelProfile::VirtualReviewV1.registered_semantics_sha256())
         || b.encoding_sha256 != hex(model::registered_encoding_sha256())
@@ -1052,10 +2199,10 @@ fn execute(config: Config) -> Result<()> {
     }
     let order = capture_order(
         &plan.groups,
-        is_cuda,
+        is_cuda && (!system_cuda || system_control),
         mode == VirtualReviewExecutionMode::Collection,
     )?;
-    let mut profiling_window = is_cuda.then(|| CudaProfilingWindow {
+    let mut profiling_window = (is_cuda && (!system_cuda || system_control)).then(|| CudaProfilingWindow {
         scope: "original planned cases only; profiles close at first registered role coverage, not full-run kernel coverage",
         actual_cases: order.slots[..order.profile_cases].iter().map(|slot| {
             let group = &plan.groups[slot.group];
@@ -1086,22 +2233,13 @@ fn execute(config: Config) -> Result<()> {
     {
         return Err("actual strict export/checkpoint/graph/encoding pins differ".into());
     }
-    let cache = RuntimeCache::open(&config.runtime_cache)?;
-    let control = if is_cuda {
-        if std::env::var("NVIDIA_TF32_OVERRIDE").ok().as_deref() != Some("0") {
-            return Err("CUDA capture requires NVIDIA_TF32_OVERRIDE=0".into());
-        }
-        Some(PalsCudaControlPolicy::from_virtual_review_inventory(
-            config
-                .cuda_inventory
-                .as_ref()
-                .ok_or("V3 inventory missing")?,
-            config
-                .cuda_inventory_sha256
-                .as_deref()
-                .ok_or("V3 inventory SHA missing")?,
-        )?)
-    } else {
+    if is_cuda && !system_cuda {
+        return Err("legacy CUDA bundle execution disabled; use a V6 system CUDA plan".into());
+    }
+    if is_cuda && std::env::var("NVIDIA_TF32_OVERRIDE").ok().as_deref() != Some("0") {
+        return Err("CUDA capture requires NVIDIA_TF32_OVERRIDE=0".into());
+    }
+    if !system_cuda {
         if config.cuda_bundle.is_some()
             || config.cuda_inventory.is_some()
             || config.cuda_inventory_sha256.is_some()
@@ -1110,105 +2248,303 @@ fn execute(config: Config) -> Result<()> {
         {
             return Err("CPU cannot carry CUDA assets".into());
         }
-        None
+    }
+    let control = match (
+        &config.system_cuda_inventory,
+        &config.system_cuda_inventory_sha256,
+    ) {
+        (Some(path), Some(digest)) => Some(PalsCudaControlPolicy::from_virtual_review_inventory(
+            path, digest,
+        )?),
+        (None, None) => None,
+        _ => return Err("system CUDA control inventory selection is incomplete".into()),
     };
-    let runtime_pin = if is_cuda {
-        let bytes = asset::read_bounded(
-            config.cuda_bundle.as_ref().ok_or("CUDA bundle missing")?,
-            64 * 1024,
-        )?;
-        if Some(hex(asset::sha256(&bytes))) != b.cuda_manifest_sha256 {
-            return Err("actual CUDA bundle manifest SHA differs".into());
-        }
-        let spec = CudaRuntimeBundleSpec::from_json(std::str::from_utf8(&bytes)?)?;
-        let expected = spec
-            .files
-            .iter()
-            .filter(|f| f.role != RuntimeBundleFileRole::Core)
-            .map(|f| f.sha256.clone())
-            .collect::<BTreeSet<_>>();
-        let core = spec
-            .files
-            .iter()
-            .find(|f| f.role == RuntimeBundleFileRole::Core)
-            .ok_or("core absent")?;
-        if expected != b.cuda_libraries
-            || core.sha256 != b.runtime_library_sha256
-            || config.runtime_library.file_name().and_then(|n| n.to_str()) != Some(&core.filename)
+    let runtime = if system_cuda {
+        #[cfg(target_os = "linux")]
         {
-            return Err("actual native library roster differs".into());
+            let bytes = asset::read_bounded(
+                config
+                    .system_cuda_config
+                    .as_ref()
+                    .ok_or("system config missing")?,
+                64 * 1024,
+            )?;
+            let config_sha = hex(asset::sha256(&bytes));
+            if Some(&config_sha) != config.system_cuda_config_sha256.as_ref()
+                || Some(&config_sha) != b.system_cuda_config_sha256.as_ref()
+            {
+                return Err("system config differs from pinned plan".into());
+            }
+            let system: SystemCudaConfig = decode_unique(&bytes)?;
+            if system.max_capture_ms == 0
+                || system
+                    .libraries
+                    .iter()
+                    .any(|entry| !entry.path.is_absolute())
+            {
+                return Err("system library paths and finite capture limit required".into());
+            }
+            let owner = SystemRuntime::capture(
+                system
+                    .libraries
+                    .into_iter()
+                    .map(|entry| SystemLibraryRequest {
+                        role: entry.role,
+                        path: entry.path,
+                        required_mapping: entry.required_mapping,
+                    })
+                    .collect(),
+                SystemCaptureLimits {
+                    max_libraries: system.max_libraries,
+                    max_file_bytes: system.max_file_bytes,
+                    max_total_bytes: system.max_total_bytes,
+                    max_elapsed: Duration::from_millis(system.max_capture_ms),
+                },
+            )?;
+            let mut observed = owner
+                .libraries()
+                .iter()
+                .map(|entry| SystemLibraryBinding {
+                    role: entry.role.clone(),
+                    sha256: hex(entry.sha256),
+                    bytes: entry.bytes,
+                    required_mapping: entry.required_mapping,
+                })
+                .collect::<Vec<_>>();
+            observed.sort_by(|a, b| a.role.cmp(&b.role));
+            let expected = b
+                .system_cuda_libraries
+                .as_ref()
+                .ok_or("system roster missing")?;
+            if expected != &observed || observed.windows(2).any(|w| w[0].role >= w[1].role) {
+                return Err("captured system library roster differs from plan".into());
+            }
+            let core = owner
+                .libraries()
+                .into_iter()
+                .find(|entry| entry.role == "ort-core" && entry.required_mapping)
+                .ok_or("required ort-core missing")?;
+            if hex(core.sha256) != b.runtime_library_sha256
+                || fs::canonicalize(&config.runtime_library)? != core.canonical_path
+            {
+                return Err("system ORT core differs from plan".into());
+            }
+            if Instant::now() >= until {
+                return Err("capture window expired before system runtime load".into());
+            }
+            // Merely capture system FDs here. The first ORT entry occurs on
+            // the retained worker after its original custody is registered.
+            PreparedRuntime::System(owner)
         }
-        cache.cuda_bundle(
-            config
-                .runtime_library
-                .parent()
-                .ok_or("core parent absent")?,
-            &spec,
-        )?
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err("system CUDA capture requires Linux".into());
+        }
     } else {
-        cache.library(&config.runtime_library, &b.runtime_library_sha256)?
+        let cache = RuntimeCache::open(&config.runtime_cache)?;
+        let runtime_pin = cache.library(&config.runtime_library, &b.runtime_library_sha256)?;
+        if Instant::now() >= until {
+            return Err("capture window expired before runtime load".into());
+        }
+        PreparedRuntime::Legacy(OrtRuntime::load(&runtime_pin)?)
     };
-    if Instant::now() >= until {
-        return Err("capture window expired before runtime load".into());
+    if system_cuda {
+        selected.validate_system_execution_selection()?;
+        #[cfg(target_os = "linux")]
+        {
+            // The original supervisor reserves the output only after this
+            // request. A pre-native rejection therefore creates no output
+            // lease; no ORT call or output directory precedes its grant.
+            let supervisor_control = supervisor.as_mut().ok_or("system supervisor is required")?;
+            let original_cleanup_limit =
+                system_cleanup_limit.ok_or("system cleanup limit absent")?;
+            system_cleanup_limit = Some(check_supervisor_deadline(
+                until,
+                Duration::from_secs(config.cleanup_seconds),
+                original_cleanup_limit,
+            )?);
+            supervisor_control.admit_native(until)?;
+        }
     }
-    let runtime = if config.provider == "cuda-control-shim" {
-        OrtRuntime::load_with_cuda_loading_profile(
-            &runtime_pin,
-            NativeLoadingProfile::CuDnnShimLazyV1,
-        )?
-    } else {
-        OrtRuntime::load(&runtime_pin)?
-    };
-    if hex(runtime.binary_digest()) != b.runtime_library_sha256 {
-        return Err("actual loaded ORT pin differs".into());
-    }
-    selected.validate_execution_selection(runtime.native_loading_profile(), control.is_some())?;
     let output_owner =
         capture_output_root(&config.output_root, config.output_root_admission.as_ref())?;
     let root = &output_owner.path;
     if Instant::now() >= until {
         return Err("capture window expired before model/session load".into());
     }
-    let backend = match (mode, control) {
-        (VirtualReviewExecutionMode::Collection, Some(policy)) => {
-            PalsVirtualReviewOnnxBackend::load_collection_with_cuda_control_policy(
-                &config.export_manifest,
-                &b.export_manifest_sha256,
-                runtime,
-                selected,
-                policy,
-                &root.join("profiles"),
-            )?
+    let (mut worker, epoch, backend_digest, policy_observation) = match runtime {
+        PreparedRuntime::Legacy(runtime) => {
+            if hex(runtime.binary_digest()) != b.runtime_library_sha256 {
+                return Err("actual loaded ORT pin differs".into());
+            }
+            selected.validate_execution_selection(
+                runtime.native_loading_profile(),
+                control.is_some(),
+            )?;
+            let backend = match (mode, control) {
+                (VirtualReviewExecutionMode::Collection, Some(policy)) => {
+                    PalsVirtualReviewOnnxBackend::load_collection_with_cuda_control_policy(
+                        &config.export_manifest,
+                        &b.export_manifest_sha256,
+                        runtime,
+                        selected,
+                        policy,
+                        &root.join("profiles"),
+                    )?
+                }
+                (_, Some(policy)) => PalsVirtualReviewOnnxBackend::load_with_cuda_control_policy(
+                    &config.export_manifest,
+                    &b.export_manifest_sha256,
+                    runtime,
+                    selected,
+                    policy,
+                    &root.join("profiles"),
+                )?,
+                (VirtualReviewExecutionMode::Collection, None) => {
+                    PalsVirtualReviewOnnxBackend::load_collection(
+                        &config.export_manifest,
+                        &b.export_manifest_sha256,
+                        runtime,
+                        selected,
+                    )?
+                }
+                (_, None) => PalsVirtualReviewOnnxBackend::load(
+                    &config.export_manifest,
+                    &b.export_manifest_sha256,
+                    runtime,
+                    selected,
+                )?,
+            };
+            let epoch = backend.model_epoch();
+            let backend_digest = backend.backend_digest();
+            let observation = loaded_policy_observation(
+                &backend,
+                config.cudnn_conv_search.as_deref(),
+                is_cuda && !system_cuda,
+            )?;
+            (
+                Worker::Legacy(backend.into_worker()?),
+                epoch,
+                backend_digest,
+                observation,
+            )
         }
-        (_, Some(policy)) => PalsVirtualReviewOnnxBackend::load_with_cuda_control_policy(
-            &config.export_manifest,
-            &b.export_manifest_sha256,
-            runtime,
-            selected,
-            policy,
-            &root.join("profiles"),
-        )?,
-        (VirtualReviewExecutionMode::Collection, None) => {
-            PalsVirtualReviewOnnxBackend::load_collection(
+        #[cfg(target_os = "linux")]
+        PreparedRuntime::System(runtime) => {
+            // Admission must establish the supervisor channel before any
+            // reservation, worker creation, or ORT entry.
+            let supervisor_control = supervisor.as_mut().ok_or("system supervisor is required")?;
+            let custody = system_startup_custody(
                 &config.export_manifest,
-                &b.export_manifest_sha256,
+                &summary,
+                &output_owner,
+                system_control,
+            )?;
+            let expected_runtime_sha256 = pin(&b.runtime_library_sha256)?;
+            let supervisor = supervisor_control.socket.try_clone()?;
+            supervisor_control.no_native_and_no_reservation = false;
+            let (mut reservation, key) = match PhysicalRecoveryReservation::reserve() {
+                Ok(value) => value,
+                Err(error) => {
+                    supervisor_control.no_native_and_no_reservation = true;
+                    return Err(Box::new(error));
+                }
+            };
+            let mut original = Some(custody);
+            let startup = owned_worker::Startup {
                 runtime,
-                selected,
-            )?
+                expected_runtime_sha256,
+                expected_manifest_sha256: b.export_manifest_sha256.clone(),
+                config: selected,
+                mode,
+                kind: VirtualReviewArtifactKind::Fresh,
+                policy: control,
+                requested_cudnn_conv_search: config.cudnn_conv_search.clone(),
+                until,
+            };
+            let physical = match owned_worker::spawn(&mut original, &mut reservation, startup) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    // Spawn failure is before worker/native entry; only the
+                    // unpublished original reservation may be canceled after
+                    // the exact custody was returned to its original slot.
+                    if original.is_some() {
+                        if let Err((owner, _cancel_error)) = reservation.try_cancel_unpublished() {
+                            return Err(Box::new(UnpublishedReservationFailure {
+                                primary: error,
+                                _reservation: owner,
+                                _recovery_key: key,
+                                detail: "unpublished original reservation could not be canceled",
+                            }));
+                        }
+                        supervisor_control.no_native_and_no_reservation = true;
+                    } else {
+                        return Err(Box::new(UnpublishedReservationFailure {
+                            primary: error,
+                            _reservation: reservation,
+                            _recovery_key: key,
+                            detail: "original custody unavailable after spawn failure",
+                        }));
+                    }
+                    return Err(Box::new(error));
+                }
+            };
+            let mut owner = SystemCaptureWorker {
+                worker: Some(physical),
+                reservation: Some(reservation),
+                recovery_key: Some(key),
+                pending: None,
+                late_completion: None,
+                release: None,
+                no_native_entry: false,
+                supervisor,
+                quarantined: false,
+            };
+            owner.send_supervisor(b"PENDING");
+            let start_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.start(until)))
+                    .unwrap_or_else(|payload| {
+                        Err(Box::new(CapturePanicFailure {
+                            stage: "startup",
+                            _original_payload: payload,
+                        }))
+                    });
+            let started = match start_result {
+                Ok(started) => started,
+                Err(startup) => {
+                    let registered = system_cleanup_limit.ok_or("system cleanup limit absent")?;
+                    let cleanup_until = Instant::now()
+                        .checked_add(Duration::from_secs(config.cleanup_seconds))
+                        .unwrap_or(registered)
+                        .min(registered);
+                    return match owner.finish_preserving_owner(until, cleanup_until) {
+                        Ok(()) => Err(startup),
+                        Err(cleanup) => Err(Box::new(CaptureAndCleanupFailure {
+                            primary_stage: "startup",
+                            primary: startup,
+                            cleanup,
+                        })),
+                    };
+                }
+            };
+            (
+                Worker::System(owner),
+                started.epoch,
+                started.backend_digest,
+                started.policy_observation,
+            )
         }
-        (_, None) => PalsVirtualReviewOnnxBackend::load(
-            &config.export_manifest,
-            &b.export_manifest_sha256,
-            runtime,
-            selected,
-        )?,
     };
-    let epoch = backend.model_epoch();
-    let backend_digest = backend.backend_digest();
-    let policy_observation =
-        loaded_policy_observation(&backend, config.cudnn_conv_search.as_deref(), is_cuda)?;
-    let mut worker = backend.into_worker()?;
-    let work = (|| -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut system_mapping = None;
+    #[cfg(target_os = "linux")]
+    let mut system_placement: Option<(serde_json::Value, serde_json::Value)> = None;
+    #[cfg(not(target_os = "linux"))]
+    let system_placement: Option<(serde_json::Value, serde_json::Value)> = None;
+    #[cfg(target_os = "linux")]
+    let mut initial_partial_failure: Option<String> = None;
+    #[cfg(not(target_os = "linux"))]
+    let initial_partial_failure: Option<String> = None;
+    let work_fn = || -> Result<Vec<(PathBuf, PathBuf)>> {
         let mut outputs = (0..plan.groups.len()).map(|_| None).collect::<Vec<_>>();
         let mut bytes = 0u64;
         let mut completion = 0u64;
@@ -1219,6 +2555,8 @@ fn execute(config: Config) -> Result<()> {
             .map(GroupCapture::from)
             .collect::<Vec<_>>();
         let mut first_placement = None;
+        #[cfg(target_os = "linux")]
+        let mut first_system_placement = None;
         for (index, slot) in order.slots.iter().enumerate() {
             let actual_nn_inputs = capture_case(
                 &mut worker,
@@ -1238,13 +2576,49 @@ fn execute(config: Config) -> Result<()> {
                     .checked_add(actual_nn_inputs)
                     .ok_or("profile window NN input overflow")?;
             }
-            if is_cuda && index + 1 == order.profile_cases {
+            if is_cuda && !system_cuda && index + 1 == order.profile_cases {
                 first_placement = Some(
                     match command(&mut worker, Command::VerifyVirtualCudaPlacement, until)? {
                         Outcome::VirtualCudaPlacementVerified(witness) => witness,
                         _ => return Err("actual initial V3 placement witness absent".into()),
                     },
                 );
+            }
+            #[cfg(target_os = "linux")]
+            if system_control && index + 1 == order.profile_cases {
+                let first_observation = match command(
+                    &mut worker,
+                    Command::ObserveSystemVirtualCudaPlacement,
+                    until,
+                )? {
+                    Outcome::SystemVirtualCudaPlacementObserved(observation) => {
+                        system_placement_observation_json(&observation)
+                    }
+                    _ => return Err("system V3 placement observation absent".into()),
+                };
+                let saved = output_owner.verify().and_then(|()| {
+                    publish_initial_system_placement_partial(
+                        root,
+                        &config.case_plan_sha256,
+                        config
+                            .system_cuda_inventory_sha256
+                            .as_deref()
+                            .ok_or("system CUDA inventory digest absent")?,
+                        &b.export_manifest_sha256,
+                        &first_observation,
+                    )
+                    .map(|_| ())
+                });
+                if let Err(error) = saved {
+                    let detail = error.to_string().chars().take(1024).collect::<String>();
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "RZ_NUMERIC_INITIAL_PLACEMENT_PARTIAL_FAILURE={}",
+                        serde_json::json!({"detail":detail,"capture_completion":"not_established", "physical_completion":"unknown"})
+                    );
+                    initial_partial_failure = Some(detail);
+                }
+                first_system_placement = Some(first_observation);
             }
             let group = &mut groups[slot.group];
             if group.remaining.iter().any(Option::is_some) {
@@ -1265,8 +2639,12 @@ fn execute(config: Config) -> Result<()> {
             let public_cache_hits = stage.public_cache_hits;
             stages.insert(group.id.clone(), stage);
             let raw = RawRun {
-                schema_version: 5,
-                domain: "rz-pals-numerical-raw-run-v5/1",
+                schema_version: if system_cuda { 6 } else { 5 },
+                domain: if system_cuda {
+                    "rz-pals-numerical-raw-run-v6/1"
+                } else {
+                    "rz-pals-numerical-raw-run-v5/1"
+                },
                 run_id: format!("native-{}", group.id),
                 producer: "rust_ort_native",
                 producer_source_component: b.source_components["model_native"].clone(),
@@ -1304,11 +2682,44 @@ fn execute(config: Config) -> Result<()> {
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .ok_or("original capture plan has an unpublished group")?;
-        match command(&mut worker, Command::VerifyRuntime, until)? {
-            Outcome::RuntimeVerified => {}
-            _ => return Err("runtime audit incomplete".into()),
+        if system_cuda {
+            match command(&mut worker, Command::ObserveRuntimeMapping, until)? {
+                Outcome::RuntimeMappingObserved {
+                    mapping,
+                    system_placement,
+                } => {
+                    system_mapping = Some(serde_json::json!({
+                        "schema":"rovezero.virtual-system-mapping-observation.v1",
+                        "mapping":format!("{mapping:?}"), "placement_prerequisites":format!("{system_placement:?}"),
+                        "gpu_kernel_placement":"unknown", "process_exit":"requires_external_supervisor"
+                    }));
+                }
+                _ => return Err("system runtime mapping observation unavailable".into()),
+            }
+            #[cfg(target_os = "linux")]
+            if system_control {
+                let final_observation = match command(
+                    &mut worker,
+                    Command::ObserveSystemVirtualCudaPlacement,
+                    until,
+                )? {
+                    Outcome::SystemVirtualCudaPlacementObserved(observation) => {
+                        system_placement_observation_json(&observation)
+                    }
+                    _ => return Err("final system V3 placement observation absent".into()),
+                };
+                system_placement = Some((
+                    first_system_placement.ok_or("first system V3 placement observation absent")?,
+                    final_observation,
+                ));
+            }
+        } else {
+            match command(&mut worker, Command::VerifyRuntime, until)? {
+                Outcome::RuntimeVerified => {}
+                _ => return Err("runtime audit incomplete".into()),
+            }
         }
-        if is_cuda {
+        if is_cuda && !system_cuda {
             match command(&mut worker, Command::VerifyVirtualCudaPlacement, until)? {
                 Outcome::VirtualCudaPlacementVerified(witness) => {
                     if first_placement.as_ref() != Some(&witness) {
@@ -1325,20 +2736,54 @@ fn execute(config: Config) -> Result<()> {
         write_pending(&stage_pending, &stages, LIMIT as u64)?;
         outputs.push((stage_pending, root.join("actual-stage-counters.json")));
         Ok(outputs)
-    })();
-    let joined = finish(
-        &mut worker,
-        Instant::now() + Duration::from_secs(config.cleanup_seconds),
-    );
+    };
+    #[cfg(target_os = "linux")]
+    let work = if system_cuda {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(work_fn)).unwrap_or_else(|payload| {
+            Err(Box::new(CapturePanicFailure {
+                stage: "capture",
+                _original_payload: payload,
+            }))
+        })
+    } else {
+        work_fn()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let work = work_fn();
+    let cleanup_until = if let Some(registered) = system_cleanup_limit {
+        Instant::now()
+            .checked_add(Duration::from_secs(config.cleanup_seconds))
+            .unwrap_or(registered)
+            .min(registered)
+    } else {
+        Instant::now() + Duration::from_secs(config.cleanup_seconds)
+    };
+    let joined = finish(&mut worker, until, cleanup_until);
     let outputs = match (work, joined) {
         (Ok(outputs), Ok(())) => outputs,
         (Err(work), Err(join)) => {
+            #[cfg(target_os = "linux")]
+            if system_cuda {
+                return Err(Box::new(CaptureAndCleanupFailure {
+                    primary_stage: "capture",
+                    primary: work,
+                    cleanup: join,
+                }));
+            }
             return Err(format!(
                 "capture failed: {work}; physical cleanup failed: {join}; pending files retained"
             )
             .into());
         }
         (Err(work), Ok(())) => {
+            #[cfg(target_os = "linux")]
+            if system_cuda {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "RZ_NUMERIC_SYSTEM_WORKER_JOINED_AFTER_FAILURE={{\"scope\":\"same_original_native_session\"}}"
+                );
+                return Err(work);
+            }
             return Err(format!(
                 "capture failed: {work}; native worker joined; pending files retained"
             )
@@ -1348,34 +2793,112 @@ fn execute(config: Config) -> Result<()> {
             return Err(format!("physical cleanup failed: {join}; pending files retained").into());
         }
     };
+    let original_system_session_release = match &worker {
+        Worker::Legacy(_) => None,
+        #[cfg(target_os = "linux")]
+        Worker::System(owner) => owner
+            .release
+            .map(|release| SystemSessionReleaseObservation {
+                completed_synchronous_runs: release.completed_synchronous_runs,
+                scope: "same_original_native_session_after_successful_worker_join",
+                process_exit: "requires_external_supervisor",
+                device_wide_gpu_fence: "not_established",
+            }),
+    };
     output_owner.verify()?;
-    // This separate, small policy observation is never part of the unchanged
-    // numerical V5 payload. Publish only after all captured physical results,
-    // the placement/runtime audits, and normal worker join have succeeded.
-    write_exclusive_bounded(
-        &root.join("actual-cudnn-execution-policy.json"),
-        &JoinedPolicyObservation {
-            domain: "rz-pals-numerical-capture-execution-policy/1",
-            scope: "loaded_request_and_session_settings_not_selected_cudnn_plan",
-            loaded: policy_observation,
-            captured_physical_completions_known: true,
-            native_worker_joined: true,
-            actual_cudnn_plan: "unknown",
-            tf32_actual: "unknown",
-            numerical_acceptance: false,
-            performance_improvement_claim: false,
-            process_exit_evidence: "requires_external_process_owner_exit_observation",
-            cuda_profiling_window: profiling_window,
+    let publication = publish_joined_capture(
+        || {
+            for (pending, final_path) in outputs {
+                if final_path.exists() {
+                    return Err("refusing final receipt overwrite".into());
+                }
+                publish_pending(&pending, &final_path)?;
+            }
+            output_owner.verify()
         },
-        POLICY_LIMIT,
+        || {
+            // This small observation is separate from the unchanged numerical
+            // V5 payload. Required runtime/placement checks and worker join have
+            // already succeeded; consumers requiring this sidecar must still
+            // reject its absence or a partial write under their own contract.
+            if let Some(observation) = &system_mapping {
+                write_exclusive_bounded(
+                    &root.join("system-runtime-mapping.json"),
+                    observation,
+                    POLICY_LIMIT,
+                )?;
+            }
+            if let Some((first, final_observation)) = &system_placement {
+                // Preserve the actual typed witness in its own unchanged
+                // representation. Unknown mappings have no invented witness.
+                let first_witness_sha = publish_system_placement_witness(
+                    root,
+                    "initial-virtual-system-cuda-placement.json",
+                    first,
+                )?;
+                let witness_sha = publish_system_placement_witness(
+                    root,
+                    "actual-virtual-system-cuda-placement.json",
+                    final_observation,
+                )?;
+                write_exclusive_bounded(
+                    &root.join("system-cuda-placement-observation.json"),
+                    &serde_json::json!({
+                        "schema":"rovezero.virtual-system-cuda-placement-observation.v1",
+                        "plan_sha256":config.case_plan_sha256,
+                        "inventory_sha256":config.system_cuda_inventory_sha256,
+                        "manifest_sha256":b.export_manifest_sha256,
+                        "first_registered_role_coverage_status":first.get("status"),
+                        "initial_witness_sha256":first_witness_sha,
+                        "initial_partial_observation":if initial_partial_failure.is_some() {"write_failed"} else {"written"},
+                        "initial_partial_error":initial_partial_failure,
+                        "final_status":final_observation.get("status"),
+                        "witness_sha256":witness_sha,
+                        "profile_scope":"original planned cases through first registered role coverage",
+                        "physical_completion":"requires_same_native_owner_completion",
+                        "process_exit":"requires_external_supervisor"
+                    }),
+                    POLICY_LIMIT,
+                )?;
+            }
+            write_exclusive_bounded(
+                &root.join("actual-cudnn-execution-policy.json"),
+                &JoinedPolicyObservation {
+                    domain: "rz-pals-numerical-capture-execution-policy/1",
+                    scope: "loaded_request_and_session_settings_not_selected_cudnn_plan",
+                    loaded: policy_observation,
+                    captured_physical_completions_known: true,
+                    native_worker_joined: true,
+                    actual_cudnn_plan: "unknown",
+                    tf32_actual: "unknown",
+                    numerical_acceptance: false,
+                    performance_improvement_claim: false,
+                    process_exit_evidence: "requires_external_process_owner_exit_observation",
+                    cuda_profiling_window: profiling_window,
+                    original_system_session_release,
+                },
+                POLICY_LIMIT,
+            )
+        },
     )?;
-    for (pending, final_path) in outputs {
-        if final_path.exists() {
-            return Err("refusing final receipt overwrite".into());
-        }
-        publish_pending(&pending, &final_path)?;
+    if let PostJoinCapturePublication::DiagnosticFailure(error) = &publication {
+        // Preserve the reporter failure before the final required owner check,
+        // so a later owner error remains primary without hiding this secondary.
+        let detail = error.to_string().chars().take(1024).collect::<String>();
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "RZ_NUMERIC_CAPTURE_DIAGNOSTIC_FAILURE={}",
+            serde_json::json!({"stage":"post_join_policy_observation","detail":detail,
+                "raw_payload_published":true,"full_capture_success":false})
+        );
     }
     output_owner.verify()?;
+    if let PostJoinCapturePublication::DiagnosticFailure(error) = publication {
+        println!(
+            "RZ_NUMERIC_CAPTURE_STATUS={{\"status\":\"captured_with_diagnostic_failure\",\"numerical_acceptance\":false,\"rules_legality_certified\":false,\"native_worker_joined\":true,\"raw_payload_published\":true,\"diagnostics_complete\":false,\"diagnostic_failure\":\"post_join_policy_observation\"}}"
+        );
+        return Err(error);
+    }
     println!(
         "RZ_NUMERIC_CAPTURE_STATUS={{\"status\":\"captured\",\"numerical_acceptance\":false,\"rules_legality_certified\":false,\"native_worker_joined\":true}}"
     );
@@ -1414,24 +2937,248 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
-    if args.len() != 1 {
-        return Err(
-            "usage: virtual_review_numeric_capture --source-pins | --model-registry | ABSOLUTE_CAPTURE_CONFIG.json"
-                .into(),
-        );
+    #[cfg(target_os = "linux")]
+    let mut supervisor = if std::env::var_os("ROVEZERO_CUSTODY_FD").is_some() {
+        let control = PreNativeSupervisor {
+            socket: system_supervisor_socket()?,
+            no_native_and_no_reservation: true,
+        };
+        control.notify(b"PENDING");
+        Some(control)
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let supervised = supervisor.is_some();
+    let mut run = || -> Result<()> {
+        if args.len() != 1 {
+            return Err(
+                "usage: virtual_review_numeric_capture --source-pins | --model-registry | ABSOLUTE_CAPTURE_CONFIG.json"
+                    .into(),
+            );
+        }
+        let path = Path::new(&args[0]);
+        if !path.is_absolute() {
+            return Err("capture config must be absolute".into());
+        }
+        let bytes = asset::read_bounded(path, 64 * 1024)?;
+        let config: Config = decode_unique(&bytes)?;
+        #[cfg(target_os = "linux")]
+        {
+            if supervised && config.provider != "cuda-system" {
+                return Err("custody supervisor is reserved for system CUDA capture".into());
+            }
+            execute(config, &mut supervisor)
+        }
+        #[cfg(not(target_os = "linux"))]
+        execute(config)
+    };
+    #[cfg(target_os = "linux")]
+    let result = if supervised {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|payload| {
+            Err(Box::new(CapturePanicFailure {
+                stage: "preflight_or_supervisor",
+                _original_payload: payload,
+            }))
+        })
+    } else {
+        run()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let result = run();
+    #[cfg(target_os = "linux")]
+    if result.is_err() {
+        if let Some(control) = supervisor.as_ref() {
+            if control.no_native_and_no_reservation {
+                control.notify(b"NO_NATIVE_ENTRY");
+            }
+        }
     }
-    let path = Path::new(&args[0]);
-    if !path.is_absolute() {
-        return Err("capture config must be absolute".into());
-    }
-    let bytes = asset::read_bounded(path, 64 * 1024)?;
-    let config: Config = decode_unique(&bytes)?;
-    execute(config)
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_cleanup_cap_respects_work_and_original_window() {
+        let anchor = Instant::now();
+        let work = anchor + Duration::from_secs(2);
+        let original = anchor + Duration::from_secs(10);
+        let sample = 1_000_000_000u128;
+        let capped = effective_cleanup_limit(
+            anchor,
+            sample,
+            sample + 4_000_000_000,
+            sample + 20_000_000_000,
+            work,
+            original,
+        )
+        .unwrap();
+        assert_eq!(capped, anchor + Duration::from_secs(4));
+        let generous =
+            effective_cleanup_limit(anchor, sample, u128::MAX, u128::MAX, work, original).unwrap();
+        assert_eq!(generous, original);
+        let supervisor_cap = effective_cleanup_limit(
+            anchor,
+            sample,
+            sample + 8_000_000_000,
+            sample + 3_000_000_000,
+            work,
+            original,
+        )
+        .unwrap();
+        assert_eq!(supervisor_cap, anchor + Duration::from_secs(3));
+        let exact_work = effective_cleanup_limit(
+            anchor,
+            sample,
+            sample + 2_000_000_000,
+            sample + 20_000_000_000,
+            work,
+            original,
+        )
+        .unwrap();
+        assert_eq!(exact_work, work);
+        assert!(effective_cleanup_limit(
+            anchor,
+            sample,
+            sample + 1_000_000_000,
+            sample + 20_000_000_000,
+            work,
+            original,
+        )
+        .is_err());
+        assert!(
+            effective_cleanup_limit(anchor, sample, sample, u128::MAX, work, original).is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn custody_test_pair() -> (
+        std::os::unix::net::UnixDatagram,
+        std::os::unix::net::UnixDatagram,
+    ) {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        extern "C" {
+            fn socketpair(domain: i32, kind: i32, protocol: i32, pair: *mut i32) -> i32;
+        }
+        let mut fds = [-1; 2];
+        // SAFETY: writable array has room for both returned descriptors; Linux
+        // AF_UNIX and SOCK_SEQPACKET are 1 and 5 respectively.
+        assert_eq!(unsafe { socketpair(1, 5, 0, fds.as_mut_ptr()) }, 0);
+        // SAFETY: successful socketpair returns two distinct owned descriptors.
+        let child = std::os::unix::net::UnixDatagram::from(unsafe { OwnedFd::from_raw_fd(fds[0]) });
+        let parent =
+            std::os::unix::net::UnixDatagram::from(unsafe { OwnedFd::from_raw_fd(fds[1]) });
+        child.set_nonblocking(true).unwrap();
+        parent
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        (child, parent)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_entry_requires_matching_supervisor_grant() {
+        let (child, parent) = custody_test_pair();
+        let mock = std::thread::spawn(move || {
+            let mut buffer = [0; 64];
+            let n = parent.recv(&mut buffer).unwrap();
+            assert_eq!(&buffer[..n], b"NATIVE_READY");
+            parent.send(b"ALLOW_NATIVE").unwrap();
+        });
+        let owner = PreNativeSupervisor {
+            socket: child,
+            no_native_and_no_reservation: true,
+        };
+        assert!(owner
+            .admit_native(Instant::now() + Duration::from_secs(2))
+            .is_ok());
+        assert!(owner.no_native_and_no_reservation);
+        mock.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_or_invalid_grant_does_not_admit_native_entry() {
+        let (child, parent) = custody_test_pair();
+        parent.send(b"WRONG_GRANT").unwrap();
+        let owner = PreNativeSupervisor {
+            socket: child,
+            no_native_and_no_reservation: true,
+        };
+        assert!(owner
+            .admit_native(Instant::now() + Duration::from_secs(1))
+            .is_err());
+        assert!(owner.no_native_and_no_reservation);
+        let (child, _parent) = custody_test_pair();
+        let owner = PreNativeSupervisor {
+            socket: child,
+            no_native_and_no_reservation: true,
+        };
+        assert!(owner
+            .admit_native(Instant::now() + Duration::from_millis(20))
+            .is_err());
+        assert!(owner.no_native_and_no_reservation);
+    }
+
+    #[test]
+    fn joined_capture_policy_failure_keeps_the_required_raw_publication() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = publish_joined_capture(
+            || {
+                calls.borrow_mut().push("raw");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("policy");
+                Err("policy reporter unavailable".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), ["raw", "policy"]);
+        let PostJoinCapturePublication::DiagnosticFailure(error) = result else {
+            panic!("reporter failure must not become complete capture success");
+        };
+        assert_eq!(error.to_string(), "policy reporter unavailable");
+    }
+
+    #[test]
+    fn joined_capture_required_raw_failure_does_not_run_the_policy_reporter() {
+        let policy_called = std::cell::Cell::new(false);
+        let result = publish_joined_capture(
+            || Err("required raw integrity failure".into()),
+            || {
+                policy_called.set(true);
+                Ok(1)
+            },
+        );
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "required raw integrity failure"
+        );
+        assert!(!policy_called.get());
+    }
+
+    #[test]
+    fn joined_capture_success_publishes_raw_before_the_separate_policy() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = publish_joined_capture(
+            || {
+                calls.borrow_mut().push("raw");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("policy");
+                Ok(1)
+            },
+        )
+        .unwrap();
+        assert!(matches!(result, PostJoinCapturePublication::Complete));
+        assert_eq!(*calls.borrow(), ["raw", "policy"]);
+    }
 
     fn schedule_group(role: PalsRole, bucket: usize) -> Group {
         let role_name = format!("{role:?}");
@@ -1878,11 +3625,134 @@ mod tests {
             cuda_bundle: Some(PathBuf::new()),
             cuda_inventory: Some(PathBuf::new()),
             cuda_inventory_sha256: Some("a".repeat(64)),
+            system_cuda_config: None,
+            system_cuda_config_sha256: None,
+            system_cuda_inventory: None,
+            system_cuda_inventory_sha256: None,
             gpu_device_id: 0,
             gpu_arena_bytes: 1024 * 1024,
             deadline_seconds: 1,
             cleanup_seconds: 1,
         }
+    }
+
+    #[test]
+    fn system_cuda_requires_own_config_and_refuses_legacy_inputs() {
+        let mut config = selection_config("cuda-system");
+        config.system_cuda_config = Some(PathBuf::from("/tmp/system.json"));
+        config.system_cuda_config_sha256 = Some("a".repeat(64));
+        assert!(config.execution_config().is_err());
+        config.cuda_bundle = None;
+        config.cuda_inventory = None;
+        config.cuda_inventory_sha256 = None;
+        assert!(config.execution_config().is_ok());
+        config.system_cuda_inventory = Some(PathBuf::from("/tmp/inventory.json"));
+        assert!(config.execution_config().is_err());
+        config.system_cuda_inventory_sha256 = Some("a".repeat(64));
+        assert!(config.execution_config().is_ok());
+        config.system_cuda_inventory = Some(PathBuf::from("relative-inventory.json"));
+        assert!(config.execution_config().is_err());
+        config.system_cuda_inventory = Some(PathBuf::from("/tmp/inventory.json"));
+        config.system_cuda_inventory_sha256 = Some("not-a-pin".into());
+        assert!(config.execution_config().is_err());
+        config.system_cuda_inventory = None;
+        config.system_cuda_inventory_sha256 = None;
+        config.cudnn_conv_search = Some("experimental_default".into());
+        assert!(config.execution_config().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_placement_mapping_unknown_is_not_a_witness_or_completion() {
+        for (observation, expected) in [
+            (
+                SystemPlacementObservation::MappingUnavailable,
+                "mapping_unavailable",
+            ),
+            (
+                SystemPlacementObservation::UnregisteredOrPreexistingMappings,
+                "unregistered_or_preexisting_mappings",
+            ),
+        ] {
+            let value = system_placement_observation_json(&observation);
+            assert_eq!(value["status"], expected);
+            assert_eq!(value["gpu_kernel_placement"], "unknown");
+            assert_eq!(value["physical_completion"], "unknown");
+            assert!(value.get("witness").is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn first_system_placement_partial_survives_later_failure_without_completion_claim() {
+        let output = OwnedOutputRootTestDirectory::new();
+        let observation =
+            system_placement_observation_json(&SystemPlacementObservation::MappingUnavailable);
+        publish_initial_system_placement_partial(
+            &output.path,
+            "plan",
+            "inventory",
+            "manifest",
+            &observation,
+        )
+        .unwrap();
+
+        // A later case can fail before joined/final publication. The initial
+        // on-disk evidence must still be readable and remain explicitly partial.
+        let later: Result<()> = Err("later case failed".into());
+        assert!(later.is_err());
+        let path = output
+            .path
+            .join("initial-system-cuda-placement.partial.json");
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["status"], "partial_observation");
+        assert_eq!(value["observation"]["status"], "mapping_unavailable");
+        assert_eq!(value["capture_completion"], "not_established");
+        assert_eq!(value["physical_completion"], "not_attested");
+        assert_eq!(value["process_exit"], "not_observed");
+        assert!(value["embedded_witness_sha256"].is_null());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_system_placement_witness_can_exceed_small_policy_sidecar_limit() {
+        let output = OwnedOutputRootTestDirectory::new();
+        // Model a placement witness with enough transfer evidence to exceed
+        // the small policy sidecar, while remaining within the placement bound.
+        let witness = serde_json::json!({"transfer_evidence": "x".repeat(POLICY_LIMIT)});
+        let witness_bytes = serde_json::to_vec(&witness).unwrap();
+        assert!(witness_bytes.len() > POLICY_LIMIT);
+        assert!(witness_bytes.len() < LIMIT);
+        let observation = serde_json::json!({"status":"verified", "witness":witness});
+        let expected_sha = hex(asset::sha256(&witness_bytes));
+
+        let actual_sha =
+            publish_system_placement_witness(&output.path, "witness.json", &observation).unwrap();
+        assert_eq!(actual_sha.as_deref(), Some(expected_sha.as_str()));
+        assert_eq!(
+            fs::read(output.path.join("witness.json")).unwrap(),
+            witness_bytes
+        );
+
+        publish_initial_system_placement_partial(
+            &output.path,
+            "plan",
+            "inventory",
+            "manifest",
+            &observation,
+        )
+        .unwrap();
+        let partial: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                output
+                    .path
+                    .join("initial-system-cuda-placement.partial.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(partial["embedded_witness_sha256"], expected_sha);
+        assert_eq!(partial["physical_completion"], "not_attested");
     }
 
     #[test]
