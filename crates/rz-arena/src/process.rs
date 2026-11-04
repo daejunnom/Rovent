@@ -31,6 +31,29 @@ pub(crate) type SpawnControl<'a> =
 pub(crate) type CleanupControl<'a> =
     &'a mut dyn FnMut(&SpawnCustody, Instant) -> Result<(), ArenaError>;
 
+/// A cooperative V6 cancellation request, polled before signalling the owned
+/// process group. `Acknowledged` means only that the peer accepted the request;
+/// it is not session, device, or process completion evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreSignalProgress {
+    Pending { partial: bool },
+    Acknowledged,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PreSignalObservation {
+    pub calls: u64,
+    pub first_partial_at: Option<Instant>,
+    pub acknowledged_at: Option<Instant>,
+    pub timed_out: bool,
+    pub first_failure: Option<String>,
+}
+
+/// Callback must not wait; it retains its own partial I/O state. Its fixed
+/// deadline is supplied by the original process owner on every poll.
+pub(crate) type PreSignalControl<'a> =
+    &'a mut dyn FnMut(&SpawnCustody, Instant) -> Result<PreSignalProgress, ArenaError>;
+
 pub const MAX_ORIGINAL_INPUT_BYTES: usize = 2 * 1024 * 1024;
 
 /// A process-local original clock. No serialized duration reconstructs this
@@ -917,14 +940,56 @@ pub(crate) fn supervise_tree_observed_with_controls<'v>(
     cleanup_control: Option<CleanupControl<'v>>,
     original: Option<OriginalProcessWindow>,
 ) -> Result<ProcessOutput, ArenaError> {
-    if (control.is_some() || cleanup_control.is_some()) && spawned.is_none() {
+    supervise_tree_observed_with_v6_controls(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        watch,
+        stdout_observer,
+        spawned,
+        control,
+        cleanup_control,
+        original,
+        None,
+        None,
+    )
+}
+
+/// V6-only cooperative pre-signal stage. The caller owns both the original
+/// child slot and the observation and must retain its control owner through
+/// process quarantine; this function never promotes ACK to physical closure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_tree_observed_with_v6_controls<'v>(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    stdout_observer: Option<StdoutObserver<'_>>,
+    spawned: Option<&'v mut SpawnCustody>,
+    control: Option<SpawnControl<'v>>,
+    cleanup_control: Option<CleanupControl<'v>>,
+    original: Option<OriginalProcessWindow>,
+    pre_signal: Option<PreSignalControl<'v>>,
+    pre_signal_observation: Option<&'v mut PreSignalObservation>,
+) -> Result<ProcessOutput, ArenaError> {
+    if (control.is_some() || cleanup_control.is_some() || pre_signal.is_some()) && spawned.is_none()
+    {
         return Err(ArenaError::Invalid(
             "owner control requires original externally retained spawn custody".into(),
         ));
     }
-    if cleanup_control.is_some() && original.is_none() {
+    if (cleanup_control.is_some() || pre_signal.is_some()) && original.is_none() {
         return Err(ArenaError::Invalid(
             "cleanup control requires an original process window".into(),
+        ));
+    }
+    if pre_signal.is_some() != pre_signal_observation.is_some() {
+        return Err(ArenaError::Invalid(
+            "pre-signal control requires its original observation".into(),
         ));
     }
     limits.validate()?;
@@ -955,6 +1020,8 @@ pub(crate) fn supervise_tree_observed_with_controls<'v>(
                 spawned,
                 control,
                 cleanup_control,
+                pre_signal,
+                pre_signal_observation,
                 original,
                 ..Default::default()
             },
@@ -972,6 +1039,8 @@ pub(crate) fn supervise_tree_observed_with_controls<'v>(
             control,
             cleanup_control,
             original,
+            pre_signal,
+            pre_signal_observation,
         );
         Err(ArenaError::Invalid(
             "native process supervision currently requires Linux".into(),
@@ -1278,6 +1347,8 @@ fn supervise_original_input(
                 spawned: None,
                 control: None,
                 cleanup_control: None,
+                pre_signal: None,
+                pre_signal_observation: None,
             },
         )?;
         let returned = Instant::now();
@@ -1338,6 +1409,8 @@ mod linux {
         pub spawned: Option<&'v mut SpawnCustody>,
         pub control: Option<SpawnControl<'v>>,
         pub cleanup_control: Option<CleanupControl<'v>>,
+        pub pre_signal: Option<PreSignalControl<'v>>,
+        pub pre_signal_observation: Option<&'v mut PreSignalObservation>,
     }
 
     #[derive(Clone, Copy)]
@@ -1402,6 +1475,8 @@ mod linux {
             spawned,
             mut control,
             mut cleanup_control,
+            mut pre_signal,
+            mut pre_signal_observation,
         } = io;
         let mut local_custody = SpawnCustody::default();
         let custody = spawned.unwrap_or(&mut local_custody);
@@ -1521,6 +1596,8 @@ mod linux {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let mut shutdown = None;
+        let mut pre_signal_until = None;
+        let mut term_sent = false;
         let mut killed = false;
         let mut leader_done = false;
         let mut ownership_lost = false;
@@ -1711,6 +1788,17 @@ mod linux {
                     }
                 }
             }
+            // V6 never makes a new control or signal decision on an interrupted
+            // wait observation. Preserve the owner if the original window has
+            // ended before the wait relationship can be observed again.
+            if pre_signal_observation.is_some() && !leader_done && !owner_live_this_tick {
+                if original.is_some_and(|window| Instant::now() >= window.whole) {
+                    evidence(&mut receipt, "process.pre_signal_wait_unverified");
+                    break;
+                }
+                std::thread::sleep(POLL);
+                continue;
+            }
             if owner_live_this_tick
                 && !leader_done
                 && !ownership_lost
@@ -1787,10 +1875,104 @@ mod linux {
                 stop.get_or_insert(ProcessStop::Exited);
             }
             if stop.is_some() && shutdown.is_none() {
-                // The observation/drain work above can take time. Grace begins
-                // at the actual termination request, not this pass's old clock.
-                shutdown = Some(Instant::now());
+                // The entire existing shutdown allowance starts here, including
+                // the optional cooperative stage; it is never renewed by ACK.
+                let at = Instant::now();
+                shutdown = Some(at);
+                if pre_signal.is_some() && owner_live_this_tick && !leader_done {
+                    if let Some(window) = original {
+                        let kill_at =
+                            window.execution + window.whole.duration_since(window.execution) / 2;
+                        pre_signal_until = at
+                            .checked_add((grace / 2).min(Duration::from_millis(100)))
+                            .map(|until| until.min(kill_at).min(window.whole));
+                    }
+                }
+            }
+            if let Some(deadline) = pre_signal_until {
+                if Instant::now() < deadline && owner_live_this_tick && !leader_done {
+                    if let Some(callback) = pre_signal.as_deref_mut() {
+                        let observed = pre_signal_observation
+                            .as_deref_mut()
+                            .expect("pre-signal observation checked before spawn");
+                        observed.calls = observed.calls.saturating_add(1);
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            callback(custody, deadline)
+                        }));
+                        let at = Instant::now();
+                        match result {
+                            Ok(Ok(PreSignalProgress::Pending { partial })) => {
+                                if partial {
+                                    observed.first_partial_at.get_or_insert(at);
+                                }
+                            }
+                            Ok(Ok(PreSignalProgress::Acknowledged)) => {
+                                observed.acknowledged_at.get_or_insert(at);
+                                // Acceptance is not completion. Allow the
+                                // same bounded window for the peer to drain.
+                                pre_signal = None;
+                            }
+                            Ok(Err(error)) => {
+                                let reason = format!("process.pre_signal_control:{error}");
+                                observed.first_failure.get_or_insert_with(|| reason.clone());
+                                evidence(&mut receipt, &reason);
+                                pre_signal = None;
+                                pre_signal_until = None;
+                            }
+                            Err(_) => {
+                                let reason = "process.pre_signal_control:panic";
+                                observed.first_failure.get_or_insert_with(|| reason.into());
+                                evidence(&mut receipt, reason);
+                                pre_signal = None;
+                                pre_signal_until = None;
+                            }
+                        }
+                        // Callback code must not run after ownership is lost.
+                        // Recheck before any group signal, as with cleanup.
+                        match waitid(
+                            Id::Pid(group),
+                            WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                        ) {
+                            Ok(WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _))
+                            | Ok(WaitStatus::StillAlive) => {}
+                            _ => {
+                                ownership_lost = true;
+                                evidence(&mut receipt, "process.pre_signal_control_ownership_lost");
+                                break;
+                            }
+                        }
+                    }
+                } else if !leader_done && !owner_live_this_tick {
+                    // An interrupted wait cannot grant a new authority to poll.
+                    pre_signal_until = None;
+                }
+                if let Some(until) = pre_signal_until
+                    && Instant::now() >= until
+                {
+                    if let Some(observed) = pre_signal_observation.as_deref_mut() {
+                        observed.timed_out = observed.acknowledged_at.is_none_or(|at| at >= until);
+                    }
+                    pre_signal_until = None;
+                }
+            }
+            if pre_signal_observation.is_some()
+                && original.is_some_and(|window| Instant::now() >= window.whole)
+            {
+                evidence(&mut receipt, "process.original_whole_window_expired");
+                if stop.is_none() || stop == Some(ProcessStop::Exited) {
+                    stop = Some(ProcessStop::WallLimit);
+                }
+                signal(
+                    group,
+                    Signal::SIGKILL,
+                    &mut receipt,
+                    "process.kill_original_whole",
+                );
+                break;
+            }
+            if shutdown.is_some() && pre_signal_until.is_none() && !term_sent {
                 signal(group, Signal::SIGTERM, &mut receipt, "process.term");
+                term_sent = true;
             }
             if let Some(shutdown_at) = shutdown {
                 let age = shutdown_at.elapsed();
@@ -1812,8 +1994,9 @@ mod linux {
             // termination signal/kill decisions. It neither changes the stop
             // reason nor supplies a new grace period. Recheck an observed
             // terminal leader without reaping before using its reservation.
-            if let (Some(shutdown_at), Some(callback), Some(window)) =
-                (shutdown, cleanup_control.as_deref_mut(), original)
+            if term_sent
+                && let (Some(shutdown_at), Some(callback), Some(window)) =
+                    (shutdown, cleanup_control.as_deref_mut(), original)
             {
                 let cleanup_until = shutdown_at
                     .checked_add(grace.saturating_mul(2))
@@ -2849,6 +3032,120 @@ mod linux {
                 error.starts_with("process.cleanup_control:")
                     && error.contains("cleanup test failure")
             }));
+        }
+
+        #[test]
+        fn v6_pre_signal_preserves_original_owner_and_ack_is_not_completion() {
+            let root = OriginalTestDirectory::new();
+            let cwd = root.file();
+            let program = File::open("/bin/sleep").unwrap();
+            let watch = original_watch();
+            let limits = original_limits();
+            let started = Instant::now();
+            let execution = started + Duration::from_millis(limits.wall_ms);
+            let whole = execution + Duration::from_millis(limits.shutdown_grace_ms * 2);
+            let window = OriginalProcessWindow::new(started, execution, whole).unwrap();
+            let cancelled = AtomicBool::new(false);
+            let mut custody = SpawnCustody::default();
+            let mut observation = PreSignalObservation::default();
+            let mut run = |_: &SpawnCustody, _: Instant| {
+                cancelled.store(true, Ordering::Release);
+                Ok(())
+            };
+            let mut calls = 0;
+            let mut request = |owner: &SpawnCustody, deadline: Instant| {
+                let pid = owner.child().unwrap().id();
+                assert_eq!(owner.last_spawn_pid, Some(pid));
+                assert!(deadline <= whole);
+                assert!(matches!(
+                    waitid(
+                        Id::Pid(Pid::from_raw(i32::try_from(pid).unwrap())),
+                        WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                    ),
+                    Ok(WaitStatus::StillAlive)
+                ));
+                calls += 1;
+                Ok(if calls == 1 {
+                    PreSignalProgress::Pending { partial: true }
+                } else {
+                    PreSignalProgress::Acknowledged
+                })
+            };
+            let result = crate::process::supervise_tree_observed_with_v6_controls(
+                &program,
+                &["10".into()],
+                &cwd,
+                limits,
+                Some(&cancelled),
+                &watch,
+                None,
+                Some(&mut custody),
+                Some(&mut run),
+                None,
+                Some(window),
+                Some(&mut request),
+                Some(&mut observation),
+            )
+            .unwrap();
+            assert_eq!(result.receipt.stop, ProcessStop::Cancelled);
+            if observation.calls != 0 {
+                assert!(observation.first_partial_at.is_some());
+            }
+            if observation.acknowledged_at.is_none() {
+                assert!(observation.timed_out);
+            }
+            assert!(observation.first_failure.is_none());
+            // /bin/sleep does not understand the ACK and must still receive
+            // the actual termination signal from the original supervisor.
+            assert_eq!(result.receipt.exit_signal, Some(Signal::SIGTERM as i32));
+        }
+
+        #[test]
+        fn v6_pre_signal_panic_falls_back_to_original_cleanup() {
+            let root = OriginalTestDirectory::new();
+            let cwd = root.file();
+            let program = File::open("/bin/sleep").unwrap();
+            let watch = original_watch();
+            let limits = original_limits();
+            let started = Instant::now();
+            let execution = started + Duration::from_millis(limits.wall_ms);
+            let whole = execution + Duration::from_millis(limits.shutdown_grace_ms * 2);
+            let window = OriginalProcessWindow::new(started, execution, whole).unwrap();
+            let cancelled = AtomicBool::new(false);
+            let mut custody = SpawnCustody::default();
+            let mut observation = PreSignalObservation::default();
+            let mut run = |_: &SpawnCustody, _: Instant| {
+                cancelled.store(true, Ordering::Release);
+                Ok(())
+            };
+            let mut request =
+                |_: &SpawnCustody, _: Instant| -> Result<PreSignalProgress, ArenaError> {
+                    panic!("pre-signal fixture")
+                };
+            let result = crate::process::supervise_tree_observed_with_v6_controls(
+                &program,
+                &["10".into()],
+                &cwd,
+                limits,
+                Some(&cancelled),
+                &watch,
+                None,
+                Some(&mut custody),
+                Some(&mut run),
+                None,
+                Some(window),
+                Some(&mut request),
+                Some(&mut observation),
+            )
+            .unwrap();
+            assert_eq!(result.receipt.stop, ProcessStop::Cancelled);
+            assert_eq!(observation.calls, 1);
+            assert_eq!(
+                observation.first_failure.as_deref(),
+                Some("process.pre_signal_control:panic")
+            );
+            assert!(observation.acknowledged_at.is_none());
+            assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone);
         }
 
         #[test]
