@@ -24,6 +24,37 @@ from pals_followup_run import outside_git, sha, unique_object, observe_resources
 from virtual_custody_transport import CustodyTransport
 
 
+def require_capture_window(config, supervisor_deadline_ns, *, now_ns=None):
+    """Check sealed child windows against the original supervisor deadline.
+
+    Child-side comparison against the inherited absolute deadline is also
+    required: process startup occurs after this admission check.
+    """
+    work = config.get("deadline_seconds")
+    cleanup = config.get("cleanup_seconds")
+    if type(work) is not int or not 1 <= work <= 7200:
+        raise ValueError("sealed capture work deadline is invalid")
+    if type(cleanup) is not int or not 1 <= cleanup <= 30:
+        raise ValueError("sealed capture cleanup deadline is invalid")
+    now = time.monotonic_ns() if now_ns is None else now_ns
+    remaining = supervisor_deadline_ns - now
+    required = (work + cleanup) * 1_000_000_000
+    if remaining < required:
+        raise TimeoutError("supervisor time remaining cannot contain sealed child work and cleanup")
+    return {"work_seconds": work, "cleanup_seconds": cleanup,
+            "remaining_ns_at_check": remaining, "required_ns": required,
+            "child_startup_recheck_required": True}
+
+
+def capture_process_status(code, gone, failure, observation):
+    """Keep exit evidence even when its observation does not establish timing."""
+    if code != 0 or gone is not True or failure is not None:
+        return "capture_process_failed_or_incomplete"
+    if observation.get("exit_observation_timing") != "before_deadline":
+        return "capture_process_completed_deadline_unknown"
+    return "capture_process_completed"
+
+
 def snapshot_file(path: Path, expected: str, maximum: int, deadline: float, *, content=False, exact_size=None, seal=True):
     """Hold the source and pass a sealed anonymous copy of the exact bytes."""
     if not path.is_absolute():
@@ -135,8 +166,10 @@ def main(argv=None):
         parser.error("Linux, finite timeout and declared binary size are required")
     if not 1 <= args.output_bytes_max <= 2**63 - 1:
         parser.error("finite output allowance required")
-    start = time.monotonic()
-    deadline = start + args.timeout
+    start_ns = time.monotonic_ns()
+    start = start_ns / 1_000_000_000
+    deadline_ns = start_ns + args.timeout * 1_000_000_000
+    deadline = deadline_ns / 1_000_000_000
     source = Path(__file__).resolve().parent.parent
     receipt_path = outside_git(args.receipt)
     if not receipt_path.parent.is_dir():
@@ -180,6 +213,7 @@ def main(argv=None):
                             parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
         if type(config) is not dict or config.get("provider") != "cuda-system" or not isinstance(config.get("output_root"), str):
             raise ValueError("explicit V3 system-CUDA config/output required")
+        receipt["capture_window_preparation"] = require_capture_window(config, deadline_ns)
         target = outside_git(Path(config["output_root"]))
         if receipt_path == target or receipt_path.is_relative_to(target):
             raise ValueError("receipt must be outside the fresh capture output")
@@ -200,14 +234,16 @@ def main(argv=None):
                        input_identity_scope="sealed_binary_and_config_bytes; plan_rechecked_by_native")
         lease = OutputLease(target, source, reserve=args.output_bytes_max, deferred=True).acquire()
         receipt["output_lease"]["acquired"] = True
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("preparation window elapsed before native dispatch")
+        receipt["capture_window_dispatch"] = require_capture_window(config, deadline_ns)
+        remaining = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
         receipt["dispatch_attempted"] = True
         receipt["producer_tree_gone"] = "unknown"
         transport = CustodyTransport()
         receipt["custody_transport"] = transport.state
+        observation = {}
+        receipt["producer_deadline_observation"] = observation
         env["ROVEZERO_CUSTODY_FD"] = str(transport.child_fd())
+        env["ROVEZERO_SUPERVISOR_DEADLINE_MONOTONIC_NS"] = str(deadline_ns)
         def producer_spawned():
             receipt["producer_spawned"] = True
             transport.child_started()
@@ -218,7 +254,8 @@ def main(argv=None):
             code, gone, failure = run_group([f"/proc/self/fd/{binary_fd}", f"/proc/self/fd/{config_image}"],
                                             args.binary.parent, env, remaining, producer_check,
                                             pass_fds=(binary_fd, config_image, transport.child_fd()), on_spawn=producer_spawned,
-                                            verify_before_spawn=True)
+                                            verify_before_spawn=True, absolute_deadline=deadline,
+                                            deadline_observation=observation)
         except ProcessNotSpawned as error:
             receipt["producer_tree_gone"] = True
             receipt["producer_not_spawned_cause"] = {
@@ -229,8 +266,7 @@ def main(argv=None):
             transport.close()
         receipt.update(producer_result_observed=True, producer_exit_code=code,
                        producer_tree_gone=gone, producer_supervisor_error=failure,
-                       status="capture_process_completed" if code == 0 and gone is True and failure is None
-                       else "capture_process_failed_or_incomplete")
+                       status=capture_process_status(code, gone, failure, observation))
     except BaseException as error:
         first_error = error
         receipt.update(status="supervisor_error", wrapper_error={"type": type(error).__name__, "message": str(error)})

@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 if sys.platform == "linux":
     import fcntl
     from managed_process import ProcessNotSpawned, run_group
-    from virtual_system_numeric_run import snapshot_file
+    from virtual_system_numeric_run import capture_process_status, require_capture_window, snapshot_file
     from virtual_custody_transport import CustodyTransport
 
 
@@ -38,6 +38,33 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
         self.addCleanup(os.close, image_fd)
         self.assertEqual(observed, data)
         return source, image_fd, data
+
+    def test_capture_window_includes_preparation_and_cleanup(self):
+        config = {"deadline_seconds": 10, "cleanup_seconds": 2}
+        result = require_capture_window(config, 20_000_000_000, now_ns=8_000_000_000)
+        self.assertEqual(result["required_ns"], 12_000_000_000)
+        with self.assertRaises(TimeoutError):
+            require_capture_window(config, 20_000_000_000, now_ns=8_000_000_001)
+        self.assertTrue(result["child_startup_recheck_required"])
+
+    def test_late_exit_observation_preserves_exit_without_claiming_deadline(self):
+        self.assertEqual(capture_process_status(0, True, None, {"exit_observation_timing": "before_deadline"}),
+                         "capture_process_completed")
+        self.assertEqual(capture_process_status(0, True, None, {"exit_observation_timing": "at_or_after_deadline"}),
+                         "capture_process_completed_deadline_unknown")
+        self.assertEqual(capture_process_status(0, True, None, {}),
+                         "capture_process_completed_deadline_unknown")
+        self.assertEqual(capture_process_status(17, True, None, {"exit_observation_timing": "at_or_after_deadline"}),
+                         "capture_process_failed_or_incomplete")
+
+    def test_capture_window_rejects_noninteger_or_out_of_range_values(self):
+        for config in ({"deadline_seconds": True, "cleanup_seconds": 1},
+                       {"deadline_seconds": 1.0, "cleanup_seconds": 1},
+                       {"deadline_seconds": 1, "cleanup_seconds": 0},
+                       {"deadline_seconds": 1, "cleanup_seconds": 31},
+                       {"deadline_seconds": 0, "cleanup_seconds": 1}):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                require_capture_window(config, 100_000_000_000, now_ns=0)
 
     def test_custody_transport_reobserves_same_child_without_device_fence(self):
         channel = CustodyTransport()

@@ -1,6 +1,7 @@
 """Finite owned command trees used by the build-storage boundary."""
 from __future__ import annotations
 import ctypes
+import math
 import os
 import signal
 import stat
@@ -32,15 +33,37 @@ def _check_before_spawn(argv, cwd, pass_fds, stdout):
 
 
 def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=None, on_spawn=None,
-              verify_before_spawn=False):
+              verify_before_spawn=False, absolute_deadline=None, deadline_observation=None):
     if os.name == "nt":
-        if pass_fds or stdout is not None or on_spawn is not None or verify_before_spawn:
+        if (pass_fds or stdout is not None or on_spawn is not None or verify_before_spawn
+                or absolute_deadline is not None or deadline_observation is not None):
             raise RuntimeError("explicit descriptor handoff requires Linux")
         return _run_windows(argv, cwd, env, timeout, admission_check)
     if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
         raise RuntimeError("non-reaping process supervision requires Linux waitid")
+    if deadline_observation is not None:
+        if type(deadline_observation) is not dict or absolute_deadline is None:
+            raise ValueError("deadline observation requires a dict and an absolute deadline")
+        deadline_observation.update(absolute_deadline_monotonic=absolute_deadline,
+                                    exit_observed_monotonic=None,
+                                    exit_observation_timing="not_observed",
+                                    actual_exit_time="unknown",
+                                    deadline_elapsed_while_running_observed=False,
+                                    reaped_exit_code=None)
+    if absolute_deadline is not None:
+        try:
+            valid_deadline = (type(absolute_deadline) in (int, float)
+                              and math.isfinite(absolute_deadline) and absolute_deadline > 0)
+        except OverflowError:
+            valid_deadline = False
+        if not valid_deadline:
+            raise ValueError("absolute deadline must be finite positive monotonic seconds")
+        if time.monotonic() >= absolute_deadline:
+            raise ProcessNotSpawned("absolute deadline expired before process spawn") from TimeoutError()
     if verify_before_spawn:
         _check_before_spawn(argv, cwd, pass_fds, stdout)
+    if absolute_deadline is not None and time.monotonic() >= absolute_deadline:
+        raise ProcessNotSpawned("absolute deadline expired before process spawn") from TimeoutError()
     child = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True,
                              pass_fds=tuple(pass_fds), stdout=stdout)
     started = time.monotonic()
@@ -53,8 +76,28 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
         while True:
             status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
             if status is not None:
+                if deadline_observation is not None:
+                    observed = time.monotonic()
+                    deadline_observation.update(
+                        exit_observed_monotonic=observed,
+                        exit_observation_timing=("before_deadline" if observed < absolute_deadline
+                                                 else "at_or_after_deadline"),
+                    )
                 break
             now = time.monotonic()
+            if absolute_deadline is not None and now >= absolute_deadline:
+                # Reobserve after the deadline was read: the child could have
+                # exited between the earlier waitid and the clock read.
+                status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                if status is not None:
+                    if deadline_observation is not None:
+                        deadline_observation.update(exit_observed_monotonic=time.monotonic(),
+                                                    exit_observation_timing="at_or_after_deadline")
+                    break
+                if deadline_observation is not None:
+                    deadline_observation["deadline_elapsed_while_running_observed"] = True
+                requested_exit = 124
+                break
             if now >= next_check:
                 admission_check()
                 # A full custody observation may itself exceed the sampling
@@ -62,7 +105,23 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
                 # and count its elapsed time toward the original deadline.
                 now = time.monotonic()
                 next_check = now + 5
-            if now - started > timeout:
+            if now - started > timeout or (absolute_deadline is not None and now >= absolute_deadline):
+                if absolute_deadline is not None:
+                    # The admission callback can be slow; the process may
+                    # have exited during it. Preserve the observed exit.
+                    check_started = now
+                    status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    now = time.monotonic()
+                    if status is not None:
+                        if deadline_observation is not None:
+                            deadline_observation.update(
+                                exit_observed_monotonic=now,
+                                exit_observation_timing=("before_deadline" if now < absolute_deadline
+                                                         else "at_or_after_deadline"),
+                            )
+                        break
+                    if deadline_observation is not None and check_started >= absolute_deadline:
+                        deadline_observation["deadline_elapsed_while_running_observed"] = True
                 requested_exit = 124
                 break
             time.sleep(0.1)
@@ -76,6 +135,8 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
         if on_spawn is None:
             raise
         requested_exit, failure = 125, f"{type(exc).__name__}: {exc}"
+    # Popen and individual observations cannot be preempted. The finite
+    # SIGTERM/SIGKILL drain below may extend beyond the work deadline.
     # The unreaped leader reserves this exact process/group ID while signaling.
     # Normal exits must also drain descendants before scratch is reclaimed.
     for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -110,6 +171,8 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
         time.sleep(0.05)
     if gone:
         result = child.wait()
+        if deadline_observation is not None:
+            deadline_observation["reaped_exit_code"] = result
     else:
         # Do not reap an unresolved leader and lose its reserved group identity.
         result = 125
