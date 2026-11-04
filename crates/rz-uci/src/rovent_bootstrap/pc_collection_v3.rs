@@ -287,16 +287,36 @@ impl RoventPcCollectionRootCustodyV3 {
 pub type RootHandoffV3 = Arc<Mutex<RoventPcCollectionHandoffV3>>;
 /// Receiver records the exact same-root handoff actually delivered to worker.
 pub struct RoventPcRootHandoffReceiverV3 {
-    receiver: mpsc::Receiver<RootHandoffV3>,
+    receiver: Option<mpsc::Receiver<RootHandoffV3>>,
     admission: RoventCollectionRootAdmissionV3,
     received: Arc<Mutex<Option<RootHandoffV3>>>,
+    receive_state: Arc<PcHandoffReceiveStateV3>,
+}
+struct PcHandoffReceiveStateV3 {
+    received_any: AtomicBool,
+    receiver_dropped: AtomicBool,
+}
+impl Drop for RoventPcRootHandoffReceiverV3 {
+    fn drop(&mut self) {
+        // The marker is published only after the original receiver and any
+        // queued handoffs have finished dropping. A panic leaves it unknown.
+        drop(self.receiver.take());
+        self.receive_state
+            .receiver_dropped
+            .store(true, Ordering::Release);
+    }
 }
 impl RoventPcRootHandoffReceiverV3 {
     pub fn recv_timeout(
         &self,
         timeout: std::time::Duration,
     ) -> Result<Option<RootHandoffV3>, AdaptiveManagerError> {
-        let handoff = match self.receiver.recv_timeout(timeout) {
+        let handoff = match self
+            .receiver
+            .as_ref()
+            .expect("live V3 receiver")
+            .recv_timeout(timeout)
+        {
             Ok(value) => value,
             Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -305,6 +325,10 @@ impl RoventPcRootHandoffReceiverV3 {
                 ));
             }
         };
+        // Record even an invalid handoff before inspecting it: it was received.
+        self.receive_state
+            .received_any
+            .store(true, Ordering::Release);
         if !handoff
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -336,6 +360,7 @@ pub struct RoventPcCollectionWorkerV3 {
     admission: RoventCollectionRootAdmissionV3,
     sender: mpsc::SyncSender<RootHandoffV3>,
     received: Arc<Mutex<Option<RootHandoffV3>>>,
+    receive_state: Arc<PcHandoffReceiveStateV3>,
     thread: Option<std::thread::JoinHandle<Box<dyn Any + Send>>>,
 }
 
@@ -354,6 +379,7 @@ struct QuarantinedPcWorkerV3 {
     admission: RoventCollectionRootAdmissionV3,
     sender: mpsc::SyncSender<RootHandoffV3>,
     received: Arc<Mutex<Option<RootHandoffV3>>>,
+    receive_state: Arc<PcHandoffReceiveStateV3>,
     thread: std::thread::JoinHandle<Box<dyn Any + Send>>,
 }
 enum PcWorkerSlotV3 {
@@ -397,6 +423,37 @@ pub enum RoventPcCollectionWorkerJoinFailureV3 {
     CompletedWithoutHandoff(Box<dyn Any + Send>),
 }
 
+/// Only the original orchestration thread joined successfully and its exact
+/// receiver was dropped without receiving any handoff. This is not teacher,
+/// native, GPU, route, or collection completion evidence.
+pub struct RoventPcCollectionNoHandoffCustodyV3 {
+    key: RoventPcCollectionWorkerKeyV3,
+    admission: RoventCollectionRootAdmissionV3,
+    original_worker: Box<dyn Any + Send>,
+}
+
+impl RoventPcCollectionNoHandoffCustodyV3 {
+    pub fn matches_worker(&self, key: &RoventPcCollectionWorkerKeyV3) -> bool {
+        self.key.same_original(key)
+    }
+
+    pub fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
+        self.admission.same_original_admission(admission)
+    }
+
+    pub fn into_original_worker(self) -> Box<dyn Any + Send> {
+        self.original_worker
+    }
+}
+
+pub enum RoventPcCollectionNoHandoffJoinFailureV3 {
+    AlreadyJoined,
+    HandoffReceived,
+    OwnerLockPoisoned,
+    WorkerSlotMissing,
+    Panicked(Box<dyn Any + Send>),
+}
+
 impl RoventPcCollectionWorkerV3 {
     /// Identity only; this does not attest worker or teacher completion.
     pub fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
@@ -424,10 +481,15 @@ impl RoventPcCollectionWorkerV3 {
         }
         let (sender, receiver) = mpsc::sync_channel(1);
         let received = Arc::new(Mutex::new(None));
+        let receive_state = Arc::new(PcHandoffReceiveStateV3 {
+            received_any: AtomicBool::new(false),
+            receiver_dropped: AtomicBool::new(false),
+        });
         let worker_receiver = RoventPcRootHandoffReceiverV3 {
-            receiver,
+            receiver: Some(receiver),
             admission: admission.clone(),
             received: Arc::clone(&received),
+            receive_state: Arc::clone(&receive_state),
         };
         // A failed thread creation must return the original task and its owners.
         let slot = Arc::new(Mutex::new(Some(task)));
@@ -448,6 +510,7 @@ impl RoventPcCollectionWorkerV3 {
                 admission,
                 sender,
                 received,
+                receive_state,
                 thread: Some(thread),
             }),
             Err(error) => {
@@ -493,8 +556,51 @@ impl RoventPcCollectionWorkerV3 {
             admission: owner.admission,
             sender: owner.sender,
             received: owner.received,
+            receive_state: owner.receive_state,
             thread: Some(owner.thread),
         })
+    }
+
+    /// Join the original worker only after its original receiver is gone and
+    /// no handoff, including an invalid one, was ever received. Busy returns
+    /// None without consuming the handle; a panic returns its original payload.
+    pub fn try_join_without_handoff(
+        &mut self,
+    ) -> Result<
+        Option<RoventPcCollectionNoHandoffCustodyV3>,
+        RoventPcCollectionNoHandoffJoinFailureV3,
+    > {
+        let thread = self
+            .thread
+            .as_ref()
+            .ok_or(RoventPcCollectionNoHandoffJoinFailureV3::AlreadyJoined)?;
+        if !thread.is_finished() || !self.receive_state.receiver_dropped.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if self.receive_state.received_any.load(Ordering::Acquire) {
+            return Err(RoventPcCollectionNoHandoffJoinFailureV3::HandoffReceived);
+        }
+        let mut slots = match quarantined_pc_workers_v3().try_lock() {
+            Ok(slots) => slots,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(RoventPcCollectionNoHandoffJoinFailureV3::OwnerLockPoisoned);
+            }
+        };
+        let Some(slot) = slots.iter().position(|slot| matches!(slot, PcWorkerSlotV3::Reserved(key) if Arc::ptr_eq(&key.0, &self.key.0))) else {
+            return Err(RoventPcCollectionNoHandoffJoinFailureV3::WorkerSlotMissing);
+        };
+        let worker = self.thread.take().expect("checked V3 worker handle");
+        slots.swap_remove(slot);
+        drop(slots);
+        match worker.join() {
+            Ok(original_worker) => Ok(Some(RoventPcCollectionNoHandoffCustodyV3 {
+                key: self.key.clone(),
+                admission: self.admission.clone(),
+                original_worker,
+            })),
+            Err(payload) => Err(RoventPcCollectionNoHandoffJoinFailureV3::Panicked(payload)),
+        }
     }
 
     pub fn try_join(
@@ -583,6 +689,7 @@ impl Drop for RoventPcCollectionWorkerV3 {
                 admission: self.admission.clone(),
                 sender: self.sender.clone(),
                 received: Arc::clone(&self.received),
+                receive_state: Arc::clone(&self.receive_state),
                 thread,
             };
             if let Some(slot) = slots.iter_mut().find(|slot| slot.matches(&self.key)) {
