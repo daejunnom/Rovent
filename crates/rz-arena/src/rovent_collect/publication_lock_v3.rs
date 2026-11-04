@@ -101,7 +101,7 @@ pub(super) fn publish_lock_v3_payloads_speculative(
     admissions: &BTreeMap<String, Arc<LockV3PublicationSource>>,
     game_gate: &std::sync::atomic::AtomicU64,
 ) -> Result<RoventLockV3Publication, ArenaError> {
-    publish_lock_v3_payloads_speculative_with_hook(
+    publish_lock_v3_payloads_speculative_impl(
         directory,
         until,
         cancel,
@@ -109,6 +109,7 @@ pub(super) fn publish_lock_v3_payloads_speculative(
         index,
         admissions,
         game_gate,
+        false,
         |_, _| Ok(()),
     )
 }
@@ -123,6 +124,25 @@ pub(super) fn publish_lock_v3_payloads_speculative_with_hook(
     index: &RoventCorpusIndexLockV3,
     admissions: &BTreeMap<String, Arc<LockV3PublicationSource>>,
     game_gate: &std::sync::atomic::AtomicU64,
+    hook: impl FnMut(
+        publication::RoventPublicationHookEventV3,
+        publication::RoventPublicationHookPhaseV3,
+    ) -> Result<(), ArenaError>,
+) -> Result<RoventLockV3Publication, ArenaError> {
+    publish_lock_v3_payloads_speculative_impl(
+        directory, until, cancel, manifest, index, admissions, game_gate, true, hook,
+    )
+}
+
+fn publish_lock_v3_payloads_speculative_impl(
+    directory: &cap_std::fs::Dir,
+    until: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+    manifest: &RoventCorpusManifestLockV3,
+    index: &RoventCorpusIndexLockV3,
+    admissions: &BTreeMap<String, Arc<LockV3PublicationSource>>,
+    game_gate: &std::sync::atomic::AtomicU64,
+    managed_paths: bool,
     hook: impl FnMut(
         publication::RoventPublicationHookEventV3,
         publication::RoventPublicationHookPhaseV3,
@@ -156,6 +176,7 @@ pub(super) fn publish_lock_v3_payloads_speculative_with_hook(
                 .map_err(|_| invalid("speculative /3 publication game changed or was aborted"))?;
             Ok(())
         },
+        managed_paths,
         hook,
     )
 }
@@ -177,6 +198,7 @@ fn publish_lock_v3_payloads_authorized(
         index,
         admissions,
         authorize,
+        false,
         |_, _| Ok(()),
     )
 }
@@ -189,6 +211,7 @@ fn publish_lock_v3_payloads_authorized_with_hook(
     index: &RoventCorpusIndexLockV3,
     admissions: &BTreeMap<String, Arc<LockV3PublicationSource>>,
     authorize: impl FnOnce() -> Result<(), ArenaError>,
+    managed_paths: bool,
     hook: impl FnMut(
         publication::RoventPublicationHookEventV3,
         publication::RoventPublicationHookPhaseV3,
@@ -209,54 +232,60 @@ fn publish_lock_v3_payloads_authorized_with_hook(
     let manifest_bytes =
         serde_json::to_vec(manifest).map_err(|error| invalid(error.to_string()))?;
     let index_bytes = serde_json::to_vec(index).map_err(|error| invalid(error.to_string()))?;
-    publication::publish_original_payloads_authorized_with_hook(
-        directory,
-        until,
-        cancel,
-        publication::RoventPublicationMaterial {
-            manifest_bytes: &manifest_bytes,
-            index_bytes: &index_bytes,
-            chunks: &index.chunks,
-            admissions,
-        },
-        |manifest_file, index_file, chunks, entries, total_payload_bytes| {
-            let mut published_admissions = Vec::with_capacity(entries.len());
-            for entry in entries {
-                check(
-                    entry.runtime_bundle_manifest.is_none(),
-                    "/3 system runtime has no copied bundle",
-                )?;
-                let original = admissions
-                    .get(&entry.native_admission_sha256)
-                    .ok_or_else(|| invalid("/3 publication original admission missing"))?;
-                published_admissions.push(RoventLockV3PublicationAdmission {
-                    native_admission_sha256: entry.native_admission_sha256,
-                    input_lock: file(entry.input_lock),
-                    input_lock_bytes_origin:
-                        RoventLockV3InputLockBytesOrigin::ValidatedSemanticSnapshot,
-                    canonical_input_lock_sha256: entry.canonical_input_lock_sha256,
-                    system_runtime_identity_sha256: original.system_runtime_identity_sha256.clone(),
-                });
-            }
-            let result = RoventLockV3Publication {
-                schema: ROVENT_LOCK_V3_PUBLICATION_DOMAIN.into(),
-                manifest: file(manifest_file),
-                index: file(index_file),
-                chunks: chunks.into_iter().map(file).collect(),
-                canonical_manifest_sha256: index.manifest_sha256.clone(),
-                canonical_index_sha256: index.sha256()?,
-                source_commit: manifest.registration.source_commit.clone(),
-                source_sha256: manifest.registration.source_sha256.clone(),
-                runtime_sha256: manifest.registration.runtime_sha256.clone(),
-                record_count: index.record_count,
-                total_payload_bytes,
-                native_admission_sha256: admissions.keys().cloned().collect(),
-                admissions: published_admissions,
-            };
-            result.validate()?;
-            Ok(result)
-        },
-        authorize,
-        hook,
-    )
+    let material = publication::RoventPublicationMaterial {
+        manifest_bytes: &manifest_bytes,
+        index_bytes: &index_bytes,
+        chunks: &index.chunks,
+        admissions,
+    };
+    let build = |manifest_file,
+                 index_file,
+                 chunks: Vec<publication::RoventPublicationFile>,
+                 entries: Vec<publication::RoventPublicationAdmission>,
+                 total_payload_bytes| {
+        let mut published_admissions = Vec::with_capacity(entries.len());
+        for entry in entries {
+            check(
+                entry.runtime_bundle_manifest.is_none(),
+                "/3 system runtime has no copied bundle",
+            )?;
+            let original = admissions
+                .get(&entry.native_admission_sha256)
+                .ok_or_else(|| invalid("/3 publication original admission missing"))?;
+            published_admissions.push(RoventLockV3PublicationAdmission {
+                native_admission_sha256: entry.native_admission_sha256,
+                input_lock: file(entry.input_lock),
+                input_lock_bytes_origin:
+                    RoventLockV3InputLockBytesOrigin::ValidatedSemanticSnapshot,
+                canonical_input_lock_sha256: entry.canonical_input_lock_sha256,
+                system_runtime_identity_sha256: original.system_runtime_identity_sha256.clone(),
+            });
+        }
+        let result = RoventLockV3Publication {
+            schema: ROVENT_LOCK_V3_PUBLICATION_DOMAIN.into(),
+            manifest: file(manifest_file),
+            index: file(index_file),
+            chunks: chunks.into_iter().map(file).collect(),
+            canonical_manifest_sha256: index.manifest_sha256.clone(),
+            canonical_index_sha256: index.sha256()?,
+            source_commit: manifest.registration.source_commit.clone(),
+            source_sha256: manifest.registration.source_sha256.clone(),
+            runtime_sha256: manifest.registration.runtime_sha256.clone(),
+            record_count: index.record_count,
+            total_payload_bytes,
+            native_admission_sha256: admissions.keys().cloned().collect(),
+            admissions: published_admissions,
+        };
+        result.validate()?;
+        Ok(result)
+    };
+    if managed_paths {
+        publication::publish_original_payloads_authorized_with_managed_hook(
+            directory, until, cancel, material, build, authorize, hook,
+        )
+    } else {
+        publication::publish_original_payloads_authorized_with_hook(
+            directory, until, cancel, material, build, authorize, hook,
+        )
+    }
 }
