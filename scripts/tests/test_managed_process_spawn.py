@@ -1,5 +1,6 @@
 """Linux process ownership checks without model, GPU or runner dependencies."""
 import json
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import subprocess
@@ -174,7 +175,7 @@ class ManagedProcessSpawnTests(unittest.TestCase):
              mock.patch("managed_process.time.monotonic", side_effect=lambda: clock["now"]), \
              mock.patch("managed_process.os.waitid", return_value=None), \
              mock.patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
-             mock.patch("managed_process.os.scandir", return_value=[]):
+             mock.patch("managed_process.os.scandir", side_effect=lambda _path: nullcontext([])):
             code, gone, failure = run_group(
                 [self.python, "-c", "import time; time.sleep(30)"], self.root,
                 os.environ.copy(), 10, lambda: None, on_spawn=lambda: None,
@@ -202,7 +203,7 @@ class ManagedProcessSpawnTests(unittest.TestCase):
              mock.patch("managed_process.time.monotonic", side_effect=lambda: clock["now"]), \
              mock.patch("managed_process.os.waitid", side_effect=[None, object()]), \
              mock.patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
-             mock.patch("managed_process.os.scandir", return_value=[]):
+             mock.patch("managed_process.os.scandir", side_effect=lambda _path: nullcontext([])):
             code, gone, failure = run_group(
                 [self.python, "-c", "import sys; sys.exit(7)"], self.root,
                 os.environ.copy(), 10, lambda: None, on_spawn=lambda: None,
@@ -227,7 +228,7 @@ class ManagedProcessSpawnTests(unittest.TestCase):
              mock.patch("managed_process.time.monotonic", side_effect=lambda: clock["now"]), \
              mock.patch("managed_process.os.waitid", side_effect=[None, object()]), \
              mock.patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
-             mock.patch("managed_process.os.scandir", return_value=[]):
+             mock.patch("managed_process.os.scandir", side_effect=lambda _path: nullcontext([])):
             code, gone, failure = run_group(
                 [self.python], self.root, os.environ.copy(), 10, slow_admission,
                 on_spawn=lambda: None, absolute_deadline=15.0, deadline_observation=observation,
@@ -259,7 +260,7 @@ class ManagedProcessSpawnTests(unittest.TestCase):
              mock.patch("managed_process.time.sleep", side_effect=advance), \
              mock.patch("managed_process.os.waitid", side_effect=[None, None, None, object()]), \
              mock.patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
-             mock.patch("managed_process.os.scandir", return_value=[]):
+             mock.patch("managed_process.os.scandir", side_effect=lambda _path: nullcontext([])):
             result = run_group([self.python], self.root, os.environ.copy(), 20,
                                lambda: scans.append(1), absolute_deadline=15.0,
                                on_tick=lambda: ticks.append(1))
@@ -280,7 +281,7 @@ class ManagedProcessSpawnTests(unittest.TestCase):
                  mock.patch("managed_process.subprocess.Popen", return_value=child), \
                  mock.patch("managed_process.os.waitid", return_value=None), \
                  mock.patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
-                 mock.patch("managed_process.os.scandir", return_value=[]):
+                 mock.patch("managed_process.os.scandir", side_effect=lambda _path: nullcontext([])):
                 result = run_group([self.python], self.root, os.environ.copy(), 10,
                                    lambda: None, on_tick=fail)
             self.assertEqual(result, (125, True, expected))
@@ -299,7 +300,7 @@ class ManagedProcessSpawnTests(unittest.TestCase):
              mock.patch("managed_process.time.monotonic", side_effect=lambda: clock["now"]), \
              mock.patch("managed_process.os.waitid", side_effect=[None, object()]), \
              mock.patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
-             mock.patch("managed_process.os.scandir", return_value=[]):
+             mock.patch("managed_process.os.scandir", side_effect=lambda _path: nullcontext([])):
             result = run_group([self.python], self.root, os.environ.copy(), 10,
                                lambda: scans.append(1), absolute_deadline=15.0,
                                deadline_observation=observation, on_tick=slow_tick)

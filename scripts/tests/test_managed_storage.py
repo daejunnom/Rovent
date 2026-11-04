@@ -1,4 +1,5 @@
 import hashlib
+from contextlib import nullcontext
 import io
 import json
 import os
@@ -960,7 +961,7 @@ class ProcessTests(unittest.TestCase):
                 with patch("managed_process.subprocess.Popen", return_value=child), \
                      patch("managed_process.os.waitid", return_value=None), \
                      patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
-                     patch("managed_process.os.scandir", return_value=[]), \
+                     patch("managed_process.os.scandir", side_effect=lambda _path: nullcontext([])), \
                      patch("managed_process.time.monotonic", side_effect=lambda: clock[0]), \
                      patch("managed_process.time.sleep", side_effect=advance):
                     code, gone, failure = run_group(["fake"], Path.cwd(), {}, timeout, admission)
