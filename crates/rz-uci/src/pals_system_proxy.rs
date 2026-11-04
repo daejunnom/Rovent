@@ -8,6 +8,8 @@
 #[allow(dead_code)]
 mod arena_grant_channel;
 #[allow(dead_code)]
+mod arena_launch_inputs;
+#[allow(dead_code)]
 mod cancel_control_v1;
 mod cli_v6;
 mod deadline_grant;
