@@ -86,6 +86,13 @@ class ParentTransportTests(unittest.TestCase):
         while handshake.state in ("connecting", "writing"):
             handshake.advance(selectors.EVENT_WRITE)
 
+    def release_quarantined(self, expected):
+        custody = transport._DROPPED_UNCERTAIN_ADMISSIONS.pop()
+        self.assertIs(custody._socket, expected)
+        expected.close()
+        custody._socket = None
+        return custody
+
     def test_partial_request_and_ack_transfer_original_socket_once(self):
         fake = FakeSocket(self.pid, chunk=7)
         handshake = self.handshake(fake)
@@ -99,6 +106,7 @@ class ParentTransportTests(unittest.TestCase):
         self.assertEqual(handshake.state, "reading")
         handshake.advance(selectors.EVENT_READ)
         self.assertEqual(handshake.state, "authenticated")
+        self.assertEqual(handshake.authenticated_wire, (bytes(fake.sent), payload))
         self.assertIs(handshake.take_authenticated_socket(), fake)
         self.assertEqual(handshake.state, "handed_off")
         with self.assertRaises(RuntimeError):
@@ -115,6 +123,21 @@ class ParentTransportTests(unittest.TestCase):
         handshake.advance(selectors.EVENT_READ)
         self.assertEqual(handshake.state, "authenticated")
         handshake.take_authenticated_socket().close()
+
+    def test_ack_processed_after_deadline_keeps_original_socket(self):
+        fake = FakeSocket(self.pid)
+        handshake = self.handshake(fake)
+        self.write_request(handshake)
+        fake.received = [json.dumps(self.ack()).encode() + b"\n"]
+        deadline = handshake._deadline
+        with mock.patch.object(transport.time, "monotonic", side_effect=[deadline - 1, deadline + 1]):
+            handshake.advance(selectors.EVENT_READ)
+        self.assertEqual(handshake.error, "deadline_expired")
+        self.assertEqual(handshake.state, "failed_after_send")
+        self.assertFalse(fake.closed)
+        del handshake
+        custody = self.release_quarantined(fake)
+        self.assertTrue(custody._response.endswith(b"\n"))
 
     def test_peer_mismatch_is_rejected_before_sending(self):
         for fake in (FakeSocket(self.pid + 1), FakeSocket(self.pid, peer_uid=os.geteuid() + 1)):
@@ -140,8 +163,7 @@ class ParentTransportTests(unittest.TestCase):
         self.assertTrue(handshake.admission_uncertain)
         self.assertFalse(after.closed)
         del handshake
-        self.assertIs(transport._DROPPED_UNCERTAIN_SOCKETS.pop(), after)
-        after.close()
+        self.release_quarantined(after)
 
     def test_interrupted_send_retains_uncertain_socket(self):
         fake = FakeSocket(self.pid)
@@ -153,8 +175,7 @@ class ParentTransportTests(unittest.TestCase):
         self.assertTrue(handshake.admission_uncertain)
         self.assertFalse(fake.closed)
         del handshake
-        self.assertIs(transport._DROPPED_UNCERTAIN_SOCKETS.pop(), fake)
-        fake.close()
+        self.release_quarantined(fake)
 
     def test_deadline_before_or_after_send_preserves_the_correct_scope(self):
         before = FakeSocket(self.pid)
@@ -173,8 +194,7 @@ class ParentTransportTests(unittest.TestCase):
         self.assertEqual(handshake.state, "failed_after_send")
         self.assertFalse(after.closed)
         del handshake
-        self.assertIs(transport._DROPPED_UNCERTAIN_SOCKETS.pop(), after)
-        after.close()
+        self.release_quarantined(after)
 
     def test_full_unix_backlog_retries_before_admission_bytes(self):
         fake = FakeSocket(self.pid)
@@ -191,8 +211,7 @@ class ParentTransportTests(unittest.TestCase):
         self.assertGreater(handshake.bytes_sent, 0)
         handshake.cancel()
         del handshake
-        self.assertIs(transport._DROPPED_UNCERTAIN_SOCKETS.pop(), fake)
-        fake.close()
+        self.release_quarantined(fake)
 
     def test_ack_rejects_wrong_identity_or_boolean_integer(self):
         for changed in ({"child_pid": self.pid + 1}, {"cuda_ordinal": False}):
@@ -207,8 +226,7 @@ class ParentTransportTests(unittest.TestCase):
                 self.assertEqual(handshake.state, "failed_after_send")
                 self.assertEqual(handshake.error, "ack_identity_mismatch")
                 del handshake
-                self.assertIs(transport._DROPPED_UNCERTAIN_SOCKETS.pop(), fake)
-                fake.close()
+                self.release_quarantined(fake)
 
     def test_bad_ack_trailing_or_duplicate_does_not_authenticate(self):
         ack = json.dumps(self.ack()).encode()
@@ -223,8 +241,7 @@ class ParentTransportTests(unittest.TestCase):
                 self.assertEqual(handshake.state, "failed_after_send")
                 self.assertFalse(fake.closed)
                 del handshake
-                self.assertIs(transport._DROPPED_UNCERTAIN_SOCKETS.pop(), fake)
-                fake.close()
+                self.release_quarantined(fake)
 
     @unittest.skipUnless(sys.platform == "linux", "requires Linux peer credentials")
     def test_real_unix_peer_credentials_and_ack(self):

@@ -36,6 +36,7 @@ class OriginalAdmission:
         if not isinstance(handshake, NonblockingParentHandshake) or handshake.state != "authenticated":
             raise ValueError("original LC0 admission is not authenticated")
         self._binding = handshake.binding
+        self.authenticated_wire = handshake.authenticated_wire
         self._socket = handshake.take_authenticated_socket()
         try:
             st = os.fstat(self._socket.fileno())
@@ -70,6 +71,7 @@ class ControlCustody:
         self.socket = owner._socket
         self.original_admission = owner._admission
         self.binding = owner._binding
+        self.control_admission_wire = owner._control_admission_wire
         self.sequence = owner._sequence
         self.state = owner._state
         self.error = owner._error
@@ -129,6 +131,7 @@ class NonblockingSessionObservation:
             raise ValueError("invalid LC0 observation admission")
         original_admission.check_control(handshake)
         self._admission = original_admission
+        self._control_admission_wire = handshake.authenticated_wire
         self._binding = handshake.binding
         self._sequence = sequence
         self._deadline = float(deadline)

@@ -48,10 +48,12 @@ class SessionObservationTests(unittest.TestCase):
         original = object.__new__(NonblockingParentHandshake)
         original._pid, original._epoch, original._lock, original._ordinal = self.binding
         original._state, original._socket = "authenticated", self.original_socket
+        original._request_wire, original._response, original._sent = b"request\n", b"ack\n", 8
         self.admission = OriginalAdmission(original)
         handshake = object.__new__(NonblockingParentHandshake)
         handshake._pid, handshake._epoch, handshake._lock, handshake._ordinal = self.binding
         handshake._state, handshake._socket = "authenticated", self.socket
+        handshake._request_wire, handshake._response, handshake._sent = b"control\n", b"ack\n", 8
         self.observe = NonblockingSessionObservation(self.admission, handshake, sequence=1, deadline=time.monotonic() + 2)
 
     def tearDown(self):

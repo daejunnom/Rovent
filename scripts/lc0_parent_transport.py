@@ -25,11 +25,11 @@ from lc0_parent_preflight import (
 
 
 # A caller accidentally dropping an uncertain admission must not close the
-# original parent stream while the process remains alive. This is quarantine,
+# original parent stream and partial wire state while the process remains alive. This is quarantine,
 # not a completion witness, an automatic retry, or an operating-owner recovery
 # capability. The owning process must retain its original child and use its own
 # authorized observation/recovery path; this list provides no release API.
-_DROPPED_UNCERTAIN_SOCKETS = []
+_DROPPED_UNCERTAIN_ADMISSIONS = []
 
 
 class NonblockingParentHandshake:
@@ -77,6 +77,7 @@ class NonblockingParentHandshake:
             "process_epoch": epoch, "lock_sha256": lock_sha256,
             "cuda_ordinal": ordinal,
         }, separators=(",", ":")).encode("utf-8") + b"\n")
+        self._request_wire = bytes(self._request)
         try:
             self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._socket.setblocking(False)
@@ -121,6 +122,13 @@ class NonblockingParentHandshake:
     @property
     def retry_at(self):
         return self._retry_at if self._state == "retry_connect" else None
+
+    @property
+    def authenticated_wire(self):
+        """Copies of this attempt's actual request and validated ACK bytes."""
+        if self._state != "authenticated" or self._sent != len(self._request_wire):
+            raise RuntimeError("LC0 authenticated wire is not available")
+        return (self._request_wire, bytes(self._response))
 
     def fileno(self):
         if self._socket is None:
@@ -221,6 +229,8 @@ class NonblockingParentHandshake:
                     if ack != expected or any(type(ack[key]) is not int for key in
                                               ("child_pid", "process_epoch", "cuda_ordinal")):
                         self._fail("ack_identity_mismatch")
+                    elif time.monotonic() >= self._deadline:
+                        self._fail("deadline_expired")
                     else:
                         self._state = "authenticated"
                 elif len(self._response) >= FRAME_LIMIT:
@@ -244,7 +254,7 @@ class NonblockingParentHandshake:
         if sock is None:
             return
         if getattr(self, "_sent", 0) or getattr(self, "_send_uncertain", False):
-            _DROPPED_UNCERTAIN_SOCKETS.append(sock)
+            _DROPPED_UNCERTAIN_ADMISSIONS.append(self)
         else:
             sock.close()
-        self._socket = None
+            self._socket = None
