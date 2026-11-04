@@ -163,8 +163,8 @@ impl<'a> DeadlineControl<'a> {
         custody: &SpawnCustody,
         execution_until: Instant,
     ) -> Result<Option<DeadlineGrantObservation>, ArenaError> {
-        if Instant::now() >= execution_until {
-            return Err(failure("execution_deadline"));
+        if Instant::now() >= self.process_cleanup_until {
+            return Err(failure("cleanup_deadline"));
         }
         let pid = custody
             .child()
