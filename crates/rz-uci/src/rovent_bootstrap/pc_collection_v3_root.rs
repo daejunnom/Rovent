@@ -8,7 +8,7 @@ use super::pc_collection_v3::{
 use super::pc_session::{RoventPcRevokeObservationV2, RoventPcSessionManager};
 use crate::pals_adaptive::{
     AdaptiveCollectionBoundaryV2, AdaptiveManagerError, ManagerPhase,
-    RoventCollectionRootAdmissionV3,
+    RoventCollectionRootAdmissionV3, RoventV3FrontierAttachFailure,
 };
 use crate::rovent_root_admission::source_seal::RoventRootAdmissionV3;
 use crate::search_driver::SearchSessionContext;
@@ -126,21 +126,32 @@ impl PcCollectionRootRunV3 {
         policy: Digest,
         context: &SearchSessionContext,
     ) -> Result<(), AdaptiveManagerError> {
-        let frontier =
-            manager
-                .driver()
-                .port()
-                .rovent_frontier()
-                .ok_or(AdaptiveManagerError::Invalid(
-                    "P/C V3 actual frontier absent",
-                ))?;
-        let admission = RoventCollectionRootAdmissionV3::from_attached_frontier(
-            &state.origin,
-            frontier,
-            root,
-            budget,
-            policy,
-        )?;
+        let admission =
+            loop {
+                match try_admission_live(context, manager.phase())? {
+                    AdaptiveCollectionBoundaryV2::Ready => {}
+                    AdaptiveCollectionBoundaryV2::Busy => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                }
+                let frontier = manager.driver().port().rovent_frontier().ok_or(
+                    AdaptiveManagerError::Invalid("P/C V3 actual frontier absent"),
+                )?;
+                match RoventCollectionRootAdmissionV3::try_from_attached_frontier(
+                    &state.origin,
+                    frontier,
+                    &root,
+                    budget,
+                    policy,
+                ) {
+                    Ok(admission) => break admission,
+                    Err(RoventV3FrontierAttachFailure::Busy) => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(RoventV3FrontierAttachFailure::Rejected(error)) => return Err(error.into()),
+                }
+            };
         self.admission = Some(admission.clone());
         loop {
             match try_admission_live(context, manager.phase()) {
