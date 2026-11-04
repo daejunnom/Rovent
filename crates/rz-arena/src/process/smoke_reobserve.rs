@@ -16,7 +16,7 @@ use nix::unistd::Pid;
 use super::{OriginalSmokeUciObservation, SpawnCustody};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ChildObservation {
+pub(crate) enum ChildObservation {
     Alive,
     Exited(i32),
     Signaled(i32),
@@ -29,7 +29,7 @@ pub(super) enum ChildObservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PipeObservation {
+pub(crate) enum PipeObservation {
     Absent,
     Eof,
     Pending,
@@ -40,14 +40,14 @@ pub(super) enum PipeObservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SmokeReobserve {
-    pub(super) child: ChildObservation,
-    pub(super) stdout: PipeObservation,
-    pub(super) stderr: PipeObservation,
+pub(crate) struct SmokeReobserve {
+    pub(crate) child: ChildObservation,
+    pub(crate) stdout: PipeObservation,
+    pub(crate) stderr: PipeObservation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SmokeReobserveError {
+pub(crate) enum SmokeReobserveError {
     NotRetained,
     DifferentOwner,
     MissingChild,
@@ -57,7 +57,7 @@ pub(super) enum SmokeReobserveError {
 /// The original capture cap remains in force. Retained bytes are a prefix; a
 /// full cap can leave the pipe backpressured. Child exit is CPU process
 /// evidence, not a GPU completion fence.
-pub(super) fn observe_once(
+pub(crate) fn observe_once(
     custody: &mut SpawnCustody,
     observation: &mut OriginalSmokeUciObservation,
     until: Instant,
@@ -133,7 +133,7 @@ pub(super) fn observe_once(
     })
 }
 
-fn observe_pipe<T: Read + AsFd>(
+pub(super) fn observe_pipe<T: Read + AsFd>(
     pipe: &mut Option<T>,
     eof: &mut bool,
     output: &mut Vec<u8>,

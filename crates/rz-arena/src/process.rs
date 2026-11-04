@@ -14,8 +14,12 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
+pub(crate) mod smoke_reobserve;
 type StdoutObserver<'a> = &'a mut dyn FnMut(&[u8]);
 type LoadedImageVerifier<'a> = &'a mut dyn FnMut(&File) -> Result<(), ()>;
 /// A nonblocking owner operation, polled only while the original child is
@@ -201,8 +205,18 @@ pub(crate) struct OriginalSmokeUciObservation {
     pre_signal: PreSignalObservation,
     output: OriginalSmokeOutputBuffers,
     dialogue: SmokeUciDialogue,
+    retained_token: Option<Arc<()>>,
     started: bool,
     returned: bool,
+}
+
+/// A NoGame owner either receives a normally closed process result, or keeps
+/// its original child/pipes and output for explicit bounded reobservation.
+/// Retention is unknown, not process, GPU or model completion.
+#[cfg(target_os = "linux")]
+pub(crate) enum RetainingSmokeOutcome {
+    Finished(ProcessOutput),
+    Retained(ProcessReceipt),
 }
 
 #[cfg(target_os = "linux")]
@@ -216,6 +230,7 @@ impl OriginalSmokeUciObservation {
             pre_signal: PreSignalObservation::default(),
             output: OriginalSmokeOutputBuffers::default(),
             dialogue: SmokeUciDialogue::default(),
+            retained_token: None,
             started: false,
             returned: false,
         }
@@ -745,8 +760,25 @@ pub struct ProcessOutput {
 #[derive(Default)]
 pub(crate) struct SpawnCustody {
     child: Option<std::process::Child>,
+    #[cfg(target_os = "linux")]
+    retained_smoke: Option<RetainedSmokePipes>,
     pub(crate) pending: AtomicBool,
     pub(crate) last_spawn_pid: Option<u32>,
+}
+
+/// The same OS handles stay with the original child owner even when the
+/// finite work window has expired or supervision returns early.
+#[cfg(target_os = "linux")]
+struct RetainedSmokePipes {
+    token: Arc<()>,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: Option<std::process::ChildStdout>,
+    stderr: Option<std::process::ChildStderr>,
+    stdout_eof: bool,
+    stderr_eof: bool,
+    ownership_lost: bool,
+    output_at_capacity: bool,
+    max_output_bytes: u64,
 }
 
 impl SpawnCustody {
@@ -1504,6 +1536,115 @@ pub(crate) fn supervise_smoke_uci_in_original_window<'v>(
     result
 }
 
+/// Opt-in NoGame custody: expiry or cancellation retains the original child
+/// and pipes without issuing new signals; reobservation cannot extend work.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_smoke_uci_retaining_in_original_window<'v>(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    window: OriginalProcessWindow,
+    spawned: &'v mut SpawnCustody,
+    mut control: SpawnControl<'v>,
+    mut cleanup_control: Option<CleanupControl<'v>>,
+    mut pre_signal: Option<PreSignalControl<'v>>,
+    observation: &'v mut OriginalSmokeUciObservation,
+) -> Result<RetainingSmokeOutcome, ArenaError> {
+    if observation.started
+        || observation.window.started != window.started
+        || observation.window.execution != window.execution
+        || observation.window.whole != window.whole
+    {
+        return Err(ArenaError::Invalid(
+            "smoke UCI observation does not match this fresh original window".into(),
+        ));
+    }
+    window.check_before_spawn(limits)?;
+    watch.validate()?;
+    if !directory
+        .metadata()
+        .map_err(|_| ArenaError::Io("process.cwd_metadata".into()))?
+        .is_dir()
+    {
+        return Err(ArenaError::Invalid(
+            "original smoke cwd handle must be a directory".into(),
+        ));
+    }
+    let directory = directory
+        .try_clone()
+        .map_err(|_| ArenaError::Io("process.cwd_clone".into()))?;
+    let has_cleanup = cleanup_control.is_some();
+    let has_pre_signal = pre_signal.is_some();
+    let mut guarded_control = |owner: &SpawnCustody, until: Instant| match std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| control(owner, until)),
+    ) {
+        Ok(result) => result,
+        Err(_) => Err(ArenaError::Io("process.smoke_run_control:panic".into())),
+    };
+    let mut guarded_cleanup = |owner: &SpawnCustody, until: Instant| {
+        cleanup_control
+            .as_deref_mut()
+            .ok_or_else(|| ArenaError::Io("process.smoke_cleanup_control_missing".into()))?(
+            owner, until,
+        )
+    };
+    let mut guarded_pre_signal = |owner: &SpawnCustody, until: Instant| {
+        pre_signal
+            .as_deref_mut()
+            .ok_or_else(|| ArenaError::Io("process.smoke_pre_signal_control_missing".into()))?(
+            owner, until,
+        )
+    };
+    let token = Arc::new(());
+    observation.retained_token = Some(Arc::clone(&token));
+    observation.started = true;
+    observation.transport.original_supervisor_entry_ns = window.elapsed_ns(Instant::now());
+    let result = linux::supervise(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        Some(linux::ArtifactObservation::Tree(watch)),
+        None,
+        linux::InvocationIo {
+            dialogue: Some(&mut observation.dialogue),
+            retain_smoke: Some(token),
+            original: Some(window),
+            observation: Some(&mut observation.transport),
+            smoke_output: Some(&mut observation.output),
+            spawned: Some(&mut *spawned),
+            control: Some(&mut guarded_control),
+            cleanup_control: has_cleanup.then_some(&mut guarded_cleanup as CleanupControl<'_>),
+            pre_signal: has_pre_signal.then_some(&mut guarded_pre_signal as PreSignalControl<'_>),
+            pre_signal_observation: has_pre_signal.then_some(&mut observation.pre_signal),
+            ..Default::default()
+        },
+    );
+    let returned = Instant::now();
+    observation.transport.original_finished_ns = window.elapsed_ns(returned);
+    observation.transport.finished_before_whole = returned < window.whole;
+    observation.transport.cancelled_at_return =
+        cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+    observation.returned = true;
+    let output = result?;
+    if spawned.child.is_some() {
+        // The live original Child and bounded bytes have never left their
+        // owners. Retained is an unknown state, not a completion receipt.
+        Ok(RetainingSmokeOutcome::Retained(output.receipt))
+    } else {
+        // supervise only removes the original Child after its normal
+        // completion path. Do not reinterpret it as a GPU fence.
+        spawned.retained_smoke = None;
+        observation.retained_token = None;
+        Ok(RetainingSmokeOutcome::Finished(output))
+    }
+}
+
 /// Finite UCI preflight input through the same pinned ELF/process-group owner.
 /// Commands are written nonblocking; the wall/output/tree bounds remain active.
 pub fn supervise_protocol_in_directory(
@@ -1807,6 +1948,7 @@ fn supervise_original_input(
                 pre_signal_observation: None,
                 dialogue: None,
                 smoke_output: None,
+                retain_smoke: None,
             },
         )?;
         let returned = Instant::now();
@@ -1862,6 +2004,7 @@ mod linux {
         pub commands: Option<&'a [u8]>,
         pub dialogue: Option<&'b mut SmokeUciDialogue>,
         pub smoke_output: Option<&'b mut OriginalSmokeOutputBuffers>,
+        pub retain_smoke: Option<Arc<()>>,
         pub original: Option<OriginalProcessWindow>,
         pub observation: Option<&'b mut OriginalProcessObservation>,
         pub verify_loaded: Option<LoadedImageVerifier<'v>>,
@@ -1930,6 +2073,7 @@ mod linux {
             commands,
             mut dialogue,
             smoke_output,
+            retain_smoke,
             original,
             mut observation,
             mut verify_loaded,
@@ -1945,6 +2089,16 @@ mod linux {
                 "smoke dialogue and batch stdin cannot share one process".into(),
             ));
         }
+        if retain_smoke.is_some()
+            && (dialogue.is_none()
+                || smoke_output.is_none()
+                || spawned.is_none()
+                || original.is_none())
+        {
+            return Err(ArenaError::Invalid(
+                "retained smoke requires its original dialogue and output owner".into(),
+            ));
+        }
         if smoke_output
             .as_ref()
             .is_some_and(|output| !output.stdout.is_empty() || !output.stderr.is_empty())
@@ -1955,7 +2109,10 @@ mod linux {
         }
         let mut local_custody = SpawnCustody::default();
         let custody = spawned.unwrap_or(&mut local_custody);
-        if custody.child.is_some() || custody.pending.load(Ordering::Acquire) {
+        if custody.child.is_some()
+            || custody.retained_smoke.is_some()
+            || custody.pending.load(Ordering::Acquire)
+        {
             return Err(ArenaError::Invalid(
                 "process original child custody is still pending".into(),
             ));
@@ -2024,6 +2181,20 @@ mod linux {
                 child.stderr.take(),
             )
         };
+        let preserving_smoke = retain_smoke.is_some();
+        if let Some(token) = retain_smoke {
+            custody.retained_smoke = Some(RetainedSmokePipes {
+                token,
+                stdin: stdin.take(),
+                stdout: stdout.take(),
+                stderr: stderr.take(),
+                stdout_eof: false,
+                stderr_eof: false,
+                ownership_lost: false,
+                output_at_capacity: false,
+                max_output_bytes: limits.max_output_bytes,
+            });
+        }
         custody.last_spawn_pid = Some(pid);
         crate::emit_native_phase("runner_spawned");
         let group = Pid::from_raw(
@@ -2049,21 +2220,30 @@ mod linux {
             errors: Vec::new(),
         };
         let mut input_offset = 0;
-        let pipe_setup = stdout
-            .as_ref()
-            .ok_or(Errno::EBADF)
-            .and_then(nonblocking)
-            .and_then(|()| stderr.as_ref().ok_or(Errno::EBADF).and_then(nonblocking))
-            .and_then(|()| match stdin.as_ref() {
-                Some(pipe) => nonblocking(pipe),
-                None => Ok(()),
-            });
+        let pipe_setup = {
+            let (input, output, error) = if let Some(pipes) = custody.retained_smoke.as_mut() {
+                (&pipes.stdin, &pipes.stdout, &pipes.stderr)
+            } else {
+                (&stdin, &stdout, &stderr)
+            };
+            output
+                .as_ref()
+                .ok_or(Errno::EBADF)
+                .and_then(nonblocking)
+                .and_then(|()| error.as_ref().ok_or(Errno::EBADF).and_then(nonblocking))
+                .and_then(|()| match input.as_ref() {
+                    Some(pipe) => nonblocking(pipe),
+                    None => Ok(()),
+                })
+        };
         let mut stop = if pipe_setup.is_err() {
             evidence(&mut receipt, "process.pipe_nonblocking");
             // A blocking descriptor is never read by this loop.
-            stdout = None;
-            stderr = None;
-            stdin = None;
+            if !preserving_smoke {
+                stdout = None;
+                stderr = None;
+                stdin = None;
+            }
             Some(ProcessStop::IoFailure)
         } else {
             None
@@ -2159,9 +2339,18 @@ mod linux {
                     stop = Some(ProcessStop::WallLimit);
                 }
             }
+            let input = if preserving_smoke {
+                &mut custody
+                    .retained_smoke
+                    .as_mut()
+                    .expect("retained pipe owner")
+                    .stdin
+            } else {
+                &mut stdin
+            };
             if stop.is_none()
                 && (original.is_none() || loaded_image_checked)
-                && let (Some(pipe), Some(commands)) = (stdin.as_mut(), commands)
+                && let (Some(pipe), Some(commands)) = (input.as_mut(), commands)
             {
                 let end = (input_offset + 4096).min(commands.len());
                 match pipe.write(&commands[input_offset..end]) {
@@ -2177,7 +2366,7 @@ mod linux {
                         }
                         input_offset += n;
                         if input_offset == commands.len() {
-                            stdin = None;
+                            *input = None;
                         }
                     }
                     Err(e)
@@ -2193,7 +2382,7 @@ mod linux {
             }
             if stop.is_none()
                 && (original.is_none() || loaded_image_checked)
-                && let (Some(pipe), Some(dialogue)) = (stdin.as_mut(), dialogue.as_deref_mut())
+                && let (Some(pipe), Some(dialogue)) = (input.as_mut(), dialogue.as_deref_mut())
                 && let Some(command) = dialogue.command()
             {
                 match pipe.write(&command[dialogue.command_offset..]) {
@@ -2209,7 +2398,7 @@ mod linux {
                         }
                         dialogue.wrote(n, out.len());
                         if dialogue.phase == SmokeUciPhase::Done {
-                            stdin = None;
+                            *input = None;
                         }
                     }
                     Err(error)
@@ -2227,24 +2416,71 @@ mod linux {
             // cancellation and process checks even under continuous output.
             let prior_out = out.len();
             let prior_err = err.len();
-            let stdout_open = stdout.is_some();
-            let stderr_open = stderr.is_some();
-            let drained = [
-                drain(&mut stdout, out, limits.max_output_bytes, &mut receipt),
-                drain(&mut stderr, err, limits.max_output_bytes, &mut receipt),
-            ];
-            stdout_eof |= stdout_open && stdout.is_none() && drained[0].is_ok();
-            stderr_eof |= stderr_open && stderr.is_none() && drained[1].is_ok();
-            for result in drained {
-                match result {
-                    Ok(true) if stop.is_none() => stop = Some(ProcessStop::OutputLimit),
-                    Err(()) => {
-                        evidence(&mut receipt, "process.pipe_read");
-                        if stop.is_none() {
-                            stop = Some(ProcessStop::IoFailure);
+            if preserving_smoke {
+                use super::smoke_reobserve::{PipeObservation, observe_pipe};
+                let pipes = custody
+                    .retained_smoke
+                    .as_mut()
+                    .expect("retained pipe owner");
+                let until = original.expect("retained smoke has original clock").whole;
+                let stdout_observation = observe_pipe(
+                    &mut pipes.stdout,
+                    &mut pipes.stdout_eof,
+                    out,
+                    err.len(),
+                    pipes.max_output_bytes,
+                    until,
+                );
+                let stderr_observation = observe_pipe(
+                    &mut pipes.stderr,
+                    &mut pipes.stderr_eof,
+                    err,
+                    out.len(),
+                    pipes.max_output_bytes,
+                    until,
+                );
+                stdout_eof = pipes.stdout_eof;
+                stderr_eof = pipes.stderr_eof;
+                receipt.stdout_bytes = out.len() as u64;
+                receipt.stderr_bytes = err.len() as u64;
+                receipt.observed_output_bytes = receipt.stdout_bytes + receipt.stderr_bytes;
+                for observed in [stdout_observation, stderr_observation] {
+                    match observed {
+                        PipeObservation::OutputCap => {
+                            pipes.output_at_capacity = true;
+                            evidence(
+                                &mut receipt,
+                                "process.smoke_capture_at_capacity_more_unknown",
+                            );
+                            stop.get_or_insert(ProcessStop::OutputLimit);
                         }
+                        PipeObservation::Unknown | PipeObservation::Absent => {
+                            evidence(&mut receipt, "process.smoke_pipe_observation_unknown");
+                            stop.get_or_insert(ProcessStop::IoFailure);
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                }
+            } else {
+                let stdout_open = stdout.is_some();
+                let stderr_open = stderr.is_some();
+                let drained = [
+                    drain(&mut stdout, out, limits.max_output_bytes, &mut receipt),
+                    drain(&mut stderr, err, limits.max_output_bytes, &mut receipt),
+                ];
+                stdout_eof |= stdout_open && stdout.is_none() && drained[0].is_ok();
+                stderr_eof |= stderr_open && stderr.is_none() && drained[1].is_ok();
+                for result in drained {
+                    match result {
+                        Ok(true) if stop.is_none() => stop = Some(ProcessStop::OutputLimit),
+                        Err(()) => {
+                            evidence(&mut receipt, "process.pipe_read");
+                            if stop.is_none() {
+                                stop = Some(ProcessStop::IoFailure);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             if stop.is_none()
@@ -2365,7 +2601,14 @@ mod linux {
                 cleanup_started.get_or_insert_with(Instant::now);
             }
             let no_others = last_group.is_some_and(|snapshot| snapshot.other_members == 0);
-            if original.is_some_and(|window| Instant::now() >= window.whole) {
+            if preserving_smoke && leader_done && no_others && stdout_eof && stderr_eof {
+                if let Some((watch, delegated)) = watch.and_then(ArtifactObservation::tree) {
+                    observe_tree(&cwd_file, watch, delegated, &mut receipt, &mut stop);
+                }
+                receipt.group_cleanup = CleanupStatus::Gone;
+                break;
+            }
+            if !preserving_smoke && original.is_some_and(|window| Instant::now() >= window.whole) {
                 evidence(&mut receipt, "process.original_whole_window_expired");
                 if stop.is_none() || stop == Some(ProcessStop::Exited) {
                     stop = Some(ProcessStop::WallLimit);
@@ -2380,7 +2623,8 @@ mod linux {
                 );
                 break;
             }
-            if leader_done && no_others && stdout.is_none() && stderr.is_none() {
+            if !preserving_smoke && leader_done && no_others && stdout.is_none() && stderr.is_none()
+            {
                 // The child may have created its final outputs between this
                 // pass's snapshot and exit observation. Inspect that final
                 // tree before reporting a completed run, without changing the
@@ -2475,7 +2719,26 @@ mod linux {
                     pre_signal_until = None;
                 }
             }
-            if pre_signal_observation.is_some()
+            if preserving_smoke {
+                if original.is_some_and(|window| Instant::now() >= window.whole) {
+                    stop.get_or_insert(ProcessStop::WallLimit);
+                }
+                // The same original owner gets the already bounded optional
+                // cooperative cancellation opportunity. An acknowledgement is
+                // not process/GPU completion and grants no further work.
+                let original_whole_elapsed =
+                    original.is_some_and(|window| Instant::now() >= window.whole);
+                if stop.is_some() && (pre_signal_until.is_none() || original_whole_elapsed) {
+                    evidence(&mut receipt, "process.smoke_retained_completion_unknown");
+                    break;
+                }
+                // Never fall through to the legacy signal/cleanup path, even
+                // if the original deadline expires between observations.
+                std::thread::sleep(POLL);
+                continue;
+            }
+            if !preserving_smoke
+                && pre_signal_observation.is_some()
                 && original.is_some_and(|window| Instant::now() >= window.whole)
             {
                 evidence(&mut receipt, "process.original_whole_window_expired");
@@ -2623,17 +2886,26 @@ mod linux {
                 stop = Some(ProcessStop::IoFailure);
             }
         }
-        let retain_child = finish_child_in_place(
-            custody
-                .child
-                .as_mut()
-                .expect("original child remains in custody"),
-            &mut receipt,
-            &mut stop,
-            leader_done,
-            ownership_lost,
-            preserve_unverified,
-        );
+        if let Some(pipes) = custody.retained_smoke.as_mut() {
+            pipes.ownership_lost |= ownership_lost;
+        }
+        let retain_child = if preserving_smoke && receipt.group_cleanup != CleanupStatus::Gone {
+            // No reap and no numeric PID authority are inferred from an
+            // expired observation or an unverified wait relationship.
+            true
+        } else {
+            finish_child_in_place(
+                custody
+                    .child
+                    .as_mut()
+                    .expect("original child remains in custody"),
+                &mut receipt,
+                &mut stop,
+                leader_done,
+                ownership_lost,
+                preserve_unverified,
+            )
+        };
         let cleanup_finished = Instant::now();
         record_cleanup_timing(
             &mut receipt,
@@ -2653,16 +2925,35 @@ mod linux {
                     .as_deref()
                     .map_or(input_offset, |state| state.written),
             );
+            let input_closed = if preserving_smoke {
+                custody
+                    .retained_smoke
+                    .as_ref()
+                    .is_some_and(|pipes| pipes.stdin.is_none())
+            } else {
+                stdin.is_none()
+            };
             o.stdin_closed_after_input = (commands
                 .is_some_and(|bytes| input_offset == bytes.len())
                 || dialogue
                     .as_deref()
                     .is_some_and(|state| state.phase == SmokeUciPhase::Done))
-                && stdin.is_none();
+                && input_closed;
             o.stdout_eof = stdout_eof;
             o.stderr_eof = stderr_eof;
             o.ownership_lost = ownership_lost;
             o.loaded_image_progress = loaded_image_progress;
+        }
+        // In the opt-in retained path there is no intermediate transfer: the
+        // original child, pipes, and bounded bytes remain in their caller-owned
+        // slots even if the caller unwinds immediately after this return.
+        if preserving_smoke && retain_child {
+            return Ok(ProcessOutput {
+                receipt,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                pending_child: None,
+            });
         }
         // This is the only transfer from the original supervisor slot to its
         // output. All preceding errors and unwinds leave the Child in custody.
