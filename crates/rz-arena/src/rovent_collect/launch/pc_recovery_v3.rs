@@ -779,10 +779,25 @@ impl PcRunRecoveryKeyV3 {
                 if original.output_close.is_none() {
                     original.output_close = original.output.try_close();
                 }
-                return if original.output_close.is_some() {
-                    terminal
-                } else {
-                    PcOutputClosureV3::Pending
+                let Some(evidence) = original.output_close.as_ref() else {
+                    return PcOutputClosureV3::Pending;
+                };
+                if !evidence.matches_original(&original.output) {
+                    return PcOutputClosureV3::Unknown;
+                }
+                use super::pc_lock_v3::ManagedOutputCloseStatusV3 as Close;
+                return match (terminal, evidence.status()) {
+                    (_, Close::Unknown | Close::UnknownAfterAttempt) => PcOutputClosureV3::Unknown,
+                    (PcOutputClosureV3::Published, Close::WritesAcknowledged { count })
+                        if count > 0 =>
+                    {
+                        terminal
+                    }
+                    (PcOutputClosureV3::NoData, Close::NoWrites) => terminal,
+                    (PcOutputClosureV3::Published | PcOutputClosureV3::NoData, _) => {
+                        PcOutputClosureV3::Unknown
+                    }
+                    _ => terminal,
                 };
             }
             if Instant::now() >= until {
@@ -906,6 +921,23 @@ impl PcRunRecoveryKeyV3 {
                 Ok(PcOutputClosureV3::Progress)
             }
         }
+    }
+
+    /// Observe the retained finalization result separately from close evidence.
+    pub(crate) fn output_terminal_observation(
+        &self,
+    ) -> Result<PcDriverPollV3<Option<PcOutputClosureV3>>, PcDriverEvidenceErrorV3> {
+        let guard = match self.0.original.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(PcDriverEvidenceErrorV3::Poisoned("recovery"));
+            }
+        };
+        let original = guard
+            .as_ref()
+            .ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
+        Ok(PcDriverPollV3::Ready(original.output_terminal))
     }
 
     /// Observe the same output-close evidence without moving its original owner.
