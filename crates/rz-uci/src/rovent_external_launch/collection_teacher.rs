@@ -54,6 +54,8 @@ pub use actor_binding_v3::{
 pub use physical_worker_v3::{
     BoundTeacherSpawnCauseV3, BoundTeacherSpawnFailureV3, RoventCollectionTeacherLifecycleV3,
     RoventCollectionTeacherPhysicalOwnerV3, RoventTeacherNoChildRetirementTokenV3,
+    RoventTeacherPolicyCustodyV3, RoventTeacherPolicyEvidenceV3, RoventTeacherPolicySealErrorV3,
+    RoventTeacherPolicySealFailureKindV3,
     RoventTeacherRetirementTokenV3, RoventTeacherWorkerTerminalTokenV3,
     spawn_bound_collection_teacher_v3,
 };

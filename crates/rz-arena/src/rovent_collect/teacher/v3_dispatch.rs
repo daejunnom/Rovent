@@ -25,7 +25,7 @@ pub(crate) struct TeacherDispatchOwnerV3 {
 }
 
 struct PendingV3 {
-    capsule: SubmittedTeacherQueryV3,
+    capsule: Arc<SubmittedTeacherQueryV3>,
     id: TeacherJobId,
     dispatch: Option<TeacherDispatch>,
     startup: VerifiedRoventExternalStartup,
@@ -42,20 +42,20 @@ struct PendingV3 {
 pub(crate) enum TeacherSubmitV3 {
     Submitted(TeacherJobId),
     /// No physical job was issued; retain and retry the same capsule later.
-    StartupPending(SubmittedTeacherQueryV3),
+    StartupPending(Arc<SubmittedTeacherQueryV3>),
     /// Original capsule and possibly admitted physical owner remain retained.
     SubmissionUnknown(TeacherJobId),
 }
 
 pub(crate) struct TeacherRejectedV3 {
     pub error: ArenaError,
-    pub capsule: SubmittedTeacherQueryV3,
+    pub capsule: Arc<SubmittedTeacherQueryV3>,
 }
 
 /// Completion is raw evidence only. Validation failure and cancellation are
 /// retained alongside the exact original capsule, dispatch and terminal.
 pub(crate) struct TeacherCompletedV3 {
-    pub capsule: SubmittedTeacherQueryV3,
+    pub capsule: Arc<SubmittedTeacherQueryV3>,
     pub dispatch: TeacherDispatch,
     pub completion: TeacherCompletion,
     pub startup: VerifiedRoventExternalStartup,
@@ -102,7 +102,7 @@ impl TeacherDispatchOwnerV3 {
     /// pre-admission rejection the exact capsule is returned to that worker.
     pub(crate) fn submit(
         &mut self,
-        capsule: SubmittedTeacherQueryV3,
+        capsule: Arc<SubmittedTeacherQueryV3>,
         constraint: ExternalGoConstraint,
         soft_quantum: Duration,
     ) -> Result<TeacherSubmitV3, Box<TeacherRejectedV3>> {

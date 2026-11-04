@@ -9,6 +9,12 @@ use super::*;
 use crate::pals_adaptive::{RoventCollectionRootAdmissionV3, RoventTeacherScopeCapabilityV3};
 use rz_search::external_cpu::process_scope::CollectionProcessMemberWitness;
 
+mod policy_seal;
+pub use policy_seal::{
+    RoventTeacherPolicyCustodyV3, RoventTeacherPolicyEvidenceV3,
+    RoventTeacherPolicySealErrorV3, RoventTeacherPolicySealFailureKindV3,
+};
+
 /// The original actor retains source descriptors and the exact /3 admission.
 pub struct RoventCollectionTeacherPhysicalOwnerV3 {
     actor: Option<BoundCollectionTeacherActorV3>,
@@ -126,7 +132,21 @@ impl RoventCollectionTeacherPhysicalOwnerV3 {
             .original_context()
             .accepts()
             .map_err(|_| invalid("teacher /3 root unavailable"))?
-            || !completion.matches_submission(dispatch)
+        {
+            return Err(invalid("teacher /3 root unavailable"));
+        }
+        self.validate_completion_provenance(completion, dispatch)
+    }
+
+    /// Does not acquire the current-root mutex; callers sealing under that
+    /// mutex must validate authority and deadline separately.
+    fn validate_completion_provenance(
+        &self,
+        completion: &TeacherCompletion,
+        dispatch: &TeacherDispatch,
+    ) -> Result<(), CheckerError> {
+        let root = self.admission().root_admission();
+        if !completion.matches_submission(dispatch)
             || dispatch.input_scope().input_lock != root.startup_lock_digest()
             || dispatch.input_scope().root_budget != self.admission().root_budget()
             || dispatch.input_scope().authority != root.authority()
