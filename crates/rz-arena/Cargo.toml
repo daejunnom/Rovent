@@ -123,3 +123,4 @@ cap-fs-ext.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix.workspace = true
+rz-platform.workspace = true

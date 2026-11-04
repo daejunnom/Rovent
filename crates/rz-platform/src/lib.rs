@@ -13,9 +13,15 @@ pub use windows::{observe_windows_cpu, observe_windows_thread_affinity};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+mod managed_output;
+#[cfg(target_os = "linux")]
 pub use linux::{
     duplicate_inherited_unix_datagram, mark_inherited_datagram_cloexec,
     observe_linux_thread_affinity, seal_exclusive_inherited_unix_datagram,
+};
+#[cfg(target_os = "linux")]
+pub use managed_output::{
+    ManagedOutputInheritedFds, ManagedOutputPacket, ManagedOutputPeerCredentials,
 };
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
