@@ -53,6 +53,7 @@ pub(super) enum PipelinePreparationV3 {
     Busy,
     NotReady,
     Failed,
+    Unknown,
 }
 
 pub(super) enum OriginalRouteMatchV3 {
@@ -225,8 +226,12 @@ impl RoventCollectionOwnerLockV3 {
             Some(slot) => slot,
             None => return Ok(PipelinePreparationV3::Busy),
         };
-        if slot.prepare(state.producer()?) {
+        if slot.is_uncertain() {
+            Ok(PipelinePreparationV3::Unknown)
+        } else if slot.prepare(state.producer()?) {
             Ok(PipelinePreparationV3::Ready)
+        } else if slot.is_uncertain() {
+            Ok(PipelinePreparationV3::Unknown)
         } else if slot.failure().is_some() {
             Ok(PipelinePreparationV3::Failed)
         } else {
