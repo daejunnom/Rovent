@@ -999,7 +999,6 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
                 }));
                 match result {
                     Ok(Ok(backend)) => {
-                        worker_shared.factory_status.store(1, Ordering::Release);
                         let mut state = WorkerState {
                             backend,
                             held: BTreeMap::new(),
@@ -1017,6 +1016,9 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
                             recovery_commands: Vec::with_capacity(command_capacity),
                             recovery_root_fence: None,
                         };
+                        // Publish readiness only after the actual worker
+                        // state owns the backend and its queues.
+                        worker_shared.factory_status.store(1, Ordering::Release);
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             recoverable::run_worker_loop(&mut state, &worker_shared, limits)
                         }));

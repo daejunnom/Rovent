@@ -208,6 +208,7 @@ pub struct Lc0SupervisedSession {
     profile: Option<Lc0ProfileDirectory>,
     profile_failure: Option<Lc0ProfileCreateError>,
     profile_verification_failure: Option<BackendError>,
+    endpoint_retirement_started: bool,
     epoch: u64,
 }
 
@@ -356,6 +357,7 @@ impl Lc0PendingSupervisor {
             profile: None,
             profile_failure: None,
             profile_verification_failure: None,
+            endpoint_retirement_started: false,
             epoch: self.epoch,
         })
     }
@@ -469,7 +471,10 @@ impl Lc0SupervisedSession {
         until: Instant,
         cancelled: &AtomicBool,
     ) -> Result<(), &'static str> {
-        if self.receipt_token.is_none() || self.profile.is_some() || self.profile_failure.is_some()
+        if self.endpoint_retirement_started
+            || self.receipt_token.is_none()
+            || self.profile.is_some()
+            || self.profile_failure.is_some()
         {
             return Err(
                 "LC0 private preparation requires its original listener and a fresh profile",
@@ -537,7 +542,7 @@ impl Lc0SupervisedSession {
         cancelled: &AtomicBool,
         backend: BackendConfig,
     ) -> Result<(), &'static str> {
-        if self.receipt_token.is_none() {
+        if self.endpoint_retirement_started || self.receipt_token.is_none() {
             return Err(
                 "LC0 native startup requires the original owned listener and receipt directory",
             );
@@ -570,6 +575,11 @@ impl Lc0SupervisedSession {
         until: Instant,
         serve: impl FnOnce(Arc<NativeCudaFactory>) -> Result<(), EngineError>,
     ) -> Result<(), NativeBootstrapError> {
+        if self.endpoint_retirement_started {
+            return Err(NativeBootstrapError::Config(
+                "LC0 listener retirement closed native admission",
+            ));
+        }
         self.supervisor.serve_until(until, serve)
     }
 
@@ -601,5 +611,43 @@ impl Lc0SupervisedSession {
         }
         let stream = listener.accept_parent(until)?;
         self.supervisor.handle_control(stream, until)
+    }
+
+    /// Retire only this session's original listener after the caller has
+    /// finished using its control endpoint. Same-session settlement is a
+    /// necessary condition; it is not a process-wide or device-wide fence.
+    /// A failed cleanup remains recorded by the endpoint and is not retried.
+    /// The original parent stream, session owner and receipts remain held.
+    pub fn retire_parent_listener(
+        &mut self,
+        listener: &mut Lc0ParentListener,
+        until: Instant,
+    ) -> io::Result<()> {
+        if !Arc::ptr_eq(&self.ticket_token, &listener.ticket_token)
+            || !self
+                .receipt_token
+                .as_ref()
+                .is_some_and(|token| Arc::ptr_eq(token, &listener.receipt_token))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "LC0 listener belongs to another session",
+            ));
+        }
+        if !self.original_scope_settled() {
+            return Err(io::Error::other(
+                "LC0 original session is not settled; listener retained",
+            ));
+        }
+        if self.endpoint_retirement_started {
+            return Err(io::Error::other(
+                "LC0 listener retirement already attempted",
+            ));
+        }
+        // `original_scope_settled` is also true before native entry. Close
+        // admission first, including on cleanup failure or unwind, so a
+        // retired endpoint cannot be followed by a new CUDA startup.
+        self.endpoint_retirement_started = true;
+        listener.endpoint.cleanup(until)
     }
 }
