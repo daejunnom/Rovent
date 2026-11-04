@@ -90,7 +90,7 @@ pub(crate) struct PcRootRecoveryV3 {
 }
 
 impl PcRootRecoveryV3 {
-    pub(crate) fn new(
+    fn new(
         admission: RoventCollectionRootAdmissionV3,
         pipeline: PolicyRowPipelineOwnerV3,
     ) -> Arc<Mutex<Self>> {
@@ -1376,7 +1376,7 @@ impl PcWorkerSupervisorV3 {
     }
 
     /// Same in-memory game output owner; no durable sink is implied.
-    pub(crate) fn output_owner(&self) -> Option<PolicyOutputOwnerV3> {
+    pub(super) fn output_owner(&self) -> Option<PolicyOutputOwnerV3> {
         self.pipeline
             .as_ref()
             .map(PolicyRowPipelineOwnerV3::output_owner)
