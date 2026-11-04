@@ -23,7 +23,7 @@ use std::{
     fs::{File, Permissions},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +61,7 @@ pub(crate) struct NoGamePreparationFailure {
 pub(crate) struct ProxyEntrySmokeSnapshotOwnerV1 {
     _lease: NativeAdmissionLease,
     pub(crate) execution: Arc<NoGameExecutionStartV1>,
+    pub(super) binding_active: AtomicBool,
     pub(crate) plan: LockedNoGameSmokePlanV1,
     pub(crate) role: NativeEngineRole,
     pub(crate) directory: Dir,
@@ -408,6 +409,7 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
         Ok(ProxyEntrySmokeSnapshotOwnerV1 {
             _lease: lease,
             execution: Arc::clone(execution),
+            binding_active: AtomicBool::new(false),
             plan: plan.clone(),
             role,
             directory,

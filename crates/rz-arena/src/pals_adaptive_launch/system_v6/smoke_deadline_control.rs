@@ -1,6 +1,7 @@
 //! Direct-child NoGame smoke deadline control. This does not authenticate a
 //! Fastchess game, prove CUDA completion, or change the exact-spawn control.
 
+use super::super::direct_smoke_launch::NoGameBindingPermit;
 use super::super::{
     LockedPalsSystemArenaPairV6, NoGameExecutionStartV1, NoGameRoleSocketsV1, PalsV6ExecutionStart,
     PalsV6RoleSockets, ProxyEntrySmokeSnapshotOwnerV1,
@@ -79,6 +80,8 @@ pub(crate) struct SmokeDeadlineControl {
     peer: Option<SmokePeer>,
     retained_grants: Vec<SmokePeer>,
     first_failure: Option<String>,
+    // Drop after listener and every retained/partial stream.
+    _retained_permit: Option<Arc<NoGameBindingPermit>>,
 }
 
 enum SmokeBinding {
@@ -130,6 +133,7 @@ impl SmokeDeadlineControl {
         execution: &Arc<NoGameExecutionStartV1>,
         sockets: &Arc<NoGameRoleSocketsV1>,
         proxy_pin: &Arc<File>,
+        permit: &Arc<NoGameBindingPermit>,
         owner_id: [u8; 16],
         owner_epoch: u64,
         request_ids: [u64; 2],
@@ -139,6 +143,7 @@ impl SmokeDeadlineControl {
         }
         if !Arc::ptr_eq(&owner.execution, execution)
             || !execution.matches(&owner.plan, owner_id, owner_epoch)
+            || !permit.matches(owner)
         {
             return Err(failure("smoke_original_execution_differs"));
         }
@@ -203,6 +208,7 @@ impl SmokeDeadlineControl {
             peer: None,
             retained_grants: Vec::new(),
             first_failure: None,
+            _retained_permit: Some(Arc::clone(permit)),
         })
     }
 
@@ -292,6 +298,7 @@ impl SmokeDeadlineControl {
             peer: None,
             retained_grants: Vec::new(),
             first_failure: None,
+            _retained_permit: None,
         })
     }
 
@@ -368,6 +375,7 @@ impl SmokeDeadlineControl {
                 owner,
                 execution,
                 sockets,
+                ..
             } => {
                 if !Arc::ptr_eq(&owner.execution, execution)
                     || sockets.role() != owner.role

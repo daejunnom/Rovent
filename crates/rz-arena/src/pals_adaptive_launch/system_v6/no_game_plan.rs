@@ -247,6 +247,12 @@ impl NoGameExecutionStartV1 {
     pub(crate) fn matches_plan(&self, plan: &LockedNoGameSmokePlanV1) -> bool {
         self.plan_sha256 == plan.sha256()
     }
+    pub(crate) fn owner_id(&self) -> [u8; 16] {
+        self.owner_id
+    }
+    pub(crate) fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
     pub(crate) fn require_running(&self) -> Result<(), ArenaError> {
         if Instant::now() >= self.run_until {
             Err(invalid("NoGame original execution expired"))

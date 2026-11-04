@@ -14,12 +14,41 @@ use super::{
 /// Independent selected-role input and control owner. It only prepares argv:
 /// a later guarded runner must supervise the exact child and physical lifetime.
 pub(crate) struct DirectNoGameBinding {
+    _permit: Arc<NoGameBindingPermit>,
     snapshot: Arc<ProxyEntrySmokeSnapshotOwnerV1>,
     execution: Arc<NoGameExecutionStartV1>,
     sockets: Arc<NoGameRoleSocketsV1>,
     proxy: Arc<File>,
     control: Arc<Mutex<SmokeDeadlineControl>>,
     arguments: Vec<OsString>,
+}
+
+/// Held by the binding itself, including when the original bundle is
+/// quarantined. Pre-dispatch preparation failures release the same permit.
+pub(crate) struct NoGameBindingPermit {
+    snapshot: Arc<ProxyEntrySmokeSnapshotOwnerV1>,
+}
+
+impl NoGameBindingPermit {
+    fn acquire(snapshot: &Arc<ProxyEntrySmokeSnapshotOwnerV1>) -> Result<Arc<Self>, ArenaError> {
+        snapshot
+            .binding_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| ArenaError::Invalid("NoGame original binding is already active".into()))?;
+        Ok(Arc::new(Self {
+            snapshot: Arc::clone(snapshot),
+        }))
+    }
+
+    pub(super) fn matches(&self, snapshot: &Arc<ProxyEntrySmokeSnapshotOwnerV1>) -> bool {
+        Arc::ptr_eq(&self.snapshot, snapshot)
+    }
+}
+
+impl Drop for NoGameBindingPermit {
+    fn drop(&mut self) {
+        self.snapshot.binding_active.store(false, Ordering::Release);
+    }
 }
 
 impl DirectNoGameBinding {
@@ -37,6 +66,7 @@ impl DirectNoGameBinding {
                 "NoGame execution identity differs".into(),
             ));
         }
+        let permit = NoGameBindingPermit::acquire(snapshot)?;
         let proxy_pin =
             crate::native_launch::linux::pin(&snapshot.pins, &snapshot.plan.input().proxy_binary)?;
         let proxy = Arc::new(
@@ -50,6 +80,7 @@ impl DirectNoGameBinding {
             execution,
             sockets,
             &proxy,
+            &permit,
             owner_id,
             owner_epoch,
             request_ids,
@@ -126,6 +157,7 @@ impl DirectNoGameBinding {
         ];
         execution.require_running()?;
         Ok(Self {
+            _permit: permit,
             snapshot: Arc::clone(snapshot),
             execution: Arc::clone(execution),
             sockets: Arc::clone(sockets),
