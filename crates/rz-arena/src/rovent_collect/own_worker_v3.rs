@@ -9,7 +9,8 @@ use super::own_hooks_lock_v3::{
     RoventOwnCollectionBridgeV3,
 };
 use super::policy_row_pipeline_v3::{
-    PolicyChunkPersistenceV3, PolicyRootRetainedOwnerV3, PolicyRowPipelineOwnerV3,
+    PolicyChunkPersistenceV3, PolicyRetentionOutcomeV3, PolicyRootRetainedOwnerV3,
+    PolicyRowPipelineOwnerV3,
 };
 use super::speculative_route_v3::{SpeculativeReceiverV3, SpeculativeRootV3};
 use super::teacher::v3_policy_consumer::{
@@ -50,6 +51,8 @@ pub(crate) struct OwnRootRecoveryV3 {
     pub(super) consumer_phase: u8,
     pub(super) processed: Option<TeacherProcessedOwnerV3>,
     pub(super) consumer_failure: Option<ArenaError>,
+    pub(super) rejection_retained: bool,
+    pub(super) rejection_retention_failure: Option<ArenaError>,
     // The pipeline owns the original packet and detailed failure. This flag
     // prevents an automatic retry after a failed or uncertain write.
     pub(super) persistence_failure: Option<&'static str>,
@@ -103,6 +106,8 @@ impl OwnRootRecoveryV3 {
             consumer_phase: 0,
             processed: None,
             consumer_failure: None,
+            rejection_retained: false,
+            rejection_retention_failure: None,
             persistence_failure: None,
             pump_error: None,
             pump_unknown: false,
@@ -312,6 +317,11 @@ impl OwnWorkerSupervisorV3 {
         }
         for original in &self.roots {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Ok(mut root) = original.try_lock() {
+                    if root.consumer_failure.is_some() {
+                        root.try_retain_known_rejection();
+                    }
+                }
                 prepare_own_root_step_v3(
                     &self.bridge,
                     &self.router,
@@ -786,7 +796,11 @@ impl OwnRootRecoveryV3 {
     /// Run only on the retained root worker. Busy and not-ready observations
     /// preserve the original consumer, completion, target and output owners.
     fn try_drive_consumer(&mut self) {
-        if !self.published || self.consumer_failure.is_some() {
+        if !self.published {
+            return;
+        }
+        if self.consumer_failure.is_some() {
+            self.try_retain_known_rejection();
             return;
         }
         let Some(stage) = self.stage.as_ref().map(Arc::clone) else {
@@ -944,6 +958,35 @@ impl OwnRootRecoveryV3 {
             Err(error) => {
                 self.consumer_failure = Some(error);
             }
+        }
+    }
+
+    /// Preserve a known row rejection in its original bounded root owner so
+    /// another root can continue. An uncertain writer is never moved here.
+    fn try_retain_known_rejection(&mut self) {
+        if self.rejection_retained || self.rejection_retention_failure.is_some() {
+            return;
+        }
+        let Some(retained) = &self.retained_policy else {
+            return;
+        };
+        let mut pipeline = match self.pipeline.try_lock() {
+            Ok(Some(pipeline)) => pipeline,
+            Ok(None) => return,
+            Err(error) => {
+                self.rejection_retention_failure = Some(invalid(error));
+                return;
+            }
+        };
+        match pipeline.try_retain_known_rejection(retained) {
+            Ok(PolicyRetentionOutcomeV3::Transferred) => self.rejection_retained = true,
+            Ok(
+                PolicyRetentionOutcomeV3::Busy
+                | PolicyRetentionOutcomeV3::NotReady
+                | PolicyRetentionOutcomeV3::OtherRoot
+                | PolicyRetentionOutcomeV3::Capacity,
+            ) => {}
+            Err(error) => self.rejection_retention_failure = Some(error),
         }
     }
     /// Best-effort cancellation of this same root after preparation failure.
