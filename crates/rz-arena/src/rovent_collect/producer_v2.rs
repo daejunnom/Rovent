@@ -11,12 +11,12 @@ use rz_experiments::rovent_submitted_input::{
 pub struct RoventInputCaptureReservationV2 {
     original: RoventInputCaptureReservation,
     native_domain: &'static str,
-    producer_owner: Option<std::sync::Arc<()>>,
+    pub(super) producer_owner: Option<std::sync::Arc<()>>,
 }
 pub struct RoventCapturedInputV2 {
-    original: RoventCapturedInput,
-    input: rz_experiments::rovent_submitted_input::RoventSubmittedInputV1,
-    producer_owner: Option<std::sync::Arc<()>>,
+    pub(super) original: RoventCapturedInput,
+    pub(super) input: rz_experiments::rovent_submitted_input::RoventSubmittedInputV1,
+    pub(super) producer_owner: Option<std::sync::Arc<()>>,
 }
 impl RoventInputCaptureReservationV2 {
     pub fn sequence(&self) -> u64 {
@@ -29,35 +29,52 @@ impl RoventInputCaptureReservationV2 {
         input: &PalsVirtualReviewInput,
         identity: &ReviewExecutionIdentity,
     ) -> Result<RoventCapturedInputV2, ArenaError> {
-        input
-            .validate()
-            .map_err(|error| invalid(error.to_string()))?;
-        check(
+        self.try_capture_preserving_owner(ticket, view, input, identity)
+            .map_err(|failure| failure.0)
+    }
+    pub(super) fn try_capture_preserving_owner(
+        self,
+        ticket: RoleTicketEnvelope,
+        view: &ReviewView,
+        input: &PalsVirtualReviewInput,
+        identity: &ReviewExecutionIdentity,
+    ) -> Result<RoventCapturedInputV2, Box<(ArenaError, Self)>> {
+        let prepared = (|| -> Result<_, ArenaError> {
             input
-                .fresh_key(identity)
-                .map_err(|error| invalid(error.to_string()))?
-                .0
-                == ticket.representation.input.0,
-            "raw3 captured input differs from original native representation",
-        )?;
-        let (captured, review) =
-            capture_rovent_submitted_input(&ticket, view, input, &self.original.context)?;
-        let input_sha256 = captured.sha256()?;
-        let replay =
-            RoventSubmittedRulesReplay::capture(&self.original.context.actual_position, view)?;
-        let raw = json!({"schema":self.native_domain,"kind":"submitted","sequence":self.original.context.capture_sequence,
-            "process_epoch":ticket.id.epoch.0,"game_generation":ticket.authority.game.0,"root_generation":ticket.authority.root.0,
-            "request_sequence":ticket.id.sequence,"head":role_name(ticket.role),"source_sha256":self.original.source_sha256,
-            "model_sha256":hex(ticket.representation.model),"encoding_sha256":hex(ticket.representation.encoding),
-            "input_digest":hex(ticket.representation.input),"view_digest":hex(ticket.view.view_digest),
-            "input_sha256":input_sha256,"ticket":ticket_json(&ticket),"rules_replay":replay,"submitted_review":review});
-        check(
-            serde_json::to_vec(&raw)
-                .map_err(|error| invalid(error.to_string()))?
-                .len()
-                <= GENERATION_MAX_ROW_BYTES,
-            "raw3 original submission exceeds bounded row cap before native dispatch",
-        )?;
+                .validate()
+                .map_err(|error| invalid(error.to_string()))?;
+            check(
+                input
+                    .fresh_key(identity)
+                    .map_err(|error| invalid(error.to_string()))?
+                    .0
+                    == ticket.representation.input.0,
+                "raw3 captured input differs from original native representation",
+            )?;
+            let (captured, review) =
+                capture_rovent_submitted_input(&ticket, view, input, &self.original.context)?;
+            let input_sha256 = captured.sha256()?;
+            let replay =
+                RoventSubmittedRulesReplay::capture(&self.original.context.actual_position, view)?;
+            let raw = json!({"schema":self.native_domain,"kind":"submitted","sequence":self.original.context.capture_sequence,
+                "process_epoch":ticket.id.epoch.0,"game_generation":ticket.authority.game.0,"root_generation":ticket.authority.root.0,
+                "request_sequence":ticket.id.sequence,"head":role_name(ticket.role),"source_sha256":self.original.source_sha256,
+                "model_sha256":hex(ticket.representation.model),"encoding_sha256":hex(ticket.representation.encoding),
+                "input_digest":hex(ticket.representation.input),"view_digest":hex(ticket.view.view_digest),
+                "input_sha256":input_sha256,"ticket":ticket_json(&ticket),"rules_replay":replay,"submitted_review":review});
+            check(
+                serde_json::to_vec(&raw)
+                    .map_err(|error| invalid(error.to_string()))?
+                    .len()
+                    <= GENERATION_MAX_ROW_BYTES,
+                "raw3 original submission exceeds bounded row cap before native dispatch",
+            )?;
+            Ok((captured, input_sha256, raw))
+        })();
+        let (captured, input_sha256, raw) = match prepared {
+            Ok(value) => value,
+            Err(error) => return Err(Box::new((error, self))),
+        };
         // 이 내부 projection은 물리 owner 처리의 공통 scalar만 전달한다.
         // legacy input/record로 검증·직렬화·게시하는 경로에 전달하지 않는다.
         let common = captured.common_validation_projection();
@@ -497,8 +514,9 @@ impl RoventCapturedInputV2 {
 
 pub struct RoventCorpusProducerV2 {
     manifest: RoventCorpusManifestV2,
-    original: RoventCorpusProducer,
-    inputs: BTreeMap<(u64, u64), rz_experiments::rovent_submitted_input::RoventSubmittedInputV1>,
+    pub(super) original: RoventCorpusProducer,
+    pub(super) inputs:
+        BTreeMap<(u64, u64), rz_experiments::rovent_submitted_input::RoventSubmittedInputV1>,
 }
 
 /// Preparation and native-event custody for the distinct input-lock /2

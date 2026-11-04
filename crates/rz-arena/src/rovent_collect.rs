@@ -1162,6 +1162,8 @@ pub use submitted_v3::{
     RoventSubmittedReviewEvidence, capture_rovent_submitted_input,
 };
 mod producer_v2;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod producer_v3;
 pub use producer_v2::{
     RoventCapturedInputV2, RoventCorpusProducerLockV2, RoventCorpusProducerV2,
     RoventInputCaptureReservationV2,
