@@ -2,6 +2,7 @@
 //! These do not grant or prove an output lease or device completion.
 use super::*;
 use nix::sys::socket::{socketpair, AddressFamily, SockFlag};
+use std::os::fd::AsFd;
 use std::process::Command;
 
 const CHILD_MARKER: &str = "ROVEZERO_MANAGED_OUTPUT_ANCILLARY_TEST_CHILD";
@@ -204,5 +205,46 @@ fn kernel_truncation_and_full_rights_are_closed_without_leaks() {
             owner.try_receive_packet(64).is_err(),
             "peer EOF is not a valid packet"
         );
+    });
+}
+
+#[test]
+fn dropped_owner_cannot_reuse_queued_ack_through_other_socket_alias() {
+    isolated(|| {
+        let directory = File::open(".").expect("working directory");
+        let (child, parent) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .expect("seqpacket pair");
+        let alias = nix::unistd::dup(child.as_fd()).expect("duplicate same socket");
+        let owner =
+            ManagedOutputInheritedFds::seal_exclusive(directory.as_raw_fd(), child.as_raw_fd())
+                .expect("original owner");
+        send(
+            parent.as_raw_fd(),
+            b"old acknowledgement",
+            MsgFlags::empty(),
+        )
+        .expect("queue stale reply");
+        drop(child);
+        drop(owner);
+        assert!(
+            send(alias.as_raw_fd(), b"new request", MsgFlags::MSG_NOSIGNAL).is_err(),
+            "shutdown must affect every dup"
+        );
+        match ManagedOutputInheritedFds::seal_exclusive(directory.as_raw_fd(), alias.as_raw_fd()) {
+            Ok(reissued) => assert!(
+                reissued.try_send_packet(b"new request").is_err(),
+                "a reissued alias cannot request or authenticate a queued ACK"
+            ),
+            Err(error) => assert_eq!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists,
+                "a retained tombstone may refuse reissue"
+            ),
+        }
     });
 }
