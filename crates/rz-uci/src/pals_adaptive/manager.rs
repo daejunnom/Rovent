@@ -2080,6 +2080,12 @@ struct RoleBinding<Q, O> {
     collection_consumption_pending: Option<bool>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_ranking_pending: Option<collection::VersionedRootRankingAcceptance>,
+    /// Failed callbacks are not retried, but their original proof must stay
+    /// with the failed binding until explicit owner handoff.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_ranking_failed: Option<collection::VersionedRootRankingAcceptance>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_raw_ranking_failed: Option<ProposerRankingPublished>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_observation_failed: bool,
     physical: Option<TicketExecutionEvidence>,
@@ -3920,7 +3926,7 @@ where
                     changed = true;
                 }
                 Err(error) => {
-                    binding.collection_ranking_pending = None;
+                    binding.collection_ranking_failed = binding.collection_ranking_pending.take();
                     binding.collection_observation_failed = true;
                     return Ok((true, Some(error)));
                 }
@@ -4760,6 +4766,10 @@ where
             collection_consumption_pending: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_ranking_pending: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_ranking_failed: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_raw_ranking_failed: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_observation_failed: false,
             physical: None,
@@ -6241,6 +6251,10 @@ where
                                         ranking_observation_failed = true;
                                         self.roles[index].collection_observation_failed =
                                             self.collection_is_v3();
+                                        if self.roles[index].collection_observation_failed {
+                                            self.roles[index].collection_ranking_failed =
+                                                Some(proof);
+                                        }
                                         self.record_failure(error.into());
                                     }
                                 },
@@ -6248,6 +6262,10 @@ where
                                     ranking_observation_failed = true;
                                     self.roles[index].collection_observation_failed =
                                         self.collection_is_v3();
+                                    if self.roles[index].collection_observation_failed {
+                                        self.roles[index].collection_raw_ranking_failed =
+                                            Some(ranking.clone());
+                                    }
                                     self.record_failure(error.into());
                                 }
                             }
