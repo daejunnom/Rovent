@@ -154,8 +154,23 @@ pub(crate) fn seal_teacher_policy_in_slots_v3(
                 }
                 _ => false,
             };
+            let unknown = match original.as_ref() {
+                TeacherPolicySealRejectionV3::BeforeClaim {
+                    cause: TeacherPolicySealCauseV3::Panic(_),
+                    ..
+                } => true,
+                TeacherPolicySealRejectionV3::Custody { custody, cause, .. } => {
+                    custody.is_uncertain()
+                        || matches!(cause, TeacherPolicySealCauseV3::Panic(_))
+                        || matches!(cause, TeacherPolicySealCauseV3::Native(error)
+                            if error.kind == RoventTeacherPolicySealFailureKindV3::Uncertain)
+                }
+                _ => false,
+            };
             *rejection = Some(original);
-            *state = if busy {
+            *state = if unknown {
+                TeacherPolicySealStepV3::Unknown
+            } else if busy {
                 TeacherPolicySealStepV3::Busy
             } else {
                 TeacherPolicySealStepV3::Rejected
@@ -168,7 +183,7 @@ pub(crate) fn seal_teacher_policy_in_slots_v3(
     *state
 }
 
-pub(crate) fn seal_teacher_policy_v3(
+fn seal_teacher_policy_v3(
     session: &mut RoventCollectionTeacherSessionV3,
     completed: TeacherCompletedV3,
 ) -> Result<RoventSealedTeacherPolicyV3, Box<TeacherPolicySealRejectionV3>> {
