@@ -32,6 +32,16 @@ pub(crate) enum PcStopStepV3 {
     Ready,
 }
 
+/// Game-join observation is separate from driver and GPU completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PcGameJoinObservationV3 {
+    Pending,
+    Bound,
+    Refused,
+    Failed(&'static str),
+    Panicked,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PcRunRecoveryStateV3 {
     Prepared,
@@ -58,6 +68,8 @@ struct OriginalPcRunV3 {
     stop_authorization: Option<PcSupervisorStopAuthorizationV3>,
     stop_handed_off: bool,
     joined_proof: Option<PcSupervisorJoinedProofV3>,
+    game_join: PcGameJoinObservationV3,
+    game_join_panic: Option<Box<dyn Any + Send>>,
     no_worker_proof: Option<PcSupervisorNoWorkerProofV3>,
     before_admission_join_proof: Option<PcSupervisorBeforeAdmissionJoinProofV3>,
     unstarted_released: bool,
@@ -126,6 +138,8 @@ impl PcRunRecoveryKeyV3 {
                 stop_authorization: None,
                 stop_handed_off: false,
                 joined_proof: None,
+                game_join: PcGameJoinObservationV3::Pending,
+                game_join_panic: None,
                 no_worker_proof: None,
                 before_admission_join_proof: None,
                 unstarted_released: false,
@@ -551,6 +565,116 @@ impl PcRunRecoveryKeyV3 {
         drop(guard);
         match result {
             Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Observe game join independently, borrowing the exact proof from its
+    /// original slot, live outcome, or same settled custody. A pending game
+    /// seal never holds back driver/native physical settlement.
+    pub(crate) fn poll_game_join(
+        &self,
+        outcome: Option<&RoventPcCollectionResourceOutcomeV3>,
+        bridge: &Arc<RoventPcCollectionBridgeV3>,
+    ) -> Result<PcGameJoinObservationV3, PcDriverEvidenceErrorV3> {
+        let mut guard = match self.0.original.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(PcGameJoinObservationV3::Pending),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(PcDriverEvidenceErrorV3::Poisoned("recovery"));
+            }
+        };
+        let original = guard
+            .as_mut()
+            .ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
+        if let Some(outcome) = outcome {
+            if !original
+                .outcome_key
+                .as_ref()
+                .is_some_and(|key| key.same_original(&outcome.recovery_key()))
+            {
+                return Err(PcDriverEvidenceErrorV3::Invalid("original outcome differs"));
+            }
+        } else if !original
+            .settled
+            .as_ref()
+            .is_some_and(|settled| Arc::ptr_eq(&settled.collection, original.owners.native()))
+        {
+            // Without a live outcome, only this slot's same-owner settled
+            // custody can supply an original joined proof.
+            return Ok(PcGameJoinObservationV3::Pending);
+        }
+        if original.game_join != PcGameJoinObservationV3::Pending {
+            return Ok(original.game_join);
+        }
+        let proof = original
+            .joined_proof
+            .as_ref()
+            .or_else(|| outcome.and_then(|original| original.joined_driver()))
+            .or_else(|| {
+                original
+                    .settled
+                    .as_ref()
+                    .and_then(|settled| settled.driver_joined.as_ref())
+            });
+        let Some(proof) = proof else {
+            return Ok(PcGameJoinObservationV3::Pending);
+        };
+        if !proof.matches_original(
+            original.owners.driver_custody(),
+            original.owners.supervisor(),
+            original.owners.native(),
+        ) {
+            return Err(PcDriverEvidenceErrorV3::Invalid(
+                "original joined proof differs",
+            ));
+        }
+        let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bridge.try_bind_game_joined(proof, original.owners.driver_custody())
+        }));
+        original.game_join = match observed {
+            Ok(Ok(None)) => PcGameJoinObservationV3::Pending,
+            Ok(Ok(Some(true))) => PcGameJoinObservationV3::Bound,
+            Ok(Ok(Some(false))) => PcGameJoinObservationV3::Refused,
+            Ok(Err(error)) => PcGameJoinObservationV3::Failed(error),
+            Err(payload) => {
+                original.game_join_panic = Some(payload);
+                PcGameJoinObservationV3::Panicked
+            }
+        };
+        Ok(original.game_join)
+    }
+
+    /// Observe only this original run's game-join result, never GPU success.
+    pub(crate) fn game_join_observation(&self) -> Result<PcGameJoinObservationV3, &'static str> {
+        let guard = self
+            .0
+            .original
+            .try_lock()
+            .map_err(|_| "P-C recovery slot unavailable")?;
+        let original = guard.as_ref().ok_or("P-C original custody missing")?;
+        Ok(original.game_join)
+    }
+
+    /// Inspect the original game-join panic without moving its payload.
+    /// The observer must be finite and must not re-enter this same slot.
+    pub(crate) fn with_game_join_panic<T>(
+        &self,
+        observe: impl FnOnce(&(dyn Any + Send)) -> T,
+    ) -> Result<Option<T>, &'static str> {
+        let guard = self
+            .0
+            .original
+            .try_lock()
+            .map_err(|_| "P-C recovery slot unavailable")?;
+        let original = guard.as_ref().ok_or("P-C original custody missing")?;
+        let Some(payload) = original.game_join_panic.as_deref() else {
+            return Ok(None);
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observe(payload)));
+        drop(guard);
+        match result {
+            Ok(value) => Ok(Some(value)),
             Err(payload) => std::panic::resume_unwind(payload),
         }
     }
