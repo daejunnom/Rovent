@@ -6,12 +6,13 @@
 //! supervisor currently polls its control callback only while Fastchess is
 //! live and before stop; shutdown/release observation needs a separate change.
 
-use super::deadline_grant::OwnerWindow;
+use super::{LockedPalsSystemArenaPairV6, PalsV6ExecutionStart, deadline_grant::OwnerWindow};
 use crate::{ArenaError, process::SpawnCustody};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use rz_contracts::pals::deadline_grant_v1::{
-    DeadlineGrant, DeadlinePhase, DeadlineRequest, DeadlineScope, REQUEST_BYTES,
+    DeadlineGrant, DeadlinePhase, DeadlineRequest, DeadlineRole, DeadlineScope, REQUEST_BYTES,
 };
+use rz_experiments::NativeEngineRole;
 use std::{
     fs::File,
     io::{self, Read, Write},
@@ -83,6 +84,7 @@ struct Peer {
     request: [u8; REQUEST_BYTES],
     read: usize,
     response: Option<Vec<u8>>,
+    response_until: Option<Instant>,
     written: usize,
 }
 
@@ -91,6 +93,20 @@ pub(crate) struct DeadlineGrantObservation {
     pub peer_pid: u32,
     pub peer_start_ticks: u64,
     pub scope: DeadlineScope,
+    /// Original upper bound used for this already transmitted frame. A later
+    /// earlier stop cannot retroactively update this observation.
+    pub granted_until: Instant,
+    /// Only the final write was observed in this phase; earlier bytes may
+    /// already have been sent in the preceding callback.
+    pub completion_observed_during_cleanup: bool,
+}
+
+/// A same-user, same-image, direct Fastchess child observation. This does not
+/// identify its game/role or authorize an endpoint by itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeadlinePeerObservation {
+    pub pid: u32,
+    pub start_ticks: u64,
 }
 
 pub(crate) struct DeadlineControl<'a> {
@@ -101,7 +117,7 @@ pub(crate) struct DeadlineControl<'a> {
     owner_epoch: u64,
     process_cleanup_until: Instant,
     fastchess: Option<(u32, ProcessIdentity)>,
-    admitted: Vec<(DeadlineScope, u32)>,
+    admitted: Vec<(DeadlineScope, u32, ProcessIdentity)>,
     used: Vec<DeadlineScope>,
     peer: Option<Peer>,
 }
@@ -147,13 +163,127 @@ impl<'a> DeadlineControl<'a> {
             || scope.owner_epoch != self.owner_epoch
             || self.admitted.len() + self.used.len() >= MAX_ADMISSIONS
             || expected_peer_pid == 0
-            || self.admitted.iter().any(|(existing, _)| existing == &scope)
+            || self
+                .admitted
+                .iter()
+                .any(|(existing, _, _)| existing == &scope)
             || self.used.contains(&scope)
         {
             return Err(failure("scope_admission"));
         }
-        self.admitted.push((scope, expected_peer_pid));
+        let identity = process_identity(expected_peer_pid)?;
+        self.admitted.push((scope, expected_peer_pid, identity));
         Ok(())
+    }
+
+    /// Observe only the already authenticated pending child. The caller must
+    /// bind it to the role-specific channel supplied by the original runner;
+    /// role and lock values claimed in a request do not establish that binding.
+    pub(crate) fn pending_peer(&self) -> Result<Option<DeadlinePeerObservation>, ArenaError> {
+        let Some(peer) = self.peer.as_ref() else {
+            return Ok(None);
+        };
+        let (leader, _) = self.fastchess.ok_or_else(|| failure("fastchess_custody"))?;
+        self.verify_peer(leader, peer.pid, peer.identity)?;
+        Ok(Some(DeadlinePeerObservation {
+            pid: peer.pid,
+            start_ticks: peer.identity.start_ticks,
+        }))
+    }
+
+    /// Atomically reserve all three phases for the same authenticated child,
+    /// deriving generation and lock from the original locked pair. The caller
+    /// must have selected this listener via its original per-role launch
+    /// channel and supply the supervisor's real child-start observation.
+    /// Neither wire claims nor connection time provide either fact.
+    pub(crate) fn admit_original_endpoint(
+        &mut self,
+        pair: &LockedPalsSystemArenaPairV6,
+        execution: &PalsV6ExecutionStart,
+        role: NativeEngineRole,
+        game: u32,
+        child_started: Instant,
+        request_ids: [u64; 3],
+    ) -> Result<[DeadlineScope; 3], ArenaError> {
+        if pair.sha256() != execution.pair_sha256()
+            || !execution.matches_deadline_identity(self.owner_id, self.owner_epoch)
+        {
+            return Err(failure("original_pair_mismatch"));
+        }
+        let startup_until = execution.child_startup_until(role, child_started)?;
+        if !self.window.matches_bounds(
+            execution.started(),
+            startup_until,
+            execution.run_until(),
+            execution.cleanup_until(),
+        ) || self.process_cleanup_until != execution.cleanup_until()
+        {
+            return Err(failure("original_window_mismatch"));
+        }
+        let peer = self
+            .pending_peer()?
+            .ok_or_else(|| failure("peer_missing"))?;
+        let endpoint = pair.endpoint(role);
+        let lock_sha256 = decode_sha256(&endpoint.startup_lock.canonical_sha256)?;
+        let role = match role {
+            NativeEngineRole::Baseline => DeadlineRole::Baseline,
+            NativeEngineRole::Candidate => DeadlineRole::Candidate,
+        };
+        let scopes = [
+            DeadlinePhase::Startup,
+            DeadlinePhase::Run,
+            DeadlinePhase::Cleanup,
+        ]
+        .map(|phase| {
+            let index = match phase {
+                DeadlinePhase::Startup => 0,
+                DeadlinePhase::Run => 1,
+                DeadlinePhase::Cleanup => 2,
+            };
+            DeadlineScope {
+                owner_id: self.owner_id,
+                owner_epoch: self.owner_epoch,
+                role,
+                game,
+                generation: endpoint.startup_lock.config.process_generation,
+                request_id: request_ids[index],
+                lock_sha256,
+                phase,
+            }
+        });
+        if request_ids.contains(&0)
+            || request_ids[0] == request_ids[1]
+            || request_ids[0] == request_ids[2]
+            || request_ids[1] == request_ids[2]
+            || self
+                .admitted
+                .len()
+                .saturating_add(self.used.len())
+                .saturating_add(3)
+                > MAX_ADMISSIONS
+            || scopes.iter().any(|scope| {
+                scope.validate().is_err()
+                    || self
+                        .admitted
+                        .iter()
+                        .any(|(existing, _, _)| existing == scope)
+                    || self.used.contains(scope)
+            })
+        {
+            return Err(failure("scope_admission"));
+        }
+        let identity = self
+            .peer
+            .as_ref()
+            .ok_or_else(|| failure("peer_missing"))?
+            .identity;
+        self.admitted.extend(
+            scopes
+                .iter()
+                .cloned()
+                .map(|scope| (scope, peer.pid, identity)),
+        );
+        Ok(scopes)
     }
 
     /// One bounded, nonblocking step from `SpawnControl`. Caller supplies the
@@ -162,6 +292,25 @@ impl<'a> DeadlineControl<'a> {
         &mut self,
         custody: &SpawnCustody,
         execution_until: Instant,
+    ) -> Result<Option<DeadlineGrantObservation>, ArenaError> {
+        self.poll_with_phase(custody, execution_until, false)
+    }
+
+    /// Cleanup callback deadlines can be shorter than the original whole
+    /// window. Do not apply that bound to requests serviced during normal run.
+    pub(crate) fn poll_cleanup(
+        &mut self,
+        custody: &SpawnCustody,
+        cleanup_until: Instant,
+    ) -> Result<Option<DeadlineGrantObservation>, ArenaError> {
+        self.poll_with_phase(custody, cleanup_until, true)
+    }
+
+    fn poll_with_phase(
+        &mut self,
+        custody: &SpawnCustody,
+        supervisor_until: Instant,
+        cleanup_callback: bool,
     ) -> Result<Option<DeadlineGrantObservation>, ArenaError> {
         if Instant::now() >= self.process_cleanup_until {
             return Err(failure("cleanup_deadline"));
@@ -204,13 +353,45 @@ impl<'a> DeadlineControl<'a> {
                 request: [0; REQUEST_BYTES],
                 read: 0,
                 response: None,
+                response_until: None,
                 written: 0,
             });
+            // The original owner must first observe and bind this actual
+            // child; never derive its authority from the following wire data.
+            return Ok(None);
         }
 
         let peer = self.peer.as_ref().ok_or_else(|| failure("peer_missing"))?;
         self.verify_peer(pid, peer.pid, peer.identity)?;
         let peer = self.peer.as_mut().ok_or_else(|| failure("peer_missing"))?;
+        if cleanup_callback && peer.response.is_some() {
+            let request = DeadlineRequest::decode(&peer.request).map_err(failure)?;
+            let current_until = peer
+                .response_until
+                .ok_or_else(|| failure("response_deadline_missing"))?;
+            let actual_until = phase_supervisor_limit(
+                request.scope.phase,
+                self.process_cleanup_until,
+                supervisor_until,
+                true,
+            )
+            .min(self.window.phase_deadline(request.scope.phase));
+            if pending_frame_needs_rebuild(current_until, actual_until, peer.written)? {
+                let encoded = self
+                    .window
+                    .grant(&request.scope, &peer.request)
+                    .map_err(failure)?;
+                let mut grant = DeadlineGrant::decode(&encoded).map_err(failure)?;
+                let remaining = actual_until
+                    .checked_duration_since(Instant::now())
+                    .ok_or_else(|| failure("cleanup_deadline"))?;
+                let remaining_ns = u64::try_from(remaining.as_nanos())
+                    .map_err(|_| failure("cleanup_deadline_overflow"))?;
+                grant.remaining_ns = grant.remaining_ns.min(remaining_ns);
+                peer.response = Some(grant.encode().map_err(failure)?.to_vec());
+                peer.response_until = Some(actual_until);
+            }
+        }
         if peer.response.is_none() {
             match peer.stream.read(&mut peer.request[peer.read..]) {
                 Ok(0) => return Err(failure("peer_eof")),
@@ -225,11 +406,13 @@ impl<'a> DeadlineControl<'a> {
             let index = self
                 .admitted
                 .iter()
-                .position(|(scope, admitted_pid)| {
-                    scope == &request.scope && *admitted_pid == peer.pid
+                .position(|(scope, admitted_pid, identity)| {
+                    scope == &request.scope
+                        && *admitted_pid == peer.pid
+                        && *identity == peer.identity
                 })
                 .ok_or_else(|| failure("scope_not_admitted"))?;
-            let (scope, _) = self.admitted.remove(index);
+            let (scope, _, _) = self.admitted.remove(index);
             // Reserve before writing: a partial or failed reply is not retried.
             self.used.push(scope.clone());
             let encoded = self.window.grant(&scope, &peer.request).map_err(failure)?;
@@ -237,11 +420,12 @@ impl<'a> DeadlineControl<'a> {
             // Cleanup is bounded by the original supervisor's separately
             // registered cleanup deadline, not by its execution deadline.
             // The latter would falsely deny the cleanup reserve altogether.
-            let supervisor_until = if scope.phase == DeadlinePhase::Cleanup {
-                self.process_cleanup_until
-            } else {
-                execution_until
-            };
+            let supervisor_until = phase_supervisor_limit(
+                scope.phase,
+                self.process_cleanup_until,
+                supervisor_until,
+                cleanup_callback,
+            );
             let supervisor_remaining = supervisor_until
                 .checked_duration_since(Instant::now())
                 .ok_or_else(|| failure("execution_deadline"))?;
@@ -249,6 +433,8 @@ impl<'a> DeadlineControl<'a> {
                 .map_err(|_| failure("execution_deadline_overflow"))?;
             grant.remaining_ns = grant.remaining_ns.min(supervisor_ns);
             peer.response = Some(grant.encode().map_err(failure)?.to_vec());
+            peer.response_until =
+                Some(supervisor_until.min(self.window.phase_deadline(scope.phase)));
         }
         let response = peer
             .response
@@ -271,6 +457,10 @@ impl<'a> DeadlineControl<'a> {
             peer_pid: peer.pid,
             peer_start_ticks: peer.identity.start_ticks,
             scope,
+            granted_until: peer
+                .response_until
+                .ok_or_else(|| failure("response_deadline_missing"))?,
+            completion_observed_during_cleanup: cleanup_callback,
         }))
     }
 
@@ -299,5 +489,105 @@ impl<'a> DeadlineControl<'a> {
             return Err(failure("peer_identity_changed"));
         }
         Ok(())
+    }
+}
+
+fn pending_frame_needs_rebuild(
+    old_until: Instant,
+    actual_until: Instant,
+    written: usize,
+) -> Result<bool, ArenaError> {
+    if actual_until >= old_until {
+        return Ok(false);
+    }
+    if written != 0 {
+        return Err(failure("response_deadline_changed_after_partial_write"));
+    }
+    Ok(true)
+}
+
+fn phase_supervisor_limit(
+    phase: DeadlinePhase,
+    original_cleanup_until: Instant,
+    callback_until: Instant,
+    cleanup_callback: bool,
+) -> Instant {
+    if phase == DeadlinePhase::Cleanup {
+        if cleanup_callback {
+            original_cleanup_until.min(callback_until)
+        } else {
+            original_cleanup_until
+        }
+    } else {
+        callback_until
+    }
+}
+
+fn decode_sha256(text: &str) -> Result<[u8; 32], ArenaError> {
+    if text.len() != 64 {
+        return Err(failure("lock_digest"));
+    }
+    let nibble = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    let mut result = [0; 32];
+    for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+        let high = nibble(pair[0]).ok_or_else(|| failure("lock_digest"))?;
+        let low = nibble(pair[1]).ok_or_else(|| failure("lock_digest"))?;
+        result[index] = (high << 4) | low;
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn cleanup_reserve_is_not_cut_by_run_but_obeys_actual_cleanup_callback() {
+        let now = Instant::now();
+        let run = now + Duration::from_secs(5);
+        let actual_cleanup = now + Duration::from_secs(7);
+        let original_cleanup = now + Duration::from_secs(10);
+        assert_eq!(
+            phase_supervisor_limit(DeadlinePhase::Cleanup, original_cleanup, run, false),
+            original_cleanup
+        );
+        assert_eq!(
+            phase_supervisor_limit(
+                DeadlinePhase::Cleanup,
+                original_cleanup,
+                actual_cleanup,
+                true
+            ),
+            actual_cleanup
+        );
+        assert_eq!(
+            phase_supervisor_limit(
+                DeadlinePhase::Cleanup,
+                actual_cleanup,
+                original_cleanup,
+                true
+            ),
+            actual_cleanup
+        );
+        assert_eq!(
+            phase_supervisor_limit(DeadlinePhase::Run, original_cleanup, run, false),
+            run
+        );
+    }
+
+    #[test]
+    fn shortening_a_partial_frame_fails_without_reissuing_it() {
+        let now = Instant::now();
+        let old = now + Duration::from_secs(10);
+        let shorter = now + Duration::from_secs(5);
+        assert!(pending_frame_needs_rebuild(old, shorter, 0).unwrap());
+        assert!(pending_frame_needs_rebuild(old, shorter, 1).is_err());
+        assert!(!pending_frame_needs_rebuild(old, old, 1).unwrap());
+        assert!(!pending_frame_needs_rebuild(shorter, old, 1).unwrap());
     }
 }

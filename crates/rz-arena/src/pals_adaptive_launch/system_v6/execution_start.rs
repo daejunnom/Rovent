@@ -23,6 +23,7 @@ pub struct PalsV6ExecutionStart {
     cleanup_until: Instant,
     startup_ms: [u64; 2],
     handshake_ms: [u64; 2],
+    deadline_identity: Option<([u8; 16], u64)>,
 }
 
 impl PalsV6ExecutionStart {
@@ -55,6 +56,7 @@ impl PalsV6ExecutionStart {
             handshake_ms: endpoints
                 .each_ref()
                 .map(|endpoint| endpoint.handshake_max_ms),
+            deadline_identity: None,
         })
     }
 
@@ -72,6 +74,53 @@ impl PalsV6ExecutionStart {
 
     pub fn cleanup_until(&self) -> Instant {
         self.cleanup_until
+    }
+
+    /// Register the original supervisor's nonzero execution identity once.
+    /// This value identifies its live scope; it does not authenticate a peer.
+    pub(crate) fn register_deadline_identity(
+        &mut self,
+        owner_id: [u8; 16],
+        owner_epoch: u64,
+    ) -> Result<(), ArenaError> {
+        self.require_running()?;
+        if owner_id == [0; 16] || owner_epoch == 0 || self.deadline_identity.is_some() {
+            return Err(invalid(
+                "PALS V6 deadline identity is invalid or already registered",
+            ));
+        }
+        self.deadline_identity = Some((owner_id, owner_epoch));
+        Ok(())
+    }
+
+    pub(crate) fn matches_deadline_identity(&self, owner_id: [u8; 16], owner_epoch: u64) -> bool {
+        self.deadline_identity == Some((owner_id, owner_epoch))
+    }
+
+    /// The caller must supply the actual child-start observation from the
+    /// original supervisor. A peer connection time is not a spawn timestamp.
+    pub(crate) fn deadline_owner_window(
+        &self,
+        pair: &LockedPalsSystemArenaPairV6,
+        role: NativeEngineRole,
+        child_started: Instant,
+    ) -> Result<super::deadline_grant::OwnerWindow, ArenaError> {
+        if pair.sha256() != self.pair_sha256() {
+            return Err(invalid("PALS V6 pair differs from original execution"));
+        }
+        if self.deadline_identity.is_none() {
+            return Err(invalid(
+                "PALS V6 original deadline identity is not registered",
+            ));
+        }
+        let startup_until = self.child_startup_until(role, child_started)?;
+        super::deadline_grant::OwnerWindow::new(
+            self.started,
+            startup_until,
+            self.run_until,
+            self.cleanup_until,
+        )
+        .map_err(invalid)
     }
 
     pub fn require_running(&self) -> Result<(), ArenaError> {
@@ -147,6 +196,7 @@ mod tests {
             cleanup_until: started + Duration::from_secs(610),
             startup_ms: [60_000, 900_000],
             handshake_ms: [120_000, 900_000],
+            deadline_identity: None,
         };
         assert_eq!(
             owner
@@ -179,6 +229,7 @@ mod tests {
             cleanup_until: now + Duration::from_secs(11),
             startup_ms: [1_000; 2],
             handshake_ms: [1_000; 2],
+            deadline_identity: None,
         };
         assert!(
             owner
@@ -195,5 +246,26 @@ mod tests {
                 .child_startup_until(NativeEngineRole::Baseline, now + Duration::from_secs(1))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn deadline_identity_is_nonzero_and_bound_once_to_the_original_execution() {
+        let now = Instant::now();
+        let mut owner = PalsV6ExecutionStart {
+            pair_sha256: String::new(),
+            started: now,
+            run_until: now + Duration::from_secs(10),
+            cleanup_until: now + Duration::from_secs(11),
+            startup_ms: [1_000; 2],
+            handshake_ms: [1_000; 2],
+            deadline_identity: None,
+        };
+        assert!(owner.register_deadline_identity([0; 16], 1).is_err());
+        assert!(owner.register_deadline_identity([1; 16], 0).is_err());
+        owner.register_deadline_identity([1; 16], 7).unwrap();
+        assert!(owner.matches_deadline_identity([1; 16], 7));
+        assert!(!owner.matches_deadline_identity([1; 16], 8));
+        assert!(!owner.matches_deadline_identity([2; 16], 7));
+        assert!(owner.register_deadline_identity([2; 16], 8).is_err());
     }
 }

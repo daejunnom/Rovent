@@ -39,6 +39,29 @@ impl OwnerWindow {
         })
     }
 
+    /// Compare the same original monotonic bounds; this is not a process or
+    /// endpoint capability and does not authorize an IPC peer.
+    pub(crate) fn matches_bounds(
+        &self,
+        started: Instant,
+        startup_until: Instant,
+        run_until: Instant,
+        cleanup_until: Instant,
+    ) -> bool {
+        self.started == started
+            && self.startup_until == startup_until
+            && self.run_until == run_until
+            && self.cleanup_until == cleanup_until
+    }
+
+    pub(crate) fn phase_deadline(&self, phase: DeadlinePhase) -> Instant {
+        match phase {
+            DeadlinePhase::Startup => self.startup_until,
+            DeadlinePhase::Run => self.run_until,
+            DeadlinePhase::Cleanup => self.cleanup_until,
+        }
+    }
+
     /// `admitted_scope` must have been bound by the owner to the authenticated
     /// peer and its current game/generation. This method cannot establish that
     /// relationship; replay prevention is also the owner's responsibility.
