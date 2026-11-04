@@ -1,0 +1,622 @@
+//! P-C /3 root resource custody primitives.
+//!
+//! This ledger alone is not a collection hook, observer, physical fence, or
+//! successful run. Root setup and actual worker integration remain separate.
+use super::launch::PreparedPcCollectionInputsV3;
+use super::speculative_route_v3::SpeculativeRootV3;
+use super::teacher::v3_pump::TeacherPumpV3;
+use super::teacher::v3_session::TeacherSessionStagingV3;
+use super::native_capture::RoventNativeCaptureRegistration;
+use super::observer_lock_v3::RoventCollectionOwnerLockV3;
+use super::{ArenaError, invalid};
+use rz_uci::pals_adaptive::{AdaptiveCollectionBoundaryV2, AdaptiveCollectionObserverBoxV3,
+    AdaptiveManagerError, RoventCollectionRootAdmissionV3, RoventNoCaptureRootCapabilityV3,
+    RoventRoleOnlyNoCaptureFenceV3};
+use rz_uci::rovent_bootstrap::pc_collection_v3::{
+    RoventPcCollectionAdmissionFailureV3, RoventPcCollectionAdmissionOutcomeV3,
+    RoventPcCollectionAdmissionPortV3, RoventPcCollectionHandoffV3,
+    RoventPcCollectionHooksV3, RoventPcCollectionRootCustodyV3,
+    RoventPcCollectionWorkerJoinFailureV3, RoventPcCollectionWorkerV3,
+    RoventPcCustodyReturnV3, RoventPcDeferredCleanupV3,
+};
+use rz_uci::rovent_bootstrap::{RoventPcCollectionLaunchOwnerV3, RoventStartupControl};
+use rz_uci::pals_native::ticketed::VirtualReviewTicketOutput;
+use rz_search::pals::engine::pc_port::PcPortQuestion;
+use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak, mpsc};
+
+/// Quota is per original root. Unresolved roots retain their reservation.
+struct RootQuotaV3 {
+    admission: RoventCollectionRootAdmissionV3,
+    worker_reserved: bool,
+    teacher_reserved: bool,
+    joined: Option<Arc<Mutex<RoventPcCollectionRootCustodyV3>>>,
+    /// Holds the original aggregate and associated handoff alive after quota
+    /// release; this does not imply that native or route retirement succeeded.
+    retired_teacher_handoff: Option<Arc<Mutex<RoventPcCollectionHandoffV3>>>,
+}
+
+pub(crate) enum PcQuotaOutcomeV3 {
+    Reserved,
+    AlreadyReserved,
+    AlreadyRetired,
+    Busy,
+    Exhausted,
+}
+
+pub(crate) enum PcQuotaEvidenceErrorV3 {
+    Busy,
+    Poisoned,
+    WrongRoot,
+    AlreadyRetired,
+    MissingTeacherAggregate,
+}
+
+/// The caller serializes operations on this ledger. Its retained roots may
+/// outlive active worker quota; this keeps historical original evidence.
+pub(crate) struct PcRootQuotaLedgerV3 {
+    inputs: Arc<PreparedPcCollectionInputsV3>,
+    roots: Vec<RootQuotaV3>,
+}
+
+/// A route unlink proof retains the original ledger and pump rather than
+/// copying their observations. Construction and every use recheck both.
+pub(crate) struct RoventTeacherRouteRetirementV3 {
+    ledger: Arc<Mutex<PcRootQuotaLedgerV3>>,
+    route: SpeculativeRootV3,
+    pump: Arc<Mutex<TeacherPumpV3>>,
+}
+
+impl RoventTeacherRouteRetirementV3 {
+    /// `None` is retryable and makes no assertion that any work is complete.
+    fn try_prepare(
+        ledger: Arc<Mutex<PcRootQuotaLedgerV3>>,
+        route: SpeculativeRootV3,
+        pump: Arc<Mutex<TeacherPumpV3>>,
+    ) -> Result<Option<Self>, ArenaError> {
+        let proof = Self { ledger, route, pump };
+        match proof.matches_original_route(&proof.route)? {
+            Some(true) => Ok(Some(proof)),
+            Some(false) | None => Ok(None),
+        }
+    }
+
+    /// Called immediately before unlink. Busy is not an identity failure.
+    /// Teacher aggregate, actual joined worker, native root fence, and the
+    /// original route receiver's accounting are independent requirements.
+    pub(crate) fn matches_original_route(
+        &self,
+        requested: &SpeculativeRootV3,
+    ) -> Result<Option<bool>, ArenaError> {
+        if !self.route.same_original_route(requested) { return Ok(Some(false)); }
+        let ledger = match self.ledger.try_lock() {
+            Ok(value) => value,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err(invalid("V3 root ledger poisoned")),
+        };
+        let Some(root) = ledger.roots.iter().find(|root|
+            self.route.matches_admission(&root.admission)) else { return Ok(Some(false)); };
+        if root.worker_reserved || root.teacher_reserved { return Ok(Some(false)); }
+        let Some(joined_owner) = &root.joined else { return Ok(Some(false)); };
+        let joined = match joined_owner.try_lock() {
+            Ok(value) => value,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err(invalid("V3 joined custody poisoned")),
+        };
+        let Some(teacher_handoff) = &root.retired_teacher_handoff else { return Ok(Some(false)); };
+        if !Arc::ptr_eq(joined.handoff(), teacher_handoff) { return Ok(Some(false)); }
+        {
+            let mut handoff = match joined.handoff().try_lock() {
+                Ok(value) => value,
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Poisoned(_)) => return Err(invalid("V3 original handoff poisoned")),
+            };
+            let (admission, _, _settlement, fence) = handoff.parts_mut();
+            if !admission.same_original_admission(&root.admission)
+                || !fence.permits_semantic_closure()
+            { return Ok(Some(false)); }
+            if !handoff.teacher_aggregate_ack().is_some_and(|ack|
+                ack.matches_admission(&root.admission)) { return Ok(Some(false)); }
+        }
+        let pump = match self.pump.try_lock() {
+            Ok(value) => value,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err(invalid("V3 original teacher pump poisoned")),
+        };
+        pump.try_retirement_ready(&self.route)
+    }
+}
+
+impl PcRootQuotaLedgerV3 {
+    pub(crate) fn new(inputs: Arc<PreparedPcCollectionInputsV3>) -> Self {
+        Self { inputs, roots: Vec::new() }
+    }
+
+    pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> { &self.inputs }
+
+    /// Reserve before starting a root worker. A duplicate original root is
+    /// never reissued as a new owner, even after its previous worker joined.
+    pub(crate) fn reserve_worker(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> PcQuotaOutcomeV3 {
+        if let Some(root) = self.roots.iter().find(|root| root.admission.same_original_admission(admission)) {
+            return if root.worker_reserved { PcQuotaOutcomeV3::AlreadyReserved }
+                else { PcQuotaOutcomeV3::AlreadyRetired };
+        }
+        let plan = self.inputs.plan();
+        if self.roots.len() >= usize::from(plan.maximum_roots)
+            || self.roots.iter().filter(|root| root.worker_reserved).count()
+                >= usize::from(plan.maximum_root_workers)
+        { return PcQuotaOutcomeV3::Exhausted; }
+        if self.roots.try_reserve(1).is_err() { return PcQuotaOutcomeV3::Busy; }
+        self.roots.push(RootQuotaV3 {
+            admission: admission.clone(), worker_reserved: true, teacher_reserved: false,
+            joined: None, retired_teacher_handoff: None,
+        });
+        PcQuotaOutcomeV3::Reserved
+    }
+
+    /// This separate reservation must be held before any teacher actor starts
+    /// and until the original root's physical aggregate is retained.
+    pub(crate) fn reserve_teacher(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<PcQuotaOutcomeV3, PcQuotaEvidenceErrorV3> {
+        let Some(index) = self.roots.iter().position(|root| root.admission.same_original_admission(admission))
+        else { return Err(PcQuotaEvidenceErrorV3::WrongRoot); };
+        if self.roots[index].teacher_reserved { return Ok(PcQuotaOutcomeV3::AlreadyReserved); }
+        if !self.roots[index].worker_reserved || self.roots[index].retired_teacher_handoff.is_some() {
+            return Err(PcQuotaEvidenceErrorV3::AlreadyRetired);
+        }
+        if self.roots.iter().filter(|root| root.teacher_reserved).count()
+            >= usize::from(self.inputs.plan().maximum_simultaneous_teacher_roots)
+        { return Ok(PcQuotaOutcomeV3::Exhausted); }
+        self.roots[index].teacher_reserved = true;
+        Ok(PcQuotaOutcomeV3::Reserved)
+    }
+
+    /// A worker slot is returned only with the original V3 joined custody
+    /// returned by the manager. The caller retains the same Arc on failure.
+    pub(crate) fn retain_joined_worker(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV3,
+        custody: Arc<Mutex<RoventPcCollectionRootCustodyV3>>,
+    ) -> Result<(), PcQuotaEvidenceErrorV3> {
+        let Some(root) = self.roots.iter_mut().find(|root| root.admission.same_original_admission(admission))
+        else { return Err(PcQuotaEvidenceErrorV3::WrongRoot); };
+        if !root.worker_reserved || root.joined.is_some() {
+            return Err(PcQuotaEvidenceErrorV3::AlreadyRetired);
+        }
+        let handoff_owner = match custody.try_lock() {
+            Ok(original) => Arc::clone(original.handoff()),
+            Err(TryLockError::WouldBlock) => return Err(PcQuotaEvidenceErrorV3::Busy),
+            Err(TryLockError::Poisoned(_)) => return Err(PcQuotaEvidenceErrorV3::Poisoned),
+        };
+        if root.retired_teacher_handoff.as_ref().is_some_and(|original|
+            !Arc::ptr_eq(original, &handoff_owner)) {
+            return Err(PcQuotaEvidenceErrorV3::WrongRoot);
+        }
+        {
+            let mut handoff = match handoff_owner.try_lock() {
+                Ok(handoff) => handoff,
+                Err(TryLockError::WouldBlock) => return Err(PcQuotaEvidenceErrorV3::Busy),
+                Err(TryLockError::Poisoned(_)) => return Err(PcQuotaEvidenceErrorV3::Poisoned),
+            };
+            if !handoff.parts_mut().0.same_original_admission(admission) {
+                drop(handoff);
+                return Err(PcQuotaEvidenceErrorV3::WrongRoot);
+            }
+        }
+        root.joined = Some(custody);
+        root.worker_reserved = false;
+        Ok(())
+    }
+
+    /// A live process, logical cancel, worker join alone, or no GPU result is
+    /// not physical teacher retirement. Keep the same original handoff Arc.
+    pub(crate) fn retain_teacher_aggregate(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV3,
+        handoff: Arc<Mutex<RoventPcCollectionHandoffV3>>,
+    ) -> Result<(), PcQuotaEvidenceErrorV3> {
+        let Some(root) = self.roots.iter_mut().find(|root| root.admission.same_original_admission(admission))
+        else { return Err(PcQuotaEvidenceErrorV3::WrongRoot); };
+        if !root.teacher_reserved || root.retired_teacher_handoff.is_some() {
+            return Err(PcQuotaEvidenceErrorV3::AlreadyRetired);
+        }
+        if let Some(joined) = &root.joined {
+            let joined = match joined.try_lock() {
+                Ok(value) => value,
+                Err(TryLockError::WouldBlock) => return Err(PcQuotaEvidenceErrorV3::Busy),
+                Err(TryLockError::Poisoned(_)) => return Err(PcQuotaEvidenceErrorV3::Poisoned),
+            };
+            if !Arc::ptr_eq(joined.handoff(), &handoff) {
+                return Err(PcQuotaEvidenceErrorV3::WrongRoot);
+            }
+        }
+        {
+            let mut original = match handoff.try_lock() {
+                Ok(original) => original,
+                Err(TryLockError::WouldBlock) => return Err(PcQuotaEvidenceErrorV3::Busy),
+                Err(TryLockError::Poisoned(_)) => return Err(PcQuotaEvidenceErrorV3::Poisoned),
+            };
+            if !original.parts_mut().0.same_original_admission(admission) {
+                return Err(PcQuotaEvidenceErrorV3::WrongRoot);
+            }
+            if !original.teacher_aggregate_ack().is_some_and(|ack| ack.matches_admission(admission)) {
+                return Err(PcQuotaEvidenceErrorV3::MissingTeacherAggregate);
+            }
+        }
+        root.retired_teacher_handoff = Some(handoff);
+        root.teacher_reserved = false;
+        Ok(())
+    }
+}
+
+type PcHandoffV3 = Arc<Mutex<RoventPcCollectionHandoffV3>>;
+type PcObserverV3 = AdaptiveCollectionObserverBoxV3<PcPortQuestion, VirtualReviewTicketOutput>;
+
+struct PcRootSlotV3 {
+    admission: RoventCollectionRootAdmissionV3,
+    requested: bool,
+    installed: bool,
+    owner: Option<RoventCollectionOwnerLockV3>,
+    route: Option<SpeculativeRootV3>,
+    stage: Option<Arc<Mutex<TeacherSessionStagingV3>>>,
+    pump: Option<Arc<Mutex<TeacherPumpV3>>>,
+    observer: Option<PcObserverV3>,
+    worker: Option<RoventPcCollectionWorkerV3>,
+    handoff: Option<PcHandoffV3>,
+    joined: Option<RoventPcCollectionRootCustodyV3>,
+    returned: Option<Arc<Mutex<RoventPcCollectionRootCustodyV3>>>,
+    join_failure: Option<RoventPcCollectionWorkerJoinFailureV3>,
+    join_panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+struct PcBridgeStateV3 {
+    roots: Vec<PcRootSlotV3>,
+    deferred: Vec<Arc<Mutex<RoventPcDeferredCleanupV3>>>,
+}
+
+/// Manager callbacks only exchange bounded state; setup runs on the separate
+/// supervisor. The same bridge, native owner and inputs must remain retained.
+pub(crate) struct RoventPcCollectionBridgeV3 {
+    inputs: Arc<PreparedPcCollectionInputsV3>,
+    registration: RoventNativeCaptureRegistration,
+    ledger: Arc<Mutex<PcRootQuotaLedgerV3>>,
+    startup: OnceLock<RoventStartupControl>,
+    native_owner: OnceLock<Weak<RoventPcCollectionLaunchOwnerV3>>,
+    state: Mutex<PcBridgeStateV3>,
+    requests: mpsc::SyncSender<RoventCollectionRootAdmissionV3>,
+    request_receiver: Mutex<mpsc::Receiver<RoventCollectionRootAdmissionV3>>,
+}
+
+/// Supervisor retains all members and the worker outside the callback until
+/// this exact bundle is accepted. It must reserve teacher quota before spawn.
+pub(crate) struct PcPreparedRootV3 {
+    pub admission: RoventCollectionRootAdmissionV3,
+    pub owner: RoventCollectionOwnerLockV3,
+    pub route: SpeculativeRootV3,
+    pub stage: Arc<Mutex<TeacherSessionStagingV3>>,
+    pub pump: Arc<Mutex<TeacherPumpV3>>,
+    pub worker: RoventPcCollectionWorkerV3,
+}
+
+pub(crate) enum PcPreparedOutcomeV3 {
+    Accepted,
+    Busy(PcPreparedRootV3),
+    Rejected(&'static str, PcPreparedRootV3),
+}
+
+impl RoventPcCollectionBridgeV3 {
+    /// Construction starts no native or teacher work. Boundary validation is
+    /// performed by the original supervisor before it prepares a root.
+    pub(crate) fn new(
+        inputs: Arc<PreparedPcCollectionInputsV3>,
+        registration: RoventNativeCaptureRegistration,
+    ) -> Result<Arc<Self>, &'static str> {
+        let max = usize::from(inputs.plan().maximum_roots);
+        if !(1..=64).contains(&max) { return Err("P-C V3 root capacity invalid"); }
+        let mut roots = Vec::new();
+        let mut deferred = Vec::new();
+        roots.try_reserve_exact(max).map_err(|_| "P-C V3 root allocation")?;
+        deferred.try_reserve_exact(max).map_err(|_| "P-C V3 cleanup allocation")?;
+        let (requests, receiver) = mpsc::sync_channel(max);
+        Ok(Arc::new(Self {
+            ledger: Arc::new(Mutex::new(PcRootQuotaLedgerV3::new(Arc::clone(&inputs)))),
+            inputs, registration, startup: OnceLock::new(), native_owner: OnceLock::new(),
+            state: Mutex::new(PcBridgeStateV3 { roots, deferred }), requests,
+            request_receiver: Mutex::new(receiver),
+        }))
+    }
+
+    pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> { &self.inputs }
+    pub(crate) fn startup(&self) -> Option<&RoventStartupControl> { self.startup.get() }
+
+    /// The bundle supplies this once, before any native root admission.
+    pub(crate) fn bind_native_owner(
+        self: &Arc<Self>, owner: &Arc<RoventPcCollectionLaunchOwnerV3>,
+    ) -> Result<(), &'static str> {
+        let hooks: Arc<dyn RoventPcCollectionHooksV3> = self.clone();
+        if !owner.matches_original_hooks(&hooks) { return Err("P-C V3 native hook identity differs"); }
+        if let Some(original) = self.native_owner.get() {
+            return if original.upgrade().is_some_and(|old| Arc::ptr_eq(&old, owner)) { Ok(()) }
+                else { Err("P-C V3 native launch owner changed") };
+        }
+        self.native_owner.set(Arc::downgrade(owner)).map_err(|_| "P-C V3 owner binding raced")
+    }
+
+    pub(crate) fn try_next_root(&self) -> Result<Option<RoventCollectionRootAdmissionV3>, &'static str> {
+        let receiver = self.request_receiver.try_lock().map_err(|_| "P-C V3 request receiver unavailable")?;
+        match receiver.try_recv() {
+            Ok(value) => Ok(Some(value)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err("P-C V3 request channel closed"),
+        }
+    }
+
+    /// Must be called before any actor starts. The same root's quota persists
+    /// through failed/unknown cleanup until its original physical aggregate.
+    pub(crate) fn try_reserve_teacher(&self, admission: &RoventCollectionRootAdmissionV3)
+        -> Result<PcQuotaOutcomeV3, PcQuotaEvidenceErrorV3> {
+        let mut ledger = match self.ledger.try_lock() {
+            Ok(ledger) => ledger,
+            Err(TryLockError::WouldBlock) => return Err(PcQuotaEvidenceErrorV3::Busy),
+            Err(TryLockError::Poisoned(_)) => return Err(PcQuotaEvidenceErrorV3::Poisoned),
+        };
+        ledger.reserve_teacher(admission)
+    }
+
+    /// Called by the supervisor after route installation, native owner
+    /// preparation and physical actor startup outside the manager callback.
+    pub(crate) fn try_publish_prepared(&self, original: PcPreparedRootV3) -> PcPreparedOutcomeV3 {
+        if !original.worker.matches_admission(&original.admission)
+            || !original.route.matches_admission(&original.admission)
+            || !self.registration.owns_speculative_root_v3(&original.route)
+            || !original.owner.capture_registration().same_original_owner(&self.registration)
+        { return PcPreparedOutcomeV3::Rejected("P-C V3 prepared owner differs", original); }
+        if self.inputs.validate_against(original.admission.native_origin().original_input_lock()).is_err() {
+            return PcPreparedOutcomeV3::Rejected("P-C V3 original inputs differ", original);
+        }
+        {
+            let ledger = match self.ledger.try_lock() {
+                Ok(ledger) => ledger,
+                Err(TryLockError::WouldBlock) => return PcPreparedOutcomeV3::Busy(original),
+                Err(TryLockError::Poisoned(_)) => return PcPreparedOutcomeV3::Rejected("P-C V3 quota ledger poisoned", original),
+            };
+            if !ledger.roots.iter().any(|root| root.worker_reserved && root.teacher_reserved
+                && root.admission.same_original_admission(&original.admission)) {
+                drop(ledger);
+                return PcPreparedOutcomeV3::Rejected("P-C V3 original worker/teacher reservation missing", original);
+            }
+        }
+        let stage_owner = Arc::clone(&original.stage);
+        let stage_session = match stage_owner.try_lock() {
+            Ok(stage) => stage.session(),
+            Err(TryLockError::WouldBlock) => return PcPreparedOutcomeV3::Busy(original),
+            Err(TryLockError::Poisoned(_)) => return PcPreparedOutcomeV3::Rejected("P-C V3 teacher stage poisoned", original),
+        };
+        let Some(stage_session) = stage_session else { return PcPreparedOutcomeV3::Busy(original); };
+        {
+            let pump_owner = Arc::clone(&original.pump);
+            let pump = match pump_owner.try_lock() {
+                Ok(pump) => pump,
+                Err(TryLockError::WouldBlock) => return PcPreparedOutcomeV3::Busy(original),
+                Err(TryLockError::Poisoned(_)) => return PcPreparedOutcomeV3::Rejected("P-C V3 pump poisoned", original),
+            };
+            if !Arc::ptr_eq(pump.session(), &stage_session) {
+                drop(pump); return PcPreparedOutcomeV3::Rejected("P-C V3 staged session differs", original);
+            }
+            let receiver_owner = Arc::clone(pump.receiver());
+            drop(pump);
+            let receiver = match receiver_owner.try_lock() {
+                Ok(receiver) => receiver,
+                Err(TryLockError::WouldBlock) => return PcPreparedOutcomeV3::Busy(original),
+                Err(TryLockError::Poisoned(_)) => return PcPreparedOutcomeV3::Rejected("P-C V3 receiver poisoned", original),
+            };
+            if !receiver.matches_original_route(&original.route) {
+                drop(receiver);
+                return PcPreparedOutcomeV3::Rejected("P-C V3 original receiver differs", original);
+            }
+        }
+        {
+            let session = match stage_session.try_lock() {
+                Ok(session) => session,
+                Err(TryLockError::WouldBlock) => return PcPreparedOutcomeV3::Busy(original),
+                Err(TryLockError::Poisoned(_)) => return PcPreparedOutcomeV3::Rejected("P-C V3 session poisoned", original),
+            };
+            if !session.original_admission().same_original_admission(&original.admission)
+                || !Arc::ptr_eq(session.manifest_lock(), self.inputs.manifest()) {
+                drop(session); return PcPreparedOutcomeV3::Rejected("P-C V3 input or root session differs", original);
+            }
+        }
+        match original.owner.try_attach_speculative_root(&original.admission, &original.route) {
+            Ok(Some(())) => {}
+            Ok(None) => return PcPreparedOutcomeV3::Busy(original),
+            Err(_) => return PcPreparedOutcomeV3::Rejected("P-C V3 route pre-attach failed", original),
+        }
+        match original.owner.try_prepare_original_admission(&original.admission) {
+            Ok(Some(())) => {}
+            Ok(None) => return PcPreparedOutcomeV3::Busy(original),
+            Err(_) => return PcPreparedOutcomeV3::Rejected("P-C V3 observer preparation failed", original),
+        }
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return PcPreparedOutcomeV3::Busy(original),
+            Err(TryLockError::Poisoned(_)) => return PcPreparedOutcomeV3::Rejected("P-C V3 roots poisoned", original),
+        };
+        let Some(slot) = state.roots.iter_mut().find(|slot| slot.admission.same_original_admission(&original.admission))
+        else { return PcPreparedOutcomeV3::Rejected("P-C V3 original request absent", original); };
+        if slot.owner.is_some() || slot.worker.is_some() || slot.installed {
+            return PcPreparedOutcomeV3::Rejected("P-C V3 root already prepared", original);
+        }
+        let PcPreparedRootV3 { owner, route, stage, pump, worker, .. } = original;
+        slot.observer = Some(owner.observer::<PcPortQuestion, VirtualReviewTicketOutput>());
+        slot.owner = Some(owner); slot.route = Some(route); slot.stage = Some(stage);
+        slot.pump = Some(pump); slot.worker = Some(worker);
+        PcPreparedOutcomeV3::Accepted
+    }
+
+    /// The supervisor, never the manager callback, joins the exact worker.
+    pub(crate) fn try_join_root(&self, admission: &RoventCollectionRootAdmissionV3) -> Result<bool, &'static str> {
+        let mut state = self.state.try_lock().map_err(|_| "P-C V3 roots unavailable")?;
+        let slot = state.roots.iter_mut().find(|slot| slot.admission.same_original_admission(admission))
+            .ok_or("P-C V3 root absent")?;
+        if slot.joined.is_some() { return Ok(true); }
+        if slot.join_failure.is_some() || slot.join_panic.is_some() { return Err("P-C V3 worker join unresolved"); }
+        let Some(handoff) = &slot.handoff else { return Ok(false); };
+        let worker = slot.worker.as_mut().ok_or("P-C V3 worker absent")?;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.try_join(handoff))) {
+            Ok(Ok(Some(custody))) => { slot.joined = Some(custody); Ok(true) }
+            Ok(Ok(None)) => Ok(false),
+            Ok(Err(error)) => { slot.join_failure = Some(error); Err("P-C V3 original join failed") }
+            Err(payload) => { slot.join_panic = Some(payload); Err("P-C V3 original join panicked") }
+        }
+    }
+}
+
+fn pc_state<'a>(state: &'a Mutex<PcBridgeStateV3>)
+    -> Result<std::sync::MutexGuard<'a, PcBridgeStateV3>, AdaptiveManagerError> {
+    match state.try_lock() {
+        Ok(value) => Ok(value),
+        Err(TryLockError::WouldBlock) => Err(AdaptiveManagerError::AuxiliaryPending),
+        Err(TryLockError::Poisoned(_)) => Err(AdaptiveManagerError::Invalid("P-C V3 root custody poisoned")),
+    }
+}
+
+impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
+    fn register_startup_control(&self, control: &RoventStartupControl) -> Result<(), AdaptiveManagerError> {
+        if let Some(old) = self.startup.get() {
+            return if old.until == control.until && old.cleanup_until == control.cleanup_until
+                && Arc::ptr_eq(&old.cancellation, &control.cancellation) { Ok(()) }
+                else { Err(AdaptiveManagerError::Invalid("P-C V3 startup owner changed")) };
+        }
+        self.startup.set(control.clone()).map_err(|_| AdaptiveManagerError::AuxiliaryPending)
+    }
+
+    fn admit(&self, port: &mut RoventPcCollectionAdmissionPortV3<'_>, admission: RoventCollectionRootAdmissionV3)
+        -> Result<RoventPcCollectionAdmissionOutcomeV3, RoventPcCollectionAdmissionFailureV3> {
+        let failure = |error, admission| RoventPcCollectionAdmissionFailureV3 { error, admission, owners: Box::new(()) };
+        if self.native_owner.get().and_then(Weak::upgrade).is_none() {
+            return Err(failure(AdaptiveManagerError::Invalid("P-C V3 native owner not bound"), admission));
+        }
+        let mut state = match pc_state(&self.state) {
+            Ok(value) => value,
+            Err(AdaptiveManagerError::AuxiliaryPending) => return Ok(RoventPcCollectionAdmissionOutcomeV3::Pending { admission }),
+            Err(error) => return Err(failure(error, admission)),
+        };
+        let index = match state.roots.iter().position(|slot| slot.admission.same_original_admission(&admission)) {
+            Some(index) => index,
+            None => {
+                if state.roots.len() >= usize::from(self.inputs.plan().maximum_roots)
+                    || state.roots.iter().any(|slot| slot.admission.root_admission().authority() == admission.root_admission().authority()) {
+                    return Err(failure(AdaptiveManagerError::Capacity("P-C V3 root capacity or duplicate authority"), admission));
+                }
+                let mut ledger = match self.ledger.try_lock() {
+                    Ok(value) => value,
+                    Err(TryLockError::WouldBlock) => return Ok(RoventPcCollectionAdmissionOutcomeV3::Pending { admission }),
+                    Err(_) => return Err(failure(AdaptiveManagerError::Invalid("P-C V3 ledger poisoned"), admission)),
+                };
+                match ledger.reserve_worker(&admission) {
+                    PcQuotaOutcomeV3::Reserved => {},
+                    PcQuotaOutcomeV3::Busy | PcQuotaOutcomeV3::Exhausted => return Ok(RoventPcCollectionAdmissionOutcomeV3::Pending { admission }),
+                    _ => return Err(failure(AdaptiveManagerError::Invalid("P-C V3 duplicate root reservation"), admission)),
+                }
+                state.roots.push(PcRootSlotV3 { admission: admission.clone(), requested: false, installed: false,
+                    owner: None, route: None, stage: None, pump: None, observer: None, worker: None,
+                    handoff: None, joined: None, returned: None, join_failure: None, join_panic: None });
+                state.roots.len() - 1
+            }
+        };
+        let slot = &mut state.roots[index];
+        if !slot.requested {
+            match self.requests.try_send(admission.clone()) {
+                Ok(()) => slot.requested = true,
+                Err(mpsc::TrySendError::Full(_)) => return Ok(RoventPcCollectionAdmissionOutcomeV3::Pending { admission }),
+                Err(mpsc::TrySendError::Disconnected(_)) => return Err(failure(AdaptiveManagerError::Invalid("P-C V3 supervisor queue closed"), admission)),
+            }
+        }
+        if slot.installed { return Ok(RoventPcCollectionAdmissionOutcomeV3::Installed); }
+        let Some(observer) = slot.observer.take() else {
+            // Once the original request is sent, the supervisor may already
+            // be creating a worker before it publishes the prepared bundle.
+            return Ok(RoventPcCollectionAdmissionOutcomeV3::PendingUncertain { admission });
+        };
+        match port.install(admission, observer) {
+            Ok(()) => { slot.installed = true; Ok(RoventPcCollectionAdmissionOutcomeV3::Installed) }
+            Err(original) => Err(RoventPcCollectionAdmissionFailureV3 {
+                error: original.error.clone(), admission: original.admission.clone(), owners: Box::new(original),
+            }),
+        }
+    }
+
+    fn pump_root(&self, admission: &RoventCollectionRootAdmissionV3) -> Result<(), AdaptiveManagerError> {
+        let state = pc_state(&self.state)?;
+        if state.roots.iter().any(|slot| slot.installed && slot.admission.same_original_admission(admission)) { Ok(()) }
+        else { Err(AdaptiveManagerError::Invalid("P-C V3 root missing")) }
+    }
+
+    fn revoke_root(&self, admission: &RoventCollectionRootAdmissionV3) -> Result<(), AdaptiveManagerError> {
+        let state = pc_state(&self.state)?;
+        let slot = state.roots.iter().find(|slot| slot.admission.same_original_admission(admission))
+            .ok_or(AdaptiveManagerError::Invalid("P-C V3 revoke root missing"))?;
+        slot.route.as_ref().ok_or(AdaptiveManagerError::AuxiliaryPending)?.cancel_all();
+        Ok(())
+    }
+
+    fn finish_deferred(&self, capability: &RoventNoCaptureRootCapabilityV3, fence: &RoventRoleOnlyNoCaptureFenceV3)
+        -> Result<AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
+        match self.registration.try_finish_whole_root_no_capture_v3_role_only(capability, fence) {
+            Ok(true) => Ok(AdaptiveCollectionBoundaryV2::Ready),
+            Ok(false) => Ok(AdaptiveCollectionBoundaryV2::Busy),
+            Err(error) => Err(AdaptiveManagerError::Semantic(error.to_string())),
+        }
+    }
+
+    fn retain_deferred_cleanup(&self, cleanup: Arc<Mutex<RoventPcDeferredCleanupV3>>) -> Result<RoventPcCustodyReturnV3, AdaptiveManagerError> {
+        let mut state = match pc_state(&self.state) {
+            Ok(value) => value, Err(AdaptiveManagerError::AuxiliaryPending) => return Ok(RoventPcCustodyReturnV3::Busy), Err(error) => return Err(error),
+        };
+        if state.deferred.iter().any(|old| Arc::ptr_eq(old, &cleanup)) { return Ok(RoventPcCustodyReturnV3::Accepted); }
+        if state.deferred.len() >= usize::from(self.inputs.plan().maximum_roots) { return Ok(RoventPcCustodyReturnV3::Busy); }
+        state.deferred.push(cleanup); Ok(RoventPcCustodyReturnV3::Accepted)
+    }
+
+    fn handoff_sender_root(&self, admission: &RoventCollectionRootAdmissionV3) -> Result<mpsc::SyncSender<PcHandoffV3>, AdaptiveManagerError> {
+        let state = pc_state(&self.state)?;
+        let slot = state.roots.iter().find(|slot| slot.admission.same_original_admission(admission))
+            .ok_or(AdaptiveManagerError::Invalid("P-C V3 handoff root absent"))?;
+        Ok(slot.worker.as_ref().ok_or(AdaptiveManagerError::AuxiliaryPending)?.sender())
+    }
+
+    fn try_take_root_custody(&self, handoff: &PcHandoffV3) -> Result<Option<RoventPcCollectionRootCustodyV3>, AdaptiveManagerError> {
+        let admission = match handoff.try_lock() {
+            Ok(mut value) => value.parts_mut().0.clone(), Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err(AdaptiveManagerError::Invalid("P-C V3 handoff poisoned")),
+        };
+        let mut state = match pc_state(&self.state) { Ok(value) => value, Err(AdaptiveManagerError::AuxiliaryPending) => return Ok(None), Err(error) => return Err(error) };
+        let slot = state.roots.iter_mut().find(|slot| slot.admission.same_original_admission(&admission))
+            .ok_or(AdaptiveManagerError::Invalid("P-C V3 handoff root absent"))?;
+        if slot.handoff.as_ref().is_some_and(|old| !Arc::ptr_eq(old, handoff)) {
+            return Err(AdaptiveManagerError::Invalid("P-C V3 handoff changed"));
+        }
+        if slot.handoff.is_none() { slot.handoff = Some(Arc::clone(handoff)); }
+        if slot.join_failure.is_some() || slot.join_panic.is_some() { return Err(AdaptiveManagerError::Invalid("P-C V3 worker join unresolved")); }
+        Ok(slot.joined.take())
+    }
+
+    fn return_root_custody(&self, custody: Arc<Mutex<RoventPcCollectionRootCustodyV3>>) -> Result<RoventPcCustodyReturnV3, AdaptiveManagerError> {
+        let handoff = match custody.try_lock() {
+            Ok(value) => Arc::clone(value.handoff()), Err(TryLockError::WouldBlock) => return Ok(RoventPcCustodyReturnV3::Busy),
+            Err(_) => return Err(AdaptiveManagerError::Invalid("P-C V3 returned custody poisoned")),
+        };
+        let mut state = match pc_state(&self.state) { Ok(value) => value, Err(AdaptiveManagerError::AuxiliaryPending) => return Ok(RoventPcCustodyReturnV3::Busy), Err(error) => return Err(error) };
+        let slot = state.roots.iter_mut().find(|slot| slot.handoff.as_ref().is_some_and(|old| Arc::ptr_eq(old, &handoff)))
+            .ok_or(AdaptiveManagerError::Invalid("P-C V3 returned owner differs"))?;
+        match &slot.returned {
+            Some(old) if Arc::ptr_eq(old, &custody) => Ok(RoventPcCustodyReturnV3::Accepted),
+            Some(_) => Err(AdaptiveManagerError::Invalid("P-C V3 returned custody changed")),
+            None => { slot.returned = Some(custody); Ok(RoventPcCustodyReturnV3::Accepted) }
+        }
+    }
+}

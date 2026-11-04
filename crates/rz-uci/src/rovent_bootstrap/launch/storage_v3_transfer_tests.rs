@@ -181,8 +181,8 @@ fn v3_transfer_child_body() {
             "search":{"node_unit":"rovent-position-visits/1","requested_nodes":null,
                 "depth_plies":null,"mate_moves":null,"registered_max_chess_plies":64,
                 "searchmoves":null,"search_configuration_sha256":search_digest,
-                "root_state_and_history_sha256":hex(&rz_position::contracts::rules_snapshot_semantic_digest(&rz_position::Position::startpos().snapshot())),
-                "rules_profile_sha256":hex(&rz_position::contracts::profile_digest())}
+                "root_state_and_history_sha256":hex(&rz_position::contracts::rules_snapshot_semantic_digest(&rz_position::Position::startpos().snapshot()).0),
+                "rules_profile_sha256":hex(&rz_position::contracts::profile_digest().0)}
         },
         "resources":{"cpu_quota_millicpus":2000,"pools":[
             {"actors":["manager","pc_caller"],"max_threads":1,"cpu_charge_millicpus":1000},
