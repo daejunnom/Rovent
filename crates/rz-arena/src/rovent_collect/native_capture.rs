@@ -5,7 +5,7 @@ use super::producer_v2::{SpeculativeTicketAuthorityV2, SubmittedTeacherQueryV2};
 use super::producer_v3::{RoventCapturedInputV3, RoventInputCaptureReservationV3};
 #[cfg(target_os = "linux")]
 use super::speculative_route_v3::{
-    SpeculativeRootV3, SpeculativeTicketRegistrationV3, SpeculativeTicketV3,
+    SpeculativeReceiverV3, SpeculativeRootV3, SpeculativeTicketRegistrationV3, SpeculativeTicketV3,
 };
 use super::*;
 use rz_search::pals::coordinator::RoleFailure;
@@ -439,13 +439,7 @@ impl RoventNativeCaptureRegistration {
         channel_capacity: usize,
         maximum_tickets: usize,
         root_revoked: Arc<AtomicBool>,
-    ) -> Result<
-        Option<(
-            SpeculativeRootV3,
-            mpsc::Receiver<Arc<super::producer_v3::SubmittedTeacherQueryV3>>,
-        )>,
-        ArenaError,
-    > {
+    ) -> Result<Option<(SpeculativeRootV3, SpeculativeReceiverV3)>, ArenaError> {
         let registered = match self.registered.try_lock() {
             Ok(registered) => registered,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
@@ -933,6 +927,35 @@ impl RoventNativeCaptureRegistration {
                     .any(|entry| entry.authority() == capability.authority()),
                 "lock-v3 conflicting root marker",
             )?;
+        }
+        Ok(true)
+    }
+
+    /// Own has a distinct opaque manager/native fence. A role-only receipt
+    /// cannot authorize this cleanup or stand in for physical completion.
+    #[cfg(target_os = "linux")]
+    pub(super) fn try_finish_whole_root_no_capture_v3_own(
+        &self,
+        capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV3,
+        fence: &rz_uci::pals_adaptive::RoventOwnNoCaptureFenceV3,
+    ) -> Result<bool, ArenaError> {
+        let mut marker = match self.disabled_root.try_lock() {
+            Ok(marker) => marker,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v3 disabled root poisoned"));
+            }
+        };
+        check(
+            capability.matches_own_fence(fence) && !capability.is_install_open(),
+            "lock-v3 original own root, worker fence or install gate mismatch",
+        )?;
+        if let Some(index) = marker.iter().position(|entry| matches!(entry,
+            DisabledCaptureRoot::WholeRootV3(original) if original.same_original_capability(capability))) {
+            marker.remove(index);
+        } else {
+            check(!marker.iter().any(|entry| entry.authority() == capability.authority()),
+                "lock-v3 conflicting root marker")?;
         }
         Ok(true)
     }
