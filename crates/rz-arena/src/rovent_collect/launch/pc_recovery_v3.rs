@@ -806,6 +806,9 @@ impl PcRunRecoveryKeyV3 {
             if let Some(terminal) = original.output_terminal {
                 return observe_closed_output_v3(original, terminal);
             }
+            if original.output_panic.is_some() {
+                return PcOutputClosureV3::Unknown;
+            }
             if Instant::now() >= until {
                 return PcOutputClosureV3::Pending;
             }
