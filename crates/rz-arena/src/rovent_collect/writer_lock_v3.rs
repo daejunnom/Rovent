@@ -35,6 +35,7 @@ pub(super) enum PolicyAppendResultV3 {
     Appended,
     Busy,
     Rejected(ArenaError),
+    GateRejected(super::speculative_route_v3::TargetBeginRejectionV3),
     /// Candidate cloning panicked before the gate or writer was touched.
     PreparationPanicked(Box<dyn std::any::Any + Send>),
     Uncertain,
@@ -259,7 +260,7 @@ impl RoventCorpusWriterLockV3 {
         let guard = match capability.try_begin_append() {
             Ok(Some(guard)) => guard,
             Ok(None) => return PolicyAppendResultV3::Busy,
-            Err(error) => return PolicyAppendResultV3::Rejected(error),
+            Err(error) => return PolicyAppendResultV3::GateRejected(error),
         };
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.append(&temporary))) {
             Ok(Ok(())) => {

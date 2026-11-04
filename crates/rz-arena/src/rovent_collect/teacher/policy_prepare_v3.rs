@@ -34,19 +34,23 @@ impl PreparedTeacherPolicyLockV3 {
 
 pub(crate) struct PrepareTeacherPolicyFailureV3 {
     pub error: ArenaError,
-    pub sealed: RoventSealedTeacherPolicyV3,
     pub panic: Option<Box<dyn std::any::Any + Send>>,
     pub policy_unavailable: bool,
 }
 
 /// The actor's actual one-shot policy evidence must already exist. A native
 /// capture by itself, a raw completion, or a matching digest cannot enter.
-pub(crate) fn prepare_teacher_policy_lock_v3(
+pub(crate) fn prepare_teacher_policy_lock_v3_in_slots(
     row: &RoventRetiredLockV3Record,
-    sealed: RoventSealedTeacherPolicyV3,
-) -> Result<PreparedTeacherPolicyLockV3, Box<PrepareTeacherPolicyFailureV3>> {
+    sealed_slot: &mut Option<RoventSealedTeacherPolicyV3>,
+    prepared_slot: &mut Option<PreparedTeacherPolicyLockV3>,
+) -> Result<(), Box<PrepareTeacherPolicyFailureV3>> {
     let unavailable = std::cell::Cell::new(false);
     let prepare = || -> Result<(GenerationPolicyTargetV3, RoventHeadSource), ArenaError> {
+        check(prepared_slot.is_none(), "V3 teacher prepared slot occupied")?;
+        let sealed = sealed_slot
+            .as_ref()
+            .ok_or_else(|| invalid("V3 teacher sealed slot empty"))?;
         let capsule = sealed.capsule();
         check(
             !capsule.is_ticket_canceled(),
@@ -149,21 +153,23 @@ pub(crate) fn prepare_teacher_policy_lock_v3(
         )
     };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(prepare)) {
-        Ok(Ok((target, source))) => Ok(PreparedTeacherPolicyLockV3 {
-            sealed,
-            ticket: row.ticket(),
-            target,
-            source,
-        }),
+        Ok(Ok((target, source))) => {
+            let sealed = sealed_slot.take().expect("validated original sealed slot");
+            *prepared_slot = Some(PreparedTeacherPolicyLockV3 {
+                sealed,
+                ticket: row.ticket(),
+                target,
+                source,
+            });
+            Ok(())
+        }
         Ok(Err(error)) => Err(Box::new(PrepareTeacherPolicyFailureV3 {
             error,
-            sealed,
             panic: None,
             policy_unavailable: unavailable.get(),
         })),
         Err(panic) => Err(Box::new(PrepareTeacherPolicyFailureV3 {
             error: invalid("V3 teacher policy preparation panicked"),
-            sealed,
             panic: Some(panic),
             policy_unavailable: false,
         })),

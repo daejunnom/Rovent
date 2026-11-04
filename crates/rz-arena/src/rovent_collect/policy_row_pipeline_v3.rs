@@ -7,8 +7,11 @@
 use super::producer_v3::{
     PendingPolicyPublicationV3, RoventCorpusProducerLockV3, RoventRetiredLockV3Record,
 };
-use super::speculative_route_v3::TargetPublicationV3;
-use super::teacher::policy_prepare_v3::PreparedTeacherPolicyLockV3;
+use super::speculative_route_v3::{TargetBeginRejectionV3, TargetPublicationV3};
+use super::teacher::policy_prepare_v3::{
+    PreparedTeacherPolicyLockV3, prepare_teacher_policy_lock_v3_in_slots,
+};
+use super::teacher::v3_policy::RoventSealedTeacherPolicyV3;
 use super::writer_lock_v3::{
     FinishedRoventCorpusLockV3, PolicyAppendResultV3, RoventCorpusWriterLockV3,
 };
@@ -22,6 +25,8 @@ pub(super) enum PolicyPipelineFailureV3 {
     Prepare(ArenaError, Option<Box<dyn std::any::Any + Send>>),
     Bind(ArenaError),
     AppendRejected(ArenaError),
+    GateRejected(TargetBeginRejectionV3),
+    PolicyUnavailable(ArenaError),
     BeforeAppendPanic(Box<dyn std::any::Any + Send>),
     AppendUncertain,
     Flush(ArenaError),
@@ -40,6 +45,12 @@ pub(super) enum PolicyPipelineProgressV3 {
 pub(super) enum PolicyFlushOutcomeV3 {
     Packet,
     Empty,
+    NotReady,
+    Failed,
+}
+
+pub(super) enum PolicyPrepareOutcomeV3 {
+    Prepared,
     NotReady,
     Failed,
 }
@@ -121,6 +132,36 @@ impl PolicyRowPipelineV3 {
         }
         self.prepared = source.take();
         true
+    }
+
+    /// The same caller-owned sealed slot is not moved until its accepted
+    /// original row has passed all checks and the prepared slot is free.
+    pub(super) fn try_prepare_sealed(
+        &mut self,
+        sealed: &mut Option<RoventSealedTeacherPolicyV3>,
+    ) -> PolicyPrepareOutcomeV3 {
+        if self.failure.is_some() {
+            return PolicyPrepareOutcomeV3::Failed;
+        }
+        if self.row.is_none()
+            || sealed.is_none()
+            || self.prepared.is_some()
+            || self.pending.is_some()
+        {
+            return PolicyPrepareOutcomeV3::NotReady;
+        }
+        let row = self.row.as_ref().expect("checked original row");
+        match prepare_teacher_policy_lock_v3_in_slots(row, sealed, &mut self.prepared) {
+            Ok(()) => PolicyPrepareOutcomeV3::Prepared,
+            Err(failure) => {
+                self.failure = Some(if failure.policy_unavailable {
+                    PolicyPipelineFailureV3::PolicyUnavailable(failure.error)
+                } else {
+                    PolicyPipelineFailureV3::Prepare(failure.error, failure.panic)
+                });
+                PolicyPrepareOutcomeV3::Failed
+            }
+        }
     }
 
     /// Exact ticket/route identity is checked by pending.bind, not by a
@@ -235,6 +276,10 @@ impl PolicyRowPipelineV3 {
             PolicyAppendResultV3::Busy => PolicyPipelineProgressV3::Busy,
             PolicyAppendResultV3::Rejected(error) => {
                 self.failure = Some(PolicyPipelineFailureV3::AppendRejected(error));
+                PolicyPipelineProgressV3::Failed
+            }
+            PolicyAppendResultV3::GateRejected(error) => {
+                self.failure = Some(PolicyPipelineFailureV3::GateRejected(error));
                 PolicyPipelineProgressV3::Failed
             }
             PolicyAppendResultV3::PreparationPanicked(payload) => {
