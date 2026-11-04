@@ -457,7 +457,7 @@ impl<S> Drop for GameRootReservationV3<S> {
     }
 }
 
-pub(super) struct GamePublishGuardV3<S> {
+pub(crate) struct GamePublishGuardV3<S> {
     owner: Arc<GameAuthorityV3<S>>,
     resolved: bool,
 }
