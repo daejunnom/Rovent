@@ -54,6 +54,11 @@ pub(crate) use system_v6::{
     ProxyEntrySmokeSnapshotOwnerV1, prepare_proxy_entry_smoke_snapshot_v1,
 };
 #[cfg(target_os = "linux")]
+pub(crate) use system_v6::{
+    NoGameResourceBindFailure, NoGameResourceLimitsV1, NoGameResourceObservationV1,
+    NoGameResourceOwnerV1, ResourceComparisonV1, ResourceLimitReadbackV1,
+};
+#[cfg(target_os = "linux")]
 pub(crate) use system_v6::{ProxyEntryFunctionalSmokeOwnerV1, SMOKE_RECEIPT_FILE};
 #[cfg(target_os = "linux")]
 pub(crate) use system_v6::{SmokeControlProgress, SmokeDeadlineControl, SmokeGrantObservation};
