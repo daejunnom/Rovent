@@ -158,6 +158,7 @@ fn component_observations(
     for (name, digest) in declared {
         if name == PALS_SYSTEM_V6_SOURCE_COMPONENT
             || name == super::PALS_SYSTEM_V6_EXECUTION_SOURCE_COMPONENT
+            || name == super::PALS_SYSTEM_V6_DEADLINE_WIRE_SOURCE_COMPONENT
         {
             continue;
         }
@@ -371,6 +372,17 @@ impl PinnedPalsSystemStartupV6 {
     /// and their historical source scope are unchanged.
     pub fn system_v6_execution_source(&self) -> PalsSystemSourceObservationV6 {
         self.system_v6_execution_source
+    }
+
+    /// Check this separate source only when its wire profile is selected.
+    /// The observation is not evidence that a grant or inference occurred.
+    pub(crate) fn observe_deadline_wire_profile(
+        &self,
+    ) -> std::io::Result<PalsSystemSourceObservationV6> {
+        super::system_v6_deadline_wire::check_selected_profile(
+            self.lock.config.source_policy,
+            &self.lock.config.source_components,
+        )
     }
     pub fn mapped_executable(&self) -> &crate::process_receipts::ExecutableIdentityV1 {
         &self.mapped_executable

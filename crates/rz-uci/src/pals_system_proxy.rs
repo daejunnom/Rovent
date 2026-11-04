@@ -6,6 +6,7 @@
 //! a UCI `bestmove` are not GPU completion and do not authorize killing it.
 
 mod cli_v6;
+mod deadline_grant;
 #[allow(dead_code)]
 pub(crate) mod finish;
 mod parent;

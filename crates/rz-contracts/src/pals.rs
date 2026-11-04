@@ -1,6 +1,8 @@
 //! PALS-specific contracts. The existing evaluation revision 0.1 is unchanged.
 //! IDs and digests are issued by owners; estimates never certify Rules facts.
 
+pub mod deadline_grant_v1;
+
 use crate::{
     ByteBudget, CancelToken, ClockDomain, Color, ContractError, Deadline, Digest, ErrorCode,
     GameGeneration, MonotonicTick, Move, ProcessEpoch, Promotion, RequestId, RootGeneration,

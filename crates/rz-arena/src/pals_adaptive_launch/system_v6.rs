@@ -7,11 +7,18 @@
 use crate::ArenaError;
 use rz_experiments::{PalsSystemStartupLockV6, SystemRuntimeReceiptV6};
 
+mod deadline_grant;
+mod deadline_sources;
+mod execution_start;
 mod pair;
 mod pair_native;
 #[cfg(target_os = "linux")]
 mod preflight;
+mod proxy_inputs;
+pub use deadline_sources::*;
+pub use execution_start::*;
 pub use pair::*;
+pub use proxy_inputs::*;
 
 /// A verified startup declaration, not a running child or an admission token.
 #[derive(Clone, Debug)]

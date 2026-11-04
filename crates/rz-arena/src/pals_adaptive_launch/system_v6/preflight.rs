@@ -229,11 +229,11 @@ pub(super) fn validate_preflight_record(
         || record.physical_completion != "not_applicable_no_gpu_execution"
         || (config.endpoint.source_commit.is_none()
             && record.source_commit_observation != SourceObservation::Unknown)
-        || (!config
-            .source_components
-            .keys()
-            .any(|key| key != "pals_system_v6" && key != "pals_system_v6_execution")
-            && record.source_components_observation != SourceObservation::Unknown)
+        || (!config.source_components.keys().any(|key| {
+            key != "pals_system_v6"
+                && key != "pals_system_v6_execution"
+                && key != "pals_system_v6_deadline_wire"
+        }) && record.source_components_observation != SourceObservation::Unknown)
         || (!config.source_components.contains_key("pals_system_v6")
             && record.system_v6_source_observation != SourceObservation::Unknown)
         || !source_matches

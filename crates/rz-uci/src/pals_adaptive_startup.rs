@@ -18,10 +18,15 @@ use std::{
 mod search_settings;
 pub use search_settings::*;
 mod system_v6;
+mod system_v6_deadline_wire;
 mod system_v6_execution;
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
 pub(crate) use system_v6::open_system_proxy_binary_until;
 pub use system_v6::*;
+pub use system_v6_deadline_wire::{
+    PALS_SYSTEM_V6_DEADLINE_WIRE_SOURCE_COMPONENT,
+    compiled_pals_system_v6_deadline_wire_source_digest,
+};
 pub use system_v6_execution::{
     PALS_SYSTEM_V6_EXECUTION_SOURCE_COMPONENT, compiled_pals_system_v6_execution_source_digest,
 };
