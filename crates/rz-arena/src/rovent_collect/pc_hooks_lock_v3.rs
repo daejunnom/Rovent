@@ -1447,6 +1447,16 @@ impl PcV3LaunchClosure {
             || joined.panicked() || !joined.matches_original(custody, &supervisor, &native) {
             return Err(invalid("P-C V3 joined game owner differs"));
         }
+        match joined.try_driver_observation() {
+            Ok(super::pc_worker_v3::PcDriverPollV3::Pending) => return Ok(None),
+            Ok(super::pc_worker_v3::PcDriverPollV3::Ready(
+                super::pc_worker_v3::PcSupervisorDriverObservationV3::Completed,
+            )) => {},
+            Ok(super::pc_worker_v3::PcDriverPollV3::Ready(failure)) => {
+                return Err(invalid(format!("P-C V3 game driver did not complete: {failure:?}")));
+            },
+            Err(error) => return Err(invalid(format!("P-C V3 driver observation: {error:?}"))),
+        }
         let pipeline = match supervisor.try_lock() {
             Ok(supervisor) => supervisor.game_pipeline(),
             Err(TryLockError::WouldBlock) => return Ok(None),
