@@ -15,11 +15,11 @@ use rz_uci::pals_adaptive::{
 };
 use rz_uci::rovent_bootstrap::RoventStartupControl;
 use rz_uci::rovent_external_launch::{
+    bind_collection_teacher_actor_v3, spawn_bound_collection_teacher_v3,
     BoundCollectionTeacherActorV3, BoundTeacherSpawnCauseV3, BoundTeacherSpawnFailureV3,
     RoventCollectionTeacherLifecycleV3, RoventTeacherScopeAggregateAckV3,
     RoventTeacherScopeAggregateFailureV3, RoventTeacherWorkerTerminalTokenV3,
     TeacherActorBindingErrorV3, TeacherRecoveryCustodianV3, TeacherRecoveryKeyV3,
-    bind_collection_teacher_actor_v3, spawn_bound_collection_teacher_v3,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -61,6 +61,16 @@ pub(crate) struct TeacherActorEffectOutcomeV3 {
     actor_id: String,
 }
 impl TeacherActorEffectSourceV3 {
+    /// Identity observations only; neither grants actor start authority.
+    pub(crate) fn session_identity_weak(&self) -> Weak<()> {
+        Arc::downgrade(&self.session_identity)
+    }
+    pub(crate) fn session_identity(&self) -> &Arc<()> {
+        &self.session_identity
+    }
+    pub(crate) fn actor_identity(&self) -> &Arc<()> {
+        &self.actor_identity
+    }
     pub(crate) fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
         self.admission.same_original_admission(admission)
     }
@@ -109,6 +119,7 @@ pub(crate) struct TeacherSessionStagingV3 {
     preflight: Option<TeacherSessionPreflightV3>,
     state: TeacherSessionStageStateV3,
     ready: Option<Arc<Mutex<RoventCollectionTeacherSessionV3>>>,
+    ready_effect_identity: Option<Weak<()>>,
     panic: Option<Box<dyn std::any::Any + Send>>,
     scope_original_admission: RoventCollectionRootAdmissionV3,
     scope_effect_identity: Arc<()>,
@@ -196,6 +207,12 @@ impl TeacherSessionStagingV3 {
     /// The original stage owns this identity before any scope claim.
     pub(crate) fn scope_effect_identity_weak(&self) -> Weak<()> {
         Arc::downgrade(&self.scope_effect_identity)
+    }
+
+    /// Identity of the actual session this stage assembled, if Ready. This
+    /// does not prove an actor was started or a worker physically completed.
+    pub(crate) fn ready_session_effect_identity_weak(&self) -> Option<Weak<()>> {
+        self.ready_effect_identity.clone()
     }
     pub(crate) fn state(&self) -> TeacherSessionStageStateV3 {
         self.state
@@ -350,9 +367,10 @@ impl TeacherSessionStagingV3 {
             self.preflight = Some(preflight);
             return Err(TeacherSessionClaimErrorV3::InvalidState);
         };
+        let session_identity = Arc::new(());
         self.ready = Some(Arc::new(Mutex::new(RoventCollectionTeacherSessionV3 {
             admission: preflight.admission,
-            effect_identity: Arc::new(()),
+            effect_identity: Arc::clone(&session_identity),
             manifest: preflight.manifest,
             registration: preflight.registration,
             manifest_digest: preflight.manifest_digest,
@@ -365,6 +383,7 @@ impl TeacherSessionStagingV3 {
             aggregate_failure: None,
             aggregate_emitted: false,
         })));
+        self.ready_effect_identity = Some(Arc::downgrade(&session_identity));
         self.state = TeacherSessionStageStateV3::Ready;
         Ok(())
     }
@@ -425,6 +444,16 @@ pub(crate) struct RoventCollectionTeacherSessionV3 {
 }
 
 impl RoventCollectionTeacherSessionV3 {
+    /// Identity observation only, while the caller holds this original
+    /// session. It is not proof of game dispatch, actor start or retirement.
+    pub(crate) fn matches_actor_effect_source(&self, source: &TeacherActorEffectSourceV3) -> bool {
+        self.admission.same_original_admission(&source.admission)
+            && Arc::ptr_eq(&self.effect_identity, &source.session_identity)
+            && self.actors.get(&source.actor_id).is_some_and(|actor| {
+                actor.effect_source_issued
+                    && Arc::ptr_eq(&actor.effect_identity, &source.actor_identity)
+            })
+    }
     pub(crate) fn original_admission(&self) -> &RoventCollectionRootAdmissionV3 {
         &self.admission
     }
@@ -561,6 +590,7 @@ impl RoventCollectionTeacherSessionV3 {
             }),
             state: TeacherSessionStageStateV3::Prepared,
             ready: None,
+            ready_effect_identity: None,
             panic: None,
             scope_original_admission: admission.clone(),
             scope_effect_identity: Arc::new(()),
