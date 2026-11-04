@@ -209,6 +209,7 @@ impl RoventCollectionOwnerLockV3 {
     pub(super) fn try_prepare_pipeline(
         &self,
         pipeline: &PolicyRowPipelineOwnerV3,
+        ticket: &RoleTicketEnvelope,
     ) -> Result<PipelinePreparationV3, ArenaError> {
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
@@ -226,9 +227,14 @@ impl RoventCollectionOwnerLockV3 {
             Some(slot) => slot,
             None => return Ok(PipelinePreparationV3::Busy),
         };
+        let admission = state
+            .admission
+            .as_ref()
+            .ok_or_else(|| invalid("lock-v3 root not admitted"))?
+            .clone();
         if slot.is_uncertain() {
             Ok(PipelinePreparationV3::Unknown)
-        } else if slot.prepare(state.producer()?) {
+        } else if slot.prepare(state.producer()?, &admission, ticket) {
             Ok(PipelinePreparationV3::Ready)
         } else if slot.is_uncertain() {
             Ok(PipelinePreparationV3::Unknown)
@@ -244,6 +250,7 @@ impl RoventCollectionOwnerLockV3 {
     pub(super) fn try_take_pipeline_capability(
         &self,
         pipeline: &PolicyRowPipelineOwnerV3,
+        ticket: &RoleTicketEnvelope,
     ) -> Result<PipelineCapabilityV3, ArenaError> {
         let state = match self.state.try_lock() {
             Ok(state) => state,
@@ -264,7 +271,7 @@ impl RoventCollectionOwnerLockV3 {
             Some(slot) => slot,
             None => return Ok(PipelineCapabilityV3::Busy),
         };
-        Ok(match slot.try_take_target_capability(route)? {
+        Ok(match slot.try_take_target_capability(route, ticket)? {
             Some(outcome) => PipelineCapabilityV3::Outcome(outcome),
             None => PipelineCapabilityV3::NotReady,
         })
