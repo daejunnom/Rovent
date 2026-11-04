@@ -527,11 +527,13 @@ impl RoventBoardCollectionWorkerV3 {
                 return Err(RoventBoardCollectionWorkerJoinFailureV3::Busy);
             }
         };
-        let result = self.thread.take().expect("checked V3 worker handle").join();
         if let Some(index) = slots.iter().position(|slot| slot.matches(&self.key)) {
             slots.swap_remove(index);
         }
         drop(slots);
+        // Do not hold the shared worker registry during OS thread join; even
+        // a finished thread can still be completing thread-local teardown.
+        let result = self.thread.take().expect("checked V3 worker handle").join();
         match result {
             Ok(original_worker) => {
                 if !received_handoff {
