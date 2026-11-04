@@ -225,7 +225,11 @@ impl OriginalCancelSender {
             match self.stream.write(&self.request[self.written..]) {
                 Ok(0) => return Err(failure("cancel_write_zero")),
                 Ok(count) => self.written += count,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
                 Err(_) => return Err(failure("cancel_write")),
             }
             if self.written < self.request.len() {
@@ -241,7 +245,11 @@ impl OriginalCancelSender {
         match self.stream.read(&mut self.ack[self.received..]) {
             Ok(0) => return Err(failure("cancel_peer_eof")),
             Ok(count) => self.received += count,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
             Err(_) => return Err(failure("cancel_read")),
         }
         if self.received < self.ack.len() {
