@@ -1084,5 +1084,52 @@ mod tests {
                 Err(_) => panic!("original output worker failed to join"),
             }
         }
+
+        // The in-place preflight retains the actual process on a callback
+        // panic and explicitly joins its idle writer without starting a timer.
+        let mut process = EngineProcess::new(
+            factory.clone(),
+            Arc::new(OwnerRegistry::default()),
+            ProcessClock::new(contract::ProcessEpoch(83)),
+        );
+        let close = process.install_priority_close().unwrap();
+        let (sender, events) = event_channel();
+        let output = AsyncOutputOwner::start(Vec::<u8>::new(), Vec::<u8>::new(), 1, 256)
+            .ok()
+            .unwrap();
+        let mut slot = AsyncEngineStartSlot::new(
+            process,
+            events,
+            sender,
+            output,
+            close,
+            EngineSettings::default(),
+        );
+        assert_eq!(slot.preflight(), InPlacePreflightStatus::RetainedFailure);
+        assert!(matches!(
+            slot.preflight_failure(),
+            Some(EngineError::StartupPanic(_))
+        ));
+        assert_eq!(slot.preflight(), InPlacePreflightStatus::RetainedFailure);
+        assert_eq!(slot.try_start_timer(), InPlaceTimerStatus::NotReady);
+        assert!(Arc::ptr_eq(
+            slot.process.factory.as_ref().unwrap(),
+            &factory
+        ));
+        assert_eq!(
+            slot.request_idle_writer_close(),
+            UnstartedWriterCloseStatus::Requested
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match slot.try_recover_idle_writer() {
+                UnstartedWriterRecoveryStatus::Recovered => break,
+                UnstartedWriterRecoveryStatus::Pending if Instant::now() < deadline => {
+                    std::thread::yield_now()
+                }
+                _ => panic!("slot writer failed to join"),
+            }
+        }
+        assert!(slot.idle_writer_recovery().unwrap().is_ok());
     }
 }
