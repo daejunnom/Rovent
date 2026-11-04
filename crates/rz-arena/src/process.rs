@@ -1132,8 +1132,8 @@ pub(crate) fn supervise_smoke_input_in_original_window<'v>(
     input: OriginalProcessInput<'_>,
     spawned: &'v mut SpawnCustody,
     mut control: SpawnControl<'v>,
-    cleanup_control: Option<CleanupControl<'v>>,
-    pre_signal: Option<PreSignalControl<'v>>,
+    mut cleanup_control: Option<CleanupControl<'v>>,
+    mut pre_signal: Option<PreSignalControl<'v>>,
     observation: &'v mut OriginalSmokeTransportObservation,
 ) -> Result<ProcessOutput, ArenaError> {
     validate_smoke_protocol_input(input.bytes)?;
@@ -1161,6 +1161,7 @@ pub(crate) fn supervise_smoke_input_in_original_window<'v>(
     let directory = directory
         .try_clone()
         .map_err(|_| ArenaError::Io("process.cwd_clone".into()))?;
+    let has_cleanup = cleanup_control.is_some();
     let has_pre_signal = pre_signal.is_some();
     // Keep a panicking run callback on the normal original-child cleanup path
     // so the returned ProcessOutput can still preserve its drained bytes.
@@ -1170,6 +1171,23 @@ pub(crate) fn supervise_smoke_input_in_original_window<'v>(
     ) {
         Ok(result) => result,
         Err(_) => Err(ArenaError::Io("process.smoke_run_control:panic".into())),
+    };
+    // Short reborrows keep all callbacks inside this invocation. Passing the
+    // caller's original trait-object references directly would force the local
+    // guarded callback to outlive the caller's longer custody lifetime.
+    let mut guarded_cleanup = |owner: &SpawnCustody, until: Instant| {
+        cleanup_control
+            .as_deref_mut()
+            .ok_or_else(|| ArenaError::Io("process.smoke_cleanup_control_missing".into()))?(
+            owner, until,
+        )
+    };
+    let mut guarded_pre_signal = |owner: &SpawnCustody, until: Instant| {
+        pre_signal
+            .as_deref_mut()
+            .ok_or_else(|| ArenaError::Io("process.smoke_pre_signal_control_missing".into()))?(
+            owner, until,
+        )
     };
     observation.started = true;
     observation.transport.original_supervisor_entry_ns = input.window.elapsed_ns(Instant::now());
@@ -1185,10 +1203,10 @@ pub(crate) fn supervise_smoke_input_in_original_window<'v>(
             commands: Some(input.bytes),
             original: Some(input.window),
             observation: Some(&mut observation.transport),
-            spawned: Some(spawned),
+            spawned: Some(&mut *spawned),
             control: Some(&mut guarded_control),
-            cleanup_control,
-            pre_signal,
+            cleanup_control: has_cleanup.then_some(&mut guarded_cleanup as CleanupControl<'_>),
+            pre_signal: has_pre_signal.then_some(&mut guarded_pre_signal as PreSignalControl<'_>),
             pre_signal_observation: has_pre_signal.then_some(&mut observation.pre_signal),
             ..Default::default()
         },
