@@ -200,12 +200,16 @@ class OptionalSystemControlEvidenceTests(unittest.TestCase):
         self.assertEqual(result["process_exit"], "not_attested")
         self.assertEqual(result["current_mapping"], "not_attested")
         self.assertEqual(result["same_numeric_run"], "not_attested")
+        self.assertEqual(result["system_runtime_identity_scope"], "producer_reported_not_recomputed")
 
     def test_unavailable_mapping_stays_unknown_without_a_witness(self):
-        result = self.read("mapping_unavailable")
+        result = self.read("mapping_unavailable", observation_updates={
+            "initial_partial_observation": "write_failed", "initial_partial_error": "write error"})
         self.assertEqual(result["producer_status"], "mapping_unavailable")
         self.assertNotIn("witness_sha256", result)
         self.assertEqual(result["current_mapping"], "not_attested")
+        self.assertEqual(result["initial_partial_observation"], "write_failed")
+        self.assertEqual(result["initial_partial_error"], "write error")
 
     def test_mismatched_plan_and_graph_are_rejected(self):
         with self.assertRaises(ValueError):
