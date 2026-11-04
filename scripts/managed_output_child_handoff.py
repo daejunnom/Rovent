@@ -398,6 +398,7 @@ class ManagedCollectionOutputHandoffV2(ManagedOutputChildHandoff):
         self._input = original_input
         self._input_directory_fd = self._input_plan_fd = None
         self._session_id = None
+        self._cleanup_only = False
         try:
             directory_fd, plan_fd = original_input.borrowed_fds()
             self._input_directory_fd = os.dup(directory_fd)
@@ -427,6 +428,16 @@ class ManagedCollectionOutputHandoffV2(ManagedOutputChildHandoff):
     def after_spawn(self):
         super().after_spawn()
         self._close_input_duplicates()
+
+    def begin_cleanup_only(self):
+        """Keep observation ACKs for the original child during bounded drain.
+
+        This is not write admission: the Rust owner enforces the work cutoff
+        before a new mutation and preserves already attempted output.
+        """
+        if os.getpid() != self._owner_pid or not self._spawned or self._admission_closed:
+            raise StorageError("original collection cleanup channel is unavailable")
+        self._cleanup_only = True
 
     def _validate_request(self, request):
         if (not isinstance(request, dict) or set(request) != {"schema", "sequence", "session_id"}

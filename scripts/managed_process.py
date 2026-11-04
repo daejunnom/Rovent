@@ -258,7 +258,15 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
             output_handoff.confirm_scope_admission()
 
         def on_tick():
-            output_handoff.service()
+            # During V3 drain, the same direct child can exit between the
+            # group observation and this tick. Its channel no longer needs an
+            # ACK; that exit alone is not GPU or output completion evidence.
+            exited = (type(output_handoff) is ManagedCollectionOutputHandoffV2
+                      and output_handoff._cleanup_only and owned_group._child is not None
+                      and os.waitid(os.P_PID, owned_group._child.pid,
+                                    os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None)
+            if not exited:
+                output_handoff.service()
             if previous_on_tick is not None:
                 previous_on_tick()
     if cleanup_absolute_deadline is not None:
@@ -421,9 +429,15 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
             owned_group._bind(child)
         if requested_exit is not None and output_handoff is not None:
             try:
-                # No new output grants after cancellation or timeout. The
-                # original lease and group remain owned through the drain.
-                output_handoff.close_admission()
+                if (type(output_handoff) is ManagedCollectionOutputHandoffV2
+                        and cleanup_absolute_deadline is not None and requested_exit == 124
+                        and absolute_deadline is not None and time.monotonic() >= absolute_deadline):
+                    output_handoff.begin_cleanup_only()
+                    graceful_drain_deadline = cleanup_absolute_deadline
+                else:
+                    # Other cancellation and failures close admission as
+                    # before; no cleanup continuation is inferred.
+                    output_handoff.close_admission()
             except BaseException as exc:
                 owned_group.output_handoff_close_error = {
                     "kind": "callback", "error_type": type(exc).__name__, "message": str(exc)
