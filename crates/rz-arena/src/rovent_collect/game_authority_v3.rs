@@ -2,7 +2,9 @@
 //! This candidate has partial bridge bindings, not complete product closure.
 //! Its close proof is intentionally unconstructible until an audited bridge
 //! proves the original native fence and all root/producer custody.
-use super::launch::{ManagedOutputOwnerV3, PreparedPcCollectionInputsV3};
+use super::launch::{
+    ManagedOutputOwnerV3, ManagedPublicationUnstartedEvidenceV3, PreparedPcCollectionInputsV3,
+};
 use super::policy_row_pipeline_v3::PolicyRowPipelineOwnerV3;
 use rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3;
 use std::convert::Infallible;
@@ -14,7 +16,8 @@ const ABORT_REQUESTED: u64 = 1;
 const PUBLICATION_GRANTED: u64 = 2;
 const NO_DATA_FINISHED: u64 = 4;
 const ADMISSION_SEALED: u64 = 8;
-const DISPATCH_CLAIM: u64 = 16;
+const PUBLICATION_NOT_STARTED: u64 = 16;
+const DISPATCH_CLAIM: u64 = 32;
 const CONTROL_FLAGS: u64 = DISPATCH_CLAIM - 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +28,7 @@ enum PhaseV3 {
     Preparing,
     Granted,
     NoData,
+    KnownNotWritten,
     Unknown,
 }
 
@@ -388,7 +392,13 @@ impl<S> GameAuthorityV3<S> {
             if current & ABORT_REQUESTED != 0 {
                 return GameStepV3::Aborted;
             }
-            if current & (ADMISSION_SEALED | PUBLICATION_GRANTED | NO_DATA_FINISHED) != 0 {
+            if current
+                & (ADMISSION_SEALED
+                    | PUBLICATION_GRANTED
+                    | NO_DATA_FINISHED
+                    | PUBLICATION_NOT_STARTED)
+                != 0
+            {
                 return GameStepV3::Closed;
             }
             let Some(next) = current.checked_add(DISPATCH_CLAIM) else {
@@ -933,7 +943,7 @@ impl<S> GamePublishGuardV3<S> {
         Ok(Some(
             matches!(
                 state.phase,
-                PhaseV3::Preparing | PhaseV3::Granted | PhaseV3::NoData
+                PhaseV3::Preparing | PhaseV3::Granted | PhaseV3::NoData | PhaseV3::KnownNotWritten
             ) && output.matches_inputs(&self.owner.inputs)
                 && state
                     .output
@@ -944,6 +954,44 @@ impl<S> GamePublishGuardV3<S> {
                     .as_ref()
                     .is_some_and(|original| original.same_owner(pipeline)),
         ))
+    }
+
+    /// Settle a known pre-mutation failure only using the exact output owner's
+    /// nonclone witness for this game. The witness stays in the caller slot
+    /// on Busy, Unknown and success; prior chunk writes remain separate.
+    pub(super) fn try_finish_publication_unstarted(
+        &mut self,
+        output: &Arc<ManagedOutputOwnerV3>,
+        evidence: &ManagedPublicationUnstartedEvidenceV3,
+    ) -> GameStepV3 {
+        if !evidence.matches_original(output, self) {
+            return GameStepV3::Foreign;
+        }
+        let mut state = match self.owner.lock() {
+            Ok(state) => state,
+            Err(error) => return error,
+        };
+        if state.phase != PhaseV3::Preparing {
+            return GameStepV3::Unknown;
+        }
+        match self.owner.control.compare_exchange(
+            ADMISSION_SEALED,
+            ADMISSION_SEALED | PUBLICATION_NOT_STARTED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {
+                state.phase = PhaseV3::KnownNotWritten;
+                self.resolved = true;
+                GameStepV3::Ready
+            }
+            Err(actual) if actual & ABORT_REQUESTED != 0 => {
+                state.phase = PhaseV3::Closed;
+                self.resolved = true;
+                GameStepV3::Aborted
+            }
+            Err(_) => GameStepV3::Unknown,
+        }
     }
 
     /// The caller must hold the original pipeline lock and have observed its
