@@ -262,7 +262,7 @@ impl OwnWorkerSupervisorV3 {
         }
         if let Some(request) = self.pending_request.as_ref() {
             if self.pipeline.is_none() {
-                let writer = RoventCorpusWriterLockV3::new(
+                let writer = RoventCorpusWriterLockV3::new_shared(
                     self.bridge.inputs().manifest(),
                     &request.admission,
                 )
