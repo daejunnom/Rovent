@@ -1804,12 +1804,12 @@ pub fn run_native_with_resources_v3(
     pin: RoventNativeResourcePlanPin,
     arguments: Vec<String>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, RoventNativeResourceRunFailure> {
-    run_native_with_resources_v3_inner(pin, arguments, false, None, None, None).map_err(|error| {
-        match error {
+    run_native_with_resources_v3_inner(pin, arguments, false, None, None, None, None).map_err(
+        |error| match error {
             V3InnerFailure::BeforeControl(failure) | V3InnerFailure::Failed(failure) => failure,
             V3InnerFailure::Quarantined(quarantine) => quarantine.original_failure,
-        }
-    })
+        },
+    )
 }
 
 /// Explicit opt-in for a reconnectable owner endpoint prepared before native
@@ -1818,8 +1818,8 @@ pub fn run_native_with_resources_v3_control(
     pin: RoventNativeResourcePlanPin,
     arguments: Vec<String>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure> {
-    run_native_with_resources_v3_inner(pin, arguments, true, None, None, None).map_err(|error| {
-        match error {
+    run_native_with_resources_v3_inner(pin, arguments, true, None, None, None, None).map_err(
+        |error| match error {
             V3InnerFailure::BeforeControl(failure) => {
                 RoventControlledRunFailure::BeforeControl(failure)
             }
@@ -1827,8 +1827,8 @@ pub fn run_native_with_resources_v3_control(
             V3InnerFailure::Quarantined(quarantine) => {
                 RoventControlledRunFailure::Quarantined(quarantine)
             }
-        }
-    })
+        },
+    )
 }
 
 /// Native/resource observation and the original Collection owner remain
@@ -2139,6 +2139,7 @@ pub fn run_pc_collection_with_resources_v3_control(
         collection,
         Box::new(validate_collection),
         None,
+        None,
     )
 }
 
@@ -2153,6 +2154,8 @@ type PcCollectionPostAuthV3 = Box<
         ) -> Result<(), RoventLaunchError>
         + Send,
 >;
+type PcCollectionRetainResourceV3 =
+    Box<dyn FnOnce(&Arc<Mutex<NativeResourceCustody>>) -> Result<(), &'static str> + Send>;
 
 /// The callback is invoked only after UCI authenticated the original parent.
 /// Its caller must pre-retain the original supervisor and partial start/join
@@ -2170,6 +2173,29 @@ pub(crate) fn run_pc_collection_with_resources_v3_post_auth(
         collection,
         validate_collection,
         Some(post_auth),
+        None,
+    )
+}
+
+/// Bind the original resource owner to the caller's preallocated recovery
+/// slot immediately after construction and before admission or worker start.
+/// Registration alone neither proves execution nor authorizes cleanup.
+#[allow(dead_code)]
+pub(crate) fn run_pc_collection_with_resources_v3_preowned(
+    pin: RoventNativeResourcePlanPin,
+    arguments: Vec<String>,
+    collection: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    validate_collection: PcCollectionValidationV3,
+    post_auth: PcCollectionPostAuthV3,
+    retain_resource: PcCollectionRetainResourceV3,
+) -> RoventPcCollectionResourceOutcomeV3 {
+    run_pc_collection_with_resources_v3_control_inner(
+        pin,
+        arguments,
+        collection,
+        validate_collection,
+        Some(post_auth),
+        Some(retain_resource),
     )
 }
 
@@ -2179,6 +2205,7 @@ fn run_pc_collection_with_resources_v3_control_inner(
     collection: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
     validate_collection: PcCollectionValidationV3,
     post_auth: Option<PcCollectionPostAuthV3>,
+    retain_resource: Option<PcCollectionRetainResourceV3>,
 ) -> RoventPcCollectionResourceOutcomeV3 {
     let native = run_native_with_resources_v3_inner(
         pin,
@@ -2187,6 +2214,7 @@ fn run_pc_collection_with_resources_v3_control_inner(
         Some(collection),
         Some(validate_collection),
         post_auth,
+        retain_resource,
     )
     .map_err(|error| match error {
         V3InnerFailure::BeforeControl(failure) => {
@@ -2227,6 +2255,7 @@ fn run_native_with_resources_v3_inner(
         >,
     >,
     post_auth: Option<PcCollectionPostAuthV3>,
+    retain_resource: Option<PcCollectionRetainResourceV3>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, V3InnerFailure> {
     let prepare = || -> Result<NativeResourceCustody, ArenaError> {
         pin.validate()?;
@@ -2268,6 +2297,17 @@ fn run_native_with_resources_v3_inner(
         pre_native_admission: None,
         factory_pre_native: None,
     };
+    if let Some(retain) = retain_resource {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| retain(&custody))) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(V3InnerFailure::Failed(failure(error.to_owned()))),
+            Err(payload) => {
+                let mut original = failure("original resource retention panicked".into());
+                original.control_panic = Some(payload);
+                return Err(V3InnerFailure::Failed(original));
+            }
+        }
+    }
     let epoch = {
         let state = custody
             .lock()
