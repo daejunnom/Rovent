@@ -40,6 +40,7 @@ struct InPlaceStagedEngine {
     timer_stop: Arc<std::sync::atomic::AtomicBool>,
     timer: Option<JoinHandle<()>>,
     timer_joined: bool,
+    timer_retirement_requested: bool,
     timer_panic: Option<Box<dyn std::any::Any + Send>>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,11 +145,9 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
         if self.preflight_failure.is_some() {
             return InPlaceTimerStatus::RetainedFailure;
         }
-        if self
-            .staged
-            .as_ref()
-            .is_some_and(|stage| stage.timer_joined || stage.timer_panic.is_some())
-        {
+        if self.staged.as_ref().is_some_and(|stage| {
+            stage.timer_retirement_requested || stage.timer_joined || stage.timer_panic.is_some()
+        }) {
             return InPlaceTimerStatus::RetainedFailure;
         }
         if self
@@ -192,6 +191,7 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
                 timer_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 timer: None,
                 timer_joined: false,
+                timer_retirement_requested: false,
                 timer_panic: None,
             });
         }
@@ -272,6 +272,7 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
         let Some(timer) = stage.timer.as_ref() else {
             return InPlaceTimerRetirement::NoStagedTimer;
         };
+        stage.timer_retirement_requested = true;
         stage.timer_stop.store(true, Ordering::Release);
         if !timer.is_finished() {
             return InPlaceTimerRetirement::Waiting;
@@ -321,6 +322,9 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
         let Some(stage) = self.staged.as_mut() else {
             return Err(InPlaceTransferStatus::NotReady);
         };
+        if stage.timer_retirement_requested || stage.timer_joined || stage.timer_panic.is_some() {
+            return Err(InPlaceTransferStatus::NotReady);
+        }
         let Some(close_owner) = self
             .process
             .priority_close
