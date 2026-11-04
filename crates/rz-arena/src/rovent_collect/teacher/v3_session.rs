@@ -11,8 +11,7 @@ use rz_search::external_cpu::collection_teacher::TeacherWorkerRegistration;
 use rz_search::external_cpu::process_scope::{CollectionProcessPermit, CollectionProcessScope};
 use rz_uci::pals_adaptive::{
     AdaptiveCollectionError, RoventCollectionRootAdmissionV3, RoventTeacherScopeCapabilityV3,
-    RoventTeacherScopeClaimFailureV3, RoventTeacherScopePhysicalAckV3,
-    RoventTeacherScopeWorkerAckV3,
+    RoventTeacherScopeClaimStageV3, RoventTeacherScopePhysicalAckV3, RoventTeacherScopeWorkerAckV3,
 };
 use rz_uci::rovent_bootstrap::RoventStartupControl;
 use rz_uci::rovent_external_launch::{
@@ -23,7 +22,7 @@ use rz_uci::rovent_external_launch::{
     bind_collection_teacher_actor_v3, spawn_bound_collection_teacher_v3,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub(crate) struct TeacherRosterEntryV3 {
@@ -58,12 +57,139 @@ pub(crate) enum TeacherPrepareErrorV3 {
     },
 }
 
+/// Publish this owner to the original root's recovery slot *before* `claim`.
+/// A panic inside UCI's consuming claim is explicitly unknown: this stage
+/// cannot recover an issuer that the lower-level call unwound through.
+pub(crate) struct TeacherSessionStagingV3 {
+    preflight: Option<TeacherSessionPreflightV3>,
+    state: TeacherSessionStageStateV3,
+    ready: Option<Arc<Mutex<RoventCollectionTeacherSessionV3>>>,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TeacherSessionStageStateV3 {
+    Prepared,
+    ClaimingUnknown,
+    BeforeClaimRejected,
+    AfterClaimRejected,
+    Claimed,
+    Ready,
+}
+
+struct TeacherSessionPreflightV3 {
+    admission: RoventCollectionRootAdmissionV3,
+    manifest: Arc<RoventCorpusManifestLockV3>,
+    registration: Arc<RoventCorpusManifestV2>,
+    manifest_digest: Digest,
+    actors: BTreeMap<String, ActorV3>,
+    scope: RoventTeacherScopeClaimStageV3,
+}
+
+pub(crate) enum TeacherSessionClaimErrorV3 {
+    InvalidState,
+    Rejected(AdaptiveCollectionError),
+    /// The original lower-level claim did not return; no no-scope assertion
+    /// or recovery of its consumed opaque issuer may be inferred.
+    Unknown,
+}
+
+impl TeacherSessionStagingV3 {
+    pub(crate) fn state(&self) -> TeacherSessionStageStateV3 {
+        self.state
+    }
+
+    pub(crate) fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.panic.as_deref()
+    }
+
+    /// The caller must have published this stage before invoking the claim.
+    pub(crate) fn claim(&mut self) -> Result<(), TeacherSessionClaimErrorV3> {
+        if self.state != TeacherSessionStageStateV3::Prepared {
+            return Err(TeacherSessionClaimErrorV3::InvalidState);
+        }
+        let Some(preflight) = self.preflight.as_mut() else {
+            return Err(TeacherSessionClaimErrorV3::InvalidState);
+        };
+        self.state = TeacherSessionStageStateV3::ClaimingUnknown;
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| preflight.scope.claim()));
+        match outcome {
+            Ok(Ok(())) => {
+                self.state = TeacherSessionStageStateV3::Claimed;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                self.state = if preflight.scope.is_claimed() {
+                    TeacherSessionStageStateV3::AfterClaimRejected
+                } else {
+                    TeacherSessionStageStateV3::BeforeClaimRejected
+                };
+                Err(TeacherSessionClaimErrorV3::Rejected(error))
+            }
+            Err(payload) => {
+                self.panic = Some(payload);
+                Err(TeacherSessionClaimErrorV3::Unknown)
+            }
+        }
+    }
+
+    /// Move the already-staged capability into the staged session without
+    /// releasing root custody. Caller keeps this stage as the recovery owner.
+    pub(crate) fn finish(&mut self) -> Result<(), TeacherSessionClaimErrorV3> {
+        if self.state != TeacherSessionStageStateV3::Claimed
+            || self.preflight.is_none()
+            || !self
+                .preflight
+                .as_ref()
+                .is_some_and(|preflight| preflight.scope.is_claimed())
+        {
+            return Err(TeacherSessionClaimErrorV3::InvalidState);
+        }
+        let Some(mut preflight) = self.preflight.take() else {
+            return Err(TeacherSessionClaimErrorV3::InvalidState);
+        };
+        let Some(scope) = preflight.scope.take_claimed_capability() else {
+            self.preflight = Some(preflight);
+            return Err(TeacherSessionClaimErrorV3::InvalidState);
+        };
+        self.ready = Some(Arc::new(Mutex::new(RoventCollectionTeacherSessionV3 {
+            admission: preflight.admission,
+            manifest: preflight.manifest,
+            registration: preflight.registration,
+            manifest_digest: preflight.manifest_digest,
+            scope,
+            actors: preflight.actors,
+            closing: false,
+            closed: false,
+            physical: None,
+            workers: None,
+            aggregate_failure: None,
+            aggregate_emitted: false,
+        })));
+        self.state = TeacherSessionStageStateV3::Ready;
+        Ok(())
+    }
+
+    pub(crate) fn session(&self) -> Option<Arc<Mutex<RoventCollectionTeacherSessionV3>>> {
+        self.ready.as_ref().map(Arc::clone)
+    }
+    pub(crate) fn issuer_claimed(&self) -> Option<bool> {
+        self.preflight
+            .as_ref()
+            .map(|preflight| preflight.scope.is_claimed())
+    }
+}
+
 pub(crate) enum TeacherStartErrorV3 {
     Invalid(String),
     BeforeSpawn(BoundTeacherSpawnCauseV3),
     /// The lifecycle is retained inside the session and this same key is
     /// already registered with the caller's recovery custodian.
-    AfterSpawn { cause: BoundTeacherSpawnCauseV3, recovery_key: TeacherRecoveryKeyV3 },
+    AfterSpawn {
+        cause: BoundTeacherSpawnCauseV3,
+        recovery_key: TeacherRecoveryKeyV3,
+    },
 }
 
 pub(crate) struct RoventCollectionTeacherSessionV3 {
@@ -117,23 +243,33 @@ impl RoventCollectionTeacherSessionV3 {
         true
     }
 
-    pub(crate) fn prepare(
+    pub(crate) fn prepare_staged(
         admission: &RoventCollectionRootAdmissionV3,
         startup: &RoventStartupControl,
         manifest: &Arc<RoventCorpusManifestLockV3>,
         roster: Vec<TeacherRosterEntryV3>,
-    ) -> Result<Self, TeacherPrepareErrorV3> {
+    ) -> Result<TeacherSessionStagingV3, TeacherPrepareErrorV3> {
         let lock = admission.native_origin().original_input_lock();
-        manifest.validate(lock).map_err(|e| TeacherPrepareErrorV3::Invalid(e.to_string()))?;
+        manifest
+            .validate(lock)
+            .map_err(|e| TeacherPrepareErrorV3::Invalid(e.to_string()))?;
         let registration = Arc::new(manifest.registration.clone());
-        let digest = registration.sha256().map_err(|e| TeacherPrepareErrorV3::Invalid(e.to_string()))?;
-        let manifest_digest = Digest(rz_eval::asset::parse_sha256(&digest)
-            .map_err(|e| TeacherPrepareErrorV3::Invalid(e.to_string()))?);
+        let digest = registration
+            .sha256()
+            .map_err(|e| TeacherPrepareErrorV3::Invalid(e.to_string()))?;
+        let manifest_digest = Digest(
+            rz_eval::asset::parse_sha256(&digest)
+                .map_err(|e| TeacherPrepareErrorV3::Invalid(e.to_string()))?,
+        );
         if roster.is_empty() || roster.len() != registration.teachers.len() {
-            return Err(TeacherPrepareErrorV3::Invalid("teacher roster is incomplete".into()));
+            return Err(TeacherPrepareErrorV3::Invalid(
+                "teacher roster is incomplete".into(),
+            ));
         }
         let root = admission.root_admission();
-        let root_digest = root.descriptor().digest()
+        let root_digest = root
+            .descriptor()
+            .digest()
             .map_err(|e| TeacherPrepareErrorV3::Invalid(e.to_string()))?;
         let mut actors = BTreeMap::new();
         let mut indices = BTreeSet::new();
@@ -145,12 +281,19 @@ impl RoventCollectionTeacherSessionV3 {
                 || entry.collection_owner == 0
                 || !owners.insert(entry.collection_owner)
             {
-                return Err(TeacherPrepareErrorV3::Invalid("duplicate or unknown teacher roster entry".into()));
+                return Err(TeacherPrepareErrorV3::Invalid(
+                    "duplicate or unknown teacher roster entry".into(),
+                ));
             }
             let bound = bind_collection_teacher_actor_v3(
-                admission, startup, &registration, &entry.actor_id,
-                entry.source_index, entry.collection_owner,
-            ).map_err(TeacherPrepareErrorV3::Binding)?;
+                admission,
+                startup,
+                &registration,
+                &entry.actor_id,
+                entry.source_index,
+                entry.collection_owner,
+            )
+            .map_err(TeacherPrepareErrorV3::Binding)?;
             let worker = TeacherWorkerRegistration {
                 collection_owner: entry.collection_owner,
                 authority: root.authority(),
@@ -160,112 +303,215 @@ impl RoventCollectionTeacherSessionV3 {
                 root_budget: admission.root_budget(),
                 frozen_actor: bound.actor_digest(),
             };
-            actors.insert(entry.actor_id, ActorV3 {
-                bound: Some(bound), registration: worker, permit: None,
-                lifecycle: None, recovery_key: None, terminal: None,
-                spawn_attempted: false, dispatch_claimed: false,
-            });
+            actors.insert(
+                entry.actor_id,
+                ActorV3 {
+                    bound: Some(bound),
+                    registration: worker,
+                    permit: None,
+                    lifecycle: None,
+                    recovery_key: None,
+                    terminal: None,
+                    spawn_attempted: false,
+                    dispatch_claimed: false,
+                },
+            );
         }
-        let scope = CollectionProcessScope::new(manifest_digest, actors.values().map(|a| a.registration).collect())
-            .map_err(|e| TeacherPrepareErrorV3::Invalid(e.to_string()))?;
-        let scope = admission.claim_teacher_scope(scope).map_err(|failure| match failure {
-            RoventTeacherScopeClaimFailureV3::BeforeClaim { error, scope } => TeacherPrepareErrorV3::Claim {
-                error, owner: TeacherPrepareOwnerV3::Unclaimed(scope),
-            },
-            RoventTeacherScopeClaimFailureV3::AfterClaim { error, capability } => TeacherPrepareErrorV3::Claim {
-                error, owner: TeacherPrepareOwnerV3::Claimed(capability),
-            },
-        })?;
-        Ok(Self { admission: admission.clone(), manifest: Arc::clone(manifest), registration,
-            manifest_digest, scope, actors, closing: false, closed: false,
-            physical: None, workers: None, aggregate_failure: None, aggregate_emitted: false })
+        let scope = CollectionProcessScope::new(
+            manifest_digest,
+            actors.values().map(|a| a.registration).collect(),
+        )
+        .map_err(|e| TeacherPrepareErrorV3::Invalid(e.to_string()))?;
+        Ok(TeacherSessionStagingV3 {
+            preflight: Some(TeacherSessionPreflightV3 {
+                admission: admission.clone(),
+                manifest: Arc::clone(manifest),
+                registration,
+                manifest_digest,
+                actors,
+                scope: admission.stage_teacher_scope(scope),
+            }),
+            state: TeacherSessionStageStateV3::Prepared,
+            ready: None,
+            panic: None,
+        })
     }
 
     pub(crate) fn start_actor(
-        &mut self, actor_id: &str, startup_deadline: Instant, cleanup_ceiling: Instant,
+        &mut self,
+        actor_id: &str,
+        startup_deadline: Instant,
+        cleanup_ceiling: Instant,
         custodian: &mut TeacherRecoveryCustodianV3,
     ) -> Result<TeacherRecoveryKeyV3, TeacherStartErrorV3> {
-        if self.closing { return Err(TeacherStartErrorV3::Invalid("teacher admission is closed".into())); }
-        let actor = self.actors.get_mut(actor_id)
-            .ok_or_else(|| TeacherStartErrorV3::Invalid("teacher actor absent".into()))?;
-        if actor.spawn_attempted { return Err(TeacherStartErrorV3::Invalid("teacher actor already attempted".into())); }
-        if actor.permit.is_none() {
-            actor.permit = Some(self.scope.permit(self.manifest_digest, actor.registration)
-                .map_err(|e| TeacherStartErrorV3::Invalid(e.to_string()))?);
+        if self.closing {
+            return Err(TeacherStartErrorV3::Invalid(
+                "teacher admission is closed".into(),
+            ));
         }
-        let bound = actor.bound.take().ok_or_else(|| TeacherStartErrorV3::Invalid("teacher bound actor absent".into()))?;
+        let actor = self
+            .actors
+            .get_mut(actor_id)
+            .ok_or_else(|| TeacherStartErrorV3::Invalid("teacher actor absent".into()))?;
+        if actor.spawn_attempted {
+            return Err(TeacherStartErrorV3::Invalid(
+                "teacher actor already attempted".into(),
+            ));
+        }
+        if actor.permit.is_none() {
+            actor.permit = Some(
+                self.scope
+                    .permit(self.manifest_digest, actor.registration)
+                    .map_err(|e| TeacherStartErrorV3::Invalid(e.to_string()))?,
+            );
+        }
+        let bound = actor
+            .bound
+            .take()
+            .ok_or_else(|| TeacherStartErrorV3::Invalid("teacher bound actor absent".into()))?;
         actor.spawn_attempted = true;
-        match spawn_bound_collection_teacher_v3(bound, actor.permit.as_ref().expect("retained permit"),
-            &self.scope, startup_deadline, cleanup_ceiling, custodian) {
+        match spawn_bound_collection_teacher_v3(
+            bound,
+            actor.permit.as_ref().expect("retained permit"),
+            &self.scope,
+            startup_deadline,
+            cleanup_ceiling,
+            custodian,
+        ) {
             Ok((lifecycle, key)) => {
                 actor.lifecycle = Some(lifecycle);
                 actor.recovery_key = Some(key.clone());
                 Ok(key)
             }
-            Err(BoundTeacherSpawnFailureV3::BeforeSpawn { cause, actor: bound }) => {
+            Err(BoundTeacherSpawnFailureV3::BeforeSpawn {
+                cause,
+                actor: bound,
+            }) => {
                 actor.bound = Some(bound);
                 Err(TeacherStartErrorV3::BeforeSpawn(cause))
             }
-            Err(BoundTeacherSpawnFailureV3::AfterSpawn { cause, lifecycle, recovery_key }) => {
+            Err(BoundTeacherSpawnFailureV3::AfterSpawn {
+                cause,
+                lifecycle,
+                recovery_key,
+            }) => {
                 actor.lifecycle = Some(lifecycle);
                 actor.recovery_key = Some(recovery_key.clone());
-                Err(TeacherStartErrorV3::AfterSpawn { cause, recovery_key })
+                Err(TeacherStartErrorV3::AfterSpawn {
+                    cause,
+                    recovery_key,
+                })
             }
         }
     }
 
-    pub(crate) fn lifecycle_mut(&mut self, actor_id: &str) -> Option<&mut RoventCollectionTeacherLifecycleV3> {
+    pub(crate) fn lifecycle_mut(
+        &mut self,
+        actor_id: &str,
+    ) -> Option<&mut RoventCollectionTeacherLifecycleV3> {
         self.actors.get_mut(actor_id)?.lifecycle.as_mut()
     }
 
-    pub(crate) fn request_shutdown(&mut self, until: Instant) -> Result<(), AdaptiveCollectionError> {
+    pub(crate) fn request_shutdown(
+        &mut self,
+        until: Instant,
+    ) -> Result<(), AdaptiveCollectionError> {
         self.closing = true;
-        let result = if self.closed { Ok(()) } else { self.scope.close() };
-        if result.is_ok() { self.closed = true; }
+        let result = if self.closed {
+            Ok(())
+        } else {
+            self.scope.close()
+        };
+        if result.is_ok() {
+            self.closed = true;
+        }
         for actor in self.actors.values_mut() {
-            if let Some(worker) = actor.lifecycle.as_mut() { worker.request_shutdown(until); }
+            if let Some(worker) = actor.lifecycle.as_mut() {
+                worker.request_shutdown(until);
+            }
         }
         result
     }
 
     /// Only after caller drains every completion and observes diagnostics.
     pub(crate) fn finish_worker(&mut self, actor_id: &str) -> Result<bool, &'static str> {
-        let actor = self.actors.get_mut(actor_id).ok_or("teacher actor absent")?;
-        if actor.terminal.is_some() { return Ok(true); }
-        let Some(lifecycle) = actor.lifecycle.take() else { return Ok(false); };
+        let actor = self
+            .actors
+            .get_mut(actor_id)
+            .ok_or("teacher actor absent")?;
+        if actor.terminal.is_some() {
+            return Ok(true);
+        }
+        let Some(lifecycle) = actor.lifecycle.take() else {
+            return Ok(false);
+        };
         match lifecycle.try_finish_worker() {
-            Ok(token) => { actor.terminal = Some(token); Ok(true) }
-            Err(lifecycle) => { actor.lifecycle = Some(lifecycle); Ok(false) }
+            Ok(token) => {
+                actor.terminal = Some(token);
+                Ok(true)
+            }
+            Err(lifecycle) => {
+                actor.lifecycle = Some(lifecycle);
+                Ok(false)
+            }
         }
     }
 
     /// Each scope acknowledgement is one-shot. Keep any independently
     /// completed evidence here until all workers and both acks are ready.
     /// A failed aggregate retains every original ack and token for retry.
-    pub(crate) fn try_aggregate(&mut self) -> Result<Option<RoventTeacherScopeAggregateAckV3>, String> {
-        if self.aggregate_emitted { return Err("teacher aggregate already emitted".into()); }
+    pub(crate) fn try_aggregate(
+        &mut self,
+    ) -> Result<Option<RoventTeacherScopeAggregateAckV3>, String> {
+        if self.aggregate_emitted {
+            return Err("teacher aggregate already emitted".into());
+        }
         if !self.closed || self.actors.values().any(|actor| actor.lifecycle.is_some()) {
             return Ok(None);
         }
         if let Some(failure) = self.aggregate_failure.take() {
             return match failure.retry() {
-                Ok(aggregate) => { self.aggregate_emitted = true; Ok(Some(aggregate)) }
-                Err(failure) => { self.aggregate_failure = Some(failure); Ok(None) }
+                Ok(aggregate) => {
+                    self.aggregate_emitted = true;
+                    Ok(Some(aggregate))
+                }
+                Err(failure) => {
+                    self.aggregate_failure = Some(failure);
+                    Ok(None)
+                }
             };
         }
         if self.physical.is_none() {
-            self.physical = self.scope.try_physical_retirement().map_err(|e| e.to_string())?;
+            self.physical = self
+                .scope
+                .try_physical_retirement()
+                .map_err(|e| e.to_string())?;
         }
         if self.workers.is_none() {
-            self.workers = self.scope.try_worker_retirement().map_err(|e| e.to_string())?;
+            self.workers = self
+                .scope
+                .try_worker_retirement()
+                .map_err(|e| e.to_string())?;
         }
-        if self.physical.is_none() || self.workers.is_none() { return Ok(None); }
+        if self.physical.is_none() || self.workers.is_none() {
+            return Ok(None);
+        }
         let physical = self.physical.take().expect("physical ack retained");
         let workers = self.workers.take().expect("worker ack retained");
-        let tokens = self.actors.values_mut().filter_map(|actor| actor.terminal.take()).collect();
+        let tokens = self
+            .actors
+            .values_mut()
+            .filter_map(|actor| actor.terminal.take())
+            .collect();
         match RoventTeacherScopeAggregateAckV3::try_build(physical, Some(workers), tokens) {
-            Ok(aggregate) => { self.aggregate_emitted = true; Ok(Some(aggregate)) }
-            Err(failure) => { self.aggregate_failure = Some(failure); Ok(None) }
+            Ok(aggregate) => {
+                self.aggregate_emitted = true;
+                Ok(Some(aggregate))
+            }
+            Err(failure) => {
+                self.aggregate_failure = Some(failure);
+                Ok(None)
+            }
         }
     }
 }

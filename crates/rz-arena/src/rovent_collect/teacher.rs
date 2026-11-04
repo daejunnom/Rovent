@@ -35,7 +35,7 @@ pub(super) mod v3_pump;
 pub(super) mod v3_policy;
 #[cfg(all(feature = "pals-collection-onnx", target_os = "linux"))]
 #[allow(dead_code)]
-mod policy_prepare_v3;
+pub(super) mod policy_prepare_v3;
 pub use session::*;
 mod pump;
 pub use pump::*;
