@@ -102,6 +102,76 @@ pub(super) struct SpeculativeRouteV3 {
 pub(crate) struct SpeculativeRootV3 {
     pub(super) route: Arc<SpeculativeRouteV3>,
 }
+
+/// Owns the original queue and its route. Only actual successful receives
+/// advance the private handoff count, and no caller can manufacture it.
+pub(crate) struct SpeculativeReceiverV3 {
+    route: Arc<SpeculativeRouteV3>,
+    receiver: mpsc::Receiver<Arc<SubmittedTeacherQueryV3>>,
+    received: usize,
+    overflowed: bool,
+    identity_failed: bool,
+}
+
+/// A received capsule is returned intact on identity or counter failure.
+pub(crate) enum SpeculativeReceiveErrorV3 {
+    Disconnected,
+    CounterOverflow(Arc<SubmittedTeacherQueryV3>),
+    CounterExhausted,
+    ForeignRoot(Arc<SubmittedTeacherQueryV3>),
+}
+
+impl SpeculativeReceiverV3 {
+    pub(crate) fn matches_original_route(&self, root: &SpeculativeRootV3) -> bool {
+        Arc::ptr_eq(&self.route, &root.route)
+    }
+
+    pub(crate) fn try_recv(
+        &mut self,
+    ) -> Result<Option<Arc<SubmittedTeacherQueryV3>>, SpeculativeReceiveErrorV3> {
+        if self.overflowed {
+            return Err(SpeculativeReceiveErrorV3::CounterExhausted);
+        }
+        let query = match self.receiver.try_recv() {
+            Ok(query) => query,
+            Err(mpsc::TryRecvError::Empty) => return Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(SpeculativeReceiveErrorV3::Disconnected);
+            }
+        };
+        let Some(next) = self.received.checked_add(1) else {
+            self.overflowed = true;
+            return Err(SpeculativeReceiveErrorV3::CounterOverflow(query));
+        };
+        self.received = next;
+        if !self
+            .route
+            .admission
+            .same_original_admission(query.admission())
+        {
+            self.identity_failed = true;
+            return Err(SpeculativeReceiveErrorV3::ForeignRoot(query));
+        }
+        Ok(Some(query))
+    }
+
+    /// This only checks callback-to-receiver accounting for this route; it is
+    /// not the external teacher worker's join or physical completion proof.
+    pub(super) fn try_handoffs_accounted(
+        &self,
+        root: &SpeculativeRootV3,
+    ) -> Result<Option<bool>, ArenaError> {
+        if !self.matches_original_route(root) {
+            return Err(invalid(
+                "lock-v3 receiver belongs to another original route",
+            ));
+        }
+        if self.overflowed || self.identity_failed {
+            return Ok(Some(false));
+        }
+        root.try_handoffs_accounted_count(self.received)
+    }
+}
 impl SpeculativeRootV3 {
     /// Call only after the original registration owner has locked and checked
     /// that this root has no existing route or registered ticket.
@@ -111,28 +181,35 @@ impl SpeculativeRootV3 {
         maximum_tickets: usize,
         root_revoked: Arc<AtomicBool>,
         registration_owner: Arc<()>,
-    ) -> Result<(Self, mpsc::Receiver<Arc<SubmittedTeacherQueryV3>>), ArenaError> {
+    ) -> Result<(Self, SpeculativeReceiverV3), ArenaError> {
         if !(1..=16).contains(&channel_capacity) || !(1..=65_536).contains(&maximum_tickets) {
             return Err(invalid("lock-v3 speculative root channel/ticket capacity"));
         }
         let (sender, receiver) = mpsc::sync_channel(channel_capacity);
+        let route = Arc::new(SpeculativeRouteV3 {
+            installed: AtomicBool::new(true),
+            registration_owner,
+            route_owner: Arc::new(()),
+            admission,
+            sender,
+            tickets: Mutex::new(HashMap::new()),
+            maximum_tickets,
+            unattributed: AtomicU64::new(0),
+            cancel_all: Arc::new(AtomicBool::new(false)),
+            root_revoked,
+            targets_revoked: Arc::new(AtomicBool::new(false)),
+        });
         Ok((
             Self {
-                route: Arc::new(SpeculativeRouteV3 {
-                    installed: AtomicBool::new(true),
-                    registration_owner,
-                    route_owner: Arc::new(()),
-                    admission,
-                    sender,
-                    tickets: Mutex::new(HashMap::new()),
-                    maximum_tickets,
-                    unattributed: AtomicU64::new(0),
-                    cancel_all: Arc::new(AtomicBool::new(false)),
-                    root_revoked,
-                    targets_revoked: Arc::new(AtomicBool::new(false)),
-                }),
+                route: Arc::clone(&route),
             },
-            receiver,
+            SpeculativeReceiverV3 {
+                route,
+                receiver,
+                received: 0,
+                overflowed: false,
+                identity_failed: false,
+            },
         ))
     }
     pub(crate) fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
@@ -287,10 +364,7 @@ impl SpeculativeRootV3 {
     }
     /// Counts only callback handoffs. The caller must separately verify the
     /// original root/worker fence, all registrations and the receiver owner.
-    pub(super) fn try_handoffs_accounted(
-        &self,
-        received: usize,
-    ) -> Result<Option<bool>, ArenaError> {
+    fn try_handoffs_accounted_count(&self, received: usize) -> Result<Option<bool>, ArenaError> {
         let tickets = match self.route.tickets.try_lock() {
             Ok(tickets) => tickets,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
