@@ -8,7 +8,7 @@ use super::teacher::v3_pump::TeacherPumpV3;
 use super::teacher::v3_session::TeacherSessionStagingV3;
 use super::native_capture::RoventNativeCaptureRegistration;
 use super::observer_lock_v3::RoventCollectionOwnerLockV3;
-use super::pc_worker_v3::{ClaimedUnstartedPollV3, PcConsumerRetirementV3, PcRootRecoveryV3};
+use super::pc_worker_v3::{ClaimedUnstartedPollV3, PcConsumerRetirementV3, PcRootRecoveryV3, PcWorkerSupervisorV3};
 use super::{ArenaError, invalid};
 use rz_uci::pals_adaptive::{AdaptiveCollectionBoundaryV2, AdaptiveCollectionError, AdaptiveCollectionObserverBoxV3,
     AdaptiveManagerError, RoventCollectionRootAdmissionV3, RoventNoCaptureRootCapabilityV3,
@@ -344,6 +344,7 @@ pub(crate) struct RoventPcCollectionBridgeV3 {
     ledger: Arc<Mutex<PcRootQuotaLedgerV3>>,
     startup: OnceLock<RoventStartupControl>,
     native_owner: OnceLock<Weak<RoventPcCollectionLaunchOwnerV3>>,
+    supervisor: OnceLock<Weak<Mutex<PcWorkerSupervisorV3>>>,
     state: Mutex<PcBridgeStateV3>,
     requests: mpsc::SyncSender<RoventCollectionRootAdmissionV3>,
     request_receiver: Mutex<mpsc::Receiver<RoventCollectionRootAdmissionV3>>,
@@ -390,7 +391,7 @@ impl RoventPcCollectionBridgeV3 {
         Ok(Arc::new_cyclic(|self_weak| Self {
             self_weak: self_weak.clone(),
             ledger: Arc::new(Mutex::new(PcRootQuotaLedgerV3::new(Arc::clone(&inputs)))),
-            inputs, registration, startup: OnceLock::new(), native_owner: OnceLock::new(),
+            inputs, registration, startup: OnceLock::new(), native_owner: OnceLock::new(), supervisor: OnceLock::new(),
             state: Mutex::new(PcBridgeStateV3 { roots, deferred }), requests,
             request_receiver: Mutex::new(receiver),
         }))
@@ -399,6 +400,23 @@ impl RoventPcCollectionBridgeV3 {
     pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> { &self.inputs }
     pub(crate) fn startup(&self) -> Option<&RoventStartupControl> { self.startup.get() }
     pub(crate) fn capture_registration(&self) -> &RoventNativeCaptureRegistration { &self.registration }
+
+    /// Bind the one original supervisor while constructing the launch bundle.
+    /// This neither starts its driver nor certifies any physical completion.
+    pub(crate) fn bind_supervisor(
+        self: &Arc<Self>, supervisor: &Arc<Mutex<PcWorkerSupervisorV3>>,
+    ) -> Result<(), &'static str> {
+        {
+            let owner = supervisor.try_lock().map_err(|_| "P-C V3 supervisor unavailable")?;
+            if !owner.matches_original_bridge(self) { return Err("P-C V3 supervisor bridge differs"); }
+        }
+        if let Some(original) = self.supervisor.get() {
+            return if original.upgrade().is_some_and(|old| Arc::ptr_eq(&old, supervisor)) {
+                Ok(())
+            } else { Err("P-C V3 original supervisor changed") };
+        }
+        self.supervisor.set(Arc::downgrade(supervisor)).map_err(|_| "P-C V3 supervisor binding raced")
+    }
 
     /// The bundle supplies this once, before any native root admission.
     pub(crate) fn bind_native_owner(
@@ -818,6 +836,101 @@ impl RoventPcCollectionBridgeV3 {
         if !recovery.matches_admission(admission) { return Err(invalid("P-C V3 consumer root differs")); }
         Ok(Some(recovery.consumer_route_retirement()))
     }
+
+    /// Phase one of normal driver shutdown. The same supervisor stays alive
+    /// while it drains root requests and retains each physical worker result.
+    /// A semantic failure or undurable output is not physical unknown here.
+    pub(crate) fn try_authorize_supervisor_stop(
+        self: &Arc<Self>,
+        fence: &RoventPcCollectionNativeFenceV3,
+        supervisor: &Arc<Mutex<PcWorkerSupervisorV3>>,
+    ) -> Result<Option<PcSupervisorStopAuthorizationV3>, &'static str> {
+        let Some(native_owner) = self.native_owner.get().and_then(Weak::upgrade) else {
+            return Err("P-C V3 original native owner absent");
+        };
+        let hooks: Arc<dyn RoventPcCollectionHooksV3> = self.clone();
+        if !fence.matches_original_owner(&native_owner) || !fence.matches_original_hooks(&hooks) {
+            return Err("P-C V3 native fence belongs to another owner");
+        }
+        if !self.supervisor.get().and_then(Weak::upgrade)
+            .is_some_and(|original| Arc::ptr_eq(&original, supervisor)) {
+            return Err("P-C V3 original supervisor differs");
+        }
+        // Same order as the running supervisor: supervisor -> bridge -> ledger.
+        let original = match supervisor.try_lock() {
+            Ok(value) => value,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 original supervisor poisoned"),
+        };
+        if !original.matches_original_bridge(self) { return Err("P-C V3 supervisor bridge differs"); }
+        if !original.pending_root_absent() { return Ok(None); }
+        let state = match self.state.try_lock() {
+            Ok(value) => value,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 root custody poisoned"),
+        };
+        let ledger = match self.ledger.try_lock() {
+            Ok(value) => value,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 quota ledger poisoned"),
+        };
+        if state.roots.len() != ledger.roots.len() { return Ok(None); }
+        for slot in &state.roots {
+            let Some(recovery) = &slot.recovery else { return Ok(None); };
+            if !slot.requested || !original.owns_recovery(recovery) { return Ok(None); }
+            let Some(root) = ledger.roots.iter().find(|root|
+                root.admission.same_original_admission(&slot.admission)) else { return Ok(None); };
+            if root.worker_reserved || root.teacher_reserved || root.teacher_seal_unknown {
+                return Ok(None);
+            }
+            if slot.unstarted_terminal {
+                let (Some(owner), Some(ack)) = (&root.unstarted_recovery, &root.unclaimed_teacher_ack)
+                    else { return Ok(None); };
+                if !Arc::ptr_eq(owner, recovery) || !ack.matches_admission(&slot.admission)
+                    || !ack.is_sealed_no_scope() { return Err("P-C V3 no-worker evidence differs"); }
+                let recovery = match recovery.try_lock() {
+                    Ok(value) => value,
+                    Err(TryLockError::WouldBlock) => return Ok(None),
+                    Err(_) => return Err("P-C V3 original recovery poisoned"),
+                };
+                if !recovery.is_sealed_unstarted() { return Ok(None); }
+            } else if slot.claimed_unstarted_terminal {
+                let Some(owner) = &root.claimed_unstarted_recovery else { return Ok(None); };
+                if !Arc::ptr_eq(owner, recovery) { return Err("P-C V3 claimed recovery differs"); }
+                let recovery = match recovery.try_lock() {
+                    Ok(value) => value,
+                    Err(TryLockError::WouldBlock) => return Ok(None),
+                    Err(_) => return Err("P-C V3 original claimed recovery poisoned"),
+                };
+                if !recovery.is_sealed_claimed_unstarted()
+                    || !recovery.claimed_unstarted_aggregate().is_some_and(|ack|
+                        claimed_unstarted_matches(ack, &slot.admission)) { return Ok(None); }
+            } else {
+                let (Some(returned), Some(joined), Some(handoff)) =
+                    (&slot.returned, &root.joined, &root.retired_teacher_handoff) else { return Ok(None); };
+                if !Arc::ptr_eq(returned, joined) { return Err("P-C V3 joined owner differs"); }
+                let custody = match joined.try_lock() {
+                    Ok(value) => value,
+                    Err(TryLockError::WouldBlock) => return Ok(None),
+                    Err(_) => return Err("P-C V3 original joined owner poisoned"),
+                };
+                if !Arc::ptr_eq(custody.handoff(), handoff) { return Err("P-C V3 physical handoff differs"); }
+                let handoff = match handoff.try_lock() {
+                    Ok(value) => value,
+                    Err(TryLockError::WouldBlock) => return Ok(None),
+                    Err(_) => return Err("P-C V3 original handoff poisoned"),
+                };
+                if !handoff.teacher_aggregate_ack().is_some_and(|ack|
+                    ack.matches_admission(&slot.admission)) { return Ok(None); }
+            }
+        }
+        drop(ledger);
+        drop(state);
+        drop(original);
+        Ok(Some(PcSupervisorStopAuthorizationV3 {
+            _bridge: Arc::clone(self), supervisor: Arc::clone(supervisor), native_owner,
+        }))
+    }
 }
 
 /// Retains all original root proof owners after the native owner seals the
@@ -825,6 +938,24 @@ impl RoventPcCollectionBridgeV3 {
 struct PcV3LaunchClosure {
     _bridge: Arc<RoventPcCollectionBridgeV3>,
     _native_owner: Arc<RoventPcCollectionLaunchOwnerV3>,
+}
+
+/// Non-cloneable authorization for stopping the exact original supervisor
+/// after native admission is closed and every original root's physical
+/// ownership is retained. It does not attest output or semantic success.
+pub(crate) struct PcSupervisorStopAuthorizationV3 {
+    _bridge: Arc<RoventPcCollectionBridgeV3>,
+    supervisor: Arc<Mutex<PcWorkerSupervisorV3>>,
+    native_owner: Arc<RoventPcCollectionLaunchOwnerV3>,
+}
+
+impl PcSupervisorStopAuthorizationV3 {
+    pub(crate) fn matches_original(
+        &self, supervisor: &Arc<Mutex<PcWorkerSupervisorV3>>,
+        native_owner: &Arc<RoventPcCollectionLaunchOwnerV3>,
+    ) -> bool {
+        Arc::ptr_eq(&self.supervisor, supervisor) && Arc::ptr_eq(&self.native_owner, native_owner)
+    }
 }
 
 fn pc_state<'a>(state: &'a Mutex<PcBridgeStateV3>)
