@@ -727,6 +727,9 @@ impl ManagedOutputStateV3 {
 pub(crate) enum ManagedOutputWriteErrorV3 {
     Busy,
     BeforeWrite(String),
+    /// The output has not been mutated by this call, but the original game
+    /// authority cannot be observed. This is not an ordinary refusal.
+    AuthorityUnknown(String),
     AfterAttempt(String),
 }
 
@@ -1012,7 +1015,7 @@ impl ManagedOutputOwnerV3 {
                     "managed publication original game or pipeline differs".into(),
                 ));
             }
-            Err(error) => return Err(ManagedOutputWriteErrorV3::BeforeWrite(error.into())),
+            Err(error) => return Err(ManagedOutputWriteErrorV3::AuthorityUnknown(error.into())),
         }
         if !finished.matches_original_manifest(self.inputs.manifest()) {
             return Err(ManagedOutputWriteErrorV3::BeforeWrite(
