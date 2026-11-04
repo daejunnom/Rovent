@@ -15,6 +15,7 @@ use std::sync::Arc;
 /// Bounded JSONL assembly with the original /3 root owners held until finish.
 pub struct RoventCorpusWriterLockV3 {
     manifest: RoventCorpusManifestLockV3,
+    original_manifest: Option<Arc<RoventCorpusManifestLockV3>>,
     lock: rz_experiments::RoventInputLockV3,
     index: RoventCorpusIndexLockV3,
     buffer: Vec<u8>,
@@ -119,6 +120,7 @@ impl RoventCorpusWriterLockV3 {
         let manifest_sha256 = manifest.sha256(&lock)?;
         Ok(Self {
             manifest: manifest.clone(),
+            original_manifest: None,
             index: RoventCorpusIndexLockV3 {
                 schema: ROVENT_CORPUS_INDEX_LOCK_V3_DOMAIN.into(),
                 manifest_sha256,
@@ -136,6 +138,30 @@ impl RoventCorpusWriterLockV3 {
             original_admissions: BTreeMap::new(),
             uncertain_append: None,
         })
+    }
+
+    /// Retain the same original manifest owner for managed output handoff.
+    /// This constructor alone does not attest a directory, lease or worker.
+    pub(super) fn new_shared(
+        manifest: &Arc<RoventCorpusManifestLockV3>,
+        admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
+    ) -> Result<Self, ArenaError> {
+        let mut writer = Self::new(manifest, admission)?;
+        writer.original_manifest = Some(Arc::clone(manifest));
+        Ok(writer)
+    }
+
+    pub(super) fn matches_original_manifest(
+        &self,
+        manifest: &Arc<RoventCorpusManifestLockV3>,
+    ) -> bool {
+        self.original_manifest
+            .as_ref()
+            .is_some_and(|original| Arc::ptr_eq(original, manifest))
+    }
+
+    pub(super) fn matches_synced_chunks(&self, receipts: &[RoventCorpusChunk]) -> bool {
+        self.index.chunks == receipts
     }
 
     /// On failure the caller retains the original opaque row and this writer

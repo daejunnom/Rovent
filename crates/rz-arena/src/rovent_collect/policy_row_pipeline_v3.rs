@@ -4,6 +4,7 @@
 //! worker and through that worker's actual join. This is not a worker-join,
 //! GPU fence, durable publication, or training-eligibility proof.
 
+use super::launch::{ManagedOutputOwnerV3, PreparedPcCollectionInputsV3};
 use super::producer_v3::{
     PendingPolicyPublicationV3, RoventCorpusProducerLockV3, RoventRetiredLockV3Record,
 };
@@ -18,7 +19,12 @@ use super::writer_lock_v3::{
     FinishedRoventCorpusLockV3, PolicyAppendResultV3, RoventCorpusWriterLockV3,
 };
 use super::{ArenaError, MAX_CORPUS_ROWS, RoventChunkPacket};
+use cap_fs_ext::OpenOptionsFollowExt;
+use rz_contracts::Digest;
 use rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3;
+use sha2::{Digest as _, Sha256};
+use std::io::Write;
+use std::path::Component;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 /// A failure remains in the same owner; an uncertain append also retains the
@@ -34,6 +40,10 @@ pub(super) enum PolicyPipelineFailureV3 {
     AppendUncertain,
     Flush(ArenaError),
     FlushPanic(Box<dyn std::any::Any + Send>),
+    ChunkPrepare(ArenaError),
+    ChunkPreparePanic(Box<dyn std::any::Any + Send>),
+    ChunkIo(ArenaError),
+    ChunkPanic(Box<dyn std::any::Any + Send>),
 }
 
 pub(super) enum PolicyPipelineProgressV3 {
@@ -49,6 +59,13 @@ pub(super) enum PolicyPipelineProgressV3 {
 pub(super) enum PolicyFlushOutcomeV3 {
     Packet,
     Empty,
+    NotReady,
+    Failed,
+    Unknown,
+}
+
+pub(super) enum PolicyChunkPersistenceV3 {
+    Persisted,
     NotReady,
     Failed,
     Unknown,
@@ -71,6 +88,9 @@ pub(super) struct PolicyRowPipelineV3 {
     output_chunk: Option<RoventChunkPacket>,
     output_completed: Option<PendingPolicyPublicationV3>,
     output_finished: Option<FinishedRoventCorpusLockV3>,
+    output_directory: Option<Arc<ManagedOutputOwnerV3>>,
+    chunk_attempted: bool,
+    chunk_receipts: Vec<rz_experiments::rovent_corpus::RoventCorpusChunk>,
     appended: bool,
     failure: Option<PolicyPipelineFailureV3>,
 }
@@ -110,6 +130,8 @@ pub(super) struct PolicyOutputStatusV3 {
     pub(super) chunk_held: bool,
     pub(super) completed_held: bool,
     pub(super) finished_held: bool,
+    pub(super) chunk_write_attempted: bool,
+    pub(super) synced_chunks: usize,
 }
 
 impl PolicyRowPipelineOwnerV3 {
@@ -124,6 +146,9 @@ impl PolicyRowPipelineOwnerV3 {
             output_chunk: None,
             output_completed: None,
             output_finished: None,
+            output_directory: None,
+            chunk_attempted: false,
+            chunk_receipts: Vec::new(),
             appended: false,
             failure: None,
         })))
@@ -212,6 +237,8 @@ impl PolicyOutputOwnerV3 {
             chunk_held: owner.output_chunk.is_some(),
             completed_held: owner.output_completed.is_some(),
             finished_held: owner.output_finished.is_some(),
+            chunk_write_attempted: owner.chunk_attempted,
+            synced_chunks: owner.chunk_receipts.len(),
         }))
     }
 }
@@ -333,13 +360,133 @@ impl PolicyRowPipelineV3 {
     pub(super) fn is_uncertain(&self) -> bool {
         matches!(
             self.failure.as_ref(),
-            Some(PolicyPipelineFailureV3::AppendUncertain | PolicyPipelineFailureV3::FlushPanic(_))
-                | Some(PolicyPipelineFailureV3::GateRejected(
-                    TargetBeginRejectionV3::Uncertain
-                        | TargetBeginRejectionV3::Poisoned
-                        | TargetBeginRejectionV3::AlreadyCommitted
-                ))
+            Some(
+                PolicyPipelineFailureV3::AppendUncertain
+                    | PolicyPipelineFailureV3::FlushPanic(_)
+                    | PolicyPipelineFailureV3::ChunkIo(_)
+                    | PolicyPipelineFailureV3::ChunkPanic(_)
+            ) | Some(PolicyPipelineFailureV3::GateRejected(
+                TargetBeginRejectionV3::Uncertain
+                    | TargetBeginRejectionV3::Poisoned
+                    | TargetBeginRejectionV3::AlreadyCommitted
+            ))
         )
+    }
+
+    /// Bind the same original plan and managed directory owner before any
+    /// row is handled. A pathname, equivalent bytes, or a separately loaded
+    /// manifest is not an original-owner proof.
+    pub(super) fn install_output_directory(
+        &mut self,
+        inputs: &Arc<PreparedPcCollectionInputsV3>,
+        output: &Arc<ManagedOutputOwnerV3>,
+    ) -> Result<(), ArenaError> {
+        super::check(
+            self.idle()
+                && self.output_directory.is_none()
+                && output.matches_inputs(inputs)
+                && self
+                    .writer
+                    .as_ref()
+                    .is_some_and(|writer| writer.matches_original_manifest(inputs.manifest())),
+            "V3 managed output plan, manifest or writer owner differs",
+        )?;
+        self.output_directory = Some(Arc::clone(output));
+        Ok(())
+    }
+
+    /// Persist the exact retained chunk through the original managed chunks
+    /// directory capability. Any attempted write error/panic retains packet,
+    /// owner and failure; the same path is never retried automatically.
+    pub(super) fn persist_chunk(&mut self) -> PolicyChunkPersistenceV3 {
+        if self.is_uncertain() || self.chunk_attempted {
+            return PolicyChunkPersistenceV3::Unknown;
+        }
+        if self.failure.is_some() {
+            return PolicyChunkPersistenceV3::Failed;
+        }
+        let (Some(packet), Some(output)) =
+            (self.output_chunk.as_ref(), self.output_directory.as_ref())
+        else {
+            return PolicyChunkPersistenceV3::NotReady;
+        };
+        let prepare = || -> Result<_, ArenaError> {
+            let path = std::path::Path::new(&packet.declaration.path);
+            let mut components = path.components();
+            let leaf = match (components.next(), components.next(), components.next()) {
+                (Some(Component::Normal(first)), Some(Component::Normal(leaf)), None)
+                    if first == "chunks" =>
+                {
+                    leaf.to_owned()
+                }
+                _ => return Err(super::invalid("V3 chunk path is not a chunks leaf")),
+            };
+            super::check(
+                !path.is_absolute()
+                    && packet.bytes.len() as u64 == packet.declaration.bytes
+                    && super::hex(Digest(Sha256::digest(&packet.bytes).into()))
+                        == packet.declaration.sha256,
+                "V3 retained chunk size or hash differs",
+            )?;
+            Ok((leaf, packet.declaration.clone()))
+        };
+        let (leaf, receipt) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(prepare))
+        {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => {
+                self.failure = Some(PolicyPipelineFailureV3::ChunkPrepare(error));
+                return PolicyChunkPersistenceV3::Failed;
+            }
+            Err(payload) => {
+                self.failure = Some(PolicyPipelineFailureV3::ChunkPreparePanic(payload));
+                return PolicyChunkPersistenceV3::Failed;
+            }
+        };
+        if self.chunk_receipts.try_reserve(1).is_err() {
+            self.failure = Some(PolicyPipelineFailureV3::ChunkPrepare(super::invalid(
+                "V3 chunk receipt allocation",
+            )));
+            return PolicyChunkPersistenceV3::Failed;
+        }
+        self.chunk_attempted = true;
+        let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<(), ArenaError> {
+                let mut options = cap_std::fs::OpenOptions::new();
+                options
+                    .write(true)
+                    .create_new(true)
+                    .follow(cap_fs_ext::FollowSymlinks::No);
+                let mut file = output
+                    .chunks()
+                    .open_with(&leaf, &options)
+                    .map_err(|e| super::invalid(e.to_string()))?;
+                file.write_all(&packet.bytes)
+                    .and_then(|_| file.sync_all())
+                    .map_err(|e| super::invalid(e.to_string()))?;
+                output
+                    .chunks()
+                    .try_clone()
+                    .and_then(|directory| directory.into_std_file().sync_all())
+                    .map_err(|e| super::invalid(e.to_string()))?;
+                Ok(())
+            },
+        ));
+        match write {
+            Ok(Ok(())) => {
+                self.chunk_receipts.push(receipt);
+                self.output_chunk = None;
+                self.chunk_attempted = false;
+                PolicyChunkPersistenceV3::Persisted
+            }
+            Ok(Err(error)) => {
+                self.failure = Some(PolicyPipelineFailureV3::ChunkIo(error));
+                PolicyChunkPersistenceV3::Unknown
+            }
+            Err(payload) => {
+                self.failure = Some(PolicyPipelineFailureV3::ChunkPanic(payload));
+                PolicyChunkPersistenceV3::Unknown
+            }
+        }
     }
 
     /// Called outside the native manager. The producer belongs to the same
@@ -548,7 +695,16 @@ impl PolicyRowPipelineV3 {
     /// validation and into this same output owner. The caller must retain
     /// the actual flushed chunk packets and separate lifecycle evidence.
     pub(super) fn finish_into(&mut self) -> bool {
-        if !self.idle() || self.output_finished.is_some() {
+        if !self.idle()
+            || self.output_finished.is_some()
+            || self.output_directory.is_none()
+            || self.output_chunk.is_some()
+            || self.chunk_attempted
+            || !self
+                .writer
+                .as_ref()
+                .is_some_and(|writer| writer.matches_synced_chunks(&self.chunk_receipts))
+        {
             return false;
         }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
