@@ -5,7 +5,9 @@
 //! and publication. This bridge does not attest their successful completion.
 
 use super::game_authority_v3::{
-    GameAuthorityV3, GameRootReservationV3, GameStepV3, RootReservationV3,
+    GameAuthorityV3, GameDispatchChannelV3, GameDispatchClaimV3, GameDispatchFullSummaryV3,
+    GameDispatchOutcomeV3, GameDispatchReceiptV3, GameRootAbortReceiptV3, GameRootReservationV3,
+    GameStepV3, RootReservationV3,
 };
 use super::launch::PreparedPcCollectionInputsV3;
 use super::native_capture::RoventNativeCaptureRegistration;
@@ -41,6 +43,10 @@ type Custody = RoventBoardCollectionRootCustodyV3<Output>;
 struct RootSlot {
     admission: RoventCollectionRootAdmissionV3,
     reservation: Option<GameRootReservationV3<super::own_worker_v3::OwnWorkerSupervisorV3>>,
+    abort_receipt: Option<GameRootAbortReceiptV3<super::own_worker_v3::OwnWorkerSupervisorV3>>,
+    dispatch: Option<GameDispatchClaimV3<super::own_worker_v3::OwnWorkerSupervisorV3>>,
+    dispatch_receipt: Option<GameDispatchReceiptV3<super::own_worker_v3::OwnWorkerSupervisorV3>>,
+    dispatch_full: Option<GameDispatchFullSummaryV3<super::own_worker_v3::OwnWorkerSupervisorV3>>,
     requested: bool,
     revoked: Arc<AtomicBool>,
     worker_reserved: bool,
@@ -210,7 +216,7 @@ pub(crate) struct RoventOwnCollectionBridgeV3 {
     startup: OnceLock<RoventStartupControl>,
     pipeline: OnceLock<PolicyRowPipelineOwnerV3>,
     state: Mutex<State>,
-    request_sender: mpsc::SyncSender<OwnRootRequestV3>,
+    request_sender: GameDispatchChannelV3<OwnRootRequestV3>,
     request_receiver: Mutex<mpsc::Receiver<OwnRootRequestV3>>,
 }
 
@@ -354,7 +360,7 @@ impl RoventOwnCollectionBridgeV3 {
                 maximum_workers,
                 maximum_teacher_roots,
             }),
-            request_sender,
+            request_sender: GameDispatchChannelV3::new(request_sender),
             request_receiver: Mutex::new(request_receiver),
         }))
     }
@@ -404,18 +410,125 @@ impl RoventOwnCollectionBridgeV3 {
         &self.game
     }
 
-    /// Sticky game abort closes new admission and requests cancellation for
-    /// each original root. It is not a physical-completion observation.
-    pub(crate) fn try_request_game_abort(&self) -> Result<bool, String> {
-        self.game.request_abort();
-        let state = match self.state.try_lock() {
+    /// Settle this root's original queue claim before reporting any send.
+    /// A known Full is summarized in the same slot and retried later; other
+    /// results and all uncertain owners remain in that slot.
+    fn try_progress_dispatch(&self, slot: &mut RootSlot) -> Result<bool, &'static str> {
+        let envelope = OwnRootRequestV3 {
+            admission: slot.admission.clone(),
+            revoked: Arc::clone(&slot.revoked),
+        };
+        if let Some(receipt) = slot.dispatch_receipt.as_ref() {
+            if !receipt.matches_game(&self.game)
+                || !receipt.matches_root(&slot.admission)
+                || !receipt.matches_envelope(&envelope)
+            {
+                return Err("Own /3 dispatch receipt owner differs");
+            }
+            match receipt.outcome() {
+                GameDispatchOutcomeV3::Sent => {
+                    slot.requested = true;
+                    return Ok(true);
+                }
+                GameDispatchOutcomeV3::Full if !receipt.abort_observed() => {
+                    return match GameDispatchFullSummaryV3::try_merge_in_slots(
+                        &mut slot.dispatch_full,
+                        &mut slot.dispatch_receipt,
+                    ) {
+                        GameStepV3::Ready => Ok(false),
+                        _ => Err("Own /3 Full dispatch summary unresolved"),
+                    };
+                }
+                GameDispatchOutcomeV3::Disconnected => {
+                    return Err("Own /3 supervisor request channel disconnected")
+                }
+                GameDispatchOutcomeV3::Full
+                | GameDispatchOutcomeV3::Aborted
+                | GameDispatchOutcomeV3::AdmissionSealed => return Ok(false),
+            }
+        }
+        if slot.dispatch.is_none() {
+            if self.game.abort_requested() {
+                return Ok(false);
+            }
+            match self
+                .game
+                .try_claim_dispatch(&slot.admission, &envelope, &mut slot.dispatch)
+            {
+                GameStepV3::Ready => {}
+                GameStepV3::Busy | GameStepV3::Aborted | GameStepV3::Closed => return Ok(false),
+                _ => return Err("Own /3 dispatch claim rejected"),
+            }
+        }
+        let claim = slot
+            .dispatch
+            .as_mut()
+            .ok_or("Own /3 dispatch claim absent")?;
+        match claim.try_send(&self.request_sender, &envelope) {
+            Ok(_) => {}
+            Err(GameStepV3::Busy) => return Ok(false),
+            Err(_) => return Err("Own /3 dispatch send unresolved"),
+        }
+        match claim.try_settle() {
+            GameStepV3::Ready | GameStepV3::Existing => {}
+            GameStepV3::Busy => return Ok(false),
+            _ => return Err("Own /3 dispatch settlement unresolved"),
+        }
+        if !claim.transfer_receipt(&mut slot.dispatch_receipt) {
+            return Err("Own /3 dispatch receipt retention failed");
+        }
+        slot.dispatch.take();
+        // Revalidate the retained receipt on the next pass.
+        Ok(false)
+    }
+
+    /// Drain already-issued claims even after native admission is sealed.
+    /// This never starts a fresh claim for a root without one.
+    pub(crate) fn try_drain_existing_dispatch(&self) -> Result<bool, String> {
+        let mut state = match self.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::WouldBlock) => return Ok(false),
             Err(TryLockError::Poisoned(_)) => return Err("Own /3 root custody poisoned".into()),
         };
         let mut pending = false;
         let mut first_error = None;
-        for slot in &state.slots {
+        for slot in &mut state.slots {
+            if slot.dispatch.is_some()
+                || (!slot.requested
+                    && slot
+                        .dispatch_receipt
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.outcome() == GameDispatchOutcomeV3::Sent))
+            {
+                match self.try_progress_dispatch(slot) {
+                    Ok(true) => {}
+                    Ok(false) => pending = true,
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(!pending),
+        }
+    }
+
+    /// Sticky game abort closes new admission and requests cancellation for
+    /// each original root. It is not a physical-completion observation.
+    pub(crate) fn try_request_game_abort(&self) -> Result<bool, String> {
+        self.game.request_abort();
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => return Err("Own /3 root custody poisoned".into()),
+        };
+        let mut pending = false;
+        let mut first_error = None;
+        for slot in &mut state.slots {
             slot.revoked.store(true, Ordering::Release);
             if let Some(route) = &slot.route {
                 route.cancel_all();
@@ -425,6 +538,23 @@ impl RoventOwnCollectionBridgeV3 {
                     Err(error) => {
                         if first_error.is_none() {
                             first_error = Some(error.to_string());
+                        }
+                    }
+                }
+            }
+            if slot.dispatch.is_some()
+                || (!slot.requested
+                    && slot
+                        .dispatch_receipt
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.outcome() == GameDispatchOutcomeV3::Sent))
+            {
+                match self.try_progress_dispatch(slot) {
+                    Ok(true) => {}
+                    Ok(false) => pending = true,
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error.to_owned());
                         }
                     }
                 }
@@ -978,6 +1108,27 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
                 });
             }
         };
+        match self.game.try_bind_dispatch_channel(&self.request_sender) {
+            GameStepV3::Ready | GameStepV3::Existing => {}
+            GameStepV3::Busy => {
+                return if state
+                    .slots
+                    .iter()
+                    .any(|slot| slot.admission.same_original_admission(&admission))
+                {
+                    Ok(RoventBoardCollectionAdmissionOutcomeV3::PendingUncertain { admission })
+                } else {
+                    Ok(RoventBoardCollectionAdmissionOutcomeV3::Pending { admission })
+                };
+            }
+            _ => {
+                return Err(RoventBoardCollectionAdmissionFailureV3 {
+                    error: AdaptiveManagerError::Invalid("Own /3 game dispatch channel rejected"),
+                    admission,
+                    owners: Box::new(()),
+                })
+            }
+        }
         let index = match state
             .slots
             .iter()
@@ -1032,6 +1183,10 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
                 state.slots.push(RootSlot {
                     admission: admission.clone(),
                     reservation: Some(reservation),
+                    abort_receipt: None,
+                    dispatch: None,
+                    dispatch_receipt: None,
+                    dispatch_full: None,
                     requested: false,
                     revoked: Arc::new(AtomicBool::new(false)),
                     worker_reserved: false,
@@ -1061,6 +1216,20 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
                     slot.reservation.take();
                 }
                 GameStepV3::Aborted => {
+                    if !reservation.transfer_abort_receipt(&mut slot.abort_receipt)
+                        || !slot.abort_receipt.as_ref().is_some_and(|receipt| {
+                            receipt.matches_game(&self.game)
+                                && receipt.matches_original(&slot.admission)
+                        })
+                    {
+                        return Err(RoventBoardCollectionAdmissionFailureV3 {
+                            error: AdaptiveManagerError::Invalid(
+                                "Own /3 root abort receipt unresolved",
+                            ),
+                            admission,
+                            owners: Box::new(()),
+                        });
+                    }
                     slot.reservation.take();
                     slot.revoked.store(true, Ordering::Release);
                     return Ok(RoventBoardCollectionAdmissionOutcomeV3::PendingUncertain {
@@ -1081,36 +1250,29 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
                 }
             }
         }
+        if !slot.requested {
+            match self.try_progress_dispatch(slot) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(RoventBoardCollectionAdmissionOutcomeV3::PendingUncertain {
+                        admission,
+                    })
+                }
+                Err(error) => {
+                    return Err(RoventBoardCollectionAdmissionFailureV3 {
+                        error: AdaptiveManagerError::Invalid(error),
+                        admission,
+                        owners: Box::new(()),
+                    })
+                }
+            }
+        }
         if self.game.abort_requested() {
             slot.revoked.store(true, Ordering::Release);
             if let Some(route) = &slot.route {
                 route.cancel_all();
             }
             return Ok(RoventBoardCollectionAdmissionOutcomeV3::PendingUncertain { admission });
-        }
-        if !slot.requested {
-            match self.request_sender.try_send(OwnRootRequestV3 {
-                admission: admission.clone(),
-                revoked: Arc::clone(&slot.revoked),
-            }) {
-                Ok(()) => slot.requested = true,
-                Err(mpsc::TrySendError::Full(_)) => {
-                    // The game reservation and original slot already exist;
-                    // queue contention must not release their session owner.
-                    return Ok(RoventBoardCollectionAdmissionOutcomeV3::PendingUncertain {
-                        admission,
-                    });
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => {
-                    return Err(RoventBoardCollectionAdmissionFailureV3 {
-                        error: AdaptiveManagerError::Invalid(
-                            "Own /3 supervisor request channel disconnected",
-                        ),
-                        admission,
-                        owners: Box::new(()),
-                    });
-                }
-            }
         }
         if slot.installed {
             return Ok(RoventBoardCollectionAdmissionOutcomeV3::Installed);

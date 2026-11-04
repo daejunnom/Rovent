@@ -251,6 +251,8 @@ pub(crate) struct OwnWorkerSupervisorV3 {
     cleanup_deadline: Instant,
     abort_revoke_pending: bool,
     abort_revoke_error: Option<String>,
+    dispatch_drain_pending: bool,
+    dispatch_drain_error: Option<String>,
 }
 
 enum OwnPublishTransferV3 {
@@ -328,6 +330,8 @@ impl OwnWorkerSupervisorV3 {
             cleanup_deadline,
             abort_revoke_pending: false,
             abort_revoke_error: None,
+            dispatch_drain_pending: false,
+            dispatch_drain_error: None,
         })
     }
 
@@ -342,6 +346,15 @@ impl OwnWorkerSupervisorV3 {
                     if self.abort_revoke_error.is_none() {
                         self.abort_revoke_error = Some(error);
                     }
+                }
+            }
+        }
+        match self.bridge.try_drain_existing_dispatch() {
+            Ok(done) => self.dispatch_drain_pending = !done,
+            Err(error) => {
+                self.dispatch_drain_pending = true;
+                if self.dispatch_drain_error.is_none() {
+                    self.dispatch_drain_error = Some(error);
                 }
             }
         }
