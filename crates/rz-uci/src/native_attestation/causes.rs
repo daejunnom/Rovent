@@ -705,8 +705,8 @@ impl Budget {
                 }),
             },
             EngineError::WorkerPanic => CauseNodeV1::EngineWorkerPanic,
-            EngineError::TimerSpawn(_) => {
-                unreachable!("V1 projection preflight rejects timer spawn")
+            EngineError::TimerSpawn(_) | EngineError::StartupPanic(_) => {
+                unreachable!("V1 projection preflight rejects unrepresentable startup failure")
             }
             EngineError::DrainTimeout => CauseNodeV1::EngineDrainTimeout,
             EngineError::UndeliveredDiagnostics(receipts) => {
@@ -760,15 +760,24 @@ pub(crate) fn backend(error: &BackendError) -> CauseReceiptV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CauseProjectionError {
     TimerSpawnUnsupportedV1,
+    StartupPanicUnsupportedV1,
 }
 impl From<CauseProjectionError> for super::AttestationError {
-    fn from(_: CauseProjectionError) -> Self {
+    fn from(error: CauseProjectionError) -> Self {
+        let detail = match error {
+            CauseProjectionError::TimerSpawnUnsupportedV1 => {
+                "V1 cannot represent a timer thread spawn failure"
+            }
+            CauseProjectionError::StartupPanicUnsupportedV1 => {
+                "V1 cannot represent an engine startup panic"
+            }
+        };
         Self::contract(
             "v1_engine_cause_projection",
             ContractError::new(
                 ContractCode::UnsupportedContract,
                 ContractStage::Output,
-                "V1 cannot represent a timer thread spawn failure",
+                detail,
             ),
         )
     }
@@ -779,6 +788,9 @@ pub(crate) fn engine(error: &EngineError) -> Result<CauseReceiptV1, CauseProject
         match current {
             EngineError::TimerSpawn(_) => {
                 return Err(CauseProjectionError::TimerSpawnUnsupportedV1);
+            }
+            EngineError::StartupPanic(_) => {
+                return Err(CauseProjectionError::StartupPanicUnsupportedV1);
             }
             EngineError::Cleanup { primary, cleanup } => {
                 pending.push(primary);
@@ -842,6 +854,19 @@ mod tests {
             panic!("spawn cause lost")
         };
         assert_eq!(error.raw_os_error(), Some(11));
+    }
+
+    #[test]
+    fn v1_rejects_startup_panic_and_keeps_original_payload() {
+        let original = EngineError::StartupPanic(Box::new("original panic"));
+        assert!(matches!(
+            engine(&original),
+            Err(CauseProjectionError::StartupPanicUnsupportedV1)
+        ));
+        let EngineError::StartupPanic(payload) = &original else {
+            panic!("startup panic missing")
+        };
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"original panic"));
     }
 
     #[test]

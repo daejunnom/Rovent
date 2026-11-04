@@ -851,6 +851,8 @@ pub enum EngineError {
     Transport(Box<ServeError<EngineError>>),
     WorkerPanic,
     TimerSpawn(std::io::Error),
+    /// Original panic while setup only borrowed the not-yet-started process.
+    StartupPanic(Box<dyn std::any::Any + Send>),
     DrainTimeout,
     UndeliveredDiagnostics(Vec<(WorkerDiagnosticReceipt, u64)>),
     UndeliveredWorkerFailure(Box<UndeliveredWorkerFailure>),
@@ -2923,78 +2925,91 @@ fn prepare_engine(
     // No original process fields are moved until every fallible, pre-worker
     // setup succeeds. On rejection the caller receives the same process and
     // event endpoints; this does not attest native or output completion.
-    let setup = (|| -> Result<_, EngineError> {
-        if settings.max_workers == 0
-            || settings.shutdown_limit.is_zero()
-            || settings.search.max_simulations == 0
-            || (process.factory.is_some() && settings.search.max_simulations > 4096)
-            || process.factory.is_some() == process.driver.is_some()
-        {
-            return Err(failure(
-                contract::ErrorCode::InvalidInput,
-                "finite workers/drain/work and exactly one search startup required",
+    let setup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> Result<_, EngineError> {
+            if settings.max_workers == 0
+                || settings.shutdown_limit.is_zero()
+                || settings.search.max_simulations == 0
+                || (process.factory.is_some() && settings.search.max_simulations > 4096)
+                || process.factory.is_some() == process.driver.is_some()
+            {
+                return Err(failure(
+                    contract::ErrorCode::InvalidInput,
+                    "finite workers/drain/work and exactly one search startup required",
+                )
+                .into());
+            }
+            let scope = if let Some(factory) = &process.factory {
+                let profile = factory.profile();
+                crate::contracts::SessionScope::Evaluation(contract::AcceptanceScope {
+                    game: contract::GameGeneration(1),
+                    root: contract::RootGeneration(0),
+                    model: profile.model.handle(),
+                    encoding: profile.model.encoding().handle,
+                    backend: profile.backend,
+                })
+            } else {
+                crate::contracts::SessionScope::Search(contract::pals::SearchAuthority {
+                    epoch: process.clock.epoch(),
+                    game: contract::GameGeneration(1),
+                    root: contract::RootGeneration(0),
+                    implementation: process
+                        .driver
+                        .as_ref()
+                        .expect("validated driver startup")
+                        .implementation(),
+                })
+            };
+            let session_owner =
+                crate::contracts::ContractSessionOwner::new_scope_with_cancel_history(
+                    scope,
+                    process.clock.epoch(),
+                    process.clock.b_clock(),
+                    settings.search,
+                    settings.max_workers,
+                )?;
+            let goal = process
+                .driver
+                .as_ref()
+                .and_then(|driver| driver.search_goal_capability());
+            let semantics = process.driver.as_ref().map_or(
+                crate::bridge::NodeBudgetSemantics::LegacySimulations,
+                |driver| driver.node_budget_semantics(),
+            );
+            let mut session = Session::new(
+                RulesUciPort::new(Arc::clone(&process.owners), settings.position),
+                process.identity.clone(),
+                vec![OptionSpec {
+                    name: "Ponder".into(),
+                    kind: OptionKind::Check { default: false },
+                }],
+                settings.parser,
             )
-            .into());
-        }
-        let scope = if let Some(factory) = &process.factory {
-            let profile = factory.profile();
-            crate::contracts::SessionScope::Evaluation(contract::AcceptanceScope {
-                game: contract::GameGeneration(1),
-                root: contract::RootGeneration(0),
-                model: profile.model.handle(),
-                encoding: profile.model.encoding().handle,
-                backend: profile.backend,
-            })
-        } else {
-            crate::contracts::SessionScope::Search(contract::pals::SearchAuthority {
-                epoch: process.clock.epoch(),
-                game: contract::GameGeneration(1),
-                root: contract::RootGeneration(0),
-                implementation: process
-                    .driver
-                    .as_ref()
-                    .expect("validated driver startup")
-                    .implementation(),
-            })
-        };
-        let session_owner = crate::contracts::ContractSessionOwner::new_scope_with_cancel_history(
-            scope,
-            process.clock.epoch(),
-            process.clock.b_clock(),
-            settings.search,
-            settings.max_workers,
-        )?;
-        let goal = process
-            .driver
-            .as_ref()
-            .and_then(|driver| driver.search_goal_capability());
-        let semantics = process.driver.as_ref().map_or(
-            crate::bridge::NodeBudgetSemantics::LegacySimulations,
-            |driver| driver.node_budget_semantics(),
-        );
-        let mut session = Session::new(
-            RulesUciPort::new(Arc::clone(&process.owners), settings.position),
-            process.identity.clone(),
-            vec![OptionSpec {
-                name: "Ponder".into(),
-                kind: OptionKind::Check { default: false },
-            }],
-            settings.parser,
-        )
-        .map_err(EngineError::Session)?;
-        session
-            .set_search_goal_capability(goal)
             .map_err(EngineError::Session)?;
-        session
-            .set_node_budget_semantics(semantics)
-            .map_err(EngineError::Session)?;
-        Ok((scope, session_owner, session))
-    })();
+            session
+                .set_search_goal_capability(goal)
+                .map_err(EngineError::Session)?;
+            session
+                .set_node_budget_semantics(semantics)
+                .map_err(EngineError::Session)?;
+            Ok((scope, session_owner, session))
+        },
+    ));
     let (scope, session_owner, session) = match setup {
-        Ok(prepared) => prepared,
-        Err(error) => {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(error)) => {
             return Err(PrepareEngineFailure {
                 error,
+                process,
+                events,
+                sender,
+            });
+        }
+        Err(payload) => {
+            // Setup only borrowed the exact original process. Retain the
+            // original panic, process and event endpoints; do not retry it.
+            return Err(PrepareEngineFailure {
+                error: EngineError::StartupPanic(payload),
                 process,
                 events,
                 sender,
@@ -4272,6 +4287,67 @@ mod tests {
             }
             self.cleanup.map_or(Ok(()), Err)
         }
+    }
+
+    #[test]
+    fn borrowed_startup_panic_retains_original_process_and_endpoints() {
+        struct PanickingProfile;
+        impl EvaluatorFactory for PanickingProfile {
+            fn profile(&self) -> EvaluatorProfile {
+                panic!("original startup payload")
+            }
+            fn create(
+                &self,
+                _: ProcessClock,
+                _: SearchAuthority,
+            ) -> Result<Box<dyn ManagedEvaluator>, contract::ContractError> {
+                panic!("runtime must not be created")
+            }
+            fn input_key(
+                &self,
+                _: &RulesState,
+                _: &[contract::Move],
+            ) -> Result<contract::EvalInputKey, contract::ContractError> {
+                panic!("encoding must not run")
+            }
+        }
+        let factory: Arc<dyn EvaluatorFactory> = Arc::new(PanickingProfile);
+        let owners = Arc::new(OwnerRegistry::default());
+        let mut process = EngineProcess::new(
+            Arc::clone(&factory),
+            Arc::clone(&owners),
+            ProcessClock::new(contract::ProcessEpoch(72)),
+        );
+        #[cfg(feature = "pals-adaptive")]
+        let close = process.install_priority_close().unwrap();
+        let (sender, events) = event_channel();
+        let rejected = match prepare_engine(events, sender, process, EngineSettings::default()) {
+            Err(rejected) => rejected,
+            Ok(_) => panic!("panicking startup was accepted"),
+        };
+        let EngineError::StartupPanic(payload) = &rejected.error else {
+            panic!("original panic missing")
+        };
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"original startup payload")
+        );
+        assert!(Arc::ptr_eq(
+            rejected.process.factory.as_ref().unwrap(),
+            &factory
+        ));
+        assert!(Arc::ptr_eq(&rejected.process.owners, &owners));
+        #[cfg(feature = "pals-adaptive")]
+        assert!(
+            rejected
+                .process
+                .priority_close
+                .as_ref()
+                .unwrap()
+                .matches(&close)
+        );
+        rejected.sender.try_send(Event::EndOfInput).unwrap();
+        assert!(matches!(rejected.events.try_recv(), Ok(Event::EndOfInput)));
     }
 
     struct UnusedFactory(EvaluatorProfile);
