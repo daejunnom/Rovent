@@ -733,6 +733,13 @@ impl RoventNativeCaptureRegistration {
                 return Err(invalid("lock-v3 disabled root poisoned"));
             }
         };
+        // The original manager closes this shared gate only after its actual
+        // root/worker fence. Checking while holding the marker lock makes a
+        // later installation impossible once finish observes that fence.
+        check(
+            capability.is_install_open(),
+            "lock-v3 no-capture install gate closed",
+        )?;
         if marker.iter().any(|entry| matches!(entry,
             DisabledCaptureRoot::WholeRootV3(original) if original.same_original_capability(capability))) {
             return Ok(true);
@@ -748,8 +755,8 @@ impl RoventNativeCaptureRegistration {
         Ok(true)
     }
 
-    /// Retire only the original root marker after its original worker issued
-    /// a sealed physical shutdown witness; ordinary receipts are insufficient.
+    /// Retire the original marker, or verify it was never installed, after
+    /// the same worker's fence closes the original shared installation gate.
     #[cfg(target_os = "linux")]
     pub(super) fn try_finish_whole_root_no_capture_v3_role_only(
         &self,
@@ -763,16 +770,24 @@ impl RoventNativeCaptureRegistration {
                 return Err(invalid("lock-v3 disabled root poisoned"));
             }
         };
-        let index = marker
-            .iter()
-            .position(|entry| {
-                matches!(entry,
+        check(
+            capability.matches_role_only_fence(fence) && !capability.is_install_open(),
+            "lock-v3 original root, worker fence or install gate mismatch",
+        )?;
+        if let Some(index) = marker.iter().position(|entry| {
+            matches!(entry,
             DisabledCaptureRoot::WholeRootV3(original)
-                if original.same_original_capability(capability)
-                    && original.matches_role_only_fence(fence))
-            })
-            .ok_or_else(|| invalid("lock-v3 original root or worker fence mismatch"))?;
-        marker.remove(index);
+                if original.same_original_capability(capability))
+        }) {
+            marker.remove(index);
+        } else {
+            check(
+                !marker
+                    .iter()
+                    .any(|entry| entry.authority() == capability.authority()),
+                "lock-v3 conflicting root marker",
+            )?;
+        }
         Ok(true)
     }
 
@@ -1114,6 +1129,13 @@ impl RoventNativeCaptureRegistration {
     }
 }
 impl RoventCapturedInputReceiver {
+    /// Move a queued original input into the cleanup router, including after
+    /// a collection failure. This does not admit or drop it, grant a fence,
+    /// or establish that any root or device has physically completed.
+    #[cfg(target_os = "linux")]
+    pub(super) fn take_queued_lock_v3_for_cleanup(&self) -> Option<RoventCapturedLockInputV3> {
+        self.lock_v3_receiver.try_recv().ok()
+    }
     #[cfg(target_os = "linux")]
     pub(super) fn try_take_lock_v3(
         &self,
