@@ -39,6 +39,7 @@ struct ActorV3 {
     recovery_key: Option<TeacherRecoveryKeyV3>,
     terminal: Option<RoventTeacherWorkerTerminalTokenV3>,
     spawn_attempted: bool,
+    spawn_accepted: bool,
     dispatch_claimed: bool,
 }
 
@@ -246,6 +247,15 @@ impl RoventCollectionTeacherSessionV3 {
         self.closing
     }
 
+    /// Each registered actor has its original accepted spawn owner. This is
+    /// not worker readiness, successful inference, or physical retirement.
+    pub(crate) fn all_actor_owners_started(&self) -> bool {
+        !self.actors.is_empty()
+            && self.actors.values().all(|actor| {
+                actor.spawn_accepted && actor.lifecycle.is_some() && actor.recovery_key.is_some()
+            })
+    }
+
     /// A physical actor has one dispatcher and one sequence namespace for the
     /// whole original root. Dropping a dispatcher does not permit re-issuance.
     pub(crate) fn claim_dispatch_owner(&mut self, actor_id: &str) -> bool {
@@ -329,6 +339,7 @@ impl RoventCollectionTeacherSessionV3 {
                     recovery_key: None,
                     terminal: None,
                     spawn_attempted: false,
+                    spawn_accepted: false,
                     dispatch_claimed: false,
                 },
             );
@@ -397,6 +408,7 @@ impl RoventCollectionTeacherSessionV3 {
             Ok((lifecycle, key)) => {
                 actor.lifecycle = Some(lifecycle);
                 actor.recovery_key = Some(key.clone());
+                actor.spawn_accepted = true;
                 Ok(key)
             }
             Err(BoundTeacherSpawnFailureV3::BeforeSpawn {
