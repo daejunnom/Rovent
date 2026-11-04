@@ -94,7 +94,7 @@ pub(super) struct PolicyRowPipelineV3 {
 }
 
 #[derive(Clone)]
-pub(super) struct PolicyRowPipelineOwnerV3(Arc<Mutex<PolicyRowPipelineV3>>);
+pub(crate) struct PolicyRowPipelineOwnerV3(Arc<Mutex<PolicyRowPipelineV3>>);
 
 /// A view of the very same game-scoped pipeline owner. It cannot be created
 /// from a digest or from another root's arbitrary output slot.
