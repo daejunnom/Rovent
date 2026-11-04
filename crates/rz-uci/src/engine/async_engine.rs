@@ -1159,7 +1159,13 @@ mod tests {
                 .any(|line| line == "uciok")
         );
         assert!(output.failure.is_none());
-        assert!(run.final_output_observation().is_some());
+        let final_output = run.final_output_observation().unwrap();
+        assert_eq!(
+            final_output.accepted_batches,
+            final_output.completed_batches
+        );
+        assert!(final_output.close_requested && final_output.worker_finished);
+        assert!(!final_output.failed && !final_output.call_completion_unknown);
         // TimerGuard retires and joins this fixture's own CPU timer on both
         // normal return and assertion unwind; no GPU resource was created.
         drop(guard);
