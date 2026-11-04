@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::pals_adaptive::{
-    AdaptiveCollectionError, AdaptiveCollectionObserverBoxV3, AdaptiveCollectionV3Rejection,
+    AdaptiveCollectionError, AdaptiveCollectionObserverBoxV3, AdaptiveCollectionV2ObserverStatus,
     AdaptiveManagerError, RoventCollectionRootAdmissionV3, RoventNativeCollectionOriginV3,
     RoventNoCaptureRootCapabilityV3, RoventOwnNoCaptureFenceV3, RoventTeacherScopePhysicalAckV3,
 };
@@ -40,6 +40,15 @@ pub struct RoventBoardCollectionAdmissionFailureV3 {
     pub error: AdaptiveManagerError,
     pub admission: RoventCollectionRootAdmissionV3,
     pub owners: Box<dyn Any + Send>,
+}
+
+/// Return the original observer and admission on a rejected installation.
+pub struct RoventBoardCollectionObserverRejectionV3<O> {
+    pub error: AdaptiveManagerError,
+    pub admission: RoventCollectionRootAdmissionV3,
+    pub observer: AdaptiveCollectionObserverBoxV3<AdaptivePortQuestion, O>,
+    pub observer_status: AdaptiveCollectionV2ObserverStatus,
+    pub panic_payload: Option<Box<dyn Any + Send>>,
 }
 
 /// Session-owned original origin and hooks. An outstanding root must remain
@@ -84,9 +93,16 @@ where
         &mut self,
         admission: RoventCollectionRootAdmissionV3,
         observer: AdaptiveCollectionObserverBoxV3<AdaptivePortQuestion, B::Output>,
-    ) -> Result<(), AdaptiveCollectionV3Rejection<AdaptivePortQuestion, B::Output>> {
+    ) -> Result<(), RoventBoardCollectionObserverRejectionV3<B::Output>> {
         self.manager
             .install_collection_observer_v3(admission, observer)
+            .map_err(|failure| RoventBoardCollectionObserverRejectionV3 {
+                error: failure.error,
+                admission: failure.admission,
+                observer: failure.observer,
+                observer_status: failure.observer_status,
+                panic_payload: failure.panic_payload,
+            })
     }
 }
 
