@@ -14,13 +14,13 @@ use rz_uci::rovent_bootstrap::{
     RoventStartupControl,
     pc_session::{
         RoventPcCollectionAdmissionFailureV2, RoventPcCollectionAdmissionOutcomeV2,
-        RoventPcCollectionAdmissionPortV2, RoventPcCollectionHandoffV2, RoventPcCollectionHooksV2,
-        RoventPcCollectionRootCustodyV2, RoventPcCustodyReturnV2, RoventPcDeferredCleanupV2,
-        RoventPcRevokeObservationV2,
+        RoventPcCollectionAdmissionPortV2, RoventPcCollectionAdmissionStatusV2,
+        RoventPcCollectionHandoffV2, RoventPcCollectionHooksV2, RoventPcCollectionRootCustodyV2,
+        RoventPcCustodyReturnV2, RoventPcDeferredCleanupV2, RoventPcRevokeObservationV2,
     },
 };
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Mutex, OnceLock, Weak,
     atomic::{AtomicU8, Ordering},
     mpsc,
 };
@@ -33,13 +33,15 @@ const SLOT_FAILED: u8 = 4;
 // This slot was proven not to have installed an observer for the root.
 const SLOT_UNAVAILABLE_BEFORE_INSTALL: u8 = 5;
 const SLOT_PREPARING: u8 = 6;
+// Installation may have begun; retry only the original admission.
+const SLOT_UNCERTAIN: u8 = 7;
 
 // A busy or prepared slot still has authority to attempt installation.
 fn has_pending_slot(states: &[AtomicU8]) -> bool {
     states.iter().any(|state| {
         matches!(
             state.load(Ordering::Acquire),
-            SLOT_READY | SLOT_RESERVED | SLOT_PREPARING
+            SLOT_READY | SLOT_RESERVED | SLOT_PREPARING | SLOT_UNCERTAIN
         )
     })
 }
@@ -67,8 +69,10 @@ pub(crate) enum PcPreparedSlotOutcomeV2 {
 }
 
 pub(crate) struct RoventPcRootRouterV2 {
+    self_weak: Weak<Self>,
     slots: Vec<OnceLock<Arc<RoventPcCollectionBridgeV2>>>,
     states: Vec<AtomicU8>,
+    attempts: Vec<OnceLock<RoventCollectionRootAdmissionV2>>,
     startup: OnceLock<RoventStartupControl>,
 }
 
@@ -115,7 +119,7 @@ impl RoventPcRootRouterV2 {
     pub(crate) fn new(
         primary: Arc<RoventPcCollectionBridgeV2>,
         maximum_roots: usize,
-    ) -> Result<Self, super::ArenaError> {
+    ) -> Result<Arc<Self>, super::ArenaError> {
         if !(1..=64).contains(&maximum_roots) {
             return Err(super::invalid("P/C root router capacity"));
         }
@@ -133,11 +137,18 @@ impl RoventPcRootRouterV2 {
             .map_err(|_| super::invalid("P/C root router state allocation"))?;
         states.resize_with(maximum_roots, || AtomicU8::new(SLOT_UNPREPARED));
         states[0].store(SLOT_READY, Ordering::Release);
-        Ok(Self {
+        let mut attempts = Vec::new();
+        attempts
+            .try_reserve_exact(maximum_roots)
+            .map_err(|_| super::invalid("P/C root router attempts allocation"))?;
+        attempts.resize_with(maximum_roots, OnceLock::new);
+        Ok(Arc::new_cyclic(|original| Self {
+            self_weak: original.clone(),
             slots,
             states,
+            attempts,
             startup: OnceLock::new(),
-        })
+        }))
     }
 
     fn primary(&self) -> &Arc<RoventPcCollectionBridgeV2> {
@@ -264,6 +275,16 @@ impl RoventPcRootRouterV2 {
         &self,
         root: &RoventCollectionRootAdmissionV2,
     ) -> Result<&Arc<RoventPcCollectionBridgeV2>, AdaptiveManagerError> {
+        self.find_original_slot(root)?
+            .ok_or(AdaptiveManagerError::Invalid(
+                "P/C original root slot unavailable",
+            ))
+    }
+
+    fn find_original_slot(
+        &self,
+        root: &RoventCollectionRootAdmissionV2,
+    ) -> Result<Option<&Arc<RoventPcCollectionBridgeV2>>, AdaptiveManagerError> {
         let mut matched = None;
         for slot in &self.slots {
             let Some(bridge) = slot.get() else {
@@ -281,9 +302,51 @@ impl RoventPcRootRouterV2 {
                 matched = Some(bridge);
             }
         }
-        matched.ok_or(AdaptiveManagerError::Invalid(
-            "P/C original root slot unavailable",
-        ))
+        Ok(matched)
+    }
+
+    /// A router attempt identifies the slot to inspect, not proof that the
+    /// bridge installed this root. The core must separately confirm its same
+    /// original attempt before cancellation can reach that bridge.
+    fn revoke_uncertain_attempt(
+        &self,
+        root: &RoventCollectionRootAdmissionV2,
+    ) -> Result<bool, AdaptiveManagerError> {
+        let mut matched = None;
+        for (index, attempt) in self.attempts.iter().enumerate() {
+            if !matches!(
+                self.states[index].load(Ordering::Acquire),
+                SLOT_UNCERTAIN | SLOT_RESERVED
+            ) || !attempt
+                .get()
+                .is_some_and(|original| original.same_original_admission(root))
+            {
+                continue;
+            }
+            if matched.is_some() {
+                return Err(AdaptiveManagerError::Invalid(
+                    "P/C uncertain root assigned to multiple slots",
+                ));
+            }
+            matched = self.slots[index].get();
+        }
+        let Some(bridge) = matched else {
+            return Ok(false);
+        };
+        match bridge.try_revoke_original_attempt(root) {
+            Ok(Some(true)) => Ok(true),
+            Ok(None) => Err(AdaptiveManagerError::AuxiliaryPending),
+            Ok(Some(false)) => Err(AdaptiveManagerError::Invalid(
+                "P/C uncertain original attempt unavailable",
+            )),
+            Err(error) => Err(AdaptiveManagerError::Collection(
+                AdaptiveCollectionError::new(
+                    AdaptiveCollectionStage::Dispatch,
+                    "PcUncertainRevoke",
+                    error.to_string(),
+                ),
+            )),
+        }
     }
 
     fn deferred_owner(
@@ -392,18 +455,47 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
         port: &mut RoventPcCollectionAdmissionPortV2<'_>,
         admission: RoventCollectionRootAdmissionV2,
     ) -> Result<RoventPcCollectionAdmissionOutcomeV2, RoventPcCollectionAdmissionFailureV2> {
+        let status = self.admit_with_status(port, admission)?;
+        let owner: Box<dyn std::any::Any + Send> = if matches!(
+            &status,
+            RoventPcCollectionAdmissionStatusV2::PendingUncertain { .. }
+        ) {
+            Box::new(self.self_weak.upgrade().expect("original P/C router owner"))
+        } else {
+            Box::new(())
+        };
+        status.into_legacy(owner)
+    }
+
+    fn admit_with_status(
+        &self,
+        port: &mut RoventPcCollectionAdmissionPortV2<'_>,
+        admission: RoventCollectionRootAdmissionV2,
+    ) -> Result<RoventPcCollectionAdmissionStatusV2, RoventPcCollectionAdmissionFailureV2> {
         for (index, (slot, state)) in self.slots.iter().zip(&self.states).enumerate() {
-            if state
+            let uncertain = if state
+                .compare_exchange(
+                    SLOT_UNCERTAIN,
+                    SLOT_RESERVED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                true
+            } else if state
                 .compare_exchange(
                     SLOT_READY,
                     SLOT_RESERVED,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
-                .is_err()
+                .is_ok()
             {
+                false
+            } else {
                 continue;
-            }
+            };
             let Some(bridge) = slot.get() else {
                 state.store(SLOT_FAILED, Ordering::Release);
                 return Err(RoventPcCollectionAdmissionFailureV2 {
@@ -412,14 +504,50 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
                     owners: Box::new(()),
                 });
             };
+            if uncertain {
+                if !self.attempts[index]
+                    .get()
+                    .is_some_and(|original| original.same_original_admission(&admission))
+                {
+                    state.store(SLOT_UNCERTAIN, Ordering::Release);
+                    return Err(RoventPcCollectionAdmissionFailureV2 {
+                        error: AdaptiveManagerError::Invalid(
+                            "P/C uncertain root admission mismatch",
+                        ),
+                        admission,
+                        owners: Box::new(Arc::clone(bridge)),
+                    });
+                }
+                return match bridge.admit_with_status(port, admission) {
+                    Ok(RoventPcCollectionAdmissionStatusV2::Installed) => {
+                        state.store(SLOT_INSTALLED, Ordering::Release);
+                        Ok(RoventPcCollectionAdmissionStatusV2::Installed)
+                    }
+                    Ok(
+                        RoventPcCollectionAdmissionStatusV2::Pending { admission }
+                        | RoventPcCollectionAdmissionStatusV2::PendingUncertain { admission },
+                    ) => {
+                        state.store(SLOT_UNCERTAIN, Ordering::Release);
+                        Ok(RoventPcCollectionAdmissionStatusV2::PendingUncertain { admission })
+                    }
+                    Ok(other @ RoventPcCollectionAdmissionStatusV2::DeferredNoCapture { .. }) => {
+                        state.store(SLOT_UNAVAILABLE_BEFORE_INSTALL, Ordering::Release);
+                        Ok(other)
+                    }
+                    Err(failure) => {
+                        state.store(SLOT_FAILED, Ordering::Release);
+                        Err(failure)
+                    }
+                };
+            }
             if index > 0 {
                 let Some(previous) = self.slots[index - 1].get() else {
                     state.store(SLOT_READY, Ordering::Release);
-                    return Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission });
+                    return Ok(RoventPcCollectionAdmissionStatusV2::Pending { admission });
                 };
                 if Self::follows_later_game(previous, &admission) {
                     state.store(SLOT_READY, Ordering::Release);
-                    return self.defer_if_closed(port, admission);
+                    return self.defer_if_closed(port, admission).map(Into::into);
                 }
                 if !Self::follows(previous, &admission) {
                     state.store(SLOT_READY, Ordering::Release);
@@ -433,7 +561,7 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
                 }
                 if !previous.closed_before_next_admission(&admission) {
                     state.store(SLOT_READY, Ordering::Release);
-                    return Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission });
+                    return Ok(RoventPcCollectionAdmissionStatusV2::Pending { admission });
                 }
             }
             let previous = if index == 0 {
@@ -445,11 +573,13 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
                 Ok(Some(true)) => {}
                 Ok(Some(false)) => {
                     state.store(SLOT_UNAVAILABLE_BEFORE_INSTALL, Ordering::Release);
-                    return self.defer_unstarted(port, admission);
+                    return self.defer_unstarted(port, admission).map(Into::into);
                 }
                 Ok(None) => {
                     state.store(SLOT_READY, Ordering::Release);
-                    return self.defer_unstarted(port, admission);
+                    // A busy worker lock is not evidence that the original
+                    // worker is unavailable or that collection never began.
+                    return Ok(RoventPcCollectionAdmissionStatusV2::Pending { admission });
                 }
                 Err(error) => {
                     state.store(SLOT_FAILED, Ordering::Release);
@@ -464,18 +594,33 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
                     });
                 }
             }
-            return match bridge.admit(port, admission) {
-                Ok(RoventPcCollectionAdmissionOutcomeV2::Installed) => {
+            return match bridge.admit_with_status(port, admission) {
+                Ok(RoventPcCollectionAdmissionStatusV2::Installed) => {
                     state.store(SLOT_INSTALLED, Ordering::Release);
-                    Ok(RoventPcCollectionAdmissionOutcomeV2::Installed)
+                    Ok(RoventPcCollectionAdmissionStatusV2::Installed)
                 }
-                Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission }) => {
+                Ok(RoventPcCollectionAdmissionStatusV2::Pending { admission }) => {
                     state.store(SLOT_READY, Ordering::Release);
-                    // The bridge may be waiting on the original attempt lock;
-                    // Pending does not establish that installation did not start.
-                    Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission })
+                    // This admission did not start; its slot may be polled again.
+                    Ok(RoventPcCollectionAdmissionStatusV2::Pending { admission })
                 }
-                Ok(other @ RoventPcCollectionAdmissionOutcomeV2::DeferredNoCapture { .. }) => {
+                Ok(RoventPcCollectionAdmissionStatusV2::PendingUncertain { admission }) => {
+                    let _ = self.attempts[index].set(admission.clone());
+                    if !self.attempts[index]
+                        .get()
+                        .is_some_and(|original| original.same_original_admission(&admission))
+                    {
+                        state.store(SLOT_FAILED, Ordering::Release);
+                        return Err(RoventPcCollectionAdmissionFailureV2 {
+                            error: AdaptiveManagerError::Invalid("P/C root attempt owner mismatch"),
+                            admission,
+                            owners: Box::new(Arc::clone(bridge)),
+                        });
+                    }
+                    state.store(SLOT_UNCERTAIN, Ordering::Release);
+                    Ok(RoventPcCollectionAdmissionStatusV2::PendingUncertain { admission })
+                }
+                Ok(other @ RoventPcCollectionAdmissionStatusV2::DeferredNoCapture { .. }) => {
                     state.store(SLOT_UNAVAILABLE_BEFORE_INSTALL, Ordering::Release);
                     Ok(other)
                 }
@@ -490,7 +635,7 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
         // later roots. A slot being prepared or reserved may still publish
         // the original worker, so neither state proves that capture is absent.
         if has_pending_slot(&self.states) {
-            return Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission });
+            return Ok(RoventPcCollectionAdmissionStatusV2::Pending { admission });
         }
         if self
             .states
@@ -514,9 +659,9 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
                 .iter()
                 .any(|state| state.load(Ordering::Acquire) == SLOT_UNAVAILABLE_BEFORE_INSTALL)
         {
-            return self.defer_unstarted(port, admission);
+            return self.defer_unstarted(port, admission).map(Into::into);
         }
-        self.defer_if_closed(port, admission)
+        self.defer_if_closed(port, admission).map(Into::into)
     }
 
     fn finish_deferred(
@@ -569,6 +714,12 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
         &self,
         root: &RoventCollectionRootAdmissionV2,
     ) -> Result<(), AdaptiveManagerError> {
+        if let Some(original) = self.find_original_slot(root)? {
+            return original.revoke_root(root);
+        }
+        if self.revoke_uncertain_attempt(root)? {
+            return Ok(());
+        }
         self.original_slot(root)?.revoke_root(root)
     }
     fn revoke_root_observed(
@@ -576,6 +727,14 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
         root: &RoventCollectionRootAdmissionV2,
         observation: RoventPcRevokeObservationV2,
     ) -> Result<(), AdaptiveManagerError> {
+        if let Some(original) = self.find_original_slot(root)? {
+            return original.revoke_root_observed(root, observation);
+        }
+        // Before installation there is no root observation to publish. The
+        // original core cancellation is retained without claiming completion.
+        if self.revoke_uncertain_attempt(root)? {
+            return Ok(());
+        }
         self.original_slot(root)?
             .revoke_root_observed(root, observation)
     }
@@ -670,6 +829,11 @@ mod tests {
             "published worker remains eligible for the normal reservation path"
         );
         assert!(has_pending_slot(&states));
+        states[0].store(SLOT_UNCERTAIN, Ordering::Release);
+        assert!(
+            has_pending_slot(&states),
+            "an uncertain installation must never prove no capture"
+        );
         states[0].store(SLOT_INSTALLED, Ordering::Release);
         assert!(!has_pending_slot(&states));
     }

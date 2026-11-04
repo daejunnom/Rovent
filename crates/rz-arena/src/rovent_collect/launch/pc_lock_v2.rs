@@ -2365,12 +2365,10 @@ fn run_rovent_pc_collection_lock_v2_inner(
     let publication_maximum_records = plan.maximum_records;
     // Route by the original admission. Additional slots remain unavailable until the
     // supervisor proves the preceding root has released shared custody.
-    let router = Arc::new(
-        crate::rovent_collect::pc_root_router_v2::RoventPcRootRouterV2::new(
-            Arc::clone(&bridge),
-            plan.maximum_roots as usize,
-        )?,
-    );
+    let router = crate::rovent_collect::pc_root_router_v2::RoventPcRootRouterV2::new(
+        Arc::clone(&bridge),
+        plan.maximum_roots as usize,
+    )?;
     let hooks: Arc<dyn rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2> =
         router.clone();
     let supervisor_custody = Arc::new(Mutex::new(None));

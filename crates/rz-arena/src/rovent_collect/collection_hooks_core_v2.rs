@@ -1101,6 +1101,30 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             Ordering::Acquire,
         );
     }
+    /// Revoke only when this core still identifies the exact original attempt.
+    /// A busy lock is not evidence that either this root or a worker is absent.
+    pub(crate) fn try_revoke_original_attempt(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<Option<bool>, ArenaError> {
+        let attempt = match self.original_attempt.try_lock() {
+            Ok(attempt) => attempt,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(ArenaError::Invalid(
+                    "Collection original attempt poisoned".into(),
+                ));
+            }
+        };
+        let Some(original) = attempt.as_ref() else {
+            return Ok(Some(false));
+        };
+        if !original.same_original_admission(admission) {
+            return Ok(Some(false));
+        }
+        self.revoke();
+        Ok(Some(true))
+    }
     pub(crate) fn handoff_sender(&self) -> mpsc::SyncSender<Arc<Mutex<H>>> {
         self.handoffs.clone()
     }

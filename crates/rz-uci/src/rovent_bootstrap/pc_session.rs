@@ -376,6 +376,15 @@ pub trait RoventPcCollectionHooksV2: Send + Sync {
         port: &mut RoventPcCollectionAdmissionPortV2<'_>,
         admission: RoventCollectionRootAdmissionV2,
     ) -> Result<RoventPcCollectionAdmissionOutcomeV2, RoventPcCollectionAdmissionFailureV2>;
+    /// Additive status path. Existing implementations keep their `admit`
+    /// contract and need not implement this method.
+    fn admit_with_status(
+        &self,
+        port: &mut RoventPcCollectionAdmissionPortV2<'_>,
+        admission: RoventCollectionRootAdmissionV2,
+    ) -> Result<RoventPcCollectionAdmissionStatusV2, RoventPcCollectionAdmissionFailureV2> {
+        self.admit(port, admission).map(Into::into)
+    }
     /// Remove the exact no-capture marker only after the native root fence.
     fn finish_deferred(
         &self,
@@ -471,6 +480,60 @@ pub enum RoventPcCollectionAdmissionOutcomeV2 {
         capability: crate::pals_adaptive::RoventNoCaptureRootCapabilityV2,
         reason: AdaptiveCollectionError,
     },
+}
+
+/// Extended admission status without changing the original V2 enum. An
+/// uncertain attempt retains the original hook and cannot be called unstarted.
+pub enum RoventPcCollectionAdmissionStatusV2 {
+    Installed,
+    Pending {
+        admission: RoventCollectionRootAdmissionV2,
+    },
+    PendingUncertain {
+        admission: RoventCollectionRootAdmissionV2,
+    },
+    DeferredNoCapture {
+        capability: crate::pals_adaptive::RoventNoCaptureRootCapabilityV2,
+        reason: AdaptiveCollectionError,
+    },
+}
+
+impl From<RoventPcCollectionAdmissionOutcomeV2> for RoventPcCollectionAdmissionStatusV2 {
+    fn from(value: RoventPcCollectionAdmissionOutcomeV2) -> Self {
+        match value {
+            RoventPcCollectionAdmissionOutcomeV2::Installed => Self::Installed,
+            RoventPcCollectionAdmissionOutcomeV2::Pending { admission } => {
+                Self::Pending { admission }
+            }
+            RoventPcCollectionAdmissionOutcomeV2::DeferredNoCapture { capability, reason } => {
+                Self::DeferredNoCapture { capability, reason }
+            }
+        }
+    }
+}
+
+impl RoventPcCollectionAdmissionStatusV2 {
+    /// Older callers receive an explicit error and retain their original hook;
+    /// an uncertain admission is never represented as ordinary Pending.
+    pub fn into_legacy(
+        self,
+        uncertain_owner: Box<dyn Any + Send>,
+    ) -> Result<RoventPcCollectionAdmissionOutcomeV2, RoventPcCollectionAdmissionFailureV2> {
+        match self {
+            Self::Installed => Ok(RoventPcCollectionAdmissionOutcomeV2::Installed),
+            Self::Pending { admission } => {
+                Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission })
+            }
+            Self::PendingUncertain { admission } => Err(RoventPcCollectionAdmissionFailureV2 {
+                error: AdaptiveManagerError::AuxiliaryPending,
+                admission,
+                owners: uncertain_owner,
+            }),
+            Self::DeferredNoCapture { capability, reason } => {
+                Ok(RoventPcCollectionAdmissionOutcomeV2::DeferredNoCapture { capability, reason })
+            }
+        }
+    }
 }
 
 /// The rejected admission and every acquired observer/teacher owner remain
@@ -3044,6 +3107,7 @@ impl RoventPcSessionDriver {
             };
         let mut v2_hook_started = false;
         let mut v2_hook_revoked = false;
+        let mut v2_admission_uncertain = false;
         let mut v2_admission_failure = None;
         let mut v2_current_admission = None;
         let mut no_capture_v2 = None;
@@ -3098,8 +3162,8 @@ impl RoventPcSessionDriver {
                         let mut port = RoventPcCollectionAdmissionPortV2 {
                             manager: &mut manager,
                         };
-                        match hook.admit(&mut port, admission.clone()) {
-                            Ok(RoventPcCollectionAdmissionOutcomeV2::Installed) => {
+                        match hook.admit_with_status(&mut port, admission.clone()) {
+                            Ok(RoventPcCollectionAdmissionStatusV2::Installed) => {
                                 let actual = manager.collection_root_admission_v2().ok_or(
                                     AdaptiveManagerError::Invalid(
                                         "P/C V2 observer was not installed",
@@ -3112,7 +3176,7 @@ impl RoventPcSessionDriver {
                                 }
                                 break;
                             }
-                            Ok(RoventPcCollectionAdmissionOutcomeV2::DeferredNoCapture {
+                            Ok(RoventPcCollectionAdmissionStatusV2::DeferredNoCapture {
                                 capability,
                                 reason,
                             }) => {
@@ -3135,7 +3199,44 @@ impl RoventPcSessionDriver {
                                 v2_hook_started = false;
                                 break;
                             }
-                            Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission }) => {
+                            Ok(RoventPcCollectionAdmissionStatusV2::PendingUncertain {
+                                admission,
+                            }) => {
+                                if !admission.same_original_admission(&expected) {
+                                    v2_admission_failure =
+                                        Some(RoventPcCollectionAdmissionFailureV2 {
+                                            error: AdaptiveManagerError::Invalid(
+                                                "P/C uncertain admission owner mismatch",
+                                            ),
+                                            admission,
+                                            owners: Box::new(()),
+                                        });
+                                    return Err(AdaptiveManagerError::Invalid(
+                                        "P/C uncertain admission owner mismatch",
+                                    ));
+                                }
+                                v2_admission_uncertain = true;
+                                v2_hook_started = true;
+                                if !context.accepts().unwrap_or(false)
+                                    || context.soft_expired(Instant::now())
+                                    || manager.phase() != ManagerPhase::Running
+                                {
+                                    v2_admission_failure = Some(
+                                        RoventPcCollectionAdmissionFailureV2 {
+                                            error: AdaptiveManagerError::Invalid(
+                                                "P/C collection admission remained uncertain at its original boundary",
+                                            ),
+                                            admission,
+                                            owners: Box::new(()),
+                                        },
+                                    );
+                                    return Err(AdaptiveManagerError::Invalid(
+                                        "P/C collection admission remained uncertain at its original boundary",
+                                    ));
+                                }
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Ok(RoventPcCollectionAdmissionStatusV2::Pending { admission }) => {
                                 if !admission.same_original_admission(&expected)
                                     || manager.collection_root_admission_v2().is_some()
                                 {
@@ -3151,7 +3252,13 @@ impl RoventPcSessionDriver {
                                         "P/C pending admission owner mismatch",
                                     ));
                                 }
-                                v2_hook_started = false;
+                                // A later unstarted poll does not retroactively
+                                // settle an earlier uncertain install attempt.
+                                v2_hook_started = v2_admission_uncertain;
+                                if !v2_admission_uncertain {
+                                    self.collection_v2_outstanding
+                                        .store(false, Ordering::Release);
+                                }
                                 if !context.accepts().unwrap_or(false)
                                     || context.soft_expired(Instant::now())
                                 {
@@ -3353,40 +3460,54 @@ impl RoventPcSessionDriver {
         };
         if v2_hook_started && !v2_hook_revoked {
             if let Some(hook) = &self.collection_hooks_v2 {
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    let root =
-                        v2_current_admission
-                            .as_ref()
-                            .ok_or(AdaptiveManagerError::Invalid(
-                                "P/C revoke original root unavailable",
-                            ))?;
-                    let now = Instant::now();
-                    let observation = RoventPcRevokeObservationV2 {
-                        origin: RoventPcRevokeOriginV2::RunEnded,
-                        elapsed_from_start: context
-                            .original_time_budget
-                            .and_then(|budget| now.checked_duration_since(budget.start)),
-                        context_acceptance: match context.accepts() {
-                            Ok(true) => RoventPcContextAcceptanceV2::Accepted,
-                            Ok(false) => RoventPcContextAcceptanceV2::Rejected,
-                            Err(_) => RoventPcContextAcceptanceV2::Unavailable,
-                        },
-                        soft_expired: context.soft_expired(now),
-                        manager_phase: manager.phase(),
-                        goal: manager
-                            .driver()
-                            .port()
-                            .rovent_frontier_receipt()
-                            .map(|receipt| receipt.snapshot.goal),
-                        role_calls_admitted: manager.role_call_budget_usage().0,
-                        role_calls_reserved: manager.role_call_budget_usage().1,
-                        role_call_limit: manager.role_call_limit(),
-                        role_call_limit_reached: manager.role_call_limit_reached(),
-                        manager_failures: manager.failures().count(),
-                        driver_complete_at_revoke: manager.driver_is_complete(),
-                    };
-                    hook.revoke_root_observed(root, observation)
-                }));
+                let result = loop {
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        let root =
+                            v2_current_admission
+                                .as_ref()
+                                .ok_or(AdaptiveManagerError::Invalid(
+                                    "P/C revoke original root unavailable",
+                                ))?;
+                        let now = Instant::now();
+                        let observation = RoventPcRevokeObservationV2 {
+                            origin: RoventPcRevokeOriginV2::RunEnded,
+                            elapsed_from_start: context
+                                .original_time_budget
+                                .and_then(|budget| now.checked_duration_since(budget.start)),
+                            context_acceptance: match context.accepts() {
+                                Ok(true) => RoventPcContextAcceptanceV2::Accepted,
+                                Ok(false) => RoventPcContextAcceptanceV2::Rejected,
+                                Err(_) => RoventPcContextAcceptanceV2::Unavailable,
+                            },
+                            soft_expired: context.soft_expired(now),
+                            manager_phase: manager.phase(),
+                            goal: manager
+                                .driver()
+                                .port()
+                                .rovent_frontier_receipt()
+                                .map(|receipt| receipt.snapshot.goal),
+                            role_calls_admitted: manager.role_call_budget_usage().0,
+                            role_calls_reserved: manager.role_call_budget_usage().1,
+                            role_call_limit: manager.role_call_limit(),
+                            role_call_limit_reached: manager.role_call_limit_reached(),
+                            manager_failures: manager.failures().count(),
+                            driver_complete_at_revoke: manager.driver_is_complete(),
+                        };
+                        hook.revoke_root_observed(root, observation)
+                    }));
+                    if matches!(&result, Ok(Err(AdaptiveManagerError::AuxiliaryPending)))
+                        && Instant::now() < context.shutdown_deadline
+                    {
+                        std::thread::sleep(
+                            context
+                                .shutdown_deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(1)),
+                        );
+                        continue;
+                    }
+                    break result;
+                };
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
@@ -4646,6 +4767,25 @@ fn poisoned() -> ContractError {
         rz_contracts::Stage::Output,
         "Rovent P/C observation mutex poisoned",
     )
+}
+
+#[cfg(test)]
+mod legacy_collection_api_tests {
+    use super::RoventPcCollectionAdmissionOutcomeV2;
+
+    #[test]
+    fn previous_v2_outcome_remains_exhaustively_matchable() {
+        // Existing downstream callers can keep their original exhaustive
+        // match while the new admission-status hook handles uncertainty.
+        fn legacy_match(value: RoventPcCollectionAdmissionOutcomeV2) {
+            match value {
+                RoventPcCollectionAdmissionOutcomeV2::Installed => {}
+                RoventPcCollectionAdmissionOutcomeV2::Pending { .. } => {}
+                RoventPcCollectionAdmissionOutcomeV2::DeferredNoCapture { .. } => {}
+            }
+        }
+        let _consumer: fn(RoventPcCollectionAdmissionOutcomeV2) = legacy_match;
+    }
 }
 
 #[cfg(test)]

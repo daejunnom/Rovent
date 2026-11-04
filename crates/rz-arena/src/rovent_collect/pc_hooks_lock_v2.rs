@@ -14,17 +14,18 @@ use rz_uci::pals_adaptive::{
 use rz_uci::rovent_bootstrap::RoventStartupControl;
 use rz_uci::rovent_bootstrap::pc_session::{
     RoventPcCollectionAdmissionFailureV2, RoventPcCollectionAdmissionOutcomeV2,
-    RoventPcCollectionAdmissionPortV2, RoventPcCollectionHandoffV2, RoventPcCollectionHooksV2,
-    RoventPcCollectionRootCustodyV2, RoventPcCustodyReturnV2, RoventPcDeferredCleanupV2,
-    RoventPcRevokeObservationV2,
+    RoventPcCollectionAdmissionPortV2, RoventPcCollectionAdmissionStatusV2,
+    RoventPcCollectionHandoffV2, RoventPcCollectionHooksV2, RoventPcCollectionRootCustodyV2,
+    RoventPcCustodyReturnV2, RoventPcDeferredCleanupV2, RoventPcRevokeObservationV2,
 };
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread::JoinHandle;
 
 pub(crate) use super::collection_hooks_core_v2::CollectionWorkerExitV2 as RoventPcCollectionWorkerExitV2;
 pub(crate) type RoventPcCollectionWorkerV2 = CollectionWorkerCoreV2<RoventPcCollectionHandoffV2>;
 
 pub(crate) struct RoventPcCollectionBridgeV2 {
+    self_weak: Weak<Self>,
     core: Arc<CollectionBridgeCoreV2<RoventPcCollectionHandoffV2>>,
     owner: RoventCollectionOwnerLockV2,
     manifest: Arc<RoventCorpusManifestLockV2>,
@@ -169,7 +170,7 @@ impl RoventPcCollectionBridgeV2 {
         port: &mut RoventPcCollectionAdmissionPortV2<'_>,
         failure: CoreAdmissionFailure,
         code: &'static str,
-    ) -> Result<RoventPcCollectionAdmissionOutcomeV2, RoventPcCollectionAdmissionFailureV2> {
+    ) -> Result<RoventPcCollectionAdmissionStatusV2, RoventPcCollectionAdmissionFailureV2> {
         match self.core.try_seal_unstarted(&failure.admission) {
             Ok(CoreUnstartedSealV2::Sealed) => {
                 let reason = AdaptiveCollectionError::new(
@@ -178,10 +179,13 @@ impl RoventPcCollectionBridgeV2 {
                     format!("{:?}", failure.error),
                 );
                 self.defer_before_start(port, failure.admission, reason)
+                    .map(Into::into)
             }
-            Ok(CoreUnstartedSealV2::Busy) => Ok(RoventPcCollectionAdmissionOutcomeV2::Pending {
-                admission: failure.admission,
-            }),
+            Ok(CoreUnstartedSealV2::Busy) => {
+                Ok(RoventPcCollectionAdmissionStatusV2::PendingUncertain {
+                    admission: failure.admission,
+                })
+            }
             Ok(CoreUnstartedSealV2::Unknown) => Err(RoventPcCollectionAdmissionFailureV2 {
                 error: failure.error,
                 admission: failure.admission,
@@ -246,6 +250,12 @@ impl RoventPcCollectionBridgeV2 {
     ) -> Option<&RoventCollectionRootAdmissionV2> {
         self.core.installed_admission_for_recovery()
     }
+    pub(crate) fn try_revoke_original_attempt(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<Option<bool>, ArenaError> {
+        self.core.try_revoke_original_attempt(admission)
+    }
     pub(crate) fn try_begin_commit(
         &self,
         admission: &RoventCollectionRootAdmissionV2,
@@ -283,7 +293,8 @@ impl RoventPcCollectionBridgeV2 {
             handoff_submit,
         )?;
         Ok((
-            Arc::new(Self {
+            Arc::new_cyclic(|original| Self {
+                self_weak: original.clone(),
                 core,
                 owner,
                 manifest,
@@ -849,11 +860,29 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
         port: &mut RoventPcCollectionAdmissionPortV2<'_>,
         admission: RoventCollectionRootAdmissionV2,
     ) -> Result<RoventPcCollectionAdmissionOutcomeV2, RoventPcCollectionAdmissionFailureV2> {
+        let status = self.admit_with_status(port, admission)?;
+        let owner: Box<dyn std::any::Any + Send> = if matches!(
+            &status,
+            RoventPcCollectionAdmissionStatusV2::PendingUncertain { .. }
+        ) {
+            // The rejection holds this same bridge and its worker slot.
+            // The enclosing product separately retains the worker and run.
+            Box::new(self.self_weak.upgrade().expect("original P/C bridge owner"))
+        } else {
+            Box::new(())
+        };
+        status.into_legacy(owner)
+    }
+    fn admit_with_status(
+        &self,
+        port: &mut RoventPcCollectionAdmissionPortV2<'_>,
+        admission: RoventCollectionRootAdmissionV2,
+    ) -> Result<RoventPcCollectionAdmissionStatusV2, RoventPcCollectionAdmissionFailureV2> {
         if self.core.closed_before_next_admission(&admission) {
             return self.defer_before_start(port, admission, AdaptiveCollectionError::new(
                 AdaptiveCollectionStage::Dispatch, "PcCollectionCapacity",
                 "The previous root's bounded collection worker remains owned; this root is not captured",
-            ));
+            )).map(Into::into);
         }
         match self.core.admit(admission, |admission, owner| {
             port.install(admission, owner.observer())
@@ -865,11 +894,17 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
                     game_gate_status: CoreGameGateStatus::NotApplicable,
                 })
         }) {
-            Ok(()) => Ok(RoventPcCollectionAdmissionOutcomeV2::Installed),
+            Ok(()) => Ok(RoventPcCollectionAdmissionStatusV2::Installed),
             Err(failure) if failure.game_gate_status == CoreGameGateStatus::Busy => {
-                Ok(RoventPcCollectionAdmissionOutcomeV2::Pending {
-                    admission: failure.admission,
-                })
+                if failure.before_start {
+                    Ok(RoventPcCollectionAdmissionStatusV2::Pending {
+                        admission: failure.admission,
+                    })
+                } else {
+                    Ok(RoventPcCollectionAdmissionStatusV2::PendingUncertain {
+                        admission: failure.admission,
+                    })
+                }
             }
             Err(failure)
                 if failure.before_start
