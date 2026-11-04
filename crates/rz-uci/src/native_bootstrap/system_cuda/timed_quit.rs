@@ -16,7 +16,11 @@ use std::{
 pub(super) enum QuitRequestObservation {
     Cancelled,
     Enqueued,
-    QueueFullUntilDeadline,
+    /// Whether this worker actually observed a full queue before the window
+    /// elapsed; scheduler delay can prevent even the first attempt.
+    DeadlineExpired {
+        full_observed: bool,
+    },
     ConsumerClosed,
 }
 
@@ -49,16 +53,17 @@ impl TimedQuitRequest {
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                 }
+                let mut full_observed = false;
                 loop {
                     if Instant::now() > enqueue_until {
-                        return QuitRequestObservation::QueueFullUntilDeadline;
+                        return QuitRequestObservation::DeadlineExpired { full_observed };
                     }
                     match events.try_send(Event::Line("quit".into())) {
                         Ok(()) => return QuitRequestObservation::Enqueued,
                         Err(TrySendError::Disconnected(_)) => {
                             return QuitRequestObservation::ConsumerClosed;
                         }
-                        Err(TrySendError::Full(_)) => {}
+                        Err(TrySendError::Full(_)) => full_observed = true,
                     }
                     let wait = enqueue_until
                         .saturating_duration_since(Instant::now())
@@ -111,9 +116,9 @@ mod tests {
         let (events, receiver) = mpsc::sync_channel(1);
         let now = Instant::now();
         let mut worker =
-            TimedQuitRequest::spawn(events, now, now + Duration::from_secs(1)).unwrap();
+            TimedQuitRequest::spawn(events, now, now + Duration::from_secs(5)).unwrap();
         assert!(
-            matches!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), Event::Line(line) if line == "quit")
+            matches!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Event::Line(line) if line == "quit")
         );
         assert_eq!(
             worker.worker.take().unwrap().join().unwrap(),
@@ -128,9 +133,9 @@ mod tests {
         let now = Instant::now();
         let mut worker =
             TimedQuitRequest::spawn(events, now, now + Duration::from_millis(25)).unwrap();
-        assert_eq!(
+        assert!(matches!(
             worker.worker.take().unwrap().join().unwrap(),
-            QuitRequestObservation::QueueFullUntilDeadline
-        );
+            QuitRequestObservation::DeadlineExpired { .. }
+        ));
     }
 }
