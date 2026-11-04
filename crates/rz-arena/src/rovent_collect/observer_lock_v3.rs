@@ -13,7 +13,7 @@ use super::policy_row_pipeline_v3::PolicyRowPipelineOwnerV3;
 use super::producer_v3::{
     RoventCorpusProducerLockV3, RoventInputCaptureReservationV3, RoventRetiredLockV3Record,
 };
-use super::speculative_route_v3::SpeculativeRootV3;
+use super::speculative_route_v3::{SpeculativeRootV3, TargetCapabilityTakeV3};
 use super::*;
 use crate::pals_collect_v3::{GenerationActionSupportV3, GenerationCaptureWorkScopeV3};
 use rz_experiments::rovent_corpus_lock_v3::record::RoventCorpusManifestLockV3;
@@ -53,6 +53,19 @@ pub(super) enum PipelinePreparationV3 {
     Busy,
     NotReady,
     Failed,
+}
+
+pub(super) enum OriginalRouteMatchV3 {
+    Match,
+    Different,
+    NotReady,
+    Busy,
+}
+
+pub(super) enum PipelineCapabilityV3 {
+    NotReady,
+    Busy,
+    Outcome(TargetCapabilityTakeV3),
 }
 
 struct Staged {
@@ -100,6 +113,24 @@ impl RoventCollectionOwnerLockV3 {
     /// Identity only: this grants no execution, publication or completion.
     pub(crate) fn same_original_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Identity observation only. Busy does not imply a different route,
+    /// installation, native completion or permission to issue teacher work.
+    pub(super) fn try_matches_original_route(
+        &self,
+        route: &SpeculativeRootV3,
+    ) -> Result<OriginalRouteMatchV3, ArenaError> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(OriginalRouteMatchV3::Busy),
+            Err(_) => return Err(invalid("lock-v3 owner poisoned")),
+        };
+        Ok(match state.speculative_root.as_ref() {
+            Some(original) if original.same_original_route(route) => OriginalRouteMatchV3::Match,
+            Some(_) => OriginalRouteMatchV3::Different,
+            None => OriginalRouteMatchV3::NotReady,
+        })
     }
 
     /// Bind this root to the supervisor-retained game pipeline. The same
@@ -201,6 +232,37 @@ impl RoventCollectionOwnerLockV3 {
         } else {
             Ok(PipelinePreparationV3::NotReady)
         }
+    }
+
+    /// Transfer only the original route's ticket capability into the bound
+    /// pipeline. Manager/native execution and writer append remain separate.
+    pub(super) fn try_take_pipeline_capability(
+        &self,
+        pipeline: &PolicyRowPipelineOwnerV3,
+    ) -> Result<PipelineCapabilityV3, ArenaError> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(PipelineCapabilityV3::Busy),
+            Err(_) => return Err(invalid("lock-v3 owner poisoned")),
+        };
+        check(
+            state
+                .policy_pipeline
+                .as_ref()
+                .is_some_and(|original| original.same_owner(pipeline)),
+            "lock-v3 policy pipeline differs from original supervisor",
+        )?;
+        let Some(route) = state.speculative_root.as_ref() else {
+            return Ok(PipelineCapabilityV3::NotReady);
+        };
+        let mut slot = match pipeline.try_lock().map_err(invalid)? {
+            Some(slot) => slot,
+            None => return Ok(PipelineCapabilityV3::Busy),
+        };
+        Ok(match slot.try_take_target_capability(route)? {
+            Some(outcome) => PipelineCapabilityV3::Outcome(outcome),
+            None => PipelineCapabilityV3::NotReady,
+        })
     }
     pub(crate) fn new_shared(
         manifest: Arc<RoventCorpusManifestLockV3>,

@@ -177,15 +177,18 @@ pub(crate) fn run_original_v3_lifecycle(
         .err()
         .expect("different original lock must be rejected");
     assert!(failure.owner.is_none());
+    assert_eq!(failure.failure.code, "RoventStorageOriginalAdmission");
     assert!(rejected.core.worker.is_none());
+    // adopt() moves the exact PC owner into its Idle wrapper before the
+    // admission check; rejection retains that wrapper, not core.original.
+    assert!(rejected.core.original.is_none());
     let retained = rejected
         .core
-        .original
+        .idle
         .take()
-        .expect("original owner retained");
-    let StorageSemanticOwner::Pc(retained) = retained else {
-        panic!("wrong retained owner")
-    };
+        .expect("original idle owner retained")
+        .into_pc()
+        .unwrap_or_else(|_| panic!("original idle owner had a different kind"));
     assert_eq!(std::ptr::from_ref(retained.as_ref()), rejected_ptr);
     assert!(rejected.core.first_failure.is_some());
 }
