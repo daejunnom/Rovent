@@ -3494,7 +3494,11 @@ fn run_lc0_supervised(
     let mut listener = pending.prepare_parent_listener(&receipts)?;
     if let Err(error) = listener.bind(cleanup_until) {
         if let Err(cleanup_error) = listener.retire_before_auth(&pending, cleanup_until) {
-            hold_lc0_pre_native((pending, listener, receipts, error, cleanup_error));
+            return Err(Box::new(Lc0PreNativeCleanupFailure {
+                original: error,
+                cleanup: cleanup_error,
+                _owners: (pending, listener, receipts),
+            }));
         }
         return Err(Box::new(error));
     }
@@ -3502,14 +3506,22 @@ fn run_lc0_supervised(
         Ok(notice) => notice,
         Err(error) => {
             if let Err(cleanup_error) = listener.retire_before_auth(&pending, cleanup_until) {
-                hold_lc0_pre_native((pending, listener, receipts, error, cleanup_error));
+                return Err(Box::new(Lc0PreNativeCleanupFailure {
+                    original: error,
+                    cleanup: cleanup_error,
+                    _owners: (pending, listener, receipts),
+                }));
             }
             return Err(Box::new(error));
         }
     };
     if let Err(error) = writeln!(io::stderr().lock(), "{notice}") {
         if let Err(cleanup_error) = listener.retire_before_auth(&pending, cleanup_until) {
-            hold_lc0_pre_native((pending, listener, receipts, error, cleanup_error));
+            return Err(Box::new(Lc0PreNativeCleanupFailure {
+                original: error,
+                cleanup: cleanup_error,
+                _owners: (pending, listener, receipts),
+            }));
         }
         return Err(Box::new(error));
     }
@@ -3520,7 +3532,11 @@ fn run_lc0_supervised(
             if let Err(cleanup_error) =
                 failure.retire_listener_before_native(&mut listener, cleanup_until)
             {
-                hold_lc0_pre_native((failure, listener, receipts, cleanup_error));
+                return Err(Box::new(Lc0PreNativeCleanupFailure {
+                    original: failure,
+                    cleanup: cleanup_error,
+                    _owners: (listener, receipts),
+                }));
             }
             return Err(Box::new(failure));
         }
@@ -3625,9 +3641,35 @@ fn run_lc0_supervised(
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
-fn hold_lc0_pre_native<T>(_original_owners_and_error: T) -> ! {
-    loop {
-        thread::park_timeout(Duration::from_secs(1));
+struct Lc0PreNativeCleanupFailure<E, O> {
+    original: E,
+    cleanup: io::Error,
+    _owners: O,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+impl<E, O> std::fmt::Debug for Lc0PreNativeCleanupFailure<E, O> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Lc0PreNativeCleanupFailure")
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+impl<E: std::fmt::Display, O> std::fmt::Display for Lc0PreNativeCleanupFailure<E, O> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "LC0 pre-native failure: {}; endpoint cleanup failed ({:?}); endpoint pathname is retained or unknown; native entry was not attempted",
+            self.original,
+            self.cleanup.kind()
+        )
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+impl<E: std::error::Error + 'static, O> std::error::Error for Lc0PreNativeCleanupFailure<E, O> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.original)
     }
 }
 
