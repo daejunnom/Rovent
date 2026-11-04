@@ -1604,6 +1604,20 @@ impl RoventNativeInputObserver {
     }
 }
 impl VirtualReviewCollectionObserver for RoventNativeInputObserver {
+    #[cfg(target_os = "linux")]
+    fn retain_after_observation_failure(
+        &mut self,
+        stage: VirtualReviewCaptureFailureStage,
+        ticket: &RoleTicketEnvelope,
+    ) -> bool {
+        let Ok(state) = self.failure.try_lock() else {
+            return false;
+        };
+        state
+            .v3_failures
+            .iter()
+            .any(|(_, failure, _)| failure.stage == stage && failure.ticket == *ticket)
+    }
     fn preserve_observation_failure(
         &mut self,
         stage: VirtualReviewCaptureFailureStage,
