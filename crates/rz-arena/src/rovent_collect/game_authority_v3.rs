@@ -1,6 +1,6 @@
 //! Candidate original game owner for V3 Collection.
-//! This module is not registered or connected to a product bridge. Its
-//! close proof is intentionally unconstructible until an audited bridge
+//! This candidate has partial bridge bindings, not complete product closure.
+//! Its close proof is intentionally unconstructible until an audited bridge
 //! proves the original native fence and all root/producer custody.
 use super::launch::{ManagedOutputOwnerV3, PreparedPcCollectionInputsV3};
 use super::policy_row_pipeline_v3::PolicyRowPipelineOwnerV3;
@@ -259,6 +259,7 @@ impl<S> GameAuthorityV3<S> {
             owner: Arc::clone(self),
             root: root.clone(),
             resolved: false,
+            abort_receipt: None,
         })
     }
 
@@ -372,6 +373,22 @@ pub(super) struct GameRootReservationV3<S> {
     owner: Arc<GameAuthorityV3<S>>,
     root: RoventCollectionRootAdmissionV3,
     resolved: bool,
+    abort_receipt: Option<GameRootAbortReceiptV3<S>>,
+}
+
+/// The original gate observed abort at this exact registration commit.
+/// This does not prove that worker, teacher, or queue work is absent.
+pub(super) struct GameRootAbortReceiptV3<S> {
+    owner: Arc<GameAuthorityV3<S>>,
+    root: RoventCollectionRootAdmissionV3,
+}
+impl<S> GameRootAbortReceiptV3<S> {
+    pub(super) fn matches_game(&self, game: &Arc<GameAuthorityV3<S>>) -> bool {
+        Arc::ptr_eq(&self.owner, game)
+    }
+    pub(super) fn matches_original(&self, root: &RoventCollectionRootAdmissionV3) -> bool {
+        self.root.same_original_admission(root)
+    }
 }
 impl<S> GameRootReservationV3<S> {
     /// Call only after the exact root slot exists. If abort raced, the caller
@@ -392,10 +409,27 @@ impl<S> GameRootReservationV3<S> {
         state.admitted.push(root);
         self.resolved = true;
         if (self.owner.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0) {
+            self.abort_receipt = Some(GameRootAbortReceiptV3 {
+                owner: Arc::clone(&self.owner),
+                root: self.root.clone(),
+            });
             GameStepV3::Aborted
         } else {
             GameStepV3::Ready
         }
+    }
+
+    /// Transfer into a pre-owned empty slot without exposing an intermediate
+    /// receipt whose owner could be lost during a later fallible operation.
+    pub(super) fn transfer_abort_receipt(
+        &mut self,
+        destination: &mut Option<GameRootAbortReceiptV3<S>>,
+    ) -> bool {
+        if destination.is_some() || self.abort_receipt.is_none() {
+            return false;
+        }
+        *destination = self.abort_receipt.take();
+        true
     }
     /// Only for a proven failure before any bridge slot/queue mutation.
     pub(super) fn cancel_unstarted(&mut self) -> GameStepV3 {
@@ -417,7 +451,7 @@ impl<S> GameRootReservationV3<S> {
 }
 impl<S> Drop for GameRootReservationV3<S> {
     fn drop(&mut self) {
-        if !self.resolved {
+        if !self.resolved || self.abort_receipt.is_some() {
             self.owner.unknown.store(true, Ordering::SeqCst);
         }
     }
@@ -472,7 +506,14 @@ impl<S> GamePublishGuardV3<S> {
             Ordering::SeqCst,
         ) {
             Ok(_) => {}
-            Err(actual) if actual & ABORT_REQUESTED != 0 => return GameStepV3::Aborted,
+            Err(actual) if actual & ABORT_REQUESTED != 0 => {
+                // Authorization is known not to have been granted. Any
+                // earlier output mutation remains the output owner's own
+                // separate custody/uncertainty, not a game-gate unknown.
+                state.phase = PhaseV3::Closed;
+                self.resolved = true;
+                return GameStepV3::Aborted;
+            }
             Err(_) => return GameStepV3::Unknown,
         }
         state.phase = PhaseV3::Granted;
