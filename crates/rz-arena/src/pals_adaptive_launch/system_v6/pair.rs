@@ -621,7 +621,7 @@ pub(super) mod tests {
             source_files: BTreeMap::new(),
         }
     }
-    pub(in crate::pals_adaptive_launch::system_v6) fn fixture() -> PalsSystemArenaPairV6 {
+    pub(crate) fn fixture() -> PalsSystemArenaPairV6 {
         let pair = PalsPairPlanV5 {
             opening_id: "test-opening".into(),
             position_command: "position startpos".into(),

@@ -54,6 +54,8 @@ pub(crate) use no_game_resources::{
     NoGameResourceOwnerV1, ResourceComparisonV1, ResourceLimitReadbackV1,
 };
 mod pair;
+#[cfg(test)]
+pub(crate) use pair::tests::fixture as v6_test_pair_fixture;
 mod pair_native;
 #[cfg(target_os = "linux")]
 mod preflight;
