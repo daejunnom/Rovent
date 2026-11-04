@@ -1029,7 +1029,10 @@ impl RoventPcCollectionBridgeV3 {
                 Err(TryLockError::WouldBlock) => return Ok(false),
                 Err(TryLockError::Poisoned(_)) => return Err("P-C V3 recovery owner poisoned"),
             };
-            if !owner.matches_admission(admission) { return Err("P-C V3 recovery root differs"); }
+            let Some(bridge) = self.self_weak.upgrade() else { return Err("P-C V3 original bridge absent"); };
+            if !owner.matches_admission(admission) || !owner.matches_received_root(&bridge) {
+                return Err("P-C V3 recovery or received root differs");
+            }
         }
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
@@ -1043,6 +1046,23 @@ impl RoventPcCollectionBridgeV3 {
         }
         slot.recovery = Some(Arc::clone(recovery));
         Ok(true)
+    }
+
+    /// Identity observation only: this does not attest effect execution or
+    /// worker/teacher completion. Busy preserves the original owner.
+    pub(super) fn try_matches_registered_recovery(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+        recovery: &Arc<Mutex<PcRootRecoveryV3>>,
+    ) -> Result<Option<bool>, &'static str> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 root custody poisoned"),
+        };
+        Ok(Some(state.roots.iter().any(|slot|
+            slot.admission.same_original_admission(admission)
+                && slot.recovery.as_ref().is_some_and(|old| Arc::ptr_eq(old, recovery)))))
     }
 
     /// Called by the supervisor after route installation, native owner
