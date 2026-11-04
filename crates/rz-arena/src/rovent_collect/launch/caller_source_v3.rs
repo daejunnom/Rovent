@@ -37,6 +37,7 @@ const ARENA_CALLER_FILES: &[(&str, &[u8])] = &[
     arena_source!("src/rovent_collect/launch.rs"),
     arena_source!("src/rovent_collect/launch/pc_lock_v3.rs"),
     arena_source!("src/rovent_collect/launch/pc_recovery_v3.rs"),
+    arena_source!("src/rovent_collect/launch/managed_output_fd_v2.rs"),
     arena_source!("src/rovent_collect/launch/caller_source_v3.rs"),
     arena_source!("src/rovent_collect/native_capture.rs"),
     arena_source!("src/rovent_collect/capture_router_v3.rs"),
