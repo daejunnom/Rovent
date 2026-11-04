@@ -62,6 +62,14 @@ pub(super) enum PolicyFinalizationV3 {
     Unknown,
 }
 
+pub(super) enum PolicyReceiptReadV3 {
+    Busy,
+    NotReady,
+    Foreign,
+    Available(rz_experiments::rovent_corpus_lock_v3::publication::RoventLockV3Publication),
+    Unknown,
+}
+
 pub(super) enum PolicyPipelineProgressV3 {
     Appended,
     /// A complete prior chunk is in this pipeline's retained output owner.
@@ -208,6 +216,29 @@ impl PolicyRowPipelineOwnerV3 {
 
     pub(super) fn output_owner(&self) -> PolicyOutputOwnerV3 {
         PolicyOutputOwnerV3(self.clone())
+    }
+
+    /// Return an immutable receipt observation for the same original game.
+    /// The original receipt and finished writer stay in this pipeline owner.
+    pub(super) fn try_read_receipt<S>(&self, guard: &GamePublishGuardV3<S>) -> PolicyReceiptReadV3 {
+        let state = match self.try_lock() {
+            Ok(Some(state)) => state,
+            Ok(None) => return PolicyReceiptReadV3::Busy,
+            Err(_) => return PolicyReceiptReadV3::Unknown,
+        };
+        if state.is_uncertain() {
+            return PolicyReceiptReadV3::Unknown;
+        }
+        let Some(origin) = state.output_origin.as_ref() else {
+            return PolicyReceiptReadV3::NotReady;
+        };
+        if !guard.matches_original_game(origin) {
+            return PolicyReceiptReadV3::Foreign;
+        }
+        match state.output_publication.as_ref() {
+            Some(receipt) => PolicyReceiptReadV3::Available(receipt.clone()),
+            None => PolicyReceiptReadV3::NotReady,
+        }
     }
 
     /// Advance only this original pipeline after the real game owner has
