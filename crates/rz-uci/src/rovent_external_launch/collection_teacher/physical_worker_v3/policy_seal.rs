@@ -151,9 +151,6 @@ impl RoventCollectionTeacherLifecycleV3 {
                 let startup = owner
                     .verified_startup()?
                     .ok_or(invalid("teacher /3 startup absent"))?;
-                // This check queries the live root, so it must run before taking
-                // the root's current-authority lock below.
-                owner.validate_completion(completion, dispatch)?;
                 let registration = owner.worker.registration();
                 let admission = owner.admission();
                 let root = admission.root_admission();
@@ -214,6 +211,9 @@ impl RoventCollectionTeacherLifecycleV3 {
                         "teacher /3 policy authority unavailable or incomplete",
                     ));
                 }
+                // This checks original worker provenance without acquiring
+                // the root mutex already held by `current`.
+                owner.validate_completion_provenance(completion, dispatch)?;
                 let now = clock
                     .try_now()
                     .map_err(|_| invalid("teacher /3 clock unavailable"))?;
