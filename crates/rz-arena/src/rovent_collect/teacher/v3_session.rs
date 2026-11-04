@@ -143,6 +143,37 @@ pub(crate) struct TeacherScopeUnclaimedProofV3 {
     admission: RoventCollectionRootAdmissionV3,
 }
 
+/// The original stage was sealed before it issued any effect source or
+/// entered its scope claim. This is not a game abort or no-scope ACK.
+pub(crate) struct TeacherScopeBeforeSourceProofV3 {
+    identity: Arc<()>,
+    admission: RoventCollectionRootAdmissionV3,
+}
+
+impl TeacherScopeBeforeSourceProofV3 {
+    pub(crate) fn matches_original(
+        &self,
+        stage: &TeacherSessionStagingV3,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> bool {
+        Arc::ptr_eq(&self.identity, &stage.scope_effect_identity)
+            && self.admission.same_original_admission(admission)
+            && stage
+                .scope_original_admission
+                .same_original_admission(admission)
+            && stage.scope_preclaim_sealed
+            && !stage.scope_effect_source_issued
+            && !stage.scope_effect_attempted
+            && stage.state == TeacherSessionStageStateV3::Prepared
+            && stage.ready.is_none()
+            && stage.panic.is_none()
+            && stage
+                .preflight
+                .as_ref()
+                .is_some_and(|preflight| !preflight.scope.is_claimed())
+    }
+}
+
 impl TeacherScopeUnclaimedProofV3 {
     pub(crate) fn matches_original(
         &self,
@@ -240,6 +271,39 @@ pub(crate) enum TeacherSessionClaimErrorV3 {
 }
 
 impl TeacherSessionStagingV3 {
+    /// Retain a distinct proof for the stage that never issued a source.
+    /// A false result leaves both the issuer and destination unchanged.
+    pub(crate) fn seal_unclaimed_scope_before_source(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV3,
+        destination: &mut Option<TeacherScopeBeforeSourceProofV3>,
+    ) -> bool {
+        if destination.is_some()
+            || self.scope_preclaim_sealed
+            || self.scope_effect_source_issued
+            || self.scope_effect_attempted
+            || self.state != TeacherSessionStageStateV3::Prepared
+            || self.ready.is_some()
+            || self.panic.is_some()
+            || !self
+                .scope_original_admission
+                .same_original_admission(admission)
+            || !self
+                .preflight
+                .as_ref()
+                .is_some_and(|preflight| !preflight.scope.is_claimed())
+        {
+            return false;
+        }
+        let proof = TeacherScopeBeforeSourceProofV3 {
+            identity: Arc::clone(&self.scope_effect_identity),
+            admission: self.scope_original_admission.clone(),
+        };
+        self.scope_preclaim_sealed = true;
+        *destination = Some(proof);
+        true
+    }
+
     /// The original stage owns this identity before any scope claim.
     pub(crate) fn scope_effect_identity_weak(&self) -> Weak<()> {
         Arc::downgrade(&self.scope_effect_identity)
