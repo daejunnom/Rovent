@@ -747,6 +747,7 @@ struct IndependentNoGameOwners {
     // snapshot/execution/socket Arcs and the selected proxy FD.
     _binding: crate::pals_adaptive_launch::DirectNoGameBinding,
     envelope: IndependentNoGameSupervisorEnvelope,
+    resource: Option<crate::pals_adaptive_launch::NoGameResourceOwnerV1>,
     plan_sha256: String,
     observation: Option<crate::process::OriginalSmokeUciObservation>,
     quarantined_error: Option<ArenaError>,
@@ -1022,6 +1023,7 @@ impl PreparedIndependentNoGameOwner {
             owners: Some(IndependentNoGameOwners {
                 _binding: binding,
                 envelope,
+                resource: None,
                 plan_sha256,
                 observation: None,
                 quarantined_error: None,
@@ -1054,6 +1056,50 @@ impl PreparedIndependentNoGameOwner {
     /// May include bytes read before an interrupted supervisor returns.
     pub(crate) fn observation(&self) -> Option<&crate::process::OriginalSmokeUciObservation> {
         self.owners.as_ref()?.observation.as_ref()
+    }
+
+    /// Keep the original optional resource observation owner with this same
+    /// scope. Rejection returns the unchanged owner and its original FD.
+    /// Neither attaching it nor a later readback authorizes dispatch.
+    pub(crate) fn attach_resource_observer(
+        &mut self,
+        resource: crate::pals_adaptive_launch::NoGameResourceOwnerV1,
+    ) -> Result<
+        (),
+        (
+            ArenaError,
+            crate::pals_adaptive_launch::NoGameResourceOwnerV1,
+        ),
+    > {
+        let Some(owners) = self.owners.as_mut() else {
+            return Err((
+                ArenaError::Invalid("NoGame original owner unavailable".into()),
+                resource,
+            ));
+        };
+        if owners.resource.is_some() {
+            return Err((
+                ArenaError::Invalid("NoGame resource observer already attached".into()),
+                resource,
+            ));
+        }
+        if !resource.matches_original(owners._binding.snapshot(), owners._binding.execution()) {
+            return Err((
+                ArenaError::Integrity("NoGame resource observer owner differs".into()),
+                resource,
+            ));
+        }
+        owners.resource = Some(resource);
+        Ok(())
+    }
+
+    /// Explicit, best-effort caller-requested observation; never an admission
+    /// or proof of CPU/memory enforcement, child barrier or GPU completion.
+    pub(crate) fn observe_resource(
+        &self,
+    ) -> Option<crate::pals_adaptive_launch::NoGameResourceObservationV1> {
+        let owners = self.owners.as_ref()?;
+        Some(owners.resource.as_ref()?.observe(Some(&self.spawn_custody)))
     }
 
     /// Source-level link only: admission has no producer until original
