@@ -24,6 +24,7 @@ use super::configuration::{
 };
 use super::launch::storage::{
     RoventStorageOwnedRuntimeRegistration, RoventStorageOwnedRuntimeRegistrationV2,
+    RoventStorageOwnedRuntimeRegistrationV3,
 };
 use super::nnuec_preparing::{
     InitialNnuecFailure, InitialNnuecPhase, InitialNnuecPreparing, InitialNnuecReady,
@@ -1321,6 +1322,12 @@ impl NnuecSources {
             _ => None,
         }
     }
+    fn v3(&self) -> Option<&Arc<RoventPinnedNativeSources<rz_experiments::RoventInputLockV3>>> {
+        match self {
+            Self::V3(v) => Some(v),
+            _ => None,
+        }
+    }
     fn forget_original(&self) {
         match self {
             Self::V1(v) => std::mem::forget(Arc::clone(v)),
@@ -2569,6 +2576,92 @@ impl RoventNnuecSessionDriver {
             ));
         }
         let shared = Arc::new(SharedRoventStorageRegistration::new_v2(original));
+        *slot = Some(SessionStorageLifecycle::new(Arc::clone(&shared)));
+        Ok(shared)
+    }
+
+    pub(crate) fn install_storage_registration_v3(
+        &self,
+        original: RoventStorageOwnedRuntimeRegistrationV3,
+    ) -> Result<
+        Arc<SharedRoventStorageRegistration>,
+        (
+            RoventStorageOwnedRuntimeRegistrationV3,
+            SearchSessionFailure,
+        ),
+    > {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(_) => {
+                return Err((
+                    original,
+                    SearchSessionFailure::physical_completion_unknown(),
+                ));
+            }
+        };
+        let mut slot = match self.storage.try_lock() {
+            Ok(slot) => slot,
+            Err(_) => {
+                return Err((
+                    original,
+                    SearchSessionFailure::physical_completion_unknown(),
+                ));
+            }
+        };
+        let valid_idle = matches!(&*state, State::Idle(idle)
+            if idle.previous_root.is_none() && idle.actor.is_none() && idle.game.is_none()
+                && idle.owner.as_ref().is_some_and(|owner| owner.stores().generation() == 0 && owner.stores().root().is_none())
+                && idle.native.finished.is_none() && !idle.native.joined
+                && !idle.native.service.is_quarantined() && idle.native.service.occupancy() == 0);
+        if slot.is_some() || self.closed.load(Ordering::Acquire) || !valid_idle {
+            return Err((
+                original,
+                unknown(
+                    "RoventNnuecStorageInstall",
+                    "storage requires the unused original native StartupReady owner",
+                ),
+            ));
+        }
+        let Some(sources) = self.sources.v3() else {
+            return Err((
+                original,
+                failure(
+                    "RoventNnuecStorageNamespace",
+                    "original V3 sources required",
+                ),
+            ));
+        };
+        if !self
+            .process_v3
+            .as_ref()
+            .is_some_and(|process| Arc::ptr_eq(process, original.process_boundary()))
+        {
+            return Err((
+                original,
+                failure(
+                    "RoventNnuecStorageNamespace",
+                    "storage and session do not retain the same original V3 process owner",
+                ),
+            ));
+        }
+        if let Err(error) =
+            original.validate_session_attachment(sources.lock(), &self.clock, self.implementation)
+        {
+            return Err((
+                original,
+                SearchSessionFailure::debug("RoventNnuecStorageNamespace", &error),
+            ));
+        }
+        if let Err(error) = original
+            .profile()
+            .validate_for_manifest_v3(&sources.lock().manifest)
+        {
+            return Err((
+                original,
+                SearchSessionFailure::debug("RoventNnuecStorageResources", &error),
+            ));
+        }
+        let shared = Arc::new(SharedRoventStorageRegistration::new_v3(original));
         *slot = Some(SessionStorageLifecycle::new(Arc::clone(&shared)));
         Ok(shared)
     }

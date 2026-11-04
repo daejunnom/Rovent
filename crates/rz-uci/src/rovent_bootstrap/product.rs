@@ -302,7 +302,10 @@ pub use diagnostics::{
     RoventProductLifecycleObservation,
 };
 pub(crate) use storage::SharedRoventStorageRegistration;
-pub use storage::{RoventProductStorageStartupRejection, RoventProductStorageStartupRejectionV2};
+pub use storage::{
+    RoventProductStorageStartupRejection, RoventProductStorageStartupRejectionV2,
+    RoventProductStorageStartupRejectionV3,
+};
 // A product's single Arc owns exactly one selected driver for the whole
 // session, including physical shutdown and retained-source custody.
 #[allow(clippy::large_enum_variant)]
@@ -1201,6 +1204,8 @@ pub struct RoventNativeProductDriverV3 {
     sources: Arc<RoventPinnedNativeSources<rz_experiments::RoventInputLockV3>>,
     process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
     physically_closed: Arc<AtomicBool>,
+    process_clock: ProcessClock,
+    storage_registration: std::sync::Mutex<Option<storage::RetainedStorageRegistration>>,
 }
 
 pub type RoventProductV3StartupRejection = RoventPcSessionV3Rejection;
@@ -1269,7 +1274,7 @@ impl RoventPcAssemblyV3 {
             &mut self.prepared,
             &mut self.loaded,
             Arc::clone(&self.process),
-            clock,
+            clock.clone(),
             owners,
             identity,
             root_policy,
@@ -1280,6 +1285,8 @@ impl RoventPcAssemblyV3 {
             sources,
             process: Arc::clone(&self.process),
             physically_closed,
+            process_clock: clock,
+            storage_registration: std::sync::Mutex::new(None),
         });
         self.driver = Some(Arc::clone(&driver));
         Ok(driver)
@@ -1305,7 +1312,7 @@ impl RoventNativeProductDriverV3 {
         let driver = RoventPcSessionDriver::new_v3(
             prepared,
             Arc::clone(&process),
-            clock,
+            clock.clone(),
             owners,
             identity,
             root_policy,
@@ -1319,6 +1326,8 @@ impl RoventNativeProductDriverV3 {
             sources,
             process,
             physically_closed: Arc::new(AtomicBool::new(false)),
+            process_clock: clock,
+            storage_registration: std::sync::Mutex::new(None),
         })
     }
 
@@ -1339,7 +1348,7 @@ impl RoventNativeProductDriverV3 {
             prepared,
             loaded,
             Arc::clone(&process),
-            clock,
+            clock.clone(),
             owners,
             identity,
             root_policy,
@@ -1353,6 +1362,8 @@ impl RoventNativeProductDriverV3 {
             sources,
             process,
             physically_closed: Arc::new(AtomicBool::new(false)),
+            process_clock: clock,
+            storage_registration: std::sync::Mutex::new(None),
         })
     }
 
@@ -2566,6 +2577,8 @@ pub struct RoventOwnNnuecProductDriverV3 {
     sources: Arc<RoventPinnedNativeSources<rz_experiments::RoventInputLockV3>>,
     process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
     physically_closed: Arc<AtomicBool>,
+    process_clock: ProcessClock,
+    storage_registration: std::sync::Mutex<Option<storage::RetainedStorageRegistration>>,
 }
 
 /// Failed assembly returns the original loaded model, prepared native owner
@@ -2643,7 +2656,7 @@ impl RoventOwnNnuecAssemblyV3 {
             &mut self.prepared,
             &mut self.loaded,
             Arc::clone(&self.process),
-            clock,
+            clock.clone(),
             owners,
             identity,
             root_policy,
@@ -2654,6 +2667,8 @@ impl RoventOwnNnuecAssemblyV3 {
             sources,
             process: Arc::clone(&self.process),
             physically_closed,
+            process_clock: clock,
+            storage_registration: std::sync::Mutex::new(None),
         });
         self.driver = Some(Arc::clone(&driver));
         Ok(driver)
@@ -2681,7 +2696,7 @@ impl RoventOwnNnuecProductDriverV3 {
             prepared,
             loaded,
             Arc::clone(&process),
-            clock,
+            clock.clone(),
             owners,
             identity,
             root_policy,
@@ -2696,6 +2711,8 @@ impl RoventOwnNnuecProductDriverV3 {
             sources,
             process,
             physically_closed: Arc::new(AtomicBool::new(false)),
+            process_clock: clock,
+            storage_registration: std::sync::Mutex::new(None),
         })
     }
 

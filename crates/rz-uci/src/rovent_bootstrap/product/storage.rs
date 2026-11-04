@@ -5,24 +5,34 @@
 
 use super::{
     ActualProductDriver, RoventNativeProductDriver, RoventNativeProductDriverV2,
-    RoventOwnNnuecProductDriverV2, RoventOwnPcrProductDriverV2,
+    RoventNativeProductDriverV3, RoventOwnNnuecProductDriverV2, RoventOwnNnuecProductDriverV3,
+    RoventOwnPcrProductDriverV2,
 };
 use crate::engine::ProcessClock;
 use crate::rovent_bootstrap::launch::storage::{
     RoventStorageAdmissionOwners, RoventStorageCompiledCustody, RoventStorageCompiledCustodyV2,
-    RoventStorageOwnedRuntimeRegistration, RoventStorageOwnedRuntimeRegistrationV2,
-    RoventStorageRegistrationFailureV2, RoventStorageRuntimeError,
-    RoventStorageRuntimeOwnershipFailure, RoventStorageRuntimeOwnershipFailureV2,
+    RoventStorageCompiledCustodyV3, RoventStorageOwnedRuntimeRegistration,
+    RoventStorageOwnedRuntimeRegistrationV2, RoventStorageOwnedRuntimeRegistrationV3,
+    RoventStorageRegistrationFailureV2, RoventStorageRegistrationFailureV3,
+    RoventStorageRuntimeError, RoventStorageRuntimeOwnershipFailure,
+    RoventStorageRuntimeOwnershipFailureV2, RoventStorageRuntimeOwnershipFailureV3,
     RoventStorageRuntimeRegistrationFailure, RoventStorageSetupRejection,
     own_rovent_storage_runtime_registration, own_rovent_storage_runtime_registration_v2,
-    register_rovent_storage_runtime, register_rovent_storage_runtime_v2,
+    own_rovent_storage_runtime_registration_v3, register_rovent_storage_runtime,
+    register_rovent_storage_runtime_v2, register_rovent_storage_runtime_v3,
 };
 use crate::rovent_bootstrap::process_boundary::{
     VerifiedOwnedRoventProcessBoundary, VerifiedOwnedRoventProcessBoundaryV2,
+    VerifiedOwnedRoventProcessBoundaryV3,
 };
-use crate::rovent_root_admission::{RoventRootAdmission, source_seal::RoventRootAdmissionV2};
+use crate::rovent_root_admission::{
+    RoventRootAdmission,
+    source_seal::{RoventRootAdmissionV2, RoventRootAdmissionV3},
+};
 use crate::search_driver::{DriverPhysicalCompletion, SearchSessionDriver, SearchSessionFailure};
-use rz_experiments::{ManifestError, RoventInputLock, RoventInputLockV2, RoventStorageProfile};
+use rz_experiments::{
+    ManifestError, RoventInputLock, RoventInputLockV2, RoventInputLockV3, RoventStorageProfile,
+};
 use rz_runtime::contracts::ContractClock;
 use rz_search::pals::engine::idle_archive::{
     UnusedIdleArchiveSetup, UnusedIdleArchiveSetupIdentity,
@@ -43,10 +53,12 @@ pub(crate) struct SharedRoventStorageRegistration {
 enum StorageRegistrationOwner {
     V1(RoventStorageOwnedRuntimeRegistration),
     V2(RoventStorageOwnedRuntimeRegistrationV2),
+    V3(RoventStorageOwnedRuntimeRegistrationV3),
 }
 enum StorageInputOwner {
     V1(Arc<RoventInputLock>),
     V2(Arc<RoventInputLockV2>),
+    V3(Arc<RoventInputLockV3>),
 }
 impl SharedRoventStorageRegistration {
     pub(crate) fn new(original: RoventStorageOwnedRuntimeRegistration) -> Self {
@@ -65,6 +77,14 @@ impl SharedRoventStorageRegistration {
             original: Mutex::new(StorageRegistrationOwner::V2(original)),
         }
     }
+    pub(crate) fn new_v3(original: RoventStorageOwnedRuntimeRegistrationV3) -> Self {
+        Self {
+            input_lock: StorageInputOwner::V3(Arc::clone(original.owners().input_lock())),
+            profile: original.profile().clone(),
+            identity: original.identity(),
+            original: Mutex::new(StorageRegistrationOwner::V3(original)),
+        }
+    }
     pub(crate) fn identity(&self) -> UnusedIdleArchiveSetupIdentity {
         self.identity
     }
@@ -74,13 +94,14 @@ impl SharedRoventStorageRegistration {
     pub(crate) fn input_lock_owner(&self) -> &Arc<RoventInputLock> {
         match &self.input_lock {
             StorageInputOwner::V1(lock) => lock,
-            StorageInputOwner::V2(_) => unreachable!("V1-only caller"),
+            StorageInputOwner::V2(_) | StorageInputOwner::V3(_) => unreachable!("V1-only caller"),
         }
     }
     pub(crate) fn validate_profile(&self) -> Result<(), ManifestError> {
         match &self.input_lock {
             StorageInputOwner::V1(lock) => self.profile.validate_for_manifest(&lock.manifest),
             StorageInputOwner::V2(lock) => self.profile.validate_for_manifest_v2(&lock.manifest),
+            StorageInputOwner::V3(lock) => self.profile.validate_for_manifest_v3(&lock.manifest),
         }
     }
     pub(crate) fn accepts_v1_admission(&self) -> bool {
@@ -104,6 +125,27 @@ impl SharedRoventStorageRegistration {
             }
             _ => Err(RoventStorageRuntimeError::Namespace(
                 "V2 admission and original storage owner differ",
+            )),
+        }
+    }
+    pub(crate) fn validate_v3_admission(
+        &self,
+        admission: &RoventRootAdmissionV3,
+    ) -> Result<(), RoventStorageRuntimeError> {
+        let owner = self.original.try_lock().map_err(|cause| {
+            RoventStorageRuntimeError::Namespace(match cause {
+                std::sync::TryLockError::WouldBlock => "original storage registration is busy",
+                std::sync::TryLockError::Poisoned(_) => "original storage registration is poisoned",
+            })
+        })?;
+        match (&*owner, &self.input_lock) {
+            (StorageRegistrationOwner::V3(original), StorageInputOwner::V3(lock))
+                if Arc::ptr_eq(original.owners().input_lock(), lock) =>
+            {
+                original.validate_live_admission(admission)
+            }
+            _ => Err(RoventStorageRuntimeError::Namespace(
+                "V3 admission and original storage owner differ",
             )),
         }
     }
@@ -164,6 +206,43 @@ impl SharedRoventStorageRegistration {
                     return Err(RoventStorageSetupRejection {
                         error: RoventStorageRuntimeError::Namespace(
                             "shared V2 storage attribution changed",
+                        ),
+                        admission,
+                    });
+                }
+                original.take_unused_idle_setup(admission)
+            }
+            Err(cause) => Err(RoventStorageSetupRejection {
+                error: RoventStorageRuntimeError::Namespace(match cause {
+                    std::sync::TryLockError::WouldBlock => "original storage registration is busy",
+                    std::sync::TryLockError::Poisoned(_) => {
+                        "original storage registration is poisoned"
+                    }
+                }),
+                admission,
+            }),
+        }
+    }
+    pub(crate) fn take_unused_setup_v3(
+        &self,
+        admission: Arc<RoventRootAdmissionV3>,
+    ) -> Result<UnusedIdleArchiveSetup, RoventStorageSetupRejection<RoventRootAdmissionV3>> {
+        match self.original.try_lock() {
+            Ok(mut owner) => {
+                let (StorageRegistrationOwner::V3(original), StorageInputOwner::V3(lock)) =
+                    (&mut *owner, &self.input_lock)
+                else {
+                    return Err(RoventStorageSetupRejection {
+                        error: RoventStorageRuntimeError::Namespace(
+                            "V3 admission with different registration",
+                        ),
+                        admission,
+                    });
+                };
+                if !Arc::ptr_eq(original.owners().input_lock(), lock) {
+                    return Err(RoventStorageSetupRejection {
+                        error: RoventStorageRuntimeError::Namespace(
+                            "shared V3 storage attribution changed",
                         ),
                         admission,
                     });
@@ -527,6 +606,151 @@ macro_rules! implement_v2_storage_attachment {
 implement_v2_storage_attachment!(RoventNativeProductDriverV2);
 implement_v2_storage_attachment!(RoventOwnPcrProductDriverV2);
 implement_v2_storage_attachment!(RoventOwnNnuecProductDriverV2);
+
+#[allow(clippy::large_enum_variant)]
+enum RejectedStorageOwnersV3<'boundary, 'process> {
+    Pending {
+        custody: RoventStorageCompiledCustodyV3<'boundary, 'process>,
+        boundary: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+    },
+    Registration {
+        rejected: RoventStorageRegistrationFailureV3<'boundary, 'process>,
+        boundary: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+    },
+    Ownership(RoventStorageRuntimeOwnershipFailureV3<'boundary, 'process>),
+    Session {
+        registration: RoventStorageOwnedRuntimeRegistrationV3,
+        failure: SearchSessionFailure,
+    },
+}
+
+/// Failure retains the original /2 custody and process owner until the real
+/// product has physically closed; a rejection is never a fence.
+pub struct RoventProductStorageStartupRejectionV3<'boundary, 'process> {
+    pub failure: SearchSessionFailure,
+    retained: RetainedOnUnknown<RejectedStorageOwnersV3<'boundary, 'process>>,
+}
+impl RoventProductStorageStartupRejectionV3<'_, '_> {
+    pub fn owners(&self) -> &RoventStorageAdmissionOwners<RoventInputLockV3> {
+        match self.retained.original() {
+            RejectedStorageOwnersV3::Pending { custody, .. } => custody.owners(),
+            RejectedStorageOwnersV3::Registration { rejected, .. } => rejected.custody.owners(),
+            RejectedStorageOwnersV3::Ownership(rejected) => rejected.registration.owners(),
+            RejectedStorageOwnersV3::Session { registration, .. } => registration.owners(),
+        }
+    }
+    pub fn process_boundary(&self) -> &Arc<VerifiedOwnedRoventProcessBoundaryV3> {
+        match self.retained.original() {
+            RejectedStorageOwnersV3::Pending { boundary, .. }
+            | RejectedStorageOwnersV3::Registration { boundary, .. } => boundary,
+            RejectedStorageOwnersV3::Ownership(rejected) => &rejected.candidate,
+            RejectedStorageOwnersV3::Session { registration, .. } => {
+                registration.process_boundary()
+            }
+        }
+    }
+    pub fn retained_session_failure(&self) -> Option<&SearchSessionFailure> {
+        match self.retained.original() {
+            RejectedStorageOwnersV3::Session { failure, .. } => Some(failure),
+            _ => None,
+        }
+    }
+}
+
+macro_rules! implement_v3_storage_attachment {
+    ($product:ty) => {
+        impl $product {
+            #[allow(clippy::result_large_err)]
+            pub fn attach_storage_runtime_registration_v3<'boundary, 'process>(
+                &self,
+                custody: RoventStorageCompiledCustodyV3<'boundary, 'process>,
+                boundary: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+                requested_clock: &ProcessClock,
+            ) -> Result<(), RoventProductStorageStartupRejectionV3<'boundary, 'process>> {
+                let mut slot = match self.storage_registration.try_lock() {
+                    Ok(slot) => slot,
+                    Err(_) => {
+                        return Err(self.reject_storage_v3(
+                            "storage registration slot is busy or poisoned",
+                            RejectedStorageOwnersV3::Pending { custody, boundary },
+                        ));
+                    }
+                };
+                let same_owner = Arc::ptr_eq(&self.process, &boundary)
+                    && same_original_lock(
+                        self.sources.lock(),
+                        custody.owners().input_lock(),
+                        boundary.input_lock(),
+                    );
+                if let Err(reason) = validate_attachment_selection(
+                    slot.is_some(),
+                    self.physically_closed.load(Ordering::Acquire),
+                    same_owner,
+                    &self.process_clock,
+                    requested_clock,
+                ) {
+                    return Err(self.reject_storage_v3(
+                        reason,
+                        RejectedStorageOwnersV3::Pending { custody, boundary },
+                    ));
+                }
+                let registration = match register_rovent_storage_runtime_v3(
+                    custody,
+                    self.process_clock.clone(),
+                    self.inner.implementation(),
+                ) {
+                    Ok(registration) => registration,
+                    Err(rejected) => {
+                        return Err(self.reject_storage_v3(
+                            rejected.error.to_string(),
+                            RejectedStorageOwnersV3::Registration { rejected, boundary },
+                        ));
+                    }
+                };
+                match own_rovent_storage_runtime_registration_v3(registration, boundary) {
+                    Ok(registration) => {
+                        match self.inner.install_storage_registration_v3(registration) {
+                            Ok(shared) => {
+                                *slot = Some(RetainedOnUnknown::new(
+                                    shared,
+                                    Arc::clone(&self.physically_closed),
+                                ));
+                                Ok(())
+                            }
+                            Err((registration, failure)) => Err(self.reject_storage_v3(
+                                format!("{}: {}", failure.code, failure.detail),
+                                RejectedStorageOwnersV3::Session {
+                                    registration,
+                                    failure,
+                                },
+                            )),
+                        }
+                    }
+                    Err(rejected) => Err(self.reject_storage_v3(
+                        rejected.error.to_string(),
+                        RejectedStorageOwnersV3::Ownership(rejected),
+                    )),
+                }
+            }
+            fn reject_storage_v3<'boundary, 'process>(
+                &self,
+                detail: impl AsRef<str>,
+                owners: RejectedStorageOwnersV3<'boundary, 'process>,
+            ) -> RoventProductStorageStartupRejectionV3<'boundary, 'process> {
+                RoventProductStorageStartupRejectionV3 {
+                    failure: SearchSessionFailure {
+                        physical_completion: DriverPhysicalCompletion::Unknown,
+                        code: "RoventStorageRuntimeRegistrationV3",
+                        detail: detail.as_ref().chars().take(512).collect(),
+                    },
+                    retained: RetainedOnUnknown::new(owners, Arc::clone(&self.physically_closed)),
+                }
+            }
+        }
+    };
+}
+implement_v3_storage_attachment!(RoventNativeProductDriverV3);
+implement_v3_storage_attachment!(RoventOwnNnuecProductDriverV3);
 
 #[cfg(test)]
 mod tests {

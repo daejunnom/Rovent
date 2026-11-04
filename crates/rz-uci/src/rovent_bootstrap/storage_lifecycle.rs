@@ -4,7 +4,10 @@
 
 use super::launch::storage::RoventStorageSetupRejection;
 use super::product::SharedRoventStorageRegistration;
-use crate::rovent_root_admission::{RoventRootAdmission, source_seal::RoventRootAdmissionV2};
+use crate::rovent_root_admission::{
+    RoventRootAdmission,
+    source_seal::{RoventRootAdmissionV2, RoventRootAdmissionV3},
+};
 use crate::search_driver::{DriverPhysicalCompletion, SearchSessionContext, SearchSessionFailure};
 use rz_contracts::RootGeneration;
 use rz_contracts::pals::SearchAuthority;
@@ -38,30 +41,35 @@ const RECEIPTS_MAX: usize = 64;
 enum OriginalStorageAdmission {
     V1(Arc<RoventRootAdmission>),
     V2(Arc<RoventRootAdmissionV2>),
+    V3(Arc<RoventRootAdmissionV3>),
 }
 impl OriginalStorageAdmission {
     fn context(&self) -> &SearchSessionContext {
         match self {
             Self::V1(a) => a.original_context(),
             Self::V2(a) => a.original_context(),
+            Self::V3(a) => a.original_context(),
         }
     }
     fn authority(&self) -> SearchAuthority {
         match self {
             Self::V1(a) => a.authority(),
             Self::V2(a) => a.authority(),
+            Self::V3(a) => a.authority(),
         }
     }
 }
 enum StorageSetupRejection {
     V1(RoventStorageSetupRejection),
     V2(RoventStorageSetupRejection<RoventRootAdmissionV2>),
+    V3(RoventStorageSetupRejection<RoventRootAdmissionV3>),
 }
 impl StorageSetupRejection {
     fn detail(&self) -> String {
         match self {
             Self::V1(a) => a.error.to_string(),
             Self::V2(a) => a.error.to_string(),
+            Self::V3(a) => a.error.to_string(),
         }
     }
 }
@@ -829,6 +837,27 @@ impl<M: RoleModel + 'static> SessionStorageLifecycle<M> {
             Err(payload) => Err(self.retain_panic(payload)),
         }
     }
+    pub(crate) fn prepare_v3(
+        &mut self,
+        owner: StorageSemanticOwner<M>,
+        admission: Arc<RoventRootAdmissionV3>,
+        reset: bool,
+        position: &Position,
+        signal: &CompletionSignal,
+    ) -> Result<StorageSemanticOwner<M>, StorageLifecycleFailure<M>> {
+        match catch_unwind(AssertUnwindSafe(|| {
+            self.prepare_inner(
+                owner,
+                OriginalStorageAdmission::V3(admission),
+                reset,
+                position,
+                signal,
+            )
+        })) {
+            Ok(result) => result,
+            Err(payload) => Err(self.retain_panic(payload)),
+        }
+    }
     fn prepare_inner(
         &mut self,
         owner: StorageSemanticOwner<M>,
@@ -865,6 +894,14 @@ impl<M: RoleModel + 'static> SessionStorageLifecycle<M> {
                         .into());
                 }
             }
+            OriginalStorageAdmission::V3(a) => {
+                if let Err(error) = self.registration.validate_v3_admission(a) {
+                    return Err(self
+                        .core
+                        .fail("RoventStorageOriginalAdmission", error)
+                        .into());
+                }
+            }
             _ => {}
         }
         let context = admission.context();
@@ -883,6 +920,10 @@ impl<M: RoleModel + 'static> SessionStorageLifecycle<M> {
                     .registration
                     .take_unused_setup_v2(Arc::clone(a))
                     .map_err(StorageSetupRejection::V2),
+                OriginalStorageAdmission::V3(a) => self
+                    .registration
+                    .take_unused_setup_v3(Arc::clone(a))
+                    .map_err(StorageSetupRejection::V3),
             };
             let setup = match setup_result {
                 Ok(setup) => setup,
@@ -981,6 +1022,14 @@ impl<M: RoleModel + 'static> SessionStorageLifecycle<M> {
         // joined, before returning the original owner to search.
         if let OriginalStorageAdmission::V2(a) = &admission {
             if let Err(error) = self.registration.validate_v2_admission(a) {
+                return Err(self
+                    .core
+                    .fail("RoventStorageOriginalAdmission", error)
+                    .into());
+            }
+        }
+        if let OriginalStorageAdmission::V3(a) = &admission {
+            if let Err(error) = self.registration.validate_v3_admission(a) {
                 return Err(self
                     .core
                     .fail("RoventStorageOriginalAdmission", error)

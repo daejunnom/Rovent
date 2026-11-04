@@ -431,12 +431,6 @@ impl RoventNnuecSessionDriver {
             idle.game = Some(context.authority.game.0);
         }
         if let Some(storage) = storage.as_mut() {
-            if matches!(&run.admission, NnuecRootAdmission::V3(_)) {
-                return Err(run.fail(
-                    "RoventNnuecStorageV3Unsupported",
-                    "V3 storage has no original admission consumer",
-                ));
-            }
             let owner = idle.owner.take().expect("original semantic owner");
             let signal = idle.native.service.signal();
             let result = match &run.admission {
@@ -454,7 +448,13 @@ impl RoventNnuecSessionDriver {
                     position,
                     &signal,
                 ),
-                NnuecRootAdmission::V3(_) => unreachable!("V3 rejected before owner transfer"),
+                NnuecRootAdmission::V3(admission) => storage.prepare_v3(
+                    StorageSemanticOwner::Pcr(owner),
+                    Arc::clone(admission),
+                    reset,
+                    position,
+                    &signal,
+                ),
             };
             match result {
                 Ok(StorageSemanticOwner::Pcr(owner)) => {
