@@ -560,6 +560,54 @@ pub(crate) struct PcWorkerSupervisorV3 {
     cleanup_deadline: Instant,
 }
 
+/// Actual same-channel receive, same-supervisor membership, bridge slot and
+/// original stage identity. This is not a teacher or physical completion.
+/// It is deliberately nonclone and must remain with its caller on Busy.
+pub(super) struct PcReceivedStageProofV3 {
+    supervisor: Arc<Mutex<PcWorkerSupervisorV3>>,
+    bridge: Arc<RoventPcCollectionBridgeV3>,
+    recovery: Arc<Mutex<PcRootRecoveryV3>>,
+    stage: Arc<Mutex<TeacherSessionStagingV3>>,
+    admission: RoventCollectionRootAdmissionV3,
+}
+
+impl PcReceivedStageProofV3 {
+    pub(super) fn matches_game(&self, game: &Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>>) -> bool {
+        Arc::ptr_eq(self.bridge.game_authority(), game)
+    }
+    pub(super) fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
+        self.admission.same_original_admission(admission)
+    }
+    pub(super) fn matches_recovery(&self, recovery: &Arc<Mutex<PcRootRecoveryV3>>) -> bool {
+        Arc::ptr_eq(&self.recovery, recovery)
+    }
+    pub(super) fn stage(&self) -> &Arc<Mutex<TeacherSessionStagingV3>> { &self.stage }
+
+    /// Reobserve the original owners before issuing an effect. This never
+    /// locks the supervisor across a blocking call or fabricates a receipt.
+    pub(super) fn try_revalidate(&self) -> Result<Option<bool>, &'static str> {
+        let supervisor = match self.supervisor.try_lock() {
+            Ok(owner) => owner,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 supervisor poisoned"),
+        };
+        if !supervisor.matches_original_bridge(&self.bridge) || !supervisor.owns_recovery(&self.recovery) {
+            return Ok(Some(false));
+        }
+        let recovery = match self.recovery.try_lock() {
+            Ok(owner) => owner,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 recovery poisoned"),
+        };
+        if !recovery.matches_admission(&self.admission) || !recovery.matches_received_root(&self.bridge)
+            || !recovery.stage.as_ref().is_some_and(|stage| Arc::ptr_eq(stage, &self.stage)) {
+            return Ok(Some(false));
+        }
+        drop(recovery);
+        self.bridge.try_matches_registered_recovery(&self.admission, &self.recovery)
+    }
+}
+
 /// A registered supervisor task is retained before any thread can start.
 /// Join of this driver is independent of teacher/native/GPU completion.
 pub(crate) struct SupervisorStartCustodyV3 {
@@ -1551,6 +1599,39 @@ impl SupervisorStartCustodyV3 {
 }
 
 impl PcWorkerSupervisorV3 {
+    /// Construct only from the same original supervisor and a recovery already
+    /// registered in its root list and in the bridge's exact slot.
+    pub(super) fn try_received_stage_proof(
+        supervisor: &Arc<Mutex<Self>>,
+        recovery: &Arc<Mutex<PcRootRecoveryV3>>,
+    ) -> Result<Option<PcReceivedStageProofV3>, &'static str> {
+        let owner = match supervisor.try_lock() {
+            Ok(owner) => owner,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 supervisor poisoned"),
+        };
+        if !owner.owns_recovery(recovery) { return Err("P-C V3 recovery not owned by supervisor"); }
+        let bridge = Arc::clone(&owner.bridge);
+        let root = match recovery.try_lock() {
+            Ok(root) => root,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 recovery poisoned"),
+        };
+        if !root.matches_received_root(&bridge) { return Err("P-C V3 received root owner differs"); }
+        let Some(stage) = root.stage.as_ref().map(Arc::clone) else { return Ok(None); };
+        let proof = PcReceivedStageProofV3 {
+            supervisor: Arc::clone(supervisor), bridge,
+            recovery: Arc::clone(recovery), stage, admission: root.admission.clone(),
+        };
+        drop(root);
+        drop(owner);
+        match proof.try_revalidate()? {
+            None => Ok(None),
+            Some(true) => Ok(Some(proof)),
+            Some(false) => Err("P-C V3 registered stage owner differs"),
+        }
+    }
+
     /// These are only identity and in-memory handoff observations. The bridge
     /// must separately close admission and verify its queue and physical proof.
     pub(crate) fn matches_original_bridge(&self, bridge: &Arc<RoventPcCollectionBridgeV3>) -> bool {
@@ -1805,13 +1886,13 @@ fn prepare_root_step_v3(
     if bridge.game_authority().abort_requested() {
         // A route or worker may have appeared while abort raced preparation.
         // Do not start another one or invent the missing native handoff.
-        if let Some(route) = &state.route {
-            route.cancel_all();
-        }
-        if let Some(pump) = &state.pump {
-            if let Ok(mut pump) = pump.try_lock() {
-                pump.close_admission();
-            }
+        if state.panic.is_some() { return Ok(PcPrepareStepV3::Pending); }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.request_route_abort(cleanup_deadline)
+        }));
+        if let Err(payload) = result {
+            state.panic = Some(payload);
+            state.failure.get_or_insert_with(|| "P-C V3 route abort request panicked".into());
         }
         return Ok(PcPrepareStepV3::Pending);
     }
@@ -2126,10 +2207,20 @@ fn prepare_root_step_v3(
     // claiming the teacher scope; failure must keep the original owner.
     if state.worker.is_none() {
         let original = Arc::clone(recovery);
+        let game = Arc::clone(bridge.game_authority());
         let task = Box::new(move |receiver: rz_uci::rovent_bootstrap::pc_collection_v3::RoventPcRootHandoffReceiverV3| {
             let mut handoff = None;
             while Instant::now() < cleanup_deadline {
                 if let Ok(mut owner) = original.try_lock() {
+                    if game.abort_requested() && owner.panic.is_none() {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            owner.request_route_abort(cleanup_deadline)
+                        }));
+                        if let Err(payload) = result {
+                            owner.panic = Some(payload);
+                            owner.failure.get_or_insert_with(|| "P-C V3 route abort request panicked".into());
+                        }
+                    }
                     if let Some(pump) = &owner.pump {
                         if let Ok(mut pump) = pump.try_lock() {
                             if matches!(pump.try_pump(), Ok(TeacherPumpStepV3::OutputBackpressure)) { /* retained by pump */ }
@@ -2151,7 +2242,18 @@ fn prepare_root_step_v3(
                 }
                 while Instant::now() < cleanup_deadline {
                     let completed = match original.try_lock() {
-                        Ok(mut owner) => owner.try_drain_teacher(&handoff, cleanup_deadline),
+                        Ok(mut owner) => {
+                            if game.abort_requested() && owner.panic.is_none() {
+                                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    owner.request_route_abort(cleanup_deadline)
+                                }));
+                                if let Err(payload) = result {
+                                    owner.panic = Some(payload);
+                                    owner.failure.get_or_insert_with(|| "P-C V3 route abort request panicked".into());
+                                }
+                            }
+                            owner.try_drain_teacher(&handoff, cleanup_deadline)
+                        },
                         Err(_) => false,
                     };
                     if completed { break; }
@@ -2351,6 +2453,42 @@ impl PcRootRecoveryV3 {
                 self.failure
                     .get_or_insert_with(|| "P-C V3 policy step panicked".into());
             }
+        }
+    }
+
+    /// Signal only this root's existing route and session. These requests do
+    /// not attest delivery, terminal drain, worker join or native completion.
+    fn request_route_abort(&mut self, deadline: Instant) {
+        if let Some(route) = &self.route {
+            route.cancel_all();
+            if let Err(error) = route.try_revoke_all_targets() {
+                self.failure.get_or_insert_with(|| format!("P-C V3 abort target revoke: {error}"));
+            }
+        }
+        if let Some(pump) = self.pump.as_ref().map(Arc::clone) {
+            if let Ok(mut pump) = pump.try_lock() {
+                pump.close_admission();
+                if let Err(error) = pump.try_closed_drain() {
+                    self.failure.get_or_insert_with(|| format!("P-C V3 abort input drain: {error}"));
+                }
+                if let Err(error) = pump.try_drain_pending() {
+                    self.failure.get_or_insert_with(|| format!("P-C V3 abort terminal drain: {error}"));
+                }
+            }
+        }
+        let Some(stage) = self.stage.as_ref().map(Arc::clone) else { return; };
+        let session = match stage.try_lock() {
+            Ok(stage) => stage.session(),
+            Err(_) => None,
+        };
+        let Some(session) = session else { return; };
+        let Ok(mut session) = session.try_lock() else { return; };
+        if !session.original_admission().same_original_admission(&self.admission) {
+            self.failure.get_or_insert_with(|| "P-C V3 abort session admission differs".into());
+            return;
+        }
+        if let Err(error) = session.request_shutdown(deadline) {
+            self.failure.get_or_insert_with(|| format!("P-C V3 abort shutdown: {error}"));
         }
     }
 
