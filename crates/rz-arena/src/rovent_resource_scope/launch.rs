@@ -2097,6 +2097,17 @@ impl RoventPcCollectionResourceOutcomeV3 {
             .expect("collection owner remains retained")
     }
 
+    /// Non-panicking identity observation; false includes an already moved
+    /// outcome and is not a completion or release proof.
+    pub(crate) fn matches_original_collection(
+        &self,
+        owner: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    ) -> bool {
+        self.collection
+            .as_ref()
+            .is_some_and(|original| Arc::ptr_eq(original, owner))
+    }
+
     /// Returns pending without discarding any owner. Hook settlement errors
     /// retain their original typed cause in `original_collection()`.
     pub fn try_settle(
