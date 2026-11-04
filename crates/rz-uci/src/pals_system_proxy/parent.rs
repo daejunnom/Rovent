@@ -893,6 +893,165 @@ mod tests {
         drop(unrelated);
     }
 
+    /// Test-process peer for the finish admission race below. The first
+    /// connection uses the actual child-side parent implementation; the
+    /// second writes its valid handshake ACK and a mock frame together so the
+    /// real parent admission sees the earliest possible queued frame. This
+    /// covers socket authentication and framing, not a model or GPU fence.
+    #[test]
+    fn finish_child_handshake_helper() {
+        let Some(path) = std::env::var_os("RZ_TEST_FINISH_PARENT_SOCKET") else {
+            return;
+        };
+        let lock = std::env::var("RZ_TEST_FINISH_LOCK").unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let parent_pid =
+            crate::rovent_bootstrap::launch::ConnectedParent::capture_original_parent().unwrap();
+        let initial = crate::rovent_bootstrap::launch::ConnectedParent::authenticate(
+            UnixStream::connect(&path).unwrap(),
+            std::process::id(),
+            parent_pid,
+            73,
+            &lock,
+            0,
+            until,
+        )
+        .unwrap();
+        let mut control = UnixStream::connect(path).unwrap();
+        control
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        control
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            control.read_exact(&mut byte).unwrap();
+            if byte[0] == b'\n' {
+                break;
+            }
+            assert!(request.len() < FRAME_LIMIT);
+            request.push(byte[0]);
+        }
+        let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+        assert_eq!(request["schema"], REQUEST_SCHEMA);
+        assert_eq!(request["child_pid"], std::process::id());
+        assert_eq!(request["process_epoch"], 73);
+        assert_eq!(request["lock_sha256"], lock);
+        assert_eq!(request["cuda_ordinal"], 0);
+        let mut response = serde_json::to_vec(&serde_json::json!({
+            "schema": ACK_SCHEMA,
+            "child_pid": std::process::id(),
+            "process_epoch": 73,
+            "lock_sha256": lock,
+            "cuda_ordinal": 0,
+            "scope": SCOPE,
+        }))
+        .unwrap();
+        response.extend_from_slice(b"\nmock-finish\n");
+        control.write_all(&response).unwrap();
+        let mut acknowledgement = [0u8; 9];
+        control.read_exact(&mut acknowledgement).unwrap();
+        assert_eq!(&acknowledgement, b"received\n");
+        assert!(initial.ensure_live().is_ok());
+    }
+
+    #[test]
+    fn separate_finish_handshake_preserves_immediately_queued_frame() {
+        use sha2::{Digest as _, Sha256};
+        use std::{
+            fs,
+            os::unix::fs::DirBuilderExt,
+            process::{Command, Stdio},
+        };
+
+        struct TestDirectory(std::path::PathBuf);
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(self.0.join("socket"));
+                let _ = fs::remove_dir(&self.0);
+            }
+        }
+        struct TestChild(Child);
+        impl Drop for TestChild {
+            fn drop(&mut self) {
+                if matches!(self.0.try_wait(), Ok(None)) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/rz-finish-auth-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        let temp = TestDirectory(path);
+        let socket = temp.0.join("socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // This is a test-only lock identifier derived at runtime, not an
+        // assertion about the hash of the executing test binary.
+        let lock = format!(
+            "{:x}",
+            Sha256::digest(format!("{}-{nonce}", std::process::id()).as_bytes())
+        );
+        let module = module_path!()
+            .split_once("::")
+            .map(|(_, tail)| tail)
+            .unwrap_or(module_path!());
+        let test_name = format!("{module}::finish_child_handshake_helper");
+        let mut child = TestChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name])
+                .env("RZ_TEST_FINISH_PARENT_SOCKET", &socket)
+                .env("RZ_TEST_FINISH_LOCK", &lock)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let cancelled = AtomicBool::new(false);
+        let until = Instant::now() + Duration::from_secs(5);
+        let initial =
+            accept_and_authenticate_child(&listener, &mut child.0, 73, &lock, 0, until, &cancelled)
+                .unwrap();
+        let mut control = accept_and_authenticate_finish_child(
+            &listener,
+            &mut child.0,
+            73,
+            &lock,
+            0,
+            until,
+            &cancelled,
+        )
+        .unwrap();
+        control
+            .stream
+            .set_read_timeout(Some(until.saturating_duration_since(Instant::now())))
+            .unwrap();
+        let mut frame = [0u8; 12];
+        control.stream.read_exact(&mut frame).unwrap();
+        assert_eq!(&frame, b"mock-finish\n");
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert!(initial.ensure_live(&mut child.0).is_ok());
+        write_frame(&mut control.stream, b"received", until, &cancelled).unwrap();
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "test child did not exit within its deadline"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn ack_binds_pid_epoch_lock_device_and_scope() {
         let lock = "a".repeat(64);

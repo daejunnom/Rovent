@@ -986,7 +986,10 @@ fn publish_system_placement_witness(
         .get("witness")
         .ok_or("verified system V3 placement lacks its witness")?;
     let bytes = serde_json::to_vec(witness)?;
-    write_exclusive_bounded(&root.join(name), witness, POLICY_LIMIT)?;
+    // The placement witness can include exact approved transfer evidence and
+    // is not the small execution-policy sidecar. Use the same existing bound
+    // as other full placement evidence instead of the smaller sidecar limit.
+    write_exclusive_bounded(&root.join(name), witness, LIMIT)?;
     Ok(Some(hex(asset::sha256(&bytes))))
 }
 
@@ -2464,6 +2467,48 @@ mod tests {
         assert_eq!(value["physical_completion"], "not_attested");
         assert_eq!(value["process_exit"], "not_observed");
         assert!(value["embedded_witness_sha256"].is_null());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_system_placement_witness_can_exceed_small_policy_sidecar_limit() {
+        let output = OwnedOutputRootTestDirectory::new();
+        // Model a placement witness with enough transfer evidence to exceed
+        // the small policy sidecar, while remaining within the placement bound.
+        let witness = serde_json::json!({"transfer_evidence": "x".repeat(POLICY_LIMIT)});
+        let witness_bytes = serde_json::to_vec(&witness).unwrap();
+        assert!(witness_bytes.len() > POLICY_LIMIT);
+        assert!(witness_bytes.len() < LIMIT);
+        let observation = serde_json::json!({"status":"verified", "witness":witness});
+        let expected_sha = hex(asset::sha256(&witness_bytes));
+
+        let actual_sha =
+            publish_system_placement_witness(&output.path, "witness.json", &observation).unwrap();
+        assert_eq!(actual_sha.as_deref(), Some(expected_sha.as_str()));
+        assert_eq!(
+            fs::read(output.path.join("witness.json")).unwrap(),
+            witness_bytes
+        );
+
+        publish_initial_system_placement_partial(
+            &output.path,
+            "plan",
+            "inventory",
+            "manifest",
+            &observation,
+        )
+        .unwrap();
+        let partial: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                output
+                    .path
+                    .join("initial-system-cuda-placement.partial.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(partial["embedded_witness_sha256"], expected_sha);
+        assert_eq!(partial["physical_completion"], "not_attested");
     }
 
     #[test]
