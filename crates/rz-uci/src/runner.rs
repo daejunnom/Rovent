@@ -8,6 +8,10 @@ use std::fmt;
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{Receiver, SyncSender};
 
+/// Opt-in bounded output custody. The existing synchronous runner below keeps
+/// its original behavior; consumers must explicitly select and own this path.
+pub mod async_output;
+
 #[derive(Clone, Debug)]
 pub enum Event {
     Line(String),
