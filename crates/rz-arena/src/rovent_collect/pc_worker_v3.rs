@@ -1500,7 +1500,7 @@ impl PcWorkerSupervisorV3 {
             .install_output_directory(self.bridge.inputs(), output)
             .map_err(|e| e.to_string())
     }
-    pub(crate) fn new(
+    pub(super) fn new(
         bridge: Arc<RoventPcCollectionBridgeV3>,
         router: Arc<CaptureRouterV3>,
         startup_deadline: Instant,
