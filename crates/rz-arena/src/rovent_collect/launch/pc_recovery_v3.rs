@@ -20,6 +20,7 @@ use crate::rovent_collect::pc_worker_v3::{
 };
 use crate::rovent_resource_scope::launch::{
     NativeResourceCustody, RoventPcCollectionRecoveryKeyV3, RoventPcCollectionResourceOutcomeV3,
+    RoventPcCollectionSettledOutcomeV3,
 };
 use std::any::Any;
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
@@ -52,6 +53,7 @@ struct OriginalPcRunV3 {
     resource: Option<Arc<Mutex<NativeResourceCustody>>>,
     outcome: Option<RoventPcCollectionResourceOutcomeV3>,
     outcome_key: Option<RoventPcCollectionRecoveryKeyV3>,
+    settled: Option<RoventPcCollectionSettledOutcomeV3>,
     panic: Option<Box<dyn Any + Send>>,
     stop_authorization: Option<PcSupervisorStopAuthorizationV3>,
     stop_handed_off: bool,
@@ -119,6 +121,7 @@ impl PcRunRecoveryKeyV3 {
                 resource: None,
                 outcome: None,
                 outcome_key: Some(outcome_key),
+                settled: None,
                 panic: None,
                 stop_authorization: None,
                 stop_handed_off: false,
@@ -394,6 +397,11 @@ impl PcRunRecoveryKeyV3 {
             if original.unstarted_released || original.before_admission_released {
                 return Ok(PcDriverPollV3::Ready(true));
             }
+            // A joined driver is owned by the outcome's settlement path;
+            // its original registry entry may already have been retired.
+            if original.joined_offered {
+                return Ok(PcDriverPollV3::Ready(false));
+            }
             if original.no_worker_proof.is_none() && original.before_admission_join_proof.is_none()
             {
                 match SupervisorStartCustodyV3::try_seal_no_worker(
@@ -543,6 +551,75 @@ impl PcRunRecoveryKeyV3 {
         drop(guard);
         match result {
             Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Settle only the same original outcome and retain every returned
+    /// observer/hook/driver owner in this slot before returning to the caller.
+    /// This is not output closure, an independent GPU fence, or registry release.
+    pub(crate) fn try_settle_outcome(
+        &self,
+        outcome: &mut RoventPcCollectionResourceOutcomeV3,
+    ) -> Result<PcDriverPollV3<bool>, &'static str> {
+        let mut guard = match self.0.original.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+            Err(TryLockError::Poisoned(_)) => return Err("P-C recovery slot poisoned"),
+        };
+        let original = guard.as_mut().ok_or("P-C original custody missing")?;
+        if !original
+            .outcome_key
+            .as_ref()
+            .is_some_and(|key| key.same_original(&outcome.recovery_key()))
+        {
+            return Err("P-C original outcome key differs");
+        }
+        if let Some(settled) = original.settled.as_ref() {
+            return if Arc::ptr_eq(&settled.collection, original.owners.native()) {
+                Ok(PcDriverPollV3::Ready(true))
+            } else {
+                Err("P-C settled original owner differs")
+            };
+        }
+        if !outcome.matches_original_collection(original.owners.native()) {
+            return Err("P-C original outcome owner differs");
+        }
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| outcome.try_settle()));
+        match result {
+            Ok(Ok(Some(settled))) => {
+                original.settled = Some(settled);
+                Ok(PcDriverPollV3::Ready(true))
+            }
+            Ok(Ok(None)) => Ok(PcDriverPollV3::Ready(false)),
+            Ok(Err(error)) => Err(error),
+            Err(payload) => {
+                drop(guard);
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    /// Borrow retained settled custody for a finite, non-reentrant read.
+    /// No ownership, physical-completion, or release authority is created.
+    pub(crate) fn with_settled<T>(
+        &self,
+        observe: impl FnOnce(&RoventPcCollectionSettledOutcomeV3) -> T,
+    ) -> Result<Option<T>, &'static str> {
+        let guard = self
+            .0
+            .original
+            .try_lock()
+            .map_err(|_| "P-C recovery slot unavailable")?;
+        let original = guard.as_ref().ok_or("P-C original custody missing")?;
+        let Some(settled) = original.settled.as_ref() else {
+            return Ok(None);
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observe(settled)));
+        drop(guard);
+        match result {
+            Ok(value) => Ok(Some(value)),
             Err(payload) => std::panic::resume_unwind(payload),
         }
     }
