@@ -21,6 +21,9 @@ mod typed_failure_projection;
 mod v2_actor_preflight;
 #[cfg(feature = "pals-collection-onnx")]
 pub(super) mod v2_session;
+#[cfg(all(feature = "pals-collection-onnx", target_os = "linux"))]
+#[allow(dead_code)]
+pub(super) mod v3_session;
 pub use session::*;
 mod pump;
 pub use pump::*;
