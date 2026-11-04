@@ -369,6 +369,8 @@ impl PcCollectionOwnersV3 {
             stop_authorized: false,
             pending_joined: None,
             joined_offered: false,
+            unstarted_proof: None,
+            unstarted_released: false,
         })
     }
 }
@@ -384,9 +386,29 @@ pub(crate) struct PcCollectionRunV3 {
     stop_authorized: bool,
     pending_joined: Option<crate::rovent_collect::pc_worker_v3::PcSupervisorJoinedProofV3>,
     joined_offered: bool,
+    unstarted_proof: Option<crate::rovent_collect::pc_worker_v3::PcSupervisorNoWorkerProofV3>,
+    unstarted_released: bool,
 }
 
 impl PcCollectionRunV3 {
+    /// Retire the original driver if it is provably unstarted. The resource
+    /// outcome stays owned and pending until its own recovery is complete.
+    pub(crate) fn try_release_unstarted_driver(&mut self) -> Result<bool, &'static str> {
+        if self.unstarted_released {
+            return Ok(true);
+        }
+        if self.unstarted_proof.is_none() {
+            self.unstarted_proof = self.owners.seal_unstarted_driver()?;
+        }
+        let Some(proof) = self.unstarted_proof.as_ref() else {
+            return Ok(false);
+        };
+        if !self.owners.release_sealed_unstarted_driver(proof)? {
+            return Ok(false);
+        }
+        self.unstarted_released = true;
+        Ok(true)
+    }
     /// Progress exact driver settlement and then the original resource
     /// outcome. A returned outcome still contains the native result and does
     /// not claim durable publication or an independent GPU observation.
