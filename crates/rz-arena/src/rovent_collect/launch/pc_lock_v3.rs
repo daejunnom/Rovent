@@ -522,9 +522,14 @@ impl PcCollectionRunV3 {
     }
 
     /// Nonblocking progress for this original run. Pre-admission driver
-    /// retirement is independent of native/resource/output settlement. A
-    /// true result means settled owners are retained in the original slot.
-    pub(crate) fn try_settle(&mut self) -> Result<bool, &'static str> {
+    /// retirement is independent of native/resource/output settlement. The
+    /// original before-native recovery may wait only until `poll_until`,
+    /// additionally bounded by the original scope cleanup deadline. A true
+    /// result means settled owners are retained in the original slot.
+    pub(crate) fn try_settle(&mut self, poll_until: Instant) -> Result<bool, &'static str> {
+        if Instant::now() >= poll_until {
+            return Ok(false);
+        }
         if self.settled {
             return Ok(true);
         }
@@ -552,7 +557,16 @@ impl PcCollectionRunV3 {
                 PcDriverEvidenceErrorV3::Poisoned(reason)
                 | PcDriverEvidenceErrorV3::Invalid(reason) => reason,
             })? {
-            PcDriverPollV3::Pending | PcDriverPollV3::Ready(true) => return Ok(false),
+            PcDriverPollV3::Pending => return Ok(false),
+            PcDriverPollV3::Ready(true) => {
+                // This only progresses the original native failure's own
+                // typed reservation recovery. It does not close resources or
+                // mark the failed run as successful.
+                let _ = self
+                    .outcome
+                    .try_recover_original_before_native_until(poll_until);
+                return Ok(false);
+            }
             PcDriverPollV3::Ready(false) => {}
         }
         let Some(fence) = self.owners.native.native_session_fence() else {

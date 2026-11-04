@@ -2108,6 +2108,26 @@ impl RoventPcCollectionResourceOutcomeV3 {
             .is_some_and(|original| Arc::ptr_eq(original, owner))
     }
 
+    /// Progress only the original failed native owner's existing typed
+    /// before-native recovery. The returned event remains in that failure;
+    /// it does not release a cgroup, output, or GPU owner.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn try_recover_original_before_native_until(
+        &mut self,
+        until: std::time::Instant,
+    ) -> Option<&rz_uci::rovent_bootstrap::launch::V3BeforeNativeScopeRecovery> {
+        match self.native.as_mut()? {
+            Ok(_) => None,
+            Err(
+                RoventControlledRunFailure::BeforeControl(failure)
+                | RoventControlledRunFailure::Failed(failure),
+            ) => failure.try_recover_before_native_until(until),
+            Err(RoventControlledRunFailure::Quarantined(quarantine)) => quarantine
+                .original_failure
+                .try_recover_before_native_until(until),
+        }
+    }
+
     /// Returns pending without discarding any owner. Hook settlement errors
     /// retain their original typed cause in `original_collection()`.
     pub fn try_settle(
