@@ -343,6 +343,12 @@ pub struct RoventPcCollectionWorkerV3 {
 #[derive(Clone)]
 pub struct RoventPcCollectionWorkerKeyV3(Arc<()>);
 impl RoventPcCollectionWorkerKeyV3 {
+    /// Same original worker identity only; this is not a completion proof.
+    pub fn same_original(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl RoventPcCollectionWorkerKeyV3 {
     /// Identity comparison only; this grants neither completion nor recovery.
     pub fn same_original(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
