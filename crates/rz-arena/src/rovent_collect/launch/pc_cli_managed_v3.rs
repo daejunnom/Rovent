@@ -27,11 +27,20 @@ pub(crate) struct ManagedCollectionCliV3 {
     pub(crate) output: RawFd,
     pub(crate) input: RawFd,
     pub(crate) plan: RawFd,
+    bootstrap_budget_ms: u64,
     pub(crate) work_deadline_ns: u64,
     pub(crate) cleanup_deadline_ns: u64,
 }
 
 impl ManagedCollectionCliV3 {
+    /// Derive the local setup ceiling from the single process-entry sample.
+    /// This budget is independent of native startup and parent work limits.
+    pub(crate) fn bootstrap_deadline(&self, entry: Instant) -> Result<Instant, ArenaError> {
+        entry
+            .checked_add(Duration::from_millis(self.bootstrap_budget_ms))
+            .ok_or_else(|| invalid("managed V3 bootstrap deadline overflow"))
+    }
+
     /// Observe the same authenticated parent's and current thread's time
     /// namespace before interpreting its original monotonic ceilings. This
     /// is a point-in-time observation, not proof against a later setns or of
@@ -94,6 +103,7 @@ pub(crate) fn parse_managed_collection_cli_v3(
     let mut selection_arguments = Vec::new();
     for argument in arguments {
         if argument.starts_with("--v3-managed-")
+            || argument.starts_with("--v3-bootstrap-")
             || argument.starts_with("--v3-work-deadline-")
             || argument.starts_with("--v3-cleanup-deadline-")
         {
@@ -107,6 +117,7 @@ pub(crate) fn parse_managed_collection_cli_v3(
                         | "--v3-managed-output-dir-fd"
                         | "--v3-managed-input-dir-fd"
                         | "--v3-managed-plan-fd"
+                        | "--v3-bootstrap-budget-ms"
                         | "--v3-work-deadline-monotonic-ns"
                         | "--v3-cleanup-deadline-monotonic-ns"
                 ) && !value.is_empty()
@@ -155,6 +166,18 @@ pub(crate) fn parse_managed_collection_cli_v3(
             }
         }
     }
+    let bootstrap_budget = take("--v3-bootstrap-budget-ms")?;
+    check(
+        bootstrap_budget.bytes().all(|byte| byte.is_ascii_digit()),
+        "managed V3 bootstrap budget must be an integer",
+    )?;
+    let bootstrap_budget_ms: u64 = bootstrap_budget
+        .parse()
+        .map_err(|_| invalid("invalid managed V3 bootstrap budget"))?;
+    check(
+        bootstrap_budget_ms > 0,
+        "managed V3 bootstrap budget must be positive",
+    )?;
     let work_deadline_ns: u64 = take("--v3-work-deadline-monotonic-ns")?
         .parse()
         .map_err(|_| invalid("invalid managed V3 work deadline"))?;
@@ -171,6 +194,7 @@ pub(crate) fn parse_managed_collection_cli_v3(
         output,
         input,
         plan,
+        bootstrap_budget_ms,
         work_deadline_ns,
         cleanup_deadline_ns,
     }))
@@ -192,6 +216,7 @@ mod tests {
             "--v3-managed-plan-fd=6".into(),
             "--v3-work-deadline-monotonic-ns=100".into(),
             "--v3-cleanup-deadline-monotonic-ns=120".into(),
+            "--v3-bootstrap-budget-ms=250".into(),
             "--native-argument=kept".into(),
         ]
     }
@@ -214,6 +239,11 @@ mod tests {
             selected.selection.native_arguments,
             ["--native-argument=kept"]
         );
+        let entry = std::time::Instant::now();
+        assert_eq!(
+            selected.bootstrap_deadline(entry).unwrap(),
+            entry + std::time::Duration::from_millis(250)
+        );
         let mut duplicate_fd = arguments();
         duplicate_fd[7] = "--v3-managed-plan-fd=3".into();
         assert!(parse_managed_collection_cli_v3(duplicate_fd).is_err());
@@ -229,5 +259,11 @@ mod tests {
         let mut observer_collision = arguments();
         observer_collision.push("--go-observer-fd=3".into());
         assert!(parse_managed_collection_cli_v3(observer_collision).is_err());
+        let mut zero_budget = arguments();
+        zero_budget[10] = "--v3-bootstrap-budget-ms=0".into();
+        assert!(parse_managed_collection_cli_v3(zero_budget).is_err());
+        let mut missing_budget = arguments();
+        missing_budget.remove(10);
+        assert!(parse_managed_collection_cli_v3(missing_budget).is_err());
     }
 }
