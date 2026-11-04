@@ -7,7 +7,8 @@
 
 use crate::{
     ArtifactRef, ManifestError, RoventActor, RoventEngineDeclaration, RoventExecutionManifest,
-    RoventExecutionManifestV2, RoventResearcher, RoventResourcePlan, decode_json, digest,
+    RoventExecutionManifestV2, RoventExecutionManifestV3, RoventResearcher, RoventResourcePlan,
+    decode_json, digest,
 };
 use rz_contracts::rovent::ExecutionMode;
 use serde::{Deserialize, Serialize};
@@ -191,9 +192,22 @@ impl RoventStorageProfile {
         self.validate_for_engine_and_resources(&manifest.engine, &manifest.resources)
     }
 
-    fn validate_for_engine_and_resources(
+    /// Validate the actual /3 declaration, including its explicit runtime
+    /// source, without manufacturing an older manifest or lock. Source commit
+    /// observation is handled by the original /3 owner; `None` remains valid
+    /// when the /3 manifest permits it. No archive authority is issued here.
+    pub fn validate_for_manifest_v3(
         &self,
-        engine: &RoventEngineDeclaration,
+        manifest: &RoventExecutionManifestV3,
+    ) -> Result<(), ManifestError> {
+        self.validate()?;
+        manifest.validate()?;
+        self.validate_for_engine_and_resources(&manifest.engine, &manifest.resources)
+    }
+
+    fn validate_for_engine_and_resources<S>(
+        &self,
+        engine: &RoventEngineDeclaration<S>,
         resources: &RoventResourcePlan,
     ) -> Result<(), ManifestError> {
         let expected_shared_nnuec = match engine.mode {
@@ -278,12 +292,14 @@ fn require(ok: bool, reason: &str) -> Result<(), ManifestError> {
 mod tests {
     use super::*;
     use crate::{
-        ROVENT_EXECUTION_DOMAIN, ROVENT_EXECUTION_V2_DOMAIN, ROVENT_EXTERNAL_PROFILE_DOMAIN,
-        ROVENT_POSITION_VISIT_UNIT, RoventBackend, RoventCoordinatorDeclaration, RoventDevice,
+        NativeRuntimeSourceV6, ROVENT_EXECUTION_DOMAIN, ROVENT_EXECUTION_V2_DOMAIN,
+        ROVENT_EXECUTION_V3_DOMAIN, ROVENT_EXTERNAL_PROFILE_DOMAIN, ROVENT_POSITION_VISIT_UNIT,
+        RoventBackend, RoventCoordinatorDeclaration, RoventCoordinatorDeclarationV3, RoventDevice,
         RoventEngineDeclaration, RoventExternalProfilePin, RoventExternalPurpose, RoventModelPin,
         RoventNnuecPin, RoventOwnRNotApplicableV2, RoventPcConfiguration, RoventPurpose,
         RoventRootTieDeclarationV2, RoventRootTiePolicyV2, RoventSearchDeclaration,
-        RoventThreadPool,
+        RoventThreadPool, SystemLibrarySpecV6, SystemPlatformV6, SystemRuntimeLockV6,
+        SystemRuntimeSpecV6,
     };
     use rz_contracts::rovent::ROVENT_SEARCH_REVISION;
     use std::collections::{BTreeMap, BTreeSet};
@@ -499,6 +515,84 @@ mod tests {
         }
     }
 
+    // Construct a new /3 declaration for this test; do not manufacture a
+    // /2 lock or use its canonical bytes as /3 provenance.
+    fn manifest_v3(mode: ExecutionMode) -> RoventExecutionManifestV3 {
+        let base = manifest_v2(mode);
+        let hybrid = matches!(mode, ExecutionMode::HybridPc | ExecutionMode::HybridPcr);
+        let original = base.engine;
+        let mut pc = original.pc;
+        let runtime = if hybrid {
+            pc.runtime_artifacts.clear();
+            let libraries = ["ort-core", "ort-provider-cuda"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, role)| SystemLibrarySpecV6 {
+                    role: role.into(),
+                    requested_path: format!("/fixture/{role}"),
+                    canonical_path: format!("/fixture/{role}"),
+                    version: None,
+                    sha256: "a".repeat(64),
+                    bytes: 1,
+                    device: 1,
+                    inode: index as u64 + 1,
+                    required_mapping: true,
+                })
+                .collect();
+            NativeRuntimeSourceV6::SystemCuda(SystemRuntimeSpecV6 {
+                platform: SystemPlatformV6::Linux,
+                libraries,
+                system_identity_sha256: "b".repeat(64),
+                cuda_device_id: 0,
+                cuda_arena_bytes: 1024,
+                startup_ms: 1000,
+                drain_ms: 200,
+                capture_max_libraries: 2,
+                capture_max_file_bytes: 1,
+                capture_max_total_bytes: 2,
+                capture_timeout_ms: 100,
+            })
+        } else {
+            NativeRuntimeSourceV6::Cpu
+        };
+        RoventExecutionManifestV3 {
+            domain: ROVENT_EXECUTION_V3_DOMAIN.into(),
+            contract_revision: base.contract_revision,
+            run_id: base.run_id,
+            purpose: base.purpose,
+            engine: RoventEngineDeclaration {
+                source_commit: None,
+                source_components: original.source_components,
+                binary: original.binary,
+                mode: original.mode,
+                pc,
+                researcher: original.researcher,
+                teachers: original.teachers,
+                nnuec: original.nnuec,
+                search: original.search,
+            },
+            resources: base.resources,
+            coordinator: RoventCoordinatorDeclarationV3 {
+                policy_sha256: base.coordinator.policy_sha256,
+                questions_max: base.coordinator.questions_max,
+                ancestor_depth_max: base.coordinator.ancestor_depth_max,
+                waiting_jobs_max: base.coordinator.waiting_jobs_max,
+                role_tickets_max: base.coordinator.role_tickets_max,
+                cpu_credit_limit: base.coordinator.cpu_credit_limit,
+            },
+            wall_time_max_ms: base.wall_time_max_ms,
+            cleanup_max_ms: base.cleanup_max_ms,
+            output_bytes_max: base.output_bytes_max,
+            agent_renewable: base.agent_renewable,
+            provenance: base.provenance,
+            startup_document: base.startup_document,
+            startup_configuration_sha256: base.startup_configuration_sha256,
+            startup_search_configuration_sha256: base.startup_search_configuration_sha256,
+            own_r_root_tie: base.own_r_root_tie,
+            system_runtime_lock: SystemRuntimeLockV6::new(runtime).unwrap(),
+        }
+    }
+
     #[test]
     fn explicit_profile_roundtrips_and_has_independent_canonical_domain() {
         let profile = profile();
@@ -710,6 +804,73 @@ mod tests {
             bad_manifest.resources.pools[1].cpu_charge_millicpus = 0;
             assert!(profile().validate_for_manifest_v2(&bad_manifest).is_err());
         }
+    }
+
+    #[test]
+    fn v3_storage_checks_actual_runtime_and_resources_with_optional_source() {
+        for mode in [
+            ExecutionMode::CpuPc,
+            ExecutionMode::CpuPcr,
+            ExecutionMode::HybridPc,
+            ExecutionMode::HybridPcr,
+        ] {
+            let original = manifest_v3(mode);
+            assert!(original.validate().is_ok());
+            assert!(original.engine.source_commit.is_none());
+            let canonical = original.canonical_bytes().unwrap();
+            let lock = original.clone().lock().unwrap();
+            assert!(profile().validate_for_manifest_v3(&original).is_ok());
+            assert_eq!(original.canonical_bytes().unwrap(), canonical);
+            assert_eq!(original.clone().lock().unwrap(), lock);
+
+            let mut bad_helpers = profile();
+            bad_helpers.helpers.shared_nnuec = 1;
+            assert!(bad_helpers.validate_for_manifest_v3(&original).is_err());
+            let mut bad_resource = original;
+            bad_resource.resources.pools[1].cpu_charge_millicpus = 0;
+            assert!(profile().validate_for_manifest_v3(&bad_resource).is_err());
+        }
+
+        // Runtime mismatch is the actual /3 declaration error, not an
+        // archive source-observation or a missing optional commit.
+        let mut mismatch = manifest_v3(ExecutionMode::HybridPc);
+        mismatch.system_runtime_lock =
+            SystemRuntimeLockV6::new(NativeRuntimeSourceV6::Cpu).unwrap();
+        assert!(profile().validate_for_manifest_v3(&mismatch).is_err());
+    }
+
+    #[test]
+    fn v3_storage_rejects_external_r_without_changing_legacy_locks() {
+        let mut external = manifest_v3(ExecutionMode::CpuPcr);
+        external.engine.researcher = Some(RoventResearcher::External {
+            profile: Box::new(RoventExternalProfilePin {
+                domain: ROVENT_EXTERNAL_PROFILE_DOMAIN.into(),
+                profile: artifact("external-profile"),
+                canonical_sha256: "8".repeat(64),
+                capability_sha256: "9".repeat(64),
+                purpose: RoventExternalPurpose::ResearchChecker,
+                binary: artifact("external-engine"),
+                source_commit: "b".repeat(40),
+                requested_threads: 1,
+                requested_hash_mib: 256,
+            }),
+        });
+        external.resources.pools[2].actors = BTreeSet::from([RoventActor::ExternalR]);
+        external.own_r_root_tie = RoventRootTieDeclarationV2::NotApplicable {
+            reason: RoventOwnRNotApplicableV2::ExternalResearcher,
+        };
+        assert!(external.validate().is_ok());
+        assert!(profile().validate_for_manifest_v3(&external).is_err());
+
+        let legacy_v1 = manifest(ExecutionMode::CpuPc).lock().unwrap();
+        let legacy_v2 = manifest_v2(ExecutionMode::CpuPc).lock().unwrap();
+        let before_v1 = serde_json::to_vec(&legacy_v1).unwrap();
+        let before_v2 = serde_json::to_vec(&legacy_v2).unwrap();
+        profile()
+            .validate_for_manifest_v3(&manifest_v3(ExecutionMode::CpuPc))
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&legacy_v1).unwrap(), before_v1);
+        assert_eq!(serde_json::to_vec(&legacy_v2).unwrap(), before_v2);
     }
 
     #[test]
