@@ -307,6 +307,80 @@ impl RoventOwnCollectionBridgeV3 {
                 original,
             };
         }
+        // Verify the registered request and recovery before mutating the
+        // observer or route. Recheck after preparation to catch revocation.
+        {
+            let state = match self.state.try_lock() {
+                Ok(state) => state,
+                Err(TryLockError::WouldBlock) => return OwnPrepareOutcomeV3::Busy(original),
+                Err(TryLockError::Poisoned(_)) => {
+                    return OwnPrepareOutcomeV3::Rejected {
+                        reason: "Own /3 root custody poisoned".into(),
+                        original,
+                    };
+                }
+            };
+            let Some(slot) = state
+                .slots
+                .iter()
+                .find(|slot| slot.admission.same_original_admission(&original.admission))
+            else {
+                return OwnPrepareOutcomeV3::Rejected {
+                    reason: "Own /3 original request absent".into(),
+                    original,
+                };
+            };
+            if !slot.requested
+                || !slot.worker_reserved
+                || !slot.teacher_reserved
+                || slot.revoked.load(Ordering::Acquire)
+                || slot.installed
+                || slot.worker.is_some()
+                || slot.observer.is_some()
+                || !slot
+                    .recovery
+                    .as_ref()
+                    .is_some_and(|owner| Arc::ptr_eq(owner, &original.recovery))
+            {
+                return OwnPrepareOutcomeV3::Rejected {
+                    reason: "Own /3 root or recovery unavailable".into(),
+                    original,
+                };
+            }
+            let recovery_owner = Arc::clone(&original.recovery);
+            let matches = match recovery_owner.try_lock() {
+                Ok(recovery) => match recovery.try_matches_prepared(
+                    &original.admission,
+                    &original.route,
+                    &original.owner,
+                    &original.stage,
+                    &original.pump,
+                    &original.worker.recovery_key(),
+                ) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => return OwnPrepareOutcomeV3::Busy(original),
+                    Err(reason) => {
+                        return OwnPrepareOutcomeV3::Rejected {
+                            reason: reason.into(),
+                            original,
+                        };
+                    }
+                },
+                Err(TryLockError::WouldBlock) => return OwnPrepareOutcomeV3::Busy(original),
+                Err(TryLockError::Poisoned(_)) => {
+                    return OwnPrepareOutcomeV3::Rejected {
+                        reason: "Own /3 recovery poisoned".into(),
+                        original,
+                    };
+                }
+            };
+            if !matches {
+                return OwnPrepareOutcomeV3::Rejected {
+                    reason: "Own /3 staged teacher owner differs".into(),
+                    original,
+                };
+            }
+        }
         let attached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             original
                 .owner
@@ -384,15 +458,25 @@ impl RoventOwnCollectionBridgeV3 {
                 original,
             };
         }
-        let matches_original = match original.recovery.try_lock() {
-            Ok(recovery) => recovery.matches_prepared(
+        let recovery_owner = Arc::clone(&original.recovery);
+        let matches_original = match recovery_owner.try_lock() {
+            Ok(recovery) => match recovery.try_matches_prepared(
                 &original.admission,
                 &original.route,
                 &original.owner,
                 &original.stage,
                 &original.pump,
                 &original.worker.recovery_key(),
-            ),
+            ) {
+                Ok(Some(value)) => value,
+                Ok(None) => return OwnPrepareOutcomeV3::Busy(original),
+                Err(reason) => {
+                    return OwnPrepareOutcomeV3::Rejected {
+                        reason: reason.into(),
+                        original,
+                    };
+                }
+            },
             Err(TryLockError::WouldBlock) => return OwnPrepareOutcomeV3::Busy(original),
             Err(TryLockError::Poisoned(_)) => {
                 return OwnPrepareOutcomeV3::Rejected {

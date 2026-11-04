@@ -52,7 +52,7 @@ impl OwnRootRecoveryV3 {
         self.request.admission.same_original_admission(original)
     }
 
-    pub(crate) fn matches_prepared(
+    pub(crate) fn try_matches_prepared(
         &self,
         admission: &RoventCollectionRootAdmissionV3,
         route: &SpeculativeRootV3,
@@ -60,8 +60,8 @@ impl OwnRootRecoveryV3 {
         stage: &Arc<Mutex<TeacherSessionStagingV3>>,
         pump: &Arc<Mutex<TeacherPumpV3>>,
         key: &RoventBoardCollectionWorkerKeyV3,
-    ) -> bool {
-        !self.request.is_revoked()
+    ) -> Result<Option<bool>, &'static str> {
+        let basic = !self.request.is_revoked()
             && self.matches_admission(admission)
             && self
                 .route
@@ -82,6 +82,57 @@ impl OwnRootRecoveryV3 {
             && self
                 .worker_key
                 .as_ref()
-                .is_some_and(|original| original.same_original(key))
+                .is_some_and(|original| original.same_original(key));
+        if !basic {
+            return Ok(Some(false));
+        }
+        let stage = match stage.try_lock() {
+            Ok(value) => value,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("Own /3 staged session poisoned");
+            }
+        };
+        let Some(session) = stage.session() else {
+            return Ok(Some(false));
+        };
+        let pump = match pump.try_lock() {
+            Ok(value) => value,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("Own /3 teacher pump poisoned");
+            }
+        };
+        if !Arc::ptr_eq(pump.session(), &session)
+            || !self
+                .receiver
+                .as_ref()
+                .is_some_and(|original| Arc::ptr_eq(original, pump.receiver()))
+        {
+            return Ok(Some(false));
+        }
+        let receiver = match pump.receiver().try_lock() {
+            Ok(value) => value,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("Own /3 route receiver poisoned");
+            }
+        };
+        if !receiver.matches_original_route(route) {
+            return Ok(Some(false));
+        }
+        let session = match session.try_lock() {
+            Ok(value) => value,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("Own /3 teacher session poisoned");
+            }
+        };
+        Ok(Some(
+            session
+                .original_admission()
+                .same_original_admission(admission)
+                && session.all_actor_owners_started(),
+        ))
     }
 }
