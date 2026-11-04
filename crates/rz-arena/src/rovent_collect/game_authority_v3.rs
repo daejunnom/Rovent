@@ -253,6 +253,46 @@ impl<S> GameAuthorityV3<S> {
         Arc::ptr_eq(&self.inputs, inputs)
     }
 
+    /// Compare the exact admitted set only after native admission was sealed.
+    /// This is not an observer drain, supervisor join or publication proof.
+    /// None preserves Busy or unfinished original reservation/claim custody.
+    pub(super) fn try_matches_sealed_roots(
+        &self,
+        roots: &[RoventCollectionRootAdmissionV3],
+    ) -> Result<Option<bool>, &'static str> {
+        let state = match self.lock() {
+            Ok(state) => state,
+            Err(GameStepV3::Busy) => return Ok(None),
+            Err(_) => return Err("V3 game authority state unknown"),
+        };
+        if state.phase != PhaseV3::AdmissionSealed {
+            return Ok(None);
+        }
+        if !state.pending.is_empty()
+            || !state.dispatching.is_empty()
+            || state.effects.iter().any(|effect| effect.active)
+            || self.control.load(Ordering::SeqCst) & !CONTROL_FLAGS != 0
+        {
+            return Ok(None);
+        }
+        if roots.len() != state.admitted.len() {
+            return Ok(Some(false));
+        }
+        for (index, root) in roots.iter().enumerate() {
+            if roots[..index]
+                .iter()
+                .any(|prior| prior.same_original_admission(root))
+                || !state
+                    .admitted
+                    .iter()
+                    .any(|original| original.same_original_admission(root))
+            {
+                return Ok(Some(false));
+            }
+        }
+        Ok(Some(true))
+    }
+
     pub(super) fn same_owner(self: &Arc<Self>, other: &Arc<Self>) -> bool {
         Arc::ptr_eq(self, other)
     }
@@ -1091,6 +1131,20 @@ pub(super) struct GameEffectClaimV3<S> {
     resolved: bool,
 }
 impl<S> GameEffectClaimV3<S> {
+    /// Validates only the same pre-registered scope start authority. An
+    /// acquired claim does not attest dispatch receipt or physical completion.
+    pub(super) fn authorizes_teacher_scope(
+        &self,
+        source: &super::teacher::v3_session::TeacherScopeEffectSourceV3,
+    ) -> bool {
+        !self.resolved
+            && !self.owner.unknown.load(Ordering::SeqCst)
+            && self.kind == GameEffectKindV3::TeacherScope
+            && self.actor.is_none()
+            && source.matches_admission(&self.root)
+            && source.matches_stage_identity(&self.stage)
+    }
+
     /// Consumes no result: the real stage/result witness remains with the
     /// caller. It is only an acquisition result, never a physical join.
     pub(super) fn try_complete(&mut self, result: &GameEffectOutcomeV3<S>) -> GameStepV3 {

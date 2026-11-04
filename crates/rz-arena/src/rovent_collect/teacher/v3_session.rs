@@ -66,6 +66,51 @@ pub(crate) struct TeacherSessionStagingV3 {
     state: TeacherSessionStageStateV3,
     ready: Option<Arc<Mutex<RoventCollectionTeacherSessionV3>>>,
     panic: Option<Box<dyn std::any::Any + Send>>,
+    scope_original_admission: RoventCollectionRootAdmissionV3,
+    scope_effect_identity: Arc<()>,
+    scope_effect_source_issued: bool,
+    scope_effect_attempted: bool,
+}
+
+/// One original staged teacher scope; this does not attest dispatch receipt,
+/// game authority, actor startup, or physical completion.
+pub(crate) struct TeacherScopeEffectSourceV3 {
+    identity: Arc<()>,
+    admission: RoventCollectionRootAdmissionV3,
+}
+
+/// Known return from the same staged scope claim. The stage and any acquired
+/// scope owner remain in their original recovery slot.
+pub(crate) struct TeacherScopeEffectOutcomeV3 {
+    identity: Arc<()>,
+    admission: RoventCollectionRootAdmissionV3,
+    state: TeacherSessionStageStateV3,
+}
+impl TeacherScopeEffectSourceV3 {
+    pub(crate) fn matches_stage_identity(&self, identity: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.identity, identity)
+    }
+    pub(crate) fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
+        self.admission.same_original_admission(admission)
+    }
+    pub(crate) fn matches_outcome(&self, outcome: &TeacherScopeEffectOutcomeV3) -> bool {
+        Arc::ptr_eq(&self.identity, &outcome.identity)
+            && self.admission.same_original_admission(&outcome.admission)
+    }
+}
+impl TeacherScopeEffectOutcomeV3 {
+    pub(crate) fn state(&self) -> TeacherSessionStageStateV3 {
+        self.state
+    }
+}
+
+pub(crate) enum TeacherScopeEffectClaimFailureV3 {
+    Known {
+        error: TeacherSessionClaimErrorV3,
+        outcome: TeacherScopeEffectOutcomeV3,
+    },
+    RejectedBeforeEntry(TeacherSessionClaimErrorV3),
+    Unknown(TeacherSessionClaimErrorV3),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,8 +149,103 @@ impl TeacherSessionStagingV3 {
         self.panic.as_deref()
     }
 
+    /// The same stage issues this once, only before the real scope claim.
+    /// Issuance does not establish that a game dispatch was received.
+    pub(crate) fn issue_scope_effect_source(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV3,
+        destination: &mut Option<TeacherScopeEffectSourceV3>,
+    ) -> Result<(), TeacherSessionClaimErrorV3> {
+        if self.scope_effect_source_issued
+            || destination.is_some()
+            || self.state != TeacherSessionStageStateV3::Prepared
+            || !self
+                .scope_original_admission
+                .same_original_admission(admission)
+        {
+            return Err(TeacherSessionClaimErrorV3::InvalidState);
+        }
+        let source = TeacherScopeEffectSourceV3 {
+            identity: Arc::clone(&self.scope_effect_identity),
+            admission: self.scope_original_admission.clone(),
+        };
+        self.scope_effect_source_issued = true;
+        *destination = Some(source);
+        Ok(())
+    }
+
     /// The caller must have published this stage before invoking the claim.
     pub(crate) fn claim(&mut self) -> Result<(), TeacherSessionClaimErrorV3> {
+        if self.scope_effect_source_issued {
+            return Err(TeacherSessionClaimErrorV3::InvalidState);
+        }
+        self.claim_original()
+    }
+
+    /// Once an effect source is issued, only that exact stage source may
+    /// enter the original claim. Unknown/unwind never creates an outcome.
+    pub(crate) fn claim_with_effect_source<S>(
+        &mut self,
+        source: &TeacherScopeEffectSourceV3,
+        guard: &super::super::game_authority_v3::GameEffectClaimV3<S>,
+        destination: &mut Option<
+            Result<TeacherScopeEffectOutcomeV3, TeacherScopeEffectClaimFailureV3>,
+        >,
+    ) -> bool {
+        if destination.is_some() || self.scope_effect_attempted {
+            return false;
+        }
+        if !self.scope_effect_source_issued
+            || !Arc::ptr_eq(&self.scope_effect_identity, &source.identity)
+            || !self
+                .scope_original_admission
+                .same_original_admission(&source.admission)
+            || !guard.authorizes_teacher_scope(source)
+        {
+            *destination = Some(Err(TeacherScopeEffectClaimFailureV3::RejectedBeforeEntry(
+                TeacherSessionClaimErrorV3::InvalidState,
+            )));
+            return true;
+        }
+        // Prepare both retained identities before the actual claim; after it
+        // returns no callback or fallible operation precedes the slot write.
+        let identity = Arc::clone(&source.identity);
+        let admission = source.admission.clone();
+        self.scope_effect_attempted = true;
+        let original_result = self.claim_original();
+        *destination = Some(match original_result {
+            Ok(()) => Ok(TeacherScopeEffectOutcomeV3 {
+                identity,
+                admission,
+                state: self.state,
+            }),
+            Err(error @ TeacherSessionClaimErrorV3::Rejected(_))
+                if matches!(
+                    self.state,
+                    TeacherSessionStageStateV3::BeforeClaimRejected
+                        | TeacherSessionStageStateV3::AfterClaimRejected
+                ) =>
+            {
+                Err(TeacherScopeEffectClaimFailureV3::Known {
+                    error,
+                    outcome: TeacherScopeEffectOutcomeV3 {
+                        identity,
+                        admission,
+                        state: self.state,
+                    },
+                })
+            }
+            Err(error @ TeacherSessionClaimErrorV3::InvalidState)
+                if self.state != TeacherSessionStageStateV3::ClaimingUnknown =>
+            {
+                Err(TeacherScopeEffectClaimFailureV3::RejectedBeforeEntry(error))
+            }
+            Err(error) => Err(TeacherScopeEffectClaimFailureV3::Unknown(error)),
+        });
+        true
+    }
+
+    fn claim_original(&mut self) -> Result<(), TeacherSessionClaimErrorV3> {
         if self.state != TeacherSessionStageStateV3::Prepared {
             return Err(TeacherSessionClaimErrorV3::InvalidState);
         }
@@ -361,6 +501,10 @@ impl RoventCollectionTeacherSessionV3 {
             state: TeacherSessionStageStateV3::Prepared,
             ready: None,
             panic: None,
+            scope_original_admission: admission.clone(),
+            scope_effect_identity: Arc::new(()),
+            scope_effect_source_issued: false,
+            scope_effect_attempted: false,
         })
     }
 
