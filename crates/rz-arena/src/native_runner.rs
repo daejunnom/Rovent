@@ -538,6 +538,14 @@ impl SnapshotCacheHint {
 /// The original V6 control owner remains in the same bundle as the runner.
 /// Its callbacks must be bounded/nonblocking and do not attest completion.
 #[cfg(target_os = "linux")]
+pub(crate) enum NoGameProgressReadback {
+    Observed(crate::pals_adaptive_launch::SmokeControlProgress),
+    Busy,
+    Poisoned,
+    Unavailable,
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) trait NativeV6Control: Send {
     /// The actual original execution allocation held by this control owner.
     /// A missing owner is never accepted as an equivalent declaration.
@@ -552,6 +560,16 @@ pub(crate) trait NativeV6Control: Send {
         &self,
     ) -> Option<&Arc<crate::pals_adaptive_launch::PalsV6RoleSockets>> {
         None
+    }
+    /// This is a borrow of optional NoGame frame observations, never an
+    /// acknowledgement, process completion, or generic V6 game receipt.
+    fn no_game_grants(
+        &self,
+    ) -> Option<&[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]> {
+        None
+    }
+    fn no_game_progress(&self) -> NoGameProgressReadback {
+        NoGameProgressReadback::Unavailable
     }
     fn poll_run(
         &mut self,
@@ -591,6 +609,7 @@ pub(crate) struct NativeV6Supervisor {
     original_pin_error: Option<ArenaError>,
     pre_signal_enabled: bool,
     pre_signal_observation: crate::process::PreSignalObservation,
+    no_game_evidence: Option<NoGameEvidence>,
     // Compiled source-byte observation only; it does not attest the separate
     // proxy executable or affect admission and older canonical records.
     cancel_source_observation: crate::pals_adaptive_launch::CancelSourceObservation,
@@ -654,6 +673,7 @@ impl NativeV6Supervisor {
             original_pin_error: None,
             pre_signal_enabled,
             pre_signal_observation: crate::process::PreSignalObservation::default(),
+            no_game_evidence: None,
             cancel_source_observation:
                 crate::pals_adaptive_launch::compiled_cancel_source_observation(),
         })
@@ -715,6 +735,63 @@ struct NativeRunBundle<S: NativeProviderDeclaration> {
     physical_guard_required: bool,
     #[cfg(target_os = "linux")]
     v6_supervisor: Option<NativeV6Supervisor>,
+}
+
+/// Retained inside the same supervisor as the original NoGame control, also
+/// when NativeRunBundle moves an unresolved owner into quarantine. These are
+/// declared endpoint resources; no installation or readback is inferred.
+#[cfg(target_os = "linux")]
+struct NoGameEvidence {
+    smoke: Arc<Mutex<crate::pals_adaptive_launch::ProxyEntryFunctionalSmokeOwnerV1>>,
+    declared_resources: rz_experiments::PalsResourcePlanV5,
+    transport: Option<crate::process::OriginalSmokeTransportObservation>,
+}
+
+/// A read-only projection of an already sent NoGame frame. It is neither a
+/// proxy acknowledgement nor evidence that a process or device is finished.
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+struct NoGameFrameSnapshot {
+    phase: &'static str,
+    role: &'static str,
+    request_id: u64,
+    generation: u64,
+    peer_pid: u32,
+    peer_start_ticks: u64,
+    original_monotonic_deadline: &'static str,
+    completion_observed_during_cleanup: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+struct NoGameFrameProgressSnapshot {
+    challenge_written: Option<usize>,
+    request_read: Option<usize>,
+    grant_written: Option<usize>,
+    retained_grants: usize,
+    first_failure: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+struct NoGameObservationSnapshot<'a> {
+    domain: &'static str,
+    smoke_lock: Option<serde_json::Value>,
+    smoke_lock_observation: &'static str,
+    declared_endpoint_resources: &'a rz_experiments::PalsResourcePlanV5,
+    resource_application: &'static str,
+    resource_readback: &'static str,
+    transport_attempt_started: Option<bool>,
+    transport_attempt_returned: Option<bool>,
+    transport_spawn_timestamp_semantics: &'static str,
+    transport: Option<&'a crate::process::OriginalProcessObservation>,
+    process: Option<&'a ProcessReceipt>,
+    frame_observation: &'static str,
+    frames: Option<Vec<NoGameFrameSnapshot>>,
+    frame_progress: Option<NoGameFrameProgressSnapshot>,
+    frame_progress_observation: &'static str,
+    physical_completion: &'static str,
+    eligible_for_paired_or_performance_acceptance: bool,
 }
 
 /// NoGame preparation reuses the original bundle's existing quarantine on
@@ -799,6 +876,20 @@ impl NativeV6Control for NoGameRetainedControl {
         &self,
     ) -> Option<&Arc<crate::pals_adaptive_launch::PalsV6RoleSockets>> {
         Some(&self.sockets)
+    }
+
+    fn no_game_grants(
+        &self,
+    ) -> Option<&[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]> {
+        Some(&self.grants)
+    }
+
+    fn no_game_progress(&self) -> NoGameProgressReadback {
+        match self.control.try_lock() {
+            Ok(control) => NoGameProgressReadback::Observed(control.progress()),
+            Err(TryLockError::WouldBlock) => NoGameProgressReadback::Busy,
+            Err(TryLockError::Poisoned(_)) => NoGameProgressReadback::Poisoned,
+        }
     }
 
     fn poll_run(
@@ -888,7 +979,26 @@ impl PreparedNoGameSmokeOwner {
             grants: [None, None],
         });
         match NativeV6Supervisor::new(execution, control) {
-            Ok(supervisor) => original.bundle.v6_supervisor = Some(supervisor),
+            Ok(mut supervisor) => {
+                let declared_resources = original
+                    .bundle
+                    .owner
+                    .as_ref()
+                    .expect("fresh original owner")
+                    .spec()
+                    .endpoint(role)
+                    .startup_lock
+                    .config
+                    .endpoint
+                    .resources
+                    .clone();
+                supervisor.no_game_evidence = Some(NoGameEvidence {
+                    smoke: Arc::clone(smoke),
+                    declared_resources,
+                    transport: None,
+                });
+                original.bundle.v6_supervisor = Some(supervisor);
+            }
             Err(rejection) => {
                 original.rejected_control = Some(rejection.control);
                 return Err(Box::new(NoGameSmokePreparationFailure {
@@ -898,6 +1008,170 @@ impl PreparedNoGameSmokeOwner {
             }
         }
         Ok(original)
+    }
+
+    /// Reserve the transport observation in the same retained supervisor as
+    /// the child owner. The input uses the original execution's exact window;
+    /// reserving it neither applies resources nor starts a process.
+    pub(crate) fn reserve_transport<'a>(
+        &mut self,
+        bytes: &'a [u8],
+    ) -> Result<crate::process::OriginalProcessInput<'a>, ArenaError> {
+        let supervisor =
+            self.bundle.v6_supervisor.as_mut().ok_or_else(|| {
+                ArenaError::Invalid("NoGame original supervisor unavailable".into())
+            })?;
+        supervisor.execution.require_running()?;
+        let window = crate::process::OriginalProcessWindow::new(
+            supervisor.execution.started(),
+            supervisor.execution.run_until(),
+            supervisor.execution.cleanup_until(),
+        )?;
+        let evidence = supervisor.no_game_evidence.as_mut().ok_or_else(|| {
+            ArenaError::Invalid("NoGame original evidence owner unavailable".into())
+        })?;
+        if evidence.transport.is_some() {
+            return Err(ArenaError::Invalid(
+                "NoGame transport already reserved".into(),
+            ));
+        }
+        let input = crate::process::OriginalProcessInput { bytes, window };
+        evidence.transport = Some(crate::process::OriginalSmokeTransportObservation::new(
+            input,
+        )?);
+        Ok(input)
+    }
+
+    /// A later direct supervisor may update only this already reserved
+    /// observation; unresolved Drop retains it with the original supervisor.
+    pub(crate) fn transport_observation_mut(
+        &mut self,
+    ) -> Option<&mut crate::process::OriginalSmokeTransportObservation> {
+        self.bundle
+            .v6_supervisor
+            .as_mut()?
+            .no_game_evidence
+            .as_mut()?
+            .transport
+            .as_mut()
+    }
+
+    /// Transfer an observed output into the existing original bundle. This
+    /// local PID check is not proof of the output's origin; a future execution
+    /// path must keep the adapter return and owner in the same call. An error
+    /// returns the same output, including any pending child handle.
+    fn retain_process_output(
+        &mut self,
+        output: ProcessOutput,
+    ) -> Result<(), (ArenaError, ProcessOutput)> {
+        if self.bundle.process.is_some()
+            || self.bundle.spawn_custody.last_spawn_pid != Some(output.receipt.pid)
+        {
+            return Err((
+                ArenaError::Integrity("NoGame output does not match original custody".into()),
+                output,
+            ));
+        }
+        self.bundle.process = Some(output);
+        Ok(())
+    }
+
+    /// Borrow raw output while the same owner remains live. A borrow or a
+    /// process receipt does not establish durable recovery or physical finish.
+    pub(crate) fn retained_process_output(&self) -> Option<&ProcessOutput> {
+        self.bundle.process.as_ref()
+    }
+
+    /// Produce a bounded in-memory observation snapshot. A busy observation
+    /// lock is reported as unavailable and never blocks unrelated execution.
+    /// Raw output remains in the original bundle; this is not durable storage.
+    pub(crate) fn observation_json(&self) -> Result<Vec<u8>, ArenaError> {
+        let supervisor =
+            self.bundle.v6_supervisor.as_ref().ok_or_else(|| {
+                ArenaError::Invalid("NoGame original supervisor unavailable".into())
+            })?;
+        let evidence = supervisor.no_game_evidence.as_ref().ok_or_else(|| {
+            ArenaError::Invalid("NoGame original evidence owner unavailable".into())
+        })?;
+        let (smoke_lock, smoke_lock_observation) = match evidence.smoke.try_lock() {
+            // The same Mutex can contain a replacement object. Until the
+            // control's original identity is checked, publish no lock value.
+            Ok(_) => (None, "unknown_original_identity"),
+            Err(TryLockError::WouldBlock) => (None, "unavailable_busy"),
+            Err(TryLockError::Poisoned(_)) => (None, "unavailable_poisoned"),
+        };
+        let (frames, frame_progress, frame_observation, frame_progress_observation) =
+            match supervisor.control.try_lock() {
+                Ok(control) => match control.no_game_grants() {
+                    Some(grants) => {
+                        let (progress, progress_status) = match control.no_game_progress() {
+                            NoGameProgressReadback::Observed(value) => (
+                                Some(NoGameFrameProgressSnapshot {
+                                    challenge_written: value.challenge_written,
+                                    request_read: value.request_read,
+                                    grant_written: value.grant_written,
+                                    retained_grants: value.retained_grants,
+                                    first_failure: value.first_failure,
+                                }),
+                                "original_control_observed",
+                            ),
+                            NoGameProgressReadback::Busy => (None, "unavailable_busy"),
+                            NoGameProgressReadback::Poisoned => (None, "unavailable_poisoned"),
+                            NoGameProgressReadback::Unavailable => (None, "unavailable"),
+                        };
+                        (
+                    Some(grants.iter().flatten().map(|grant| NoGameFrameSnapshot {
+                        phase: match grant.scope.phase {
+                            rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Run => "run",
+                            rz_contracts::pals::proxy_entry_smoke_grant_v1::ProxyEntrySmokePhase::Cleanup => "cleanup",
+                        },
+                        role: match grant.scope.role {
+                            rz_contracts::pals::deadline_grant_v1::DeadlineRole::Baseline => "baseline",
+                            rz_contracts::pals::deadline_grant_v1::DeadlineRole::Candidate => "candidate",
+                        },
+                        request_id: grant.scope.request_id,
+                        generation: grant.scope.generation,
+                        peer_pid: grant.peer_pid,
+                        peer_start_ticks: grant.peer_start_ticks,
+                        original_monotonic_deadline: "retained_in_original_control",
+                        completion_observed_during_cleanup: grant.completion_observed_during_cleanup,
+                    }).collect()),
+                    progress,
+                    "original_owner_borrowed",
+                    progress_status,
+                )
+                    }
+                    None => (None, None, "unavailable", "unavailable"),
+                },
+                Err(TryLockError::WouldBlock) => {
+                    (None, None, "unavailable_busy", "unavailable_busy")
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    (None, None, "unavailable_poisoned", "unavailable_poisoned")
+                }
+            };
+        let transport = evidence.transport.as_ref();
+        let snapshot = NoGameObservationSnapshot {
+            domain: "rz-pals-nogame-original-observation/1",
+            smoke_lock,
+            smoke_lock_observation,
+            declared_endpoint_resources: &evidence.declared_resources,
+            resource_application: "unknown",
+            resource_readback: "unknown",
+            transport_attempt_started: transport.map(|v| v.attempt_started()),
+            transport_attempt_returned: transport.map(|v| v.attempt_returned()),
+            transport_spawn_timestamp_semantics: "supervisor_pre_spawn_not_os_spawn",
+            transport: transport.map(|v| v.transport()),
+            process: self.bundle.process.as_ref().map(|v| &v.receipt),
+            frame_observation,
+            frames,
+            frame_progress,
+            frame_progress_observation,
+            physical_completion: "unknown",
+            eligible_for_paired_or_performance_acceptance: false,
+        };
+        serde_json::to_vec(&snapshot)
+            .map_err(|_| ArenaError::Io("NoGame observation serialization failed".into()))
     }
 }
 
