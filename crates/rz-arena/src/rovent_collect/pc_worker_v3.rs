@@ -41,7 +41,10 @@ use rz_uci::rovent_external_launch::{
     RoventTeacherScopeAggregateAckV3, RoventTeacherScopeAggregateFailureV3,
     TeacherRecoveryCustodianV3,
 };
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 /// The original scope, route, session and any uncertain worker remain rooted
@@ -513,6 +516,340 @@ pub(crate) struct PcWorkerSupervisorV3 {
     cleanup_deadline: Instant,
 }
 
+/// A registered supervisor task is retained before any thread can start.
+/// Join of this driver is independent of teacher/native/GPU completion.
+pub(crate) struct SupervisorStartCustodyV3 {
+    supervisor: Arc<Mutex<PcWorkerSupervisorV3>>,
+    native: Option<Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>>,
+    stop: Arc<AtomicBool>,
+    admitted: Arc<AtomicBool>,
+    until: Instant,
+    state: SupervisorThreadStateV3,
+    thread: Option<std::thread::JoinHandle<Result<(), String>>>,
+    result: Option<Result<(), String>>,
+    first_error: Option<String>,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SupervisorThreadStateV3 {
+    Prepared,
+    StartingUnknown,
+    Running,
+    NoWorker,
+    Joined,
+    JoinPanicked,
+}
+
+struct SupervisorRegistryEntryV3 {
+    supervisor: Arc<Mutex<PcWorkerSupervisorV3>>,
+    custody: Arc<Mutex<SupervisorStartCustodyV3>>,
+}
+
+fn supervisor_registry_v3() -> &'static Mutex<Vec<SupervisorRegistryEntryV3>> {
+    static REGISTRY: OnceLock<Mutex<Vec<SupervisorRegistryEntryV3>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+impl SupervisorStartCustodyV3 {
+    /// Reserve exactly one retained owner per original supervisor before
+    /// entering the post-auth callback. This creates no thread or teacher.
+    pub(crate) fn register(
+        supervisor: &Arc<Mutex<PcWorkerSupervisorV3>>,
+        until: Instant,
+    ) -> Result<Arc<Mutex<Self>>, &'static str> {
+        {
+            let original = supervisor
+                .try_lock()
+                .map_err(|_| "P-C supervisor unavailable")?;
+            if until <= Instant::now() || until > original.cleanup_deadline {
+                return Err("P-C supervisor driver deadline invalid");
+            }
+        }
+        let mut registry = supervisor_registry_v3()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if registry
+            .iter()
+            .any(|entry| Arc::ptr_eq(&entry.supervisor, supervisor))
+        {
+            return Err("P-C original supervisor already registered");
+        }
+        registry
+            .try_reserve(1)
+            .map_err(|_| "P-C supervisor registry allocation")?;
+        let custody = Arc::new(Mutex::new(Self {
+            supervisor: Arc::clone(supervisor),
+            native: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            admitted: Arc::new(AtomicBool::new(false)),
+            until,
+            state: SupervisorThreadStateV3::Prepared,
+            thread: None,
+            result: None,
+            first_error: None,
+            panic: None,
+        }));
+        registry.push(SupervisorRegistryEntryV3 {
+            supervisor: Arc::clone(supervisor),
+            custody: Arc::clone(&custody),
+        });
+        Ok(custody)
+    }
+
+    /// Recover the same original owner; this key does not authorize starting.
+    pub(crate) fn recover(
+        supervisor: &Arc<Mutex<PcWorkerSupervisorV3>>,
+    ) -> Result<Option<Arc<Mutex<Self>>>, &'static str> {
+        let registry = supervisor_registry_v3()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Ok(registry
+            .iter()
+            .find(|entry| Arc::ptr_eq(&entry.supervisor, supervisor))
+            .map(|entry| Arc::clone(&entry.custody)))
+    }
+
+    /// Only the one registered original owner may start, and only inside the
+    /// same post-auth gate after the arena's original resource/control proof.
+    /// The registry lock also serializes this transition with no-worker release.
+    pub(crate) fn start_verified(
+        owner: &Arc<Mutex<Self>>,
+        lease: &crate::rovent_resource_scope::launch::PcCollectionResourceStartLeaseV3<'_>,
+        gate: &rz_uci::rovent_bootstrap::launch::RoventPcCollectionStartGateV3,
+        native: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+        control: &rz_uci::rovent_bootstrap::RoventStartupControl,
+    ) -> Result<(), &'static str> {
+        let registry = match supervisor_registry_v3().try_lock() {
+            Ok(registry) => registry,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err("P-C supervisor registry busy"),
+        };
+        if !registry
+            .iter()
+            .any(|entry| Arc::ptr_eq(&entry.custody, owner))
+        {
+            return Err("P-C supervisor original owner is not registered");
+        }
+        let mut custody = owner
+            .try_lock()
+            .map_err(|_| "P-C supervisor custody unavailable")?;
+        // The exact owner lock prevents its removal; unrelated registry
+        // entries need not wait through lease validation or thread creation.
+        drop(registry);
+        let original_supervisor = Arc::clone(&custody.supervisor);
+        let verified = (|| -> Result<(), &'static str> {
+            if !lease.matches_original(gate, native, control) {
+                return Err("P-C supervisor original resource lease differs");
+            }
+            let supervisor = original_supervisor
+                .try_lock()
+                .map_err(|_| "P-C supervisor unavailable")?;
+            supervisor.bridge.bind_native_owner(native)?;
+            let original_control = supervisor
+                .bridge
+                .startup()
+                .ok_or("P-C original startup control absent")?;
+            if !gate.matches_startup_control(original_control) {
+                return Err("P-C supervisor startup control differs from original gate");
+            }
+            Ok(())
+        })();
+        if let Err(error) = verified {
+            custody.first_error.get_or_insert_with(|| error.to_owned());
+            return Err(error);
+        }
+        custody.native = Some(Arc::clone(native));
+        let result = custody.spawn_after_authorization(control);
+        if let Err(error) = result {
+            custody.first_error.get_or_insert_with(|| error.to_owned());
+            return Err(error);
+        }
+        // Cancellation can race the OS thread creation.  Preserve the exact
+        // handle and Running state even when this post-check rejects startup.
+        if control.check().is_err() {
+            let error = "P-C supervisor startup canceled or expired after spawn";
+            custody.first_error.get_or_insert_with(|| error.to_owned());
+            // The driver has not been admitted to step any root yet.
+            custody.stop.store(true, Ordering::Release);
+            return Err(error);
+        }
+        custody.admitted.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// A joined driver may be removed only with this exact launch owner's
+    /// original settlement permit. Merely joining or timing out is not proof.
+    pub(crate) fn release_after_settlement(
+        owner: &Arc<Mutex<Self>>,
+        permit: &rz_uci::rovent_bootstrap::launch::RoventPcCollectionSettlementPermitV3,
+    ) -> Result<bool, &'static str> {
+        let mut registry = match supervisor_registry_v3().try_lock() {
+            Ok(registry) => registry,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err("P-C supervisor registry busy"),
+        };
+        let Some(index) = registry
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.custody, owner))
+        else {
+            return Ok(false);
+        };
+        let custody = owner
+            .try_lock()
+            .map_err(|_| "P-C supervisor custody unavailable")?;
+        if custody.state != SupervisorThreadStateV3::Joined
+            || custody.thread.is_some()
+            || !custody
+                .native
+                .as_ref()
+                .is_some_and(|native| permit.matches_original_owner(native))
+        {
+            return Ok(false);
+        }
+        drop(custody);
+        registry.swap_remove(index);
+        Ok(true)
+    }
+
+    /// A started or unknown driver cannot be released by this path.
+    pub(crate) fn release_no_worker(owner: &Arc<Mutex<Self>>) -> Result<bool, &'static str> {
+        let mut registry = supervisor_registry_v3()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(index) = registry
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.custody, owner))
+        else {
+            return Ok(false);
+        };
+        let custody = owner
+            .try_lock()
+            .map_err(|_| "P-C supervisor custody unavailable")?;
+        if !matches!(
+            custody.state,
+            SupervisorThreadStateV3::Prepared | SupervisorThreadStateV3::NoWorker
+        ) || custody.thread.is_some()
+        {
+            return Ok(false);
+        }
+        drop(custody);
+        registry.swap_remove(index);
+        Ok(true)
+    }
+
+    pub(crate) fn state(&self) -> SupervisorThreadStateV3 {
+        self.state
+    }
+    pub(crate) fn matches_supervisor(&self, supervisor: &Arc<Mutex<PcWorkerSupervisorV3>>) -> bool {
+        Arc::ptr_eq(&self.supervisor, supervisor)
+    }
+    pub(crate) fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+    pub(crate) fn result(&self) -> Option<&Result<(), String>> {
+        self.result.as_ref()
+    }
+    pub(crate) fn first_error(&self) -> Option<&str> {
+        self.first_error.as_deref()
+    }
+    pub(crate) fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.panic.as_deref()
+    }
+
+    /// Never wait on a live thread. A driver join says nothing about its
+    /// root workers, physical devices, output durability or collection success.
+    pub(crate) fn try_join(&mut self) -> SupervisorThreadStateV3 {
+        if self.state != SupervisorThreadStateV3::Running
+            || !self
+                .thread
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            return self.state;
+        }
+        let Some(handle) = self.thread.take() else {
+            return self.state;
+        };
+        match handle.join() {
+            Ok(result) => {
+                if let Err(error) = &result {
+                    self.first_error.get_or_insert_with(|| error.clone());
+                }
+                self.result = Some(result);
+                self.state = SupervisorThreadStateV3::Joined;
+            }
+            Err(payload) => {
+                self.panic = Some(payload);
+                self.state = SupervisorThreadStateV3::JoinPanicked;
+            }
+        }
+        self.state
+    }
+
+    /// Internal primitive; an externally callable start must first validate
+    /// the original post-auth gate and same resource/control/parent custody.
+    /// Until that verifier exists this method has no production caller.
+    fn spawn_after_authorization(
+        &mut self,
+        control: &rz_uci::rovent_bootstrap::RoventStartupControl,
+    ) -> Result<(), &'static str> {
+        if self.state != SupervisorThreadStateV3::Prepared || Instant::now() >= self.until {
+            return Err("P-C supervisor start state or deadline invalid");
+        }
+        control
+            .check()
+            .map_err(|_| "P-C supervisor startup canceled or expired before spawn")?;
+        self.state = SupervisorThreadStateV3::StartingUnknown;
+        let supervisor = Arc::clone(&self.supervisor);
+        let stop = Arc::clone(&self.stop);
+        let admitted = Arc::clone(&self.admitted);
+        let until = self.until;
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::Builder::new()
+                .name("rovent-pc-supervisor-v3".into())
+                .spawn(move || {
+                    loop {
+                        if stop.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        if Instant::now() >= until {
+                            return Err("P-C supervisor cleanup deadline expired".into());
+                        }
+                        if !admitted.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                        match supervisor.try_lock() {
+                            Ok(mut owner) => owner.step()?,
+                            Err(std::sync::TryLockError::WouldBlock) => {}
+                            Err(std::sync::TryLockError::Poisoned(_)) => {
+                                return Err("P-C supervisor owner poisoned".into());
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                })
+        }));
+        match started {
+            Ok(Ok(handle)) => {
+                self.thread = Some(handle);
+                self.state = SupervisorThreadStateV3::Running;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                self.result = Some(Err(error.to_string()));
+                self.state = SupervisorThreadStateV3::NoWorker;
+                Err("P-C supervisor thread creation failed")
+            }
+            Err(payload) => {
+                self.panic = Some(payload);
+                Err("P-C supervisor thread creation unknown")
+            }
+        }
+    }
+}
+
 impl PcWorkerSupervisorV3 {
     /// Same in-memory game output owner; no durable sink is implied.
     pub(crate) fn output_owner(&self) -> Option<PolicyOutputOwnerV3> {
@@ -563,7 +900,7 @@ impl PcWorkerSupervisorV3 {
     }
 
     /// One finite poll; unresolved evidence stays in its original root owner.
-    pub(crate) fn step(&mut self) -> Result<(), String> {
+    fn step(&mut self) -> Result<(), String> {
         if self.pending_root.is_none()
             && self.roots.len() < usize::from(self.bridge.inputs().plan().maximum_roots)
         {
@@ -630,7 +967,7 @@ impl PcWorkerSupervisorV3 {
 
 /// Called outside the native manager callback. Busy leaves the same recovery
 /// owner in place; no new actor or claim is issued for another root.
-pub(crate) fn prepare_root_step_v3(
+fn prepare_root_step_v3(
     bridge: &Arc<RoventPcCollectionBridgeV3>,
     router: &Arc<CaptureRouterV3>,
     recovery: &Arc<Mutex<PcRootRecoveryV3>>,
