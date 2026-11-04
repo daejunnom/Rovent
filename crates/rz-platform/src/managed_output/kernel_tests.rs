@@ -43,6 +43,10 @@ fn align(value: usize) -> usize {
 /// Send real SCM_RIGHTS over the kernel socket; all entries may name the same
 /// sender-owned source FD because the receiver gets independently installed FDs.
 fn send_rights(socket: RawFd, source: RawFd, count: usize) {
+    send_rights_with_payload(socket, source, count, b"x");
+}
+
+fn send_rights_with_payload(socket: RawFd, source: RawFd, count: usize, payload: &[u8]) {
     let header_len = align(std::mem::size_of::<libc::cmsghdr>());
     let body_len = count * std::mem::size_of::<RawFd>();
     let control_len = header_len + align(body_len);
@@ -65,10 +69,9 @@ fn send_rights(socket: RawFd, source: RawFd, count: usize) {
                 source,
             );
         }
-        let mut byte = [b'x'];
         let mut iov = libc::iovec {
-            iov_base: byte.as_mut_ptr().cast(),
-            iov_len: byte.len(),
+            iov_base: payload.as_ptr().cast_mut().cast(),
+            iov_len: payload.len(),
         };
         let mut msg: libc::msghdr = std::mem::zeroed();
         msg.msg_iov = &mut iov;
@@ -77,7 +80,7 @@ fn send_rights(socket: RawFd, source: RawFd, count: usize) {
         msg.msg_controllen = control_len;
         assert_eq!(
             libc::sendmsg(socket, &msg, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT),
-            1,
+            payload.len() as isize,
             "sendmsg: {}",
             io::Error::last_os_error()
         );
@@ -178,6 +181,20 @@ fn kernel_truncation_and_full_rights_are_closed_without_leaks() {
                 "full ancillary receive leaked a descriptor"
             );
         }
+        // Payload truncation must also close every installed descriptor;
+        // valid ancillary data does not make a truncated packet acceptable.
+        let oversized = vec![b'x'; 128];
+        send_rights_with_payload(parent.as_raw_fd(), directory.as_raw_fd(), 8, &oversized);
+        let result = owner.try_receive_packet(1);
+        assert_eq!(
+            result.err().map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidData)
+        );
+        assert_eq!(
+            fd_count(),
+            baseline,
+            "payload-truncated receive leaked a descriptor"
+        );
         assert!(
             directory.metadata().is_ok(),
             "sender-owned directory remains open"
