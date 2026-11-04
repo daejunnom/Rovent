@@ -2009,6 +2009,15 @@ pub struct RoventPcCollectionSettledOutcomeV3 {
 }
 
 impl RoventPcCollectionResourceOutcomeV3 {
+    /// Borrow this outcome's original driver proof without transferring it or
+    /// making game publication a prerequisite for physical settlement.
+    #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+    pub(crate) fn joined_driver(
+        &self,
+    ) -> Option<&crate::rovent_collect::launch::PcSupervisorJoinedProofV3> {
+        self.driver_joined.as_ref()
+    }
+
     /// Retain physical join evidence from this original supervisor. This
     /// neither proves GPU completion nor releases any owner by itself.
     #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
