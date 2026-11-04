@@ -680,6 +680,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
         &[
             source!("crates/rz-eval/Cargo.toml"),
             source!("crates/rz-eval/examples/virtual_review_numeric_capture.rs"),
+            source!("crates/rz-eval/examples/virtual_review_numeric_capture/owned_worker.rs"),
             source!("crates/rz-eval/examples/virtual_review_numeric_capture/tensors.rs"),
             source!("crates/rz-eval/src/pals_onnx.rs"),
             source!("crates/rz-eval/src/pals_onnx/cuda_control.rs"),

@@ -19,11 +19,18 @@ use rz_eval::pals_onnx::virtual_review::{
     VirtualReviewNativeCommand as Command, VirtualReviewNativeResult as Outcome,
     validate_virtual_review_export_manifest,
 };
+#[cfg(target_os = "linux")]
+use rz_eval::pals_onnx::virtual_review::{
+    VirtualReviewArtifactKind, VirtualReviewExportManifestSummary, VirtualReviewHeldFileSources,
+    VirtualReviewHeldGraph, VirtualReviewProfileDirectory, VirtualReviewStartupCustody,
+};
 use rz_eval::pals_onnx::{
     PalsBackendStats, PalsCuDnnConvSearch, PalsCudaControlPolicy, PalsOnnxConfig,
 };
 use rz_eval::runtime_pin::RuntimeCache;
 use rz_eval::worker::{PhysicalPoll, SingleWorker};
+#[cfg(target_os = "linux")]
+use rz_eval::worker::{PhysicalRecoveryKey, PhysicalRecoveryReservation, SessionReleased};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,10 +43,25 @@ use std::{
     task::Poll,
     time::{Duration, Instant},
 };
+#[cfg(target_os = "linux")]
+#[path = "virtual_review_numeric_capture/owned_worker.rs"]
+mod owned_worker;
 #[path = "virtual_review_numeric_capture/tensors.rs"]
 mod tensors;
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
-type Worker = SingleWorker<Command, std::result::Result<Outcome, BackendError>>;
+type LegacyWorker = SingleWorker<Command, std::result::Result<Outcome, BackendError>>;
+
+enum Worker {
+    Legacy(LegacyWorker),
+    #[cfg(target_os = "linux")]
+    System(SystemCaptureWorker),
+}
+
+enum PreparedRuntime {
+    Legacy(OrtRuntime),
+    #[cfg(target_os = "linux")]
+    System(SystemRuntime),
+}
 const LIMIT: usize = 4 * 1024 * 1024;
 const POLICY_LIMIT: usize = 16 * 1024;
 // This bound is the registered logical raw numerical payload total. The exact
@@ -336,6 +358,68 @@ fn capture_output_root(
     }
 }
 
+/// Prepare the exact manifest, graph and optional profile directory owners
+/// before entering ORT. Native loading will re-check bytes from these FDs.
+#[cfg(target_os = "linux")]
+fn system_startup_custody(
+    manifest_path: &Path,
+    summary: &VirtualReviewExportManifestSummary,
+    output: &CaptureOutputRoot,
+    with_control: bool,
+) -> Result<VirtualReviewStartupCustody> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Component;
+
+    const O_NOFOLLOW: i32 = 0x20000;
+    const O_NONBLOCK: i32 = 0x800;
+    const O_DIRECTORY: i32 = 0x10000;
+
+    let open_file = |path: &Path| -> Result<fs::File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+            .open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err("system capture source is not a regular file".into());
+        }
+        Ok(file)
+    };
+    let manifest = open_file(manifest_path)?;
+    let parent = manifest_path.parent().ok_or("manifest parent absent")?;
+    let mut graphs = Vec::new();
+    graphs.try_reserve_exact(summary.graphs.len())?;
+    for graph in &summary.graphs {
+        let mut components = Path::new(&graph.file).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            return Err("registered graph path is not a single filename".into());
+        }
+        graphs.push(VirtualReviewHeldGraph {
+            role: graph.role.clone(),
+            registered_file: graph.file.clone(),
+            sha256: graph.sha256,
+            file: open_file(&parent.join(&graph.file))?,
+        });
+    }
+    let profile = if with_control {
+        output.verify()?;
+        let path = output.path.join("profiles");
+        fs::create_dir(&path)?;
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_DIRECTORY)
+            .open(&path)?;
+        output.verify()?;
+        Some(VirtualReviewProfileDirectory::from_owned_directory(dir)?)
+    } else {
+        None
+    };
+    let sources = VirtualReviewHeldFileSources::new(manifest, graphs);
+    Ok(VirtualReviewStartupCustody::new(
+        std::sync::Arc::new(sources),
+        profile,
+    ))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -531,6 +615,16 @@ struct JoinedPolicyObservation {
     performance_improvement_claim: bool,
     process_exit_evidence: &'static str,
     cuda_profiling_window: Option<CudaProfilingWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_system_session_release: Option<SystemSessionReleaseObservation>,
+}
+
+#[derive(Serialize)]
+struct SystemSessionReleaseObservation {
+    completed_synchronous_runs: u64,
+    scope: &'static str,
+    process_exit: &'static str,
+    device_wide_gpu_fence: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1081,7 +1175,234 @@ fn publish_joined_capture(
     })
 }
 
+#[cfg(target_os = "linux")]
+struct SystemCaptureWorker {
+    worker: Option<owned_worker::Worker>,
+    reservation: Option<PhysicalRecoveryReservation>,
+    recovery_key: Option<PhysicalRecoveryKey>,
+    pending: Option<owned_worker::Lease>,
+    late_completion: Option<std::result::Result<owned_worker::CaptureReply, BackendError>>,
+    release: Option<SessionReleased>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct SystemPhysicalUnknown {
+    detail: &'static str,
+    cause: Option<BackendError>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for SystemPhysicalUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.detail)?;
+        if let Some(cause) = &self.cause {
+            write!(formatter, ": {cause}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Error for SystemPhysicalUnknown {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.cause
+            .as_ref()
+            .map(|cause| cause as &(dyn Error + 'static))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct CaptureAndCleanupFailure {
+    primary_stage: &'static str,
+    primary: Box<dyn Error>,
+    cleanup: Box<dyn Error>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for CaptureAndCleanupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "system {} failed: {}; cleanup: {}",
+            self.primary_stage, self.primary, self.cleanup
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Error for CaptureAndCleanupFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SystemCaptureWorker {
+    fn wait(
+        &mut self,
+        mut lease: owned_worker::Lease,
+        until: Instant,
+    ) -> Result<owned_worker::CaptureReply> {
+        loop {
+            match lease.poll() {
+                PhysicalPoll::Ready(result) => return Ok(result?),
+                PhysicalPoll::Quarantined => {
+                    let cause = match lease.quarantine_cause() {
+                        Ok(cause) => cause,
+                        Err(cause) => Some(cause),
+                    };
+                    self.pending = Some(lease);
+                    return Err(Box::new(SystemPhysicalUnknown {
+                        detail: "system capture physical completion unknown; original lease retained",
+                        cause,
+                    }));
+                }
+                PhysicalPoll::Consumed => {
+                    self.pending = Some(lease);
+                    return Err(Box::new(SystemPhysicalUnknown {
+                        detail: "system capture completion consumed twice; original lease retained",
+                        cause: None,
+                    }));
+                }
+                PhysicalPoll::Pending if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                PhysicalPoll::Pending => {
+                    self.pending = Some(lease);
+                    return Err(Box::new(SystemPhysicalUnknown {
+                        detail: "system capture deadline reached; original physical lease retained",
+                        cause: None,
+                    }));
+                }
+            }
+        }
+    }
+
+    fn start(&mut self, until: Instant) -> Result<owned_worker::Started> {
+        if Instant::now() >= until {
+            return Err("capture window expired before native startup dispatch".into());
+        }
+        let lease =
+            owned_worker::submit_start(self.worker.as_mut().ok_or("system worker absent")?)?;
+        match self.wait(lease, until)? {
+            owned_worker::CaptureReply::Started(started) => Ok(started),
+            owned_worker::CaptureReply::Native(_) => {
+                Err("system startup returned a native command result".into())
+            }
+        }
+    }
+
+    fn command(&mut self, request: Command, until: Instant) -> Result<Outcome> {
+        if self.pending.is_some() {
+            return Err("system capture has an unresolved original physical lease".into());
+        }
+        if Instant::now() >= until {
+            return Err("capture window expired before native dispatch".into());
+        }
+        let lease = owned_worker::submit_native(
+            self.worker.as_mut().ok_or("system worker absent")?,
+            request,
+        )?;
+        match self.wait(lease, until)? {
+            owned_worker::CaptureReply::Native(outcome) => Ok(outcome),
+            owned_worker::CaptureReply::Started(_) => {
+                Err("native command returned a startup result".into())
+            }
+        }
+    }
+
+    fn finish(&mut self, until: Instant) -> Result<()> {
+        loop {
+            if let Some(lease) = self.pending.as_mut() {
+                match lease.poll() {
+                    PhysicalPoll::Ready(result) => {
+                        // Preserve a late result separately; it does not turn
+                        // the earlier deadline or request error into success.
+                        self.late_completion = Some(result);
+                        self.pending.take();
+                    }
+                    PhysicalPoll::Quarantined => {
+                        let cause = match lease.quarantine_cause() {
+                            Ok(cause) => cause,
+                            Err(cause) => Some(cause),
+                        };
+                        return Err(Box::new(SystemPhysicalUnknown {
+                            detail: "system capture is quarantined; original lease and owner retained",
+                            cause,
+                        }));
+                    }
+                    PhysicalPoll::Consumed => {
+                        return Err(Box::new(SystemPhysicalUnknown {
+                            detail: "system capture late completion was already consumed",
+                            cause: None,
+                        }));
+                    }
+                    PhysicalPoll::Pending => {}
+                }
+            }
+            let worker = self.worker.as_mut().ok_or("system worker absent")?;
+            match worker.try_shutdown() {
+                Poll::Ready(Ok(())) if self.pending.is_none() => {
+                    self.release = Some(worker.session_release().ok_or(
+                        "system worker joined without original owner session-release proof",
+                    )?);
+                    return Ok(());
+                }
+                Poll::Ready(Ok(())) => {
+                    return Err(
+                        "system worker joined while original lease remained unresolved".into(),
+                    );
+                }
+                Poll::Ready(Err(error)) => return Err(Box::new(error)),
+                Poll::Pending if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Poll::Pending => {
+                    return Err("system worker did not join within cleanup deadline; original owner retained".into());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SystemCaptureWorker {
+    fn drop(&mut self) {
+        if self.release.is_none() {
+            // Keep the exact worker, request lease, reservation and key alive
+            // for the remaining process lifetime when no same-owner session
+            // release was proven. This does not establish external persistence
+            // after process exit or a device-wide GPU fence.
+            if let Some(lease) = self.pending.take() {
+                std::mem::forget(lease);
+            }
+            if let Some(worker) = self.worker.take() {
+                std::mem::forget(worker);
+            }
+            if let Some(reservation) = self.reservation.take() {
+                std::mem::forget(reservation);
+            }
+            if let Some(key) = self.recovery_key.take() {
+                std::mem::forget(key);
+            }
+            if let Some(late) = self.late_completion.take() {
+                std::mem::forget(late);
+            }
+        }
+    }
+}
+
 fn command(worker: &mut Worker, command: Command, until: Instant) -> Result<Outcome> {
+    match worker {
+        Worker::Legacy(worker) => legacy_command(worker, command, until),
+        #[cfg(target_os = "linux")]
+        Worker::System(worker) => worker.command(command, until),
+    }
+}
+
+fn legacy_command(worker: &mut LegacyWorker, command: Command, until: Instant) -> Result<Outcome> {
     if Instant::now() >= until {
         return Err("capture window expired before native dispatch".into());
     }
@@ -1112,6 +1433,14 @@ fn stats(worker: &mut Worker, until: Instant) -> Result<PalsBackendStats> {
     }
 }
 fn finish(worker: &mut Worker, until: Instant) -> Result<()> {
+    match worker {
+        Worker::Legacy(worker) => finish_legacy(worker, until),
+        #[cfg(target_os = "linux")]
+        Worker::System(worker) => worker.finish(until),
+    }
+}
+
+fn finish_legacy(worker: &mut LegacyWorker, until: Instant) -> Result<()> {
     loop {
         match worker.try_shutdown() {
             Poll::Ready(result) => return Ok(result?),
@@ -1435,7 +1764,9 @@ fn execute(config: Config) -> Result<()> {
             if Instant::now() >= until {
                 return Err("capture window expired before system runtime load".into());
             }
-            OrtRuntime::load_system_cuda(&owner)?
+            // Merely capture system FDs here. The first ORT entry occurs on
+            // the retained worker after its original custody is registered.
+            PreparedRuntime::System(owner)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1447,16 +1778,10 @@ fn execute(config: Config) -> Result<()> {
         if Instant::now() >= until {
             return Err("capture window expired before runtime load".into());
         }
-        OrtRuntime::load(&runtime_pin)?
+        PreparedRuntime::Legacy(OrtRuntime::load(&runtime_pin)?)
     };
-    if hex(runtime.binary_digest()) != b.runtime_library_sha256 {
-        return Err("actual loaded ORT pin differs".into());
-    }
     if system_cuda {
         selected.validate_system_execution_selection()?;
-    } else {
-        selected
-            .validate_execution_selection(runtime.native_loading_profile(), control.is_some())?;
     }
     let output_owner =
         capture_output_root(&config.output_root, config.output_root_admission.as_ref())?;
@@ -1464,48 +1789,139 @@ fn execute(config: Config) -> Result<()> {
     if Instant::now() >= until {
         return Err("capture window expired before model/session load".into());
     }
-    let backend = match (mode, control) {
-        (VirtualReviewExecutionMode::Collection, Some(policy)) => {
-            PalsVirtualReviewOnnxBackend::load_collection_with_cuda_control_policy(
-                &config.export_manifest,
-                &b.export_manifest_sha256,
-                runtime,
-                selected,
-                policy,
-                &root.join("profiles"),
-            )?
+    let (mut worker, epoch, backend_digest, policy_observation) = match runtime {
+        PreparedRuntime::Legacy(runtime) => {
+            if hex(runtime.binary_digest()) != b.runtime_library_sha256 {
+                return Err("actual loaded ORT pin differs".into());
+            }
+            selected.validate_execution_selection(
+                runtime.native_loading_profile(),
+                control.is_some(),
+            )?;
+            let backend = match (mode, control) {
+                (VirtualReviewExecutionMode::Collection, Some(policy)) => {
+                    PalsVirtualReviewOnnxBackend::load_collection_with_cuda_control_policy(
+                        &config.export_manifest,
+                        &b.export_manifest_sha256,
+                        runtime,
+                        selected,
+                        policy,
+                        &root.join("profiles"),
+                    )?
+                }
+                (_, Some(policy)) => PalsVirtualReviewOnnxBackend::load_with_cuda_control_policy(
+                    &config.export_manifest,
+                    &b.export_manifest_sha256,
+                    runtime,
+                    selected,
+                    policy,
+                    &root.join("profiles"),
+                )?,
+                (VirtualReviewExecutionMode::Collection, None) => {
+                    PalsVirtualReviewOnnxBackend::load_collection(
+                        &config.export_manifest,
+                        &b.export_manifest_sha256,
+                        runtime,
+                        selected,
+                    )?
+                }
+                (_, None) => PalsVirtualReviewOnnxBackend::load(
+                    &config.export_manifest,
+                    &b.export_manifest_sha256,
+                    runtime,
+                    selected,
+                )?,
+            };
+            let epoch = backend.model_epoch();
+            let backend_digest = backend.backend_digest();
+            let observation = loaded_policy_observation(
+                &backend,
+                config.cudnn_conv_search.as_deref(),
+                is_cuda && !system_cuda,
+            )?;
+            (
+                Worker::Legacy(backend.into_worker()?),
+                epoch,
+                backend_digest,
+                observation,
+            )
         }
-        (_, Some(policy)) => PalsVirtualReviewOnnxBackend::load_with_cuda_control_policy(
-            &config.export_manifest,
-            &b.export_manifest_sha256,
-            runtime,
-            selected,
-            policy,
-            &root.join("profiles"),
-        )?,
-        (VirtualReviewExecutionMode::Collection, None) => {
-            PalsVirtualReviewOnnxBackend::load_collection(
+        #[cfg(target_os = "linux")]
+        PreparedRuntime::System(runtime) => {
+            let custody = system_startup_custody(
                 &config.export_manifest,
-                &b.export_manifest_sha256,
+                &summary,
+                &output_owner,
+                system_control,
+            )?;
+            let (mut reservation, key) = PhysicalRecoveryReservation::reserve()?;
+            let mut original = Some(custody);
+            let startup = owned_worker::Startup {
                 runtime,
-                selected,
-            )?
+                expected_runtime_sha256: pin(&b.runtime_library_sha256)?,
+                expected_manifest_sha256: b.export_manifest_sha256.clone(),
+                config: selected,
+                mode,
+                kind: VirtualReviewArtifactKind::Fresh,
+                policy: control,
+                requested_cudnn_conv_search: config.cudnn_conv_search.clone(),
+                until,
+            };
+            let physical = match owned_worker::spawn(&mut original, &mut reservation, startup) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    // Spawn failure is before worker/native entry; only the
+                    // unpublished original reservation may be canceled after
+                    // the exact custody was returned to its original slot.
+                    if original.is_some() {
+                        if let Err((owner, cancel_error)) = reservation.try_cancel_unpublished() {
+                            let _ = writeln!(
+                                std::io::stderr().lock(),
+                                "RZ_NUMERIC_UNPUBLISHED_RESERVATION_RETAINED={cancel_error:?}"
+                            );
+                            std::mem::forget(owner);
+                        }
+                    } else {
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
+                            "RZ_NUMERIC_RESERVATION_RETAINED={{\"reason\":\"original_custody_unavailable\"}}"
+                        );
+                        std::mem::forget(reservation);
+                    }
+                    return Err(Box::new(error));
+                }
+            };
+            let mut owner = SystemCaptureWorker {
+                worker: Some(physical),
+                reservation: Some(reservation),
+                recovery_key: Some(key),
+                pending: None,
+                late_completion: None,
+                release: None,
+            };
+            let started = match owner.start(until) {
+                Ok(started) => started,
+                Err(startup) => {
+                    let cleanup_until =
+                        Instant::now() + Duration::from_secs(config.cleanup_seconds);
+                    return match owner.finish(cleanup_until) {
+                        Ok(()) => Err(startup),
+                        Err(cleanup) => Err(Box::new(CaptureAndCleanupFailure {
+                            primary_stage: "startup",
+                            primary: startup,
+                            cleanup,
+                        })),
+                    };
+                }
+            };
+            (
+                Worker::System(owner),
+                started.epoch,
+                started.backend_digest,
+                started.policy_observation,
+            )
         }
-        (_, None) => PalsVirtualReviewOnnxBackend::load(
-            &config.export_manifest,
-            &b.export_manifest_sha256,
-            runtime,
-            selected,
-        )?,
     };
-    let epoch = backend.model_epoch();
-    let backend_digest = backend.backend_digest();
-    let policy_observation = loaded_policy_observation(
-        &backend,
-        config.cudnn_conv_search.as_deref(),
-        is_cuda && (!system_cuda || system_control),
-    )?;
-    let mut worker = backend.into_worker()?;
     let mut system_mapping = None;
     #[cfg(target_os = "linux")]
     let mut system_placement: Option<(serde_json::Value, serde_json::Value)> = None;
@@ -1715,12 +2131,28 @@ fn execute(config: Config) -> Result<()> {
     let outputs = match (work, joined) {
         (Ok(outputs), Ok(())) => outputs,
         (Err(work), Err(join)) => {
+            #[cfg(target_os = "linux")]
+            if system_cuda {
+                return Err(Box::new(CaptureAndCleanupFailure {
+                    primary_stage: "capture",
+                    primary: work,
+                    cleanup: join,
+                }));
+            }
             return Err(format!(
                 "capture failed: {work}; physical cleanup failed: {join}; pending files retained"
             )
             .into());
         }
         (Err(work), Ok(())) => {
+            #[cfg(target_os = "linux")]
+            if system_cuda {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "RZ_NUMERIC_SYSTEM_WORKER_JOINED_AFTER_FAILURE={{\"scope\":\"same_original_native_session\"}}"
+                );
+                return Err(work);
+            }
             return Err(format!(
                 "capture failed: {work}; native worker joined; pending files retained"
             )
@@ -1729,6 +2161,18 @@ fn execute(config: Config) -> Result<()> {
         (Ok(_), Err(join)) => {
             return Err(format!("physical cleanup failed: {join}; pending files retained").into());
         }
+    };
+    let original_system_session_release = match &worker {
+        Worker::Legacy(_) => None,
+        #[cfg(target_os = "linux")]
+        Worker::System(owner) => owner
+            .release
+            .map(|release| SystemSessionReleaseObservation {
+                completed_synchronous_runs: release.completed_synchronous_runs,
+                scope: "same_original_native_session_after_successful_worker_join",
+                process_exit: "requires_external_supervisor",
+                device_wide_gpu_fence: "not_established",
+            }),
     };
     output_owner.verify()?;
     let publication = publish_joined_capture(
@@ -1800,6 +2244,7 @@ fn execute(config: Config) -> Result<()> {
                     performance_improvement_claim: false,
                     process_exit_evidence: "requires_external_process_owner_exit_observation",
                     cuda_profiling_window: profiling_window,
+                    original_system_session_release,
                 },
                 POLICY_LIMIT,
             )

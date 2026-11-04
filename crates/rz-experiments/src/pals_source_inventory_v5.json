@@ -557,6 +557,7 @@
     "model_native": [
       "crates/rz-eval/Cargo.toml",
       "crates/rz-eval/examples/virtual_review_numeric_capture.rs",
+      "crates/rz-eval/examples/virtual_review_numeric_capture/owned_worker.rs",
       "crates/rz-eval/examples/virtual_review_numeric_capture/tensors.rs",
       "crates/rz-eval/src/pals_onnx.rs",
       "crates/rz-eval/src/pals_onnx/cuda_control.rs",
