@@ -512,6 +512,9 @@ pub(crate) struct PcWorkerSupervisorV3 {
     roots: Vec<Arc<Mutex<PcRootRecoveryV3>>>,
     pending_root: Option<RoventCollectionRootAdmissionV3>,
     pipeline: Option<PolicyRowPipelineOwnerV3>,
+    managed_output: Option<Arc<ManagedOutputOwnerV3>>,
+    output_installed: bool,
+    driver_sealed: bool,
     startup_deadline: Instant,
     cleanup_deadline: Instant,
 }
@@ -542,6 +545,74 @@ pub(crate) enum SupervisorThreadStateV3 {
     JoinPanicked,
 }
 
+/// Evidence only for this driver's joined thread, not GPU or output success.
+pub(crate) struct PcSupervisorJoinedProofV3 {
+    custody: Arc<Mutex<SupervisorStartCustodyV3>>,
+    supervisor: Arc<Mutex<PcWorkerSupervisorV3>>,
+    native: Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    panicked: bool,
+}
+
+impl PcSupervisorJoinedProofV3 {
+    pub(crate) fn panicked(&self) -> bool {
+        self.panicked
+    }
+    pub(crate) fn matches_original(
+        &self,
+        custody: &Arc<Mutex<SupervisorStartCustodyV3>>,
+        supervisor: &Arc<Mutex<PcWorkerSupervisorV3>>,
+        native: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    ) -> bool {
+        Arc::ptr_eq(&self.custody, custody)
+            && Arc::ptr_eq(&self.supervisor, supervisor)
+            && Arc::ptr_eq(&self.native, native)
+    }
+}
+
+/// A sealed original driver which never created a supervisor thread.
+pub(crate) struct PcSupervisorNoWorkerProofV3 {
+    custody: Arc<Mutex<SupervisorStartCustodyV3>>,
+    supervisor: Arc<Mutex<PcWorkerSupervisorV3>>,
+    native: Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+}
+
+impl PcSupervisorNoWorkerProofV3 {
+    pub(crate) fn matches_original(
+        &self,
+        custody: &Arc<Mutex<SupervisorStartCustodyV3>>,
+        supervisor: &Arc<Mutex<PcWorkerSupervisorV3>>,
+        native: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    ) -> bool {
+        Arc::ptr_eq(&self.custody, custody)
+            && Arc::ptr_eq(&self.supervisor, supervisor)
+            && Arc::ptr_eq(&self.native, native)
+    }
+}
+
+/// A created driver joined before it was admitted to process any root.
+pub(crate) struct PcSupervisorBeforeAdmissionJoinProofV3 {
+    custody: Arc<Mutex<SupervisorStartCustodyV3>>,
+    supervisor: Arc<Mutex<PcWorkerSupervisorV3>>,
+    native: Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    panicked: bool,
+}
+
+impl PcSupervisorBeforeAdmissionJoinProofV3 {
+    pub(crate) fn panicked(&self) -> bool {
+        self.panicked
+    }
+    pub(crate) fn matches_original(
+        &self,
+        custody: &Arc<Mutex<SupervisorStartCustodyV3>>,
+        supervisor: &Arc<Mutex<PcWorkerSupervisorV3>>,
+        native: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    ) -> bool {
+        Arc::ptr_eq(&self.custody, custody)
+            && Arc::ptr_eq(&self.supervisor, supervisor)
+            && Arc::ptr_eq(&self.native, native)
+    }
+}
+
 struct SupervisorRegistryEntryV3 {
     supervisor: Arc<Mutex<PcWorkerSupervisorV3>>,
     custody: Arc<Mutex<SupervisorStartCustodyV3>>,
@@ -563,7 +634,10 @@ impl SupervisorStartCustodyV3 {
             let original = supervisor
                 .try_lock()
                 .map_err(|_| "P-C supervisor unavailable")?;
-            if until <= Instant::now() || until > original.cleanup_deadline {
+            if original.driver_sealed
+                || until <= Instant::now()
+                || until > original.cleanup_deadline
+            {
                 return Err("P-C supervisor driver deadline invalid");
             }
         }
@@ -575,6 +649,13 @@ impl SupervisorStartCustodyV3 {
             .any(|entry| Arc::ptr_eq(&entry.supervisor, supervisor))
         {
             return Err("P-C original supervisor already registered");
+        }
+        if supervisor
+            .try_lock()
+            .map_err(|_| "P-C supervisor unavailable")?
+            .driver_sealed
+        {
+            return Err("P-C supervisor driver is sealed");
         }
         registry
             .try_reserve(1)
@@ -610,6 +691,163 @@ impl SupervisorStartCustodyV3 {
             .iter()
             .find(|entry| Arc::ptr_eq(&entry.supervisor, supervisor))
             .map(|entry| Arc::clone(&entry.custody)))
+    }
+
+    /// Capture actual join of the same quiescence-authorized driver. This
+    /// establishes no GPU, semantic, or durable-output result.
+    pub(crate) fn joined_proof(
+        owner: &Arc<Mutex<Self>>,
+    ) -> Result<Option<PcSupervisorJoinedProofV3>, &'static str> {
+        let registry = supervisor_registry_v3()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !registry
+            .iter()
+            .any(|entry| Arc::ptr_eq(&entry.custody, owner))
+        {
+            return Err("P-C supervisor original owner is not registered");
+        }
+        let custody = owner
+            .try_lock()
+            .map_err(|_| "P-C supervisor custody unavailable")?;
+        let Some(native) = custody.native.as_ref() else {
+            return Ok(None);
+        };
+        if !matches!(
+            custody.state,
+            SupervisorThreadStateV3::Joined | SupervisorThreadStateV3::JoinPanicked
+        ) || custody.thread.is_some()
+            || custody.stop_authorization.is_none()
+        {
+            return Ok(None);
+        }
+        Ok(Some(PcSupervisorJoinedProofV3 {
+            custody: Arc::clone(owner),
+            supervisor: Arc::clone(&custody.supervisor),
+            native: Arc::clone(native),
+            panicked: custody.state == SupervisorThreadStateV3::JoinPanicked,
+        }))
+    }
+
+    pub(crate) fn before_admission_join_proof(
+        owner: &Arc<Mutex<Self>>,
+    ) -> Result<Option<PcSupervisorBeforeAdmissionJoinProofV3>, &'static str> {
+        let registry = supervisor_registry_v3()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !registry
+            .iter()
+            .any(|entry| Arc::ptr_eq(&entry.custody, owner))
+        {
+            return Err("P-C supervisor original owner is not registered");
+        }
+        let custody = owner
+            .try_lock()
+            .map_err(|_| "P-C supervisor custody unavailable")?;
+        let Some(native) = custody.native.as_ref() else {
+            return Ok(None);
+        };
+        if !matches!(
+            custody.state,
+            SupervisorThreadStateV3::Joined | SupervisorThreadStateV3::JoinPanicked
+        ) || custody.thread.is_some()
+            || custody.admitted.load(Ordering::Acquire)
+            || !custody.stop.load(Ordering::Acquire)
+            || custody.stop_authorization.is_some()
+            || custody.first_error.is_none()
+        {
+            return Ok(None);
+        }
+        Ok(Some(PcSupervisorBeforeAdmissionJoinProofV3 {
+            custody: Arc::clone(owner),
+            supervisor: Arc::clone(&custody.supervisor),
+            native: Arc::clone(native),
+            panicked: custody.state == SupervisorThreadStateV3::JoinPanicked,
+        }))
+    }
+
+    /// The joined-before-admission case has no native root work; only the
+    /// exact original proof can retire this driver's registry entry.
+    pub(crate) fn release_before_admission_join(
+        owner: &Arc<Mutex<Self>>,
+        proof: &PcSupervisorBeforeAdmissionJoinProofV3,
+    ) -> Result<bool, &'static str> {
+        let mut registry = supervisor_registry_v3()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(index) = registry
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.custody, owner))
+        else {
+            return Ok(false);
+        };
+        let custody = owner
+            .try_lock()
+            .map_err(|_| "P-C supervisor custody unavailable")?;
+        let Some(native) = custody.native.as_ref() else {
+            return Ok(false);
+        };
+        if !proof.matches_original(owner, &custody.supervisor, native)
+            || !matches!(
+                custody.state,
+                SupervisorThreadStateV3::Joined | SupervisorThreadStateV3::JoinPanicked
+            )
+            || custody.thread.is_some()
+            || custody.admitted.load(Ordering::Acquire)
+            || !custody.stop.load(Ordering::Acquire)
+            || custody.stop_authorization.is_some()
+        {
+            return Ok(false);
+        }
+        custody
+            .supervisor
+            .try_lock()
+            .map_err(|_| "P-C supervisor unavailable")?
+            .driver_sealed = true;
+        drop(custody);
+        registry.swap_remove(index);
+        Ok(true)
+    }
+
+    /// Irreversibly seal a registered driver which never spawned a thread.
+    /// A started or unknown worker cannot be converted to this evidence.
+    pub(crate) fn seal_no_worker(
+        owner: &Arc<Mutex<Self>>,
+        native: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    ) -> Result<Option<PcSupervisorNoWorkerProofV3>, &'static str> {
+        let registry = supervisor_registry_v3()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !registry
+            .iter()
+            .any(|entry| Arc::ptr_eq(&entry.custody, owner))
+        {
+            return Err("P-C supervisor original owner is not registered");
+        }
+        let mut custody = owner
+            .try_lock()
+            .map_err(|_| "P-C supervisor custody unavailable")?;
+        if !matches!(
+            custody.state,
+            SupervisorThreadStateV3::Prepared | SupervisorThreadStateV3::NoWorker
+        ) || custody.thread.is_some()
+            || custody.admitted.load(Ordering::Acquire)
+        {
+            return Ok(None);
+        }
+        let original_supervisor = Arc::clone(&custody.supervisor);
+        let mut original = original_supervisor
+            .try_lock()
+            .map_err(|_| "P-C supervisor unavailable")?;
+        original.bridge.bind_native_owner(native)?;
+        original.driver_sealed = true;
+        custody.state = SupervisorThreadStateV3::NoWorker;
+        drop(original);
+        Ok(Some(PcSupervisorNoWorkerProofV3 {
+            custody: Arc::clone(owner),
+            supervisor: original_supervisor,
+            native: Arc::clone(native),
+        }))
     }
 
     /// Only the one registered original owner may start, and only inside the
@@ -709,6 +947,11 @@ impl SupervisorStartCustodyV3 {
         {
             return Ok(false);
         }
+        custody
+            .supervisor
+            .try_lock()
+            .map_err(|_| "P-C supervisor unavailable")?
+            .driver_sealed = true;
         drop(custody);
         registry.swap_remove(index);
         Ok(true)
@@ -728,10 +971,14 @@ impl SupervisorStartCustodyV3 {
         let custody = owner
             .try_lock()
             .map_err(|_| "P-C supervisor custody unavailable")?;
-        if !matches!(
-            custody.state,
-            SupervisorThreadStateV3::Prepared | SupervisorThreadStateV3::NoWorker
-        ) || custody.thread.is_some()
+        if custody.state != SupervisorThreadStateV3::NoWorker || custody.thread.is_some() {
+            return Ok(false);
+        }
+        if !custody
+            .supervisor
+            .try_lock()
+            .map_err(|_| "P-C supervisor unavailable")?
+            .driver_sealed
         {
             return Ok(false);
         }
@@ -894,6 +1141,26 @@ impl PcWorkerSupervisorV3 {
             .any(|original| Arc::ptr_eq(original, recovery))
     }
 
+    /// Retain the game's original output owner before the first root exists.
+    /// Actual pipeline installation occurs only after that root creates it.
+    pub(crate) fn register_output(
+        &mut self,
+        output: &Arc<ManagedOutputOwnerV3>,
+    ) -> Result<(), &'static str> {
+        if let Some(original) = &self.managed_output {
+            return if Arc::ptr_eq(original, output) {
+                Ok(())
+            } else {
+                Err("P-C V3 original output owner changed")
+            };
+        }
+        if self.pipeline.is_some() || self.pending_root.is_some() || !self.roots.is_empty() {
+            return Err("P-C V3 output owner must be registered before roots");
+        }
+        self.managed_output = Some(Arc::clone(output));
+        Ok(())
+    }
+
     /// Same in-memory game output owner; no durable sink is implied.
     pub(crate) fn output_owner(&self) -> Option<PolicyOutputOwnerV3> {
         self.pipeline
@@ -903,10 +1170,7 @@ impl PcWorkerSupervisorV3 {
 
     /// The caller retains its original managed output capability; path names
     /// or a second copy of input bytes cannot manufacture this ownership.
-    pub(crate) fn try_install_output(
-        &self,
-        output: &Arc<ManagedOutputOwnerV3>,
-    ) -> Result<bool, String> {
+    fn try_install_output(&self, output: &Arc<ManagedOutputOwnerV3>) -> Result<bool, String> {
         let Some(pipeline) = self.pipeline.as_ref() else {
             return Ok(false);
         };
@@ -937,6 +1201,9 @@ impl PcWorkerSupervisorV3 {
             roots,
             pending_root: None,
             pipeline: None,
+            managed_output: None,
+            output_installed: false,
+            driver_sealed: false,
             startup_deadline,
             cleanup_deadline,
         })
@@ -957,6 +1224,14 @@ impl PcWorkerSupervisorV3 {
                 )
                 .map_err(|error| error.to_string())?;
                 self.pipeline = Some(PolicyRowPipelineOwnerV3::new(writer));
+            }
+            if !self.output_installed {
+                if let Some(output) = self.managed_output.as_ref() {
+                    if !self.try_install_output(output)? {
+                        return Ok(());
+                    }
+                    self.output_installed = true;
+                }
             }
             if self.roots.iter().any(|root| {
                 root.lock()
