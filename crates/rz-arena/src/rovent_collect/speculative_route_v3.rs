@@ -71,7 +71,13 @@ impl SpeculativeTicketV3 {
             .compare_exchange(0, 6, Ordering::AcqRel, Ordering::Acquire);
         Ok(Some(()))
     }
-    pub(super) fn try_take_target_capability(&self) -> Result<TargetCapabilityTakeV3, ArenaError> {
+    fn try_take_target_capability_in_slot(
+        &self,
+        destination: &mut Option<TargetPublicationV3>,
+    ) -> Result<TargetCapabilityTakeV3, ArenaError> {
+        if destination.is_some() {
+            return Ok(TargetCapabilityTakeV3::Occupied);
+        }
         let mut slot = match self.target_capability.try_lock() {
             Ok(slot) => slot,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(TargetCapabilityTakeV3::Busy),
@@ -79,10 +85,14 @@ impl SpeculativeTicketV3 {
                 return Err(invalid("lock-v3 target capability custody poisoned"));
             }
         };
-        Ok(match slot.take() {
-            Some(capability) => TargetCapabilityTakeV3::Ready(capability),
-            None => TargetCapabilityTakeV3::AlreadyTaken,
-        })
+        let Some(capability) = slot.take() else {
+            return Ok(TargetCapabilityTakeV3::AlreadyTaken);
+        };
+        // The checked-empty destination belongs to the caller's already-held
+        // custody slot. No fallible operation or callback occurs between the
+        // original slot take and the installation into that destination.
+        *destination = Some(capability);
+        Ok(TargetCapabilityTakeV3::Transferred)
     }
     pub(super) fn not_required(&self) {
         self.state.store(8, Ordering::Release);
@@ -101,9 +111,18 @@ impl SpeculativeTicketV3 {
 }
 
 pub(super) enum TargetCapabilityTakeV3 {
-    Ready(TargetPublicationV3),
+    Transferred,
     Busy,
     AlreadyTaken,
+    Occupied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TargetBeginRejectionV3 {
+    Revoked,
+    AlreadyCommitted,
+    Uncertain,
+    Poisoned,
 }
 
 /// Read-only root revocation view. No caller can mutate the shared flag
@@ -143,21 +162,23 @@ impl TargetPublicationV3 {
     }
     /// None is transient contention. A cancellation, prior commit, or
     /// uncertain previous append is an error and never grants a new attempt.
-    pub(crate) fn try_begin_append(&self) -> Result<Option<TargetAppendGuardV3<'_>>, ArenaError> {
+    pub(crate) fn try_begin_append(
+        &self,
+    ) -> Result<Option<TargetAppendGuardV3<'_>>, TargetBeginRejectionV3> {
         let gate = match self.gate.try_lock() {
             Ok(gate) => gate,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
             Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(invalid("lock-v3 target publication gate poisoned"));
+                return Err(TargetBeginRejectionV3::Poisoned);
             }
         };
-        if self.revoked.is_revoked() || self.authority.canceled() {
-            return Err(invalid("lock-v3 target revoked before append"));
+        match self.state.load(Ordering::Acquire) {
+            0 => {}
+            2 => return Err(TargetBeginRejectionV3::AlreadyCommitted),
+            _ => return Err(TargetBeginRejectionV3::Uncertain),
         }
-        if self.state.load(Ordering::Acquire) != 0 {
-            return Err(invalid(
-                "lock-v3 target append already committed or uncertain",
-            ));
+        if self.revoked.is_revoked() || self.authority.canceled() {
+            return Err(TargetBeginRejectionV3::Revoked);
         }
         self.state.store(1, Ordering::Release);
         Ok(Some(TargetAppendGuardV3 {
@@ -512,9 +533,10 @@ impl SpeculativeRootV3 {
 
     /// Take the only publication capability from this exact root/ticket.
     /// The caller must retain it if later preparation or append fails.
-    pub(super) fn try_take_target_capability(
+    pub(super) fn try_take_target_capability_in_slot(
         &self,
         ticket: &RoleTicketEnvelope,
+        destination: &mut Option<TargetPublicationV3>,
     ) -> Result<TargetCapabilityTakeV3, ArenaError> {
         if !self.matches_ticket_authority(ticket) {
             return Err(invalid("lock-v3 target ticket root mismatch"));
@@ -530,7 +552,7 @@ impl SpeculativeRootV3 {
             .get(&ticket.id)
             .filter(|item| item.ticket == *ticket)
             .ok_or_else(|| invalid("lock-v3 original target ticket missing or changed"))?;
-        item.try_take_target_capability()
+        item.try_take_target_capability_in_slot(destination)
     }
     pub(crate) fn cancel_all(&self) {
         self.route.cancel_all.store(true, Ordering::Release);
