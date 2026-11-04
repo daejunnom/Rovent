@@ -11,6 +11,50 @@ use rz_experiments::rovent_corpus_lock_v2::record::{
 };
 use std::sync::Arc;
 
+/// The optional partial-output limit counts actual JSONL bytes only. The
+/// original writer's independent lock-wide metadata/output cap still applies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PartialChunkBudget {
+    limit: u64,
+    admitted: u64,
+}
+impl PartialChunkBudget {
+    fn checked_next(self, row_bytes: u64) -> Result<u64, ArenaError> {
+        self.admitted
+            .checked_add(row_bytes)
+            .filter(|total| *total <= self.limit)
+            .ok_or_else(|| invalid("writer /2 partial chunk byte limit"))
+    }
+}
+
+#[cfg(test)]
+mod partial_chunk_budget_tests {
+    use super::PartialChunkBudget;
+
+    #[test]
+    fn actual_chunk_limit_is_cumulative_and_rejection_preserves_original() {
+        let mut budget = PartialChunkBudget {
+            limit: 10,
+            admitted: 0,
+        };
+        budget.admitted = budget.checked_next(4).unwrap();
+        let retained = budget;
+        assert!(budget.checked_next(7).is_err());
+        assert_eq!(budget, retained);
+        budget.admitted = budget.checked_next(6).unwrap();
+        assert_eq!(budget.admitted, 10);
+        assert!(budget.checked_next(1).is_err());
+        assert!(
+            PartialChunkBudget {
+                limit: u64::MAX,
+                admitted: u64::MAX
+            }
+            .checked_next(1)
+            .is_err()
+        );
+    }
+}
+
 /// Owns bounded JSONL buffers and the source snapshots of the real rows it
 /// has consumed. The caller still owns chunk persistence and quota enforcement.
 pub struct RoventCorpusWriterLockV2 {
@@ -21,6 +65,7 @@ pub struct RoventCorpusWriterLockV2 {
     buffer_rows: u64,
     total_bytes: u64,
     output_bytes_max: u64,
+    partial_chunk_budget: Option<PartialChunkBudget>,
     record_seals: BTreeSet<String>,
     admissions: BTreeMap<String, Arc<LockV2PublicationSource>>,
     // While accepting rows, compare the actual issuer/root owners as well as
@@ -30,6 +75,25 @@ pub struct RoventCorpusWriterLockV2 {
 }
 
 impl RoventCorpusWriterLockV2 {
+    /// Restrict actual JSONL payload bytes before accepting rows. This does
+    /// not relax or replace the original lock's conservative output limit.
+    pub(crate) fn restrict_partial_chunk_bytes(&mut self, limit: u64) -> Result<(), ArenaError> {
+        check(
+            limit > 0
+                && self.index.record_count == 0
+                && self.buffer.is_empty()
+                && self.index.chunks.is_empty(),
+            "writer /2 partial chunk limit must precede rows",
+        )?;
+        let effective = self
+            .partial_chunk_budget
+            .map_or(limit, |budget| budget.limit.min(limit));
+        self.partial_chunk_budget = Some(PartialChunkBudget {
+            limit: effective,
+            admitted: 0,
+        });
+        Ok(())
+    }
     /// Set a tighter output budget before accepting any rows. This conservative
     /// budget includes manifest, source and index overhead as well as chunks.
     /// It cannot increase the original admitted lock's output limit.
@@ -104,6 +168,7 @@ impl RoventCorpusWriterLockV2 {
             buffer_rows: 0,
             total_bytes,
             output_bytes_max,
+            partial_chunk_budget: None,
             record_seals: BTreeSet::new(),
             admissions: BTreeMap::new(),
             original_admissions: BTreeMap::new(),
@@ -130,6 +195,10 @@ impl RoventCorpusWriterLockV2 {
         )?;
         let mut bytes = serde_json::to_vec(record).map_err(|error| invalid(error.to_string()))?;
         bytes.push(b'\n');
+        let partial_chunk_next = self
+            .partial_chunk_budget
+            .map(|budget| budget.checked_next(bytes.len() as u64))
+            .transpose()?;
         let origin = RoventCorpusOrigin {
             record_sha256: value.record_sha256.clone(),
             input_sha256: value.input_sha256.clone(),
@@ -199,6 +268,9 @@ impl RoventCorpusWriterLockV2 {
         self.index.record_count += 1;
         self.buffer_rows += 1;
         self.total_bytes += added;
+        if let (Some(budget), Some(next)) = (&mut self.partial_chunk_budget, partial_chunk_next) {
+            budget.admitted = next;
+        }
         self.buffer.extend(bytes);
         Ok(())
     }

@@ -11,6 +11,7 @@ struct LockV2Cli {
     sealed_teacher_slots: Vec<usize>,
     speculative_teacher: bool,
     partial_spec: Option<rz_arena::rovent_collect::RoventPublicationFile>,
+    partial_game_limits: Option<(u64, u64)>,
     original: Vec<String>,
 }
 
@@ -39,6 +40,8 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
                     | "--v2-partial-spec"
                     | "--v2-partial-spec-sha256"
                     | "--v2-partial-spec-bytes"
+                    | "--v2-partial-game-bytes"
+                    | "--v2-partial-game-index-bytes"
             ) || value.is_empty()
                 || fields.insert(key.to_owned(), value.to_owned()).is_some()
             {
@@ -108,6 +111,21 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
             );
         }
     };
+    let partial_game_limits = match (
+        fields.remove("--v2-partial-game-bytes"),
+        fields.remove("--v2-partial-game-index-bytes"),
+    ) {
+        (None, None) => None,
+        (Some(total), Some(index)) if partial_spec.is_some() => {
+            let total = total.parse::<u64>()?;
+            let index = index.parse::<u64>()?;
+            if total == 0 || index == 0 {
+                return Err("game partial requires positive byte limits".into());
+            }
+            Some((total, index))
+        }
+        _ => return Err("game partial requires both limits and a pinned partial spec".into()),
+    };
     if !input.is_absolute() || !output.is_absolute() || worker_ms == 0 || cleanup_ms < worker_ms {
         return Err(
             "absolute input/output and finite ordered worker/cleanup timeouts required".into(),
@@ -123,6 +141,7 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
         sealed_teacher_slots,
         speculative_teacher,
         partial_spec,
+        partial_game_limits,
         original,
     }))
 }
@@ -132,6 +151,7 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
 enum V2CliOutcome {
     StrictComplete,
     PartialReceiptWritten,
+    PartialGameIndexWritten,
     Incomplete,
 }
 
@@ -141,8 +161,9 @@ fn run_lock_v2(
 ) -> Result<(serde_json::Value, V2CliOutcome), Box<dyn std::error::Error>> {
     use rz_arena::rovent_collect::launch::{
         load_rovent_collection_lock_v2_plan, load_rovent_partial_collection_spec,
-        run_rovent_own_nnuec_collection_lock_v2,
+        load_verified_partial_game_inputs, run_rovent_own_nnuec_collection_lock_v2,
         run_rovent_pc_collection_lock_v2_with_speculative_teacher,
+        run_rovent_pc_collection_lock_v2_with_verified_partial_game,
     };
     use std::time::{Duration, Instant};
     let start = Instant::now();
@@ -153,12 +174,31 @@ fn run_lock_v2(
         .checked_add(Duration::from_millis(cli.cleanup_ms))
         .ok_or("cleanup deadline overflow")?;
     let directory = cap_std::fs::Dir::open_ambient_dir(&cli.input, cap_std::ambient_authority())?;
-    let plan = load_rovent_collection_lock_v2_plan(&directory, &cli.plan)?;
-    let partial_spec = cli
-        .partial_spec
-        .as_ref()
-        .map(|pin| load_rovent_partial_collection_spec(&directory, pin, &cli.plan.sha256))
-        .transpose()?;
+    let mut verified_game =
+        if let Some((max_total_bytes, index_max_bytes)) = cli.partial_game_limits {
+            Some(load_verified_partial_game_inputs(
+                &directory,
+                &cli.plan,
+                cli.partial_spec
+                    .as_ref()
+                    .ok_or("partial game spec missing")?,
+                max_total_bytes,
+                index_max_bytes,
+            )?)
+        } else {
+            None
+        };
+    let (plan, partial_spec) = if let Some(inputs) = verified_game.as_ref() {
+        (inputs.plan().clone(), Some(inputs.spec().clone()))
+    } else {
+        (
+            load_rovent_collection_lock_v2_plan(&directory, &cli.plan)?,
+            cli.partial_spec
+                .as_ref()
+                .map(|pin| load_rovent_partial_collection_spec(&directory, pin, &cli.plan.sha256))
+                .transpose()?,
+        )
+    };
     if plan.output_directory != cli.output {
         return Err("V2 output directory differs from pinned plan".into());
     }
@@ -182,15 +222,26 @@ fn run_lock_v2(
         .collect();
     let (observation, accepted, publication, publication_error) = match cli.mode.as_str() {
         "pc" => {
-            let mut run = run_rovent_pc_collection_lock_v2_with_speculative_teacher(
-                cli.original,
-                plan,
-                &directory,
-                worker_until,
-                cleanup_until,
-                sealed_effective.clone(),
-                speculative_effective,
-            )?;
+            let mut run = match verified_game.take() {
+                Some(inputs) => run_rovent_pc_collection_lock_v2_with_verified_partial_game(
+                    cli.original,
+                    inputs,
+                    &directory,
+                    worker_until,
+                    cleanup_until,
+                    sealed_effective.clone(),
+                    speculative_effective,
+                )?,
+                None => run_rovent_pc_collection_lock_v2_with_speculative_teacher(
+                    cli.original,
+                    plan,
+                    &directory,
+                    worker_until,
+                    cleanup_until,
+                    sealed_effective.clone(),
+                    speculative_effective,
+                )?,
+            };
             while !run.poll_worker() && Instant::now() < cleanup_until {
                 std::thread::sleep(
                     cleanup_until
@@ -204,7 +255,11 @@ fn run_lock_v2(
                 .min(cleanup_until);
             let (publication, publication_error) = match partial_spec.as_ref() {
                 Some(spec) => {
-                    match run.collect_partial_single_root(spec, &cli.plan.sha256, until) {
+                    let result = match cli.partial_game_limits {
+                        Some(_) => run.collect_partial_settled_game(until),
+                        None => run.collect_partial_single_root(spec, &cli.plan.sha256, until),
+                    };
+                    match result {
                         Ok(()) => ("partial", None),
                         Err(error) => ("partial", Some(error.to_string())),
                     }
@@ -307,9 +362,11 @@ fn run_lock_v2(
             .expect("CLI observation is an object")
             .insert(
                 "partial_collection_selection".into(),
-            serde_json::json!({"policy":"partial_policy_unavailable_v1", "spec":pin,
+            serde_json::json!({"policy":if cli.partial_game_limits.is_some() { "partial_game_v2" } else { "partial_policy_unavailable_v1" }, "spec":pin,
                 "receipt_status":if partial_receipt_written { "written" } else { "unavailable" },
-                "receipt_path":if partial_receipt_written { Some("partial_collection/partial_collection.json") } else { None },
+                "receipt_path":if partial_receipt_written {
+                    Some(if cli.partial_game_limits.is_some() { "partial-game-v2.json" } else { "partial_collection/partial_collection.json" })
+                } else { None },
                 "training_eligible":false,"physical_completion":"not_attested"}),
             );
     }
@@ -330,6 +387,8 @@ fn run_lock_v2(
     }
     let outcome = if in_process_complete {
         V2CliOutcome::StrictComplete
+    } else if partial_receipt_written && cli.partial_game_limits.is_some() {
+        V2CliOutcome::PartialGameIndexWritten
     } else if partial_receipt_written {
         V2CliOutcome::PartialReceiptWritten
     } else {
@@ -369,6 +428,9 @@ fn main() -> std::process::ExitCode {
                             V2CliOutcome::StrictComplete => std::process::ExitCode::SUCCESS,
                             V2CliOutcome::PartialReceiptWritten => std::process::ExitCode::from(
                                 rz_arena::rovent_collect::launch::partial_followup_v1::PARTIAL_COLLECTION_EXIT_CODE as u8,
+                            ),
+                            V2CliOutcome::PartialGameIndexWritten => std::process::ExitCode::from(
+                                rz_arena::rovent_collect::launch::partial_game_v2::GAME_PARTIAL_EXIT_CODE,
                             ),
                             V2CliOutcome::Incomplete => std::process::ExitCode::FAILURE,
                         }
@@ -574,6 +636,33 @@ mod v2_cli_tests {
         let mut missing = arguments();
         missing.push("--v2-partial-spec=inputs/partial.json".into());
         assert!(parse_lock_v2(missing).is_err());
+    }
+
+    #[test]
+    fn game_partial_requires_explicit_partial_spec_and_both_finite_limits() {
+        let mut selected = arguments();
+        selected.extend([
+            "--v2-partial-spec=inputs/partial.json".to_owned(),
+            "--v2-partial-spec-sha256=unused-at-parse".to_owned(),
+            "--v2-partial-spec-bytes=123".to_owned(),
+            "--v2-partial-game-bytes=4096".to_owned(),
+            "--v2-partial-game-index-bytes=1024".to_owned(),
+        ]);
+        assert_eq!(
+            parse_lock_v2(selected.clone())
+                .unwrap()
+                .unwrap()
+                .partial_game_limits,
+            Some((4096, 1024))
+        );
+        selected.pop();
+        assert!(parse_lock_v2(selected).is_err());
+        let mut no_spec = arguments();
+        no_spec.extend([
+            "--v2-partial-game-bytes=4096".into(),
+            "--v2-partial-game-index-bytes=1024".into(),
+        ]);
+        assert!(parse_lock_v2(no_spec).is_err());
     }
 
     #[test]

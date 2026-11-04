@@ -1,5 +1,6 @@
 //! P-C input-lock /2 launch custody. A returned run is an observation, not a
 //! published corpus or a claim of native/teacher physical completion.
+mod partial_game_driver_v2;
 use super::*;
 use crate::rovent_collect::pc_hooks_lock_v2::{
     PcWorkerExitKindV2, PcWorkerStartErrorV2, RoventPcCollectionBridgeV2,
@@ -19,6 +20,63 @@ const WORKER_NOT_STARTED: u8 = 0;
 const WORKER_STARTING: u8 = 1;
 const WORKER_STARTED: u8 = 2;
 const WORKER_START_FAILED: u8 = 3;
+
+/// Return the very same owner alongside a captured unwind. The caller must
+/// put it back in run-owned in-process custody before resuming the panic. This
+/// cannot protect values moved inside the callback, aborts, or process exit.
+fn run_with_unwind_owner<T, R>(
+    mut owner: T,
+    action: impl FnOnce(&mut T) -> R,
+) -> (T, std::thread::Result<R>) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(&mut owner)));
+    (owner, result)
+}
+
+#[cfg(test)]
+mod partial_unwind_custody_tests {
+    use super::run_with_unwind_owner;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Original(Arc<AtomicUsize>);
+    impl Drop for Original {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn unwinding_restores_original_owner_before_resuming_same_payload() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut slot = Some(Box::new(Original(Arc::clone(&drops))));
+        let original_address = &**slot.as_ref().unwrap() as *const Original;
+        let payload = Box::new(41_u64);
+        let payload_address = &*payload as *const u64;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (original, result) = run_with_unwind_owner::<_, ()>(slot.take().unwrap(), |_| {
+                std::panic::panic_any(payload)
+            });
+            slot = Some(original);
+            if let Err(payload) = result {
+                std::panic::resume_unwind(payload);
+            }
+        }));
+        let payload = outcome
+            .expect_err("the same panic must propagate")
+            .downcast::<Box<u64>>()
+            .expect("original payload type");
+        assert_eq!(&**payload as *const u64, payload_address);
+        assert_eq!(
+            &**slot.as_ref().unwrap() as *const Original,
+            original_address
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(slot);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+}
 
 /// Write only failure-domain payloads, never a corpus publication receipt.
 /// The caller owns the already-created directory and retains source custody.
@@ -216,8 +274,10 @@ pub struct RoventPcCollectionRunV2 {
     publication_manifest: Arc<RoventCorpusManifestLockV2>,
     publication_directory: std::path::PathBuf,
     publication_maximum_records: u64,
+    verified_game_inputs: Option<super::VerifiedPartialGameInputs>,
     publication_assembly: Option<RoventCorpusAssemblyLockV2>,
     publication_dir: Option<Dir>,
+    partial_game_assemblies: Vec<(Dir, RoventCorpusAssemblyLockV2)>,
     publication_attempted: bool,
     publication:
         Option<rz_experiments::rovent_corpus_lock_v2::publication::RoventLockV2Publication>,
@@ -310,126 +370,139 @@ impl RoventPcCollectionRunV2 {
             .as_mut()
             .expect("partial assembly retained")
             .restrict_output_limit(spec.byte_limit)?;
-        let mut assembly = self.publication_assembly.take().expect("partial assembly");
-        let result = (|| -> Result<(), ArenaError> {
-            loop {
-                check(Instant::now() < until, "P/C partial collection deadline")?;
-                let polled = self.pump_consumer.poll()?;
-                match self.try_offer_partial_consumer_item_for(
-                    &self.bridge,
-                    &self.worker,
-                    &self.pump_consumer,
-                    &mut assembly,
-                )? {
-                    PartialOfferOutcomeV2::Offered => {
-                        self.advance_game_row(&self.bridge, &self.worker, &mut assembly)?
-                    }
-                    PartialOfferOutcomeV2::PolicyUnavailableRetained => {}
-                    PartialOfferOutcomeV2::BlockedFailureRetained => {
-                        return Err(invalid("P/C partial has other retained failure"));
-                    }
-                    PartialOfferOutcomeV2::Pending => {
-                        let Some((items, _, _, _)) = self.pump_consumer.try_counts()? else {
-                            std::thread::sleep(Duration::from_millis(1));
-                            continue;
-                        };
-                        if items != 0 {
-                            std::thread::sleep(Duration::from_millis(1));
-                            continue;
+        let assembly = self.publication_assembly.take().expect("partial assembly");
+        // Restore the same assembly to the run even when a surrounding
+        // operation unwinds. This guard does not prove ownership of a writer
+        // or row moved inside an individual assembly operation.
+        let (assembly, result) =
+            run_with_unwind_owner(assembly, |assembly| -> Result<(), ArenaError> {
+                loop {
+                    check(Instant::now() < until, "P/C partial collection deadline")?;
+                    let polled = self.pump_consumer.poll()?;
+                    match self.try_offer_partial_consumer_item_for(
+                        &self.bridge,
+                        &self.worker,
+                        &self.pump_consumer,
+                        assembly,
+                    )? {
+                        PartialOfferOutcomeV2::Offered => {
+                            self.advance_game_row(&self.bridge, &self.worker, assembly)?
                         }
-                        // The joined original worker still owns its sender;
-                        // channel disconnect is therefore not guaranteed.
-                        // The admission checks above prove both producers have
-                        // stopped and no original pump rows remain in flight.
-                        if matches!(polled, OwnPumpPollV2::Disconnected | OwnPumpPollV2::Empty) {
-                            break;
+                        PartialOfferOutcomeV2::PolicyUnavailableRetained => {}
+                        PartialOfferOutcomeV2::BlockedFailureRetained => {
+                            return Err(invalid("P/C partial has other retained failure"));
                         }
-                        std::thread::sleep(Duration::from_millis(1));
+                        PartialOfferOutcomeV2::Pending => {
+                            let Some((items, _, _, _)) = self.pump_consumer.try_counts()? else {
+                                std::thread::sleep(Duration::from_millis(1));
+                                continue;
+                            };
+                            if items != 0 {
+                                std::thread::sleep(Duration::from_millis(1));
+                                continue;
+                            }
+                            // The joined original worker still owns its sender;
+                            // channel disconnect is therefore not guaranteed.
+                            // The admission checks above prove both producers have
+                            // stopped and no original pump rows remain in flight.
+                            if matches!(polled, OwnPumpPollV2::Disconnected | OwnPumpPollV2::Empty)
+                            {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
                     }
                 }
-            }
-            let failures = self
-                .pump_consumer
-                .try_partial_failure_ids()?
-                .ok_or_else(|| invalid("P/C partial failure custody busy"))?;
-            check(
-                assembly.records() > 0,
-                "P/C partial contains no validated rows",
-            )?;
-            check(
-                self.owner.try_status()?.is_some_and(|status| {
-                    status.pending_retired_count == 0
-                        && status.game_reserved_slots == Some(0)
-                        && assembly
-                            .records()
-                            .checked_add(failures.len() as u64)
-                            .is_some_and(|total| {
-                                u64::try_from(status.game_retired_total).ok() == Some(total)
-                            })
-                }),
-                "P/C partial original row accounting differs",
-            )?;
-            assembly.flush()?;
-            let finished = assembly.finish()?;
-            let pins: Vec<PartialChunkPin> = finished
-                .index()
-                .chunks
-                .iter()
-                .map(|chunk| PartialChunkPin {
-                    path: chunk.path.clone(),
-                    bytes: chunk.bytes,
-                    sha256: chunk.sha256.clone(),
-                    rows: chunk.records,
-                })
-                .collect();
-            let directory = self
-                .publication_dir
-                .as_ref()
-                .expect("partial directory retained");
-            let mut accounting = PartialCollectionAccounting::new(spec.row_limit, spec.byte_limit)
-                .map_err(|e| invalid(format!("partial accounting: {e:?}")))?;
-            account_flushed_chunks(directory, spec, &mut accounting, &pins).map_err(io)?;
-            let chunk_bytes = pins
-                .iter()
-                .try_fold(0u64, |sum, pin| sum.checked_add(pin.bytes))
-                .ok_or_else(|| invalid("partial chunk byte count overflow"))?;
-            let remaining = spec
-                .byte_limit
-                .checked_sub(chunk_bytes)
-                .ok_or_else(|| invalid("partial chunk byte limit"))?;
-            let capture = self
-                .pump_consumer
-                .capture_partial_failures(directory, remaining)?;
-            let captured_ids: Vec<_> = capture
-                .as_ref()
-                .map(|(_, rows)| rows.iter().map(|(id, _)| id.clone()).collect())
-                .unwrap_or_default();
-            check(
-                captured_ids == failures,
-                "partial failure capture custody differs",
-            )?;
-            if let Some((_, rows)) = capture.as_ref() {
-                for (id, bytes) in rows {
-                    accounting
-                        .begin_row(id)
-                        .map_err(|e| invalid(format!("partial failure accounting: {e:?}")))?;
-                    accounting
-                        .record_failure(id, &format!("failure-evidence.jsonl#{id}"), *bytes)
-                        .map_err(|e| invalid(format!("partial failure accounting: {e:?}")))?;
+                let failures = self
+                    .pump_consumer
+                    .try_partial_failure_ids()?
+                    .ok_or_else(|| invalid("P/C partial failure custody busy"))?;
+                check(
+                    assembly.records() > 0 || !failures.is_empty(),
+                    "P/C partial contains no validated rows or retained failures",
+                )?;
+                check(
+                    self.owner.try_status()?.is_some_and(|status| {
+                        status.pending_retired_count == 0
+                            && status.game_reserved_slots == Some(0)
+                            && assembly
+                                .records()
+                                .checked_add(failures.len() as u64)
+                                .is_some_and(|total| {
+                                    u64::try_from(status.game_retired_total).ok() == Some(total)
+                                })
+                    }),
+                    "P/C partial original row accounting differs",
+                )?;
+                let pins: Vec<PartialChunkPin> = if assembly.records() == 0 {
+                    Vec::new()
+                } else {
+                    assembly.flush()?;
+                    assembly
+                        .finish()?
+                        .index()
+                        .chunks
+                        .iter()
+                        .map(|chunk| PartialChunkPin {
+                            path: chunk.path.clone(),
+                            bytes: chunk.bytes,
+                            sha256: chunk.sha256.clone(),
+                            rows: chunk.records,
+                        })
+                        .collect()
+                };
+                let directory = self
+                    .publication_dir
+                    .as_ref()
+                    .expect("partial directory retained");
+                let mut accounting =
+                    PartialCollectionAccounting::new(spec.row_limit, spec.byte_limit)
+                        .map_err(|e| invalid(format!("partial accounting: {e:?}")))?;
+                account_flushed_chunks(directory, spec, &mut accounting, &pins).map_err(io)?;
+                let chunk_bytes = pins
+                    .iter()
+                    .try_fold(0u64, |sum, pin| sum.checked_add(pin.bytes))
+                    .ok_or_else(|| invalid("partial chunk byte count overflow"))?;
+                let remaining = spec
+                    .byte_limit
+                    .checked_sub(chunk_bytes)
+                    .ok_or_else(|| invalid("partial chunk byte limit"))?;
+                let capture = self
+                    .pump_consumer
+                    .capture_partial_failures(directory, remaining)?;
+                let captured_ids: Vec<_> = capture
+                    .as_ref()
+                    .map(|(_, rows)| rows.iter().map(|(id, _)| id.clone()).collect())
+                    .unwrap_or_default();
+                check(
+                    captured_ids == failures,
+                    "partial failure capture custody differs",
+                )?;
+                if let Some((_, rows)) = capture.as_ref() {
+                    for (id, bytes) in rows {
+                        accounting
+                            .begin_row(id)
+                            .map_err(|e| invalid(format!("partial failure accounting: {e:?}")))?;
+                        accounting
+                            .record_failure(id, &format!("failure-evidence.jsonl#{id}"), *bytes)
+                            .map_err(|e| invalid(format!("partial failure accounting: {e:?}")))?;
+                    }
                 }
-            }
-            let mut receipt = accounting
-                .finish(PartialEndReason::InputExhausted)
-                .map_err(|(e, _)| invalid(format!("partial accounting: {e:?}")))?
-                .with_chunks(pins);
-            if let Some((pin, _)) = capture {
-                receipt = receipt.with_failure_evidence(pin);
-            }
-            write_partial_receipt(directory, spec, &receipt).map_err(io)?;
-            Ok(())
-        })();
+                let mut receipt = accounting
+                    .finish(PartialEndReason::InputExhausted)
+                    .map_err(|(e, _)| invalid(format!("partial accounting: {e:?}")))?
+                    .with_chunks(pins);
+                if let Some((pin, _)) = capture {
+                    receipt = receipt.with_failure_evidence(pin);
+                }
+                write_partial_receipt(directory, spec, &receipt).map_err(io)?;
+                Ok(())
+            });
         self.publication_assembly = Some(assembly);
-        result
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
     /// Transfer bounded local diagnostics only after each original worker has
     /// exited. Unknown roots remain unknown and confer no completion rights.
@@ -2062,6 +2135,9 @@ impl Drop for RoventPcCollectionRunV2 {
             if let Some(directory) = self.publication_dir.take() {
                 std::mem::forget(directory);
             }
+            if !self.partial_game_assemblies.is_empty() {
+                std::mem::forget(std::mem::take(&mut self.partial_game_assemblies));
+            }
             if !self.late_rows.is_empty() {
                 std::mem::forget(std::mem::take(&mut self.late_rows));
             }
@@ -2087,6 +2163,7 @@ pub fn run_rovent_pc_collection_lock_v2(
         cleanup_deadline,
         Vec::new(),
         false,
+        None,
         |_| Ok(()),
     )
 }
@@ -2109,6 +2186,7 @@ pub fn run_rovent_pc_collection_lock_v2_with_sealed_policy(
         cleanup_deadline,
         sealed_teacher_indices,
         false,
+        None,
         |_| Ok(()),
     )
 }
@@ -2132,6 +2210,32 @@ pub fn run_rovent_pc_collection_lock_v2_with_speculative_teacher(
         cleanup_deadline,
         sealed_teacher_indices,
         speculative_teacher,
+        None,
+        |_| Ok(()),
+    )
+}
+
+/// Explicit game-partial entry: the same plan/spec bytes were pinned before
+/// the native owner was started and remain attached to its returned run.
+pub fn run_rovent_pc_collection_lock_v2_with_verified_partial_game(
+    arguments: Vec<String>,
+    inputs: super::VerifiedPartialGameInputs,
+    input_directory: &Dir,
+    worker_deadline: Instant,
+    cleanup_deadline: Instant,
+    sealed_teacher_indices: Vec<usize>,
+    speculative_teacher: bool,
+) -> Result<RoventPcCollectionRunV2, ArenaError> {
+    let plan = inputs.plan.clone();
+    run_rovent_pc_collection_lock_v2_inner(
+        arguments,
+        plan,
+        input_directory,
+        worker_deadline,
+        cleanup_deadline,
+        sealed_teacher_indices,
+        speculative_teacher,
+        Some(inputs),
         |_| Ok(()),
     )
 }
@@ -2155,6 +2259,7 @@ pub fn run_rovent_pc_collection_lock_v2_with_test_owner(
         cleanup_deadline,
         Vec::new(),
         false,
+        None,
         on_owner,
     )
 }
@@ -2167,8 +2272,16 @@ fn run_rovent_pc_collection_lock_v2_inner(
     cleanup_deadline: Instant,
     sealed_teacher_indices: Vec<usize>,
     speculative_teacher_requested: bool,
+    verified_game_inputs: Option<super::VerifiedPartialGameInputs>,
     on_owner: impl FnOnce(&RoventCollectionOwnerLockV2) -> Result<(), ArenaError>,
 ) -> Result<RoventPcCollectionRunV2, ArenaError> {
+    if let Some(inputs) = verified_game_inputs.as_ref() {
+        check(
+            serde_json::to_value(&inputs.plan).map_err(|e| invalid(e.to_string()))?
+                == serde_json::to_value(&plan).map_err(|e| invalid(e.to_string()))?,
+            "P/C verified game plan differs before native startup",
+        )?;
+    }
     check(
         (1..=64).contains(&plan.maximum_roots),
         "P/C Collection /2 root capacity must be between 1 and 64",
@@ -2406,8 +2519,10 @@ fn run_rovent_pc_collection_lock_v2_inner(
         publication_manifest,
         publication_directory,
         publication_maximum_records,
+        verified_game_inputs,
         publication_assembly: None,
         publication_dir: None,
+        partial_game_assemblies: Vec::new(),
         publication_attempted: false,
         publication: None,
         late_rows: std::collections::VecDeque::new(),

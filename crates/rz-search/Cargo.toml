@@ -7,6 +7,7 @@ license = "MIT"
 description = "RoveZero deterministic PUCT accounting and time control"
 
 [features]
+test-teacher-fixtures = []
 experimental-batch = []
 # Explicit raw NNUEC scalar observation only; no evaluator/search behavior.
 nnuec-scalar-diagnostics = []
@@ -32,6 +33,11 @@ rz-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+
+[[bin]]
+name = "rz-test-teacher-fixture"
+path = "src/bin/rz-test-teacher-fixture.rs"
+required-features = ["test-teacher-fixtures"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["fs", "signal", "process"] }

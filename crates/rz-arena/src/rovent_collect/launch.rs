@@ -49,13 +49,14 @@ mod own_nnuec_lock_v2;
 pub(crate) mod own_publisher_v2;
 mod partial_collection_v1;
 pub mod partial_followup_v1;
+pub mod partial_game_followup_v2;
 pub mod partial_game_v2;
 mod pc_lock_v2;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod teacher_fixture_identity_v1;
 pub use partial_collection_v1::{
-    PartialCollectionReader, PartialCollectionReceipt, PartialCollectionSpec, read_partial_receipt,
-    visit_partial_chunk,
+    InspectionFailureEvidenceStatus, PartialCollectionReader, PartialCollectionReceipt,
+    PartialCollectionSpec, PartialInspectionReader, read_partial_receipt, visit_partial_chunk,
 };
 mod r_stream;
 mod resources;
@@ -78,6 +79,7 @@ pub use pc_lock_v2::{
     RoventPcCollectionRunV2, run_rovent_pc_collection_lock_v2,
     run_rovent_pc_collection_lock_v2_with_sealed_policy,
     run_rovent_pc_collection_lock_v2_with_speculative_teacher,
+    run_rovent_pc_collection_lock_v2_with_verified_partial_game,
 };
 pub use r_stream::{RoventRCollectionAncestor, RoventRCollectionPlan};
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
@@ -361,13 +363,32 @@ pub fn load_rovent_collection_lock_v2_plan(
     input_directory: &Dir,
     pin: &RoventPublicationFile,
 ) -> Result<RoventCollectionLockV2LaunchPlan, ArenaError> {
+    let raw = load_rovent_collection_lock_v2_plan_bytes(input_directory, pin)?;
+    decode_rovent_collection_lock_v2_plan(&raw)
+}
+
+/// The exact pinned plan bytes can be reused by the game partial index.
+pub fn load_rovent_collection_lock_v2_plan_bytes(
+    input_directory: &Dir,
+    pin: &RoventPublicationFile,
+) -> Result<Vec<u8>, ArenaError> {
     check(
         pin.path.starts_with("inputs/") && valid_relative(&pin.path),
         "Collection /2 plan must be an original private input",
     )?;
-    let raw = read_pin(input_directory, pin, ROVENT_LOCK_V2_PLAN_MAX_BYTES)?;
+    read_pin(input_directory, pin, ROVENT_LOCK_V2_PLAN_MAX_BYTES)
+}
+
+/// Decode the same bounded bytes, without replacing source pin verification.
+pub fn decode_rovent_collection_lock_v2_plan(
+    raw: &[u8],
+) -> Result<RoventCollectionLockV2LaunchPlan, ArenaError> {
+    check(
+        raw.len() as u64 <= ROVENT_LOCK_V2_PLAN_MAX_BYTES,
+        "Collection /2 plan byte limit",
+    )?;
     Ok(rz_experiments::decode_json(
-        std::str::from_utf8(&raw).map_err(|_| invalid("Collection /2 plan UTF8"))?,
+        std::str::from_utf8(raw).map_err(|_| invalid("Collection /2 plan UTF8"))?,
     )?)
 }
 
@@ -470,10 +491,95 @@ pub fn load_rovent_partial_collection_spec(
     pin: &RoventPublicationFile,
     collection_plan_sha256: &str,
 ) -> Result<PartialCollectionSpec, ArenaError> {
-    let bytes = read_pin(directory, pin, 64 << 10)?;
-    let text = std::str::from_utf8(&bytes).map_err(|error| invalid(error.to_string()))?;
+    let bytes = load_rovent_partial_collection_spec_bytes(directory, pin)?;
+    decode_rovent_partial_collection_spec(&bytes, collection_plan_sha256)
+}
+
+/// Read the exact original pinned bytes for the game partial index.
+pub fn load_rovent_partial_collection_spec_bytes(
+    directory: &Dir,
+    pin: &RoventPublicationFile,
+) -> Result<Vec<u8>, ArenaError> {
+    read_pin(directory, pin, 64 << 10)
+}
+
+pub fn decode_rovent_partial_collection_spec(
+    bytes: &[u8],
+    collection_plan_sha256: &str,
+) -> Result<PartialCollectionSpec, ArenaError> {
+    let text = std::str::from_utf8(bytes).map_err(|error| invalid(error.to_string()))?;
     PartialCollectionSpec::from_json(text, collection_plan_sha256)
         .map_err(|error| invalid(error.to_string()))
+}
+
+/// Pinned plan and partial spec read before starting the native owner. Private
+/// fields prevent callers from fabricating a post-execution source binding.
+#[derive(Clone)]
+pub struct VerifiedPartialGameInputs {
+    plan_bytes: Arc<[u8]>,
+    spec_bytes: Arc<[u8]>,
+    plan: RoventCollectionLockV2LaunchPlan,
+    spec: PartialCollectionSpec,
+    plan_sha256: String,
+    spec_sha256: String,
+    max_total_bytes: u64,
+    index_max_bytes: u64,
+}
+
+impl VerifiedPartialGameInputs {
+    pub fn plan(&self) -> &RoventCollectionLockV2LaunchPlan {
+        &self.plan
+    }
+    pub fn spec(&self) -> &PartialCollectionSpec {
+        &self.spec
+    }
+}
+
+pub fn load_verified_partial_game_inputs(
+    directory: &Dir,
+    plan_pin: &RoventPublicationFile,
+    spec_pin: &RoventPublicationFile,
+    max_total_bytes: u64,
+    index_max_bytes: u64,
+) -> Result<VerifiedPartialGameInputs, ArenaError> {
+    let plan_bytes = load_rovent_collection_lock_v2_plan_bytes(directory, plan_pin)?;
+    let spec_bytes = load_rovent_partial_collection_spec_bytes(directory, spec_pin)?;
+    let plan = decode_rovent_collection_lock_v2_plan(&plan_bytes)?;
+    let spec = decode_rovent_partial_collection_spec(&spec_bytes, &plan_pin.sha256)?;
+    let preflight = partial_game_v2::GamePartialIndexV2 {
+        schema: partial_game_v2::GAME_PARTIAL_INDEX_V2_DOMAIN.into(),
+        collection_plan_sha256: plan_pin.sha256.clone(),
+        partial_spec_sha256: spec_pin.sha256.clone(),
+        status: "incomplete".into(),
+        training_eligible: false,
+        publication_authority: false,
+        physical_completion: "not_attested".into(),
+        root_capacity: plan.maximum_roots,
+        max_total_rows: (spec.row_limit as u64).min(plan.maximum_records),
+        max_total_bytes,
+        index_max_bytes,
+        observed_valid_rows: 0,
+        observed_failed_rows: 0,
+        roots: (0..plan.maximum_roots)
+            .map(|slot| partial_game_v2::GamePartialRootV2::Unknown {
+                slot,
+                root_admission_sha256: None,
+                reason: "slot has no observed admission".into(),
+            })
+            .collect(),
+    };
+    partial_game_v2::validate_game_partial_index(directory, &preflight, &plan_bytes, &spec_bytes)
+        .map_err(io)?;
+    Ok(VerifiedPartialGameInputs {
+        plan_bytes: Arc::from(plan_bytes),
+        spec_bytes: Arc::from(spec_bytes),
+        plan,
+        spec,
+        plan_sha256: plan_pin.sha256.clone(),
+        spec_sha256: spec_pin.sha256.clone(),
+        max_total_bytes,
+        index_max_bytes,
+    })
 }
 
 impl RoventCollectionLaunchPlan {

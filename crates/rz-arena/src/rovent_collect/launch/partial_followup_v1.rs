@@ -3,7 +3,7 @@
 //! The caller supplies independently observed process and resource states.
 //! This policy does not establish a process fence, GPU completion, dataset
 //! authority, or permission to reuse an in-flight session.
-use super::partial_collection_v1::PartialCollectionReader;
+use super::partial_collection_v1::{PartialCollectionReader, PartialInspectionReader};
 
 /// Exit 0 retains its existing strict-success meaning. Exit 2 is reserved by
 /// the opt-in partial CLI for a separately verified incomplete receipt.
@@ -38,6 +38,9 @@ pub enum FollowupResources {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FollowupDependency {
     Independent,
+    /// Read durable failure observations even when no valid row exists.
+    FailureEvidenceInspection,
+    /// Inspect validated rows without authorizing training or acceptance.
     PartialInspection,
     StrictCorpus,
 }
@@ -69,14 +72,18 @@ pub fn decide_partial_followup(
     match dependency {
         FollowupDependency::Independent => FollowupDecision::Run,
         FollowupDependency::StrictCorpus => FollowupDecision::BlockedStrictCorpus,
-        FollowupDependency::PartialInspection => {
+        FollowupDependency::FailureEvidenceInspection | FollowupDependency::PartialInspection => {
             if process_tree == ProcessTreeState::GoneObserved
                 && producer_exit == ProducerExit::Exited(PARTIAL_COLLECTION_EXIT_CODE)
-                && partial.is_some_and(|reader| {
-                    reader.chunk_count() > 0
-                        && reader
-                            .verify_failure_evidence_current()
-                            .is_ok_and(|valid| valid)
+                && partial.is_some_and(|reader| match dependency {
+                    FollowupDependency::FailureEvidenceInspection => {
+                        reader.receipt().failed_rows() > 0
+                            && reader
+                                .verify_failure_evidence_current()
+                                .is_ok_and(|valid| valid)
+                    }
+                    FollowupDependency::PartialInspection => reader.chunk_count() > 0,
+                    _ => false,
                 })
             {
                 FollowupDecision::Run
@@ -111,6 +118,33 @@ pub fn run_partial_followup<T>(
     } else {
         Err(decision)
     }
+}
+
+/// Inspect an independently verified valid chunk even when separate failure
+/// evidence is unavailable. The caller can inspect the reader's typed failure
+/// status; this neither repairs that evidence nor grants training authority.
+pub fn visit_independent_partial_chunk(
+    reader: &PartialInspectionReader,
+    chunk_index: usize,
+    resources: FollowupResources,
+    physical: PriorResourceState,
+    producer_exit: ProducerExit,
+    process_tree: ProcessTreeState,
+    visit: impl FnMut(
+        &rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2,
+    ) -> std::io::Result<()>,
+) -> std::io::Result<usize> {
+    if producer_exit != ProducerExit::Exited(PARTIAL_COLLECTION_EXIT_CODE)
+        || process_tree != ProcessTreeState::GoneObserved
+        || (resources == FollowupResources::ReusesPrior
+            && physical != PriorResourceState::PhysicalCompletionObserved)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "partial producer or resource admission unavailable",
+        ));
+    }
+    reader.visit_chunk(chunk_index, visit)
 }
 
 #[cfg(test)]

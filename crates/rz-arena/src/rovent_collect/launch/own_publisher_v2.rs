@@ -166,6 +166,20 @@ mod failure_stream_tests {
     }
 }
 
+enum PartialTransfer {
+    Unlabeled {
+        row: Option<RoventRetiredLockV2Record>,
+    },
+    Prepared {
+        row: Option<RoventRetiredLockV2Record>,
+        evidence: Option<PreparedTeacherPolicyLockV2>,
+        sealed: Option<SealedTeacherPolicyV2>,
+    },
+    Committed {
+        row: Option<RoventRetiredLockV2Record>,
+        sealed: Option<SealedTeacherPolicyV2>,
+    },
+}
 struct State {
     receiver: Receiver<PumpItemV2>,
     items: VecDeque<PumpItemV2>,
@@ -175,6 +189,9 @@ struct State {
     commit_failures: Vec<Box<CommitTeacherPolicyFailureV2>>,
     failed_items: Vec<PumpItemV2>,
     overflow_item: Option<PumpItemV2>,
+    // The consumer retains the exact source row and teacher evidence while a
+    // partial transfer is in progress or has failed.
+    partial_transfer: Option<PartialTransfer>,
 }
 
 pub(super) enum OwnOfferOutcomeV2 {
@@ -228,6 +245,7 @@ impl OwnPumpConsumerV2 {
             .try_lock()
             .map_err(|_| ArenaError::Invalid("partial failure custody busy or poisoned".into()))?;
         if !state.items.is_empty()
+            || state.partial_transfer.is_some()
             || !state.commit_failures.is_empty()
             || state.overflow_item.is_some()
         {
@@ -358,7 +376,8 @@ impl OwnPumpConsumerV2 {
             .items
             .len()
             .saturating_add(state.failed_items.len())
-            .saturating_add(usize::from(state.overflow_item.is_some()));
+            .saturating_add(usize::from(state.overflow_item.is_some()))
+            .saturating_add(usize::from(state.partial_transfer.is_some()));
         let mut sha = Sha256::new();
         let mut bytes = 0u64;
         let mut rows = 0usize;
@@ -397,6 +416,9 @@ impl OwnPumpConsumerV2 {
             bytes += size;
             rows += 1;
         }
+        if state.partial_transfer.is_some() && reason.is_none() {
+            reason = Some("partial_transition_retained");
+        }
         Ok(Some(
             serde_json::json!({"rows":rows,"bytes":bytes,"sha256":format!("{:x}",sha.finalize()),
             "omitted":total.saturating_sub(rows),"reason":reason,
@@ -416,6 +438,7 @@ impl OwnPumpConsumerV2 {
                     commit_failures: Vec::new(),
                     failed_items: Vec::new(),
                     overflow_item: None,
+                    partial_transfer: None,
                 }),
             }),
             sender,
@@ -428,6 +451,9 @@ impl OwnPumpConsumerV2 {
             .state
             .lock()
             .map_err(|_| ArenaError::Invalid("Own publisher custody poisoned".into()))?;
+        if state.partial_transfer.is_some() {
+            return Ok(OwnPumpPollV2::Full);
+        }
         if state
             .items
             .len()
@@ -476,7 +502,10 @@ impl OwnPumpConsumerV2 {
             }
         };
         Ok(Some((
-            state.items.len(),
+            state
+                .items
+                .len()
+                .saturating_add(usize::from(state.partial_transfer.is_some())),
             state.failed_items.len(),
             state.teacher_evidence.len(),
             state.disconnected,
@@ -537,6 +566,7 @@ impl OwnPumpConsumerV2 {
         Ok(Some(
             serde_json::json!({"count":total, "reported":entries, "omitted":total.saturating_sub(32),
             "commit_failure_count":state.commit_failures.len(), "commit_failures":commits,
+            "partial_transition_retained":state.partial_transfer.is_some(),
             "commit_failures_omitted":state.commit_failures.len().saturating_sub(32)}),
         ))
     }
@@ -558,6 +588,7 @@ impl OwnPumpConsumerV2 {
                 .any(|item| matches!(item, PumpItemV2::Failed { .. }))
                 || !state.failed_items.is_empty()
                 || !state.commit_failures.is_empty()
+                || state.partial_transfer.is_some()
                 || state.overflow_item.is_some(),
         ))
     }
@@ -573,7 +604,10 @@ impl OwnPumpConsumerV2 {
                 return Err(ArenaError::Invalid("Own publisher custody poisoned".into()));
             }
         };
-        if !state.commit_failures.is_empty() || state.overflow_item.is_some() {
+        if !state.commit_failures.is_empty()
+            || state.overflow_item.is_some()
+            || state.partial_transfer.is_some()
+        {
             return Err(ArenaError::Invalid(
                 "partial failure custody is incomplete".into(),
             ));
@@ -721,6 +755,11 @@ impl OwnPumpConsumerV2 {
                 return Err(ArenaError::Invalid("Own publisher custody poisoned".into()));
             }
         };
+        if state.partial_transfer.is_some() {
+            return Err(ArenaError::Invalid(
+                "partial original transfer retained; recovery required".into(),
+            ));
+        }
         // A drained queue requires no new evidence or failure custody. This
         // remains a valid terminal observation even when the last row filled
         // the configured record capacity exactly.
@@ -830,6 +869,73 @@ impl OwnPumpConsumerV2 {
             .teacher_evidence
             .try_reserve(1)
             .map_err(|_| ArenaError::Invalid("Own teacher evidence capacity".into()))?;
+        if partial {
+            if matches!(
+                state.items.front(),
+                Some(PumpItemV2::Prepared {
+                    evidence: Some(_),
+                    ..
+                })
+            ) {
+                return Err(ArenaError::Invalid(
+                    "partial teacher evidence not committed; original retained".into(),
+                ));
+            }
+            // This single straight-line move places both original row and
+            // teacher evidence into this owner's transition slot before any
+            // further fallible operation or callback can run.
+            state.partial_transfer = Some(match state.items.pop_front().expect("front checked") {
+                PumpItemV2::Unlabeled { row } => PartialTransfer::Unlabeled { row: Some(row) },
+                PumpItemV2::Prepared {
+                    row,
+                    evidence,
+                    sealed,
+                } => PartialTransfer::Prepared {
+                    row: Some(row),
+                    evidence,
+                    sealed,
+                },
+                PumpItemV2::Committed { row, sealed } => PartialTransfer::Committed {
+                    row: Some(row),
+                    sealed: Some(sealed),
+                },
+                original @ PumpItemV2::Failed { .. } => {
+                    state.items.push_front(original);
+                    return Err(ArenaError::Invalid(
+                        "partial failed row remained at front".into(),
+                    ));
+                }
+            });
+            if matches!(
+                state.partial_transfer.as_ref(),
+                Some(PartialTransfer::Prepared {
+                    evidence: Some(_),
+                    ..
+                })
+            ) {
+                return Err(ArenaError::Invalid(
+                    "partial transition retains unconsumed evidence".into(),
+                ));
+            }
+            let slot = match state.partial_transfer.as_mut().expect("transfer stored") {
+                PartialTransfer::Unlabeled { row }
+                | PartialTransfer::Prepared { row, .. }
+                | PartialTransfer::Committed { row, .. } => row,
+            };
+            // Rejection or unwind leaves source slot or assembly as the sole
+            // row owner; the transition keeps the original teacher evidence.
+            assembly.offer_from_slot(slot)?;
+            let sealed = match state.partial_transfer.as_mut().expect("transfer retained") {
+                PartialTransfer::Prepared { sealed, .. }
+                | PartialTransfer::Committed { sealed, .. } => sealed.take(),
+                PartialTransfer::Unlabeled { .. } => None,
+            };
+            if let Some(sealed) = sealed {
+                state.teacher_evidence.push(sealed);
+            }
+            state.partial_transfer = None;
+            return Ok(PartialOfferOutcomeV2::Offered);
+        }
         let item = state.items.pop_front().expect("front checked");
         match item {
             PumpItemV2::Unlabeled { row } => match assembly.offer(row) {

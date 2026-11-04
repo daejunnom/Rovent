@@ -3224,6 +3224,7 @@ mod tests {
         let mut readiness_count = 0usize;
         let mut pending_best = None;
         let mut multipv = 1_u16;
+        let mut go_count = 0usize;
         for line in std::io::stdin().lock().lines() {
             let line = line.expect("fixture stdin");
             if line == "uci" {
@@ -3251,6 +3252,7 @@ mod tests {
                     }
                 }
             } else if line.starts_with("go ") {
+                go_count += 1;
                 let words: Vec<&str> = line.split_ascii_whitespace().collect();
                 let depth = words
                     .iter()
@@ -3272,6 +3274,19 @@ mod tests {
                 } else {
                     requested.min(10)
                 };
+                if mode == 11 && go_count > 1 {
+                    let other = position
+                        .legal_moves()
+                        .into_iter()
+                        .find(|mv| *mv != best)
+                        .unwrap();
+                    println!(
+                        "info depth {depth} multipv 1 nodes {nodes} score cp 32 lowerbound pv {best}"
+                    );
+                    println!("bestmove {other}");
+                    std::io::stdout().flush().unwrap();
+                    continue;
+                }
                 if mode == 10 {
                     // A completed older set agrees with final bestmove even
                     // though a newer exact set chose another first move.
@@ -3434,6 +3449,14 @@ mod tests {
     fn fake_uci_prior_exact_matching_best() {
         if fixture_mode("external_cpu::tests::fake_uci_prior_exact_matching_best") {
             fixture_loop(10);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-teacher-fixtures"))]
+    #[test]
+    fn fake_uci_first_exact_second_lower() {
+        if fixture_mode("external_cpu::tests::fake_uci_first_exact_second_lower") {
+            fixture_loop(11);
         }
     }
 

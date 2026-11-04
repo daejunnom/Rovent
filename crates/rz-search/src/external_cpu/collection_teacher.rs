@@ -288,6 +288,9 @@ struct TimedTeacherJob {
     dispatch: TeacherDispatch,
     admitted_at: Instant,
 }
+#[cfg(all(target_os = "linux", feature = "test-teacher-fixtures"))]
+pub mod fixture_worker;
+
 type Mailbox = WorkerMailbox<TimedTeacherJob, TeacherCompletion, TeacherProgress>;
 
 /// One physical owner, one admitted Job at a time, with reserved terminal space.
@@ -2145,5 +2148,101 @@ mod tests {
         let closed = close_fixture(&mut worker, Instant::now() + Duration::from_secs(2));
         assert_eq!(closed.process_identity, Some(submitted.process_identity()));
         assert!(worker.take_diagnostics_after_join().is_some());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-teacher-fixtures"))]
+    #[test]
+    fn fixture_domain_worker_keeps_exact_and_unknown_results_separate() {
+        use super::fixture_worker::{
+            FIXTURE_SOURCE_DOMAIN, FixtureTeacherWorker, FixtureWorkerSource,
+        };
+        let _guard = super::super::tests::FIXTURE_LOCK.lock().unwrap();
+        let mut config = super::super::tests::fixture_config("fake_uci_first_exact_second_lower");
+        config.identity.options.insert("MultiPV".into(), "1".into());
+        config.identity.declared_source = FIXTURE_SOURCE_DOMAIN.into();
+        config.stop_grace = EXTERNAL_STOP_DRAIN_RESERVE;
+        config.shutdown_grace = Duration::from_secs(1);
+        let executable = File::open(&config.program).unwrap();
+        let source = FixtureWorkerSource {
+            schema: FIXTURE_SOURCE_DOMAIN.into(),
+            executable_sha256: config.identity.binary_sha256.clone(),
+            executable_bytes: executable.metadata().unwrap().len(),
+            fixture_scenario: "exact-then-lower".into(),
+            scope: "test_elf_only".into(),
+            official_engine_identity: false,
+            training_eligible: false,
+        };
+        let pin = ExternalLaunchPin::from_owned_descriptors(
+            executable,
+            File::open(&config.working_directory).unwrap(),
+        )
+        .unwrap();
+        let (mut job, mut registration, _, clock) = fixture();
+        let startup = clock.origin + config.handshake_timeout;
+        let wall = config
+            .handshake_timeout
+            .checked_add(config.max_task_wall_time.checked_mul(2).unwrap())
+            .unwrap();
+        job.original_deadline.at = MonotonicTick(u64::try_from(wall.as_nanos()).unwrap());
+        registration.original_deadline = job.original_deadline;
+        let hard = registration_deadline(registration, clock).unwrap();
+        let cleanup = hard + config.shutdown_grace;
+        let mut worker = FixtureTeacherWorker::spawn(
+            &source,
+            config,
+            registration,
+            clock,
+            startup,
+            cleanup,
+            pin,
+        )
+        .unwrap();
+        loop {
+            match worker.startup_ready() {
+                Some(result) => {
+                    result.unwrap();
+                    break;
+                }
+                None => {
+                    assert!(Instant::now() < startup);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        job.soft_quantum = Duration::from_secs(1);
+        worker.submit(job.clone()).unwrap();
+        let first = loop {
+            if let Some(result) = worker.poll_observation().unwrap() {
+                break result;
+            }
+            assert!(Instant::now() < hard);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(first.conditional_policy_target_known(), Some(true));
+        assert!(!first.training_eligible() && !first.official_engine_identity());
+        let mut next = job;
+        next.id.sequence += 1;
+        next.control = ControlMailbox::new(next.id, CompletionSignal::default());
+        worker.submit(next).unwrap();
+        let second = loop {
+            if let Some(result) = worker.poll_observation().unwrap() {
+                break result;
+            }
+            assert!(Instant::now() < hard);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(second.conditional_policy_target_known(), Some(false));
+        assert_ne!(first.request_sequence(), second.request_sequence());
+        assert!(first.same_fixture_worker(&second));
+        assert!(!second.training_eligible() && !second.official_engine_identity());
+        worker.request_shutdown(cleanup);
+        loop {
+            if let Some(result) = worker.poll_join() {
+                result.unwrap();
+                break;
+            }
+            assert!(Instant::now() < cleanup);
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }

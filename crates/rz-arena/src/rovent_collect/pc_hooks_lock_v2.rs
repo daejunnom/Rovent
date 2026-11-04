@@ -754,6 +754,51 @@ impl RoventPcCollectionBridgeV2 {
         Ok(Some(worker.separated_rows.pop_front()))
     }
 
+    /// Move an eligible separated row directly between retained owners. A
+    /// result is not a seal or a teacher/process completion observation.
+    #[allow(dead_code)]
+    pub(crate) fn try_offer_separated_unlabeled(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+        assembly: &mut super::RoventCorpusAssemblyLockV2,
+    ) -> Result<Option<bool>, ArenaError> {
+        if !self
+            .core
+            .installed_admission_for_recovery()
+            .is_some_and(|original| original.same_original_admission(admission))
+        {
+            return Err(super::invalid(
+                "P/C separated row original admission mismatch",
+            ));
+        }
+        let mut slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(super::invalid("P/C separated row custody poisoned"));
+            }
+        };
+        let worker = slot
+            .as_mut()
+            .ok_or_else(|| super::invalid("P/C separated row owner missing"))?;
+        if worker.separation_failed {
+            return Err(super::invalid(
+                "P/C row separation failed; original retained",
+            ));
+        }
+        if let Some(row) = worker.separated_rows.front() {
+            if !row.admission.same_original_admission(admission)
+                || (row.submitted_input_seal().teacher_actor_id.is_some()
+                    && !row.record.0.input.legal_moves.is_empty())
+            {
+                return Err(super::invalid(
+                    "P/C separated row admission or teacher evidence differs; original retained",
+                ));
+            }
+        }
+        Ok(Some(assembly.offer_from_queue(&mut worker.separated_rows)?))
+    }
+
     /// Copy bounded serializable row projections for a failure report. The
     /// original row and authority stay in this bridge; JSON is not authority.
     pub(crate) fn try_snapshot_separated_rows(

@@ -20,6 +20,8 @@ use std::{
 };
 
 pub const GAME_PARTIAL_INDEX_V2_DOMAIN: &str = "rz-rovent-game-partial-index/2";
+/// Dedicated nonzero result for a written game partial index; never strict success.
+pub const GAME_PARTIAL_EXIT_CODE: u8 = 3;
 const INDEX_FILE: &str = "partial-game-v2.json";
 const INDEX_PENDING: &str = "partial-game-v2.pending.json";
 const FAILURE_PATH: &str = "failure-evidence.jsonl";
@@ -55,6 +57,7 @@ pub enum GamePartialRootV2 {
 pub struct GamePartialIndexV2 {
     pub schema: String,
     pub collection_plan_sha256: String,
+    pub partial_spec_sha256: String,
     pub status: String,
     pub training_eligible: bool,
     pub publication_authority: bool,
@@ -81,13 +84,19 @@ fn digest_ok(value: &str) -> bool {
 fn valid_reason(value: &str) -> bool {
     !value.is_empty() && value.len() <= 4096 && !value.chars().any(char::is_control)
 }
-fn open_relative_directory(parent: &Dir, relative: &str) -> io::Result<Dir> {
-    if relative.is_empty()
-        || relative.contains(['\\', ':', '\0'])
-        || relative
+fn valid_relative_root(relative: &str) -> bool {
+    !relative.is_empty()
+        && !relative.contains(['\\', ':', '\0'])
+        && !relative
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
-    {
+        && Path::new(relative)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn open_relative_directory(parent: &Dir, relative: &str) -> io::Result<Dir> {
+    if !valid_relative_root(relative) {
         return Err(bad("game partial root path"));
     }
     let path = Path::new(relative);
@@ -147,7 +156,7 @@ fn root_of_record(
 
 /// Verify original failure projection bytes against the *same /1 receipt*;
 /// the original in-process sealed owner remains non-reconstructable.
-fn verify_failure_root(
+pub(super) fn verify_failure_root(
     directory: &Dir,
     pin: &serde_json::Value,
     expected: &str,
@@ -223,6 +232,7 @@ fn verify_failure_root(
 fn validate_index_shape(index: &GamePartialIndexV2) -> io::Result<()> {
     if index.schema != GAME_PARTIAL_INDEX_V2_DOMAIN
         || !digest_ok(&index.collection_plan_sha256)
+        || !digest_ok(&index.partial_spec_sha256)
         || index.status != "incomplete"
         || index.training_eligible
         || index.publication_authority
@@ -255,12 +265,11 @@ fn validate_index_shape(index: &GamePartialIndexV2) -> io::Result<()> {
     Ok(())
 }
 
-/// Validate /1 receipts and root-local data; this does not restore authority.
-pub fn validate_game_partial_index(
-    parent: &Dir,
+fn validate_game_partial_metadata(
     index: &GamePartialIndexV2,
     source_plan_bytes: &[u8],
-) -> io::Result<()> {
+    source_spec_bytes: &[u8],
+) -> io::Result<PartialCollectionSpec> {
     if source_plan_bytes.len() as u64 > super::ROVENT_LOCK_V2_PLAN_MAX_BYTES
         || format!("{:x}", Sha256::digest(source_plan_bytes)) != index.collection_plan_sha256
     {
@@ -275,11 +284,122 @@ pub fn validate_game_partial_index(
     {
         return Err(bad("game partial original plan capacity differs"));
     }
+    let source_spec = PartialCollectionSpec::from_json(
+        std::str::from_utf8(source_spec_bytes).map_err(|_| bad("source partial spec UTF-8"))?,
+        &index.collection_plan_sha256,
+    )?;
+    if format!("{:x}", Sha256::digest(source_spec_bytes)) != index.partial_spec_sha256 {
+        return Err(bad("game partial original spec digest differs"));
+    }
+    if index.max_total_rows > source_spec.row_limit as u64 {
+        return Err(bad("game partial row limit exceeds original spec"));
+    }
     validate_index_shape(index)?;
+    let mut roots = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    let mut declared_receipt_bytes = 0u64;
+    for entry in &index.roots {
+        match entry {
+            GamePartialRootV2::Unknown {
+                root_admission_sha256,
+                ..
+            } => {
+                if let Some(id) = root_admission_sha256 {
+                    if !roots.insert(id.clone()) {
+                        return Err(bad("duplicate root"));
+                    }
+                }
+            }
+            GamePartialRootV2::Available {
+                root_admission_sha256,
+                relative_path,
+                receipt,
+                ..
+            } => {
+                if !roots.insert(root_admission_sha256.clone())
+                    || !paths.insert(relative_path.clone())
+                {
+                    return Err(bad("duplicate root or path"));
+                }
+                declared_receipt_bytes = declared_receipt_bytes
+                    .checked_add(receipt.bytes)
+                    .ok_or_else(|| bad("game partial declared byte overflow"))?;
+            }
+        }
+    }
+    let index_bytes = serde_json::to_vec(index).map_err(io::Error::other)?.len() as u64;
+    if index
+        .observed_valid_rows
+        .checked_add(index.observed_failed_rows)
+        .is_none_or(|n| n > index.max_total_rows)
+        || declared_receipt_bytes
+            .checked_add(index_bytes)
+            .is_none_or(|n| n > index.max_total_bytes)
+    {
+        return Err(bad("game partial declared totals or limits differ"));
+    }
+    Ok(source_spec)
+}
+
+fn validate_root_declaration(
+    index: &GamePartialIndexV2,
+    source_spec: &PartialCollectionSpec,
+    entry: &GamePartialRootV2,
+) -> io::Result<()> {
+    match entry {
+        GamePartialRootV2::Unknown {
+            root_admission_sha256,
+            reason,
+            ..
+        } => {
+            if !valid_reason(reason)
+                || root_admission_sha256
+                    .as_ref()
+                    .is_some_and(|id| !digest_ok(id))
+            {
+                return Err(bad("unknown root declaration"));
+            }
+        }
+        GamePartialRootV2::Available {
+            root_admission_sha256,
+            relative_path,
+            spec,
+            receipt,
+            ..
+        } => {
+            if !digest_ok(root_admission_sha256)
+                || !valid_relative_root(relative_path)
+                || !digest_ok(&receipt.sha256)
+                || receipt.bytes == 0
+                || receipt.bytes > spec.receipt_byte_limit
+            {
+                return Err(bad("available root declaration"));
+            }
+            spec.validate(&index.collection_plan_sha256)?;
+            if spec.row_limit > source_spec.row_limit
+                || spec.byte_limit > source_spec.byte_limit
+                || spec.receipt_byte_limit > source_spec.receipt_byte_limit
+            {
+                return Err(bad("game partial root limit exceeds original spec"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate /1 receipts and root-local data; this does not restore authority.
+pub fn validate_game_partial_index(
+    parent: &Dir,
+    index: &GamePartialIndexV2,
+    source_plan_bytes: &[u8],
+    source_spec_bytes: &[u8],
+) -> io::Result<()> {
+    let source_spec = validate_game_partial_metadata(index, source_plan_bytes, source_spec_bytes)?;
     let mut roots = BTreeSet::new();
     let mut paths = BTreeSet::new();
     let (mut valid, mut failed, mut total_bytes) = (0u64, 0u64, 0u64);
     for entry in &index.roots {
+        validate_root_declaration(index, &source_spec, entry)?;
         match entry {
             GamePartialRootV2::Unknown {
                 root_admission_sha256,
@@ -312,6 +432,12 @@ pub fn validate_game_partial_index(
                     return Err(bad("available root declaration"));
                 }
                 spec.validate(&index.collection_plan_sha256)?;
+                if spec.row_limit > source_spec.row_limit
+                    || spec.byte_limit > source_spec.byte_limit
+                    || spec.receipt_byte_limit > source_spec.receipt_byte_limit
+                {
+                    return Err(bad("game partial root limit exceeds original spec"));
+                }
                 let root = open_relative_directory(parent, relative_path)?;
                 let partial = root.open_dir_nofollow("partial_collection")?;
                 let raw = read_file(&partial, "partial_collection.json", spec.receipt_byte_limit)?;
@@ -403,8 +529,9 @@ pub fn write_game_partial_index(
     parent: &Dir,
     index: &GamePartialIndexV2,
     source_plan_bytes: &[u8],
+    source_spec_bytes: &[u8],
 ) -> io::Result<()> {
-    validate_game_partial_index(parent, index, source_plan_bytes)?;
+    validate_game_partial_index(parent, index, source_plan_bytes, source_spec_bytes)?;
     let data = serde_json::to_vec(index).map_err(io::Error::other)?;
     if data.len() as u64 > index.index_max_bytes {
         return Err(bad("game partial index byte limit"));
@@ -427,12 +554,45 @@ pub fn write_game_partial_index(
     Ok(())
 }
 
-/// Recheck current /1 receipt pins and files; later mutations are not excluded.
-pub fn read_game_partial_index(
+/// Plan/spec and index declarations only. No referenced /1 root file or
+/// original native owner has been checked by this value.
+pub struct GamePartialIndexMetadataV2 {
+    index: GamePartialIndexV2,
+    source_spec: PartialCollectionSpec,
+}
+
+impl GamePartialIndexMetadataV2 {
+    pub fn index(&self) -> &GamePartialIndexV2 {
+        &self.index
+    }
+    pub fn into_index(self) -> GamePartialIndexV2 {
+        self.index
+    }
+    /// Validate only this slot's declaration against the original spec. This
+    /// does not read its files or establish its original authority.
+    pub fn validate_root(&self, slot: u16) -> io::Result<()> {
+        let entry = self
+            .index
+            .roots
+            .iter()
+            .find(|entry| match entry {
+                GamePartialRootV2::Available { slot: current, .. }
+                | GamePartialRootV2::Unknown { slot: current, .. } => *current == slot,
+            })
+            .ok_or_else(|| bad("game partial root slot absent"))?;
+        validate_root_declaration(&self.index, &self.source_spec, entry)
+    }
+}
+
+/// Read only the game index and its source declarations. Inspectors must
+/// separately verify the selected /1 root, and must not promote metadata to
+/// a complete game, corpus, physical or training receipt.
+pub fn read_game_partial_index_metadata(
     parent: &Dir,
     max_index_bytes: u64,
     source_plan_bytes: &[u8],
-) -> io::Result<GamePartialIndexV2> {
+    source_spec_bytes: &[u8],
+) -> io::Result<GamePartialIndexMetadataV2> {
     if max_index_bytes == 0 || max_index_bytes > MAX_INDEX_BYTES {
         return Err(bad("game partial read limit"));
     }
@@ -443,7 +603,25 @@ pub fn read_game_partial_index(
     if index.index_max_bytes > max_index_bytes || data.len() as u64 > index.index_max_bytes {
         return Err(bad("game partial declared index limit"));
     }
-    validate_game_partial_index(parent, &index, source_plan_bytes)?;
+    let source_spec = validate_game_partial_metadata(&index, source_plan_bytes, source_spec_bytes)?;
+    Ok(GamePartialIndexMetadataV2 { index, source_spec })
+}
+
+/// Recheck current /1 receipt pins and files; later mutations are not excluded.
+pub fn read_game_partial_index(
+    parent: &Dir,
+    max_index_bytes: u64,
+    source_plan_bytes: &[u8],
+    source_spec_bytes: &[u8],
+) -> io::Result<GamePartialIndexV2> {
+    let index = read_game_partial_index_metadata(
+        parent,
+        max_index_bytes,
+        source_plan_bytes,
+        source_spec_bytes,
+    )?
+    .into_index();
+    validate_game_partial_index(parent, &index, source_plan_bytes, source_spec_bytes)?;
     Ok(index)
 }
 
@@ -455,6 +633,7 @@ mod tests {
         GamePartialIndexV2 {
             schema: GAME_PARTIAL_INDEX_V2_DOMAIN.into(),
             collection_plan_sha256: "a".repeat(64),
+            partial_spec_sha256: "b".repeat(64),
             status: "incomplete".into(),
             training_eligible: false,
             publication_authority: false,
@@ -500,5 +679,26 @@ mod tests {
         assert!(validate_index_shape(&index).is_err());
         assert!(open_relative_directory(&parent, "root/../outside").is_err());
         assert!(open_relative_directory(&parent, "root//other").is_err());
+    }
+
+    #[test]
+    fn root_declaration_failure_is_scoped_to_its_slot() {
+        let mut index = unknown_only();
+        index.root_capacity = 2;
+        index.roots.push(GamePartialRootV2::Unknown {
+            slot: 1,
+            root_admission_sha256: None,
+            reason: String::new(),
+        });
+        let source_spec = PartialCollectionSpec {
+            schema: super::super::partial_collection_v1::PARTIAL_COLLECTION_SPEC_DOMAIN.into(),
+            collection_plan_sha256: index.collection_plan_sha256.clone(),
+            row_limit: 10,
+            byte_limit: 8192,
+            receipt_byte_limit: 8192,
+        };
+        assert!(validate_index_shape(&index).is_ok());
+        assert!(validate_root_declaration(&index, &source_spec, &index.roots[0]).is_ok());
+        assert!(validate_root_declaration(&index, &source_spec, &index.roots[1]).is_err());
     }
 }

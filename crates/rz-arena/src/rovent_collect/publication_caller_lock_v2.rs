@@ -25,6 +25,22 @@ pub struct RoventCorpusAssemblyLockV2 {
 }
 
 impl RoventCorpusAssemblyLockV2 {
+    /// Limit only actual partial JSONL bytes before accepting any row; the
+    /// original lock-wide writer cap remains independently enforced.
+    pub(crate) fn restrict_partial_chunk_bytes(&mut self, limit: u64) -> Result<(), ArenaError> {
+        check(
+            self.records == 0
+                && self.pending.is_none()
+                && self.sealed.is_none()
+                && self.chunk.is_none()
+                && self.finished.is_none(),
+            "lock-v2 partial chunk limit must precede assembly",
+        )?;
+        self.writer
+            .as_mut()
+            .ok_or_else(|| invalid("lock-v2 writer missing"))?
+            .restrict_partial_chunk_bytes(limit)
+    }
     /// Restrict the original writer's output cap before the first row. The
     /// underlying writer counts metadata and source overhead conservatively.
     pub(crate) fn restrict_output_limit(&mut self, limit: u64) -> Result<(), ArenaError> {
@@ -185,6 +201,51 @@ impl RoventCorpusAssemblyLockV2 {
         }
         self.pending = Some(row);
         Ok(())
+    }
+
+    /// Transfer only after all rejectable checks. The caller's slot remains
+    /// the owner on failure; the final take/assignment invokes no callback,
+    /// allocation or I/O. This does not seal a row or prove its fence.
+    #[allow(dead_code)]
+    pub(crate) fn offer_from_slot(
+        &mut self,
+        row: &mut Option<RoventRetiredLockV2Record>,
+    ) -> Result<(), ArenaError> {
+        check(
+            self.writer.is_some()
+                && self.finished.is_none()
+                && self.pending.is_none()
+                && self.sealed.is_none()
+                && self.chunk.is_none()
+                && self.records < self.maximum_records
+                && row.is_some(),
+            "lock-v2 assembly busy, closed, empty slot or at record cap",
+        )?;
+        self.pending = row.take();
+        Ok(())
+    }
+
+    /// The original bridge keeps the queue while the row is transferred.
+    /// A rejected offer never removes the front original.
+    #[allow(dead_code)]
+    pub(crate) fn offer_from_queue(
+        &mut self,
+        rows: &mut std::collections::VecDeque<RoventRetiredLockV2Record>,
+    ) -> Result<bool, ArenaError> {
+        if rows.is_empty() {
+            return Ok(false);
+        }
+        check(
+            self.writer.is_some()
+                && self.finished.is_none()
+                && self.pending.is_none()
+                && self.sealed.is_none()
+                && self.chunk.is_none()
+                && self.records < self.maximum_records,
+            "lock-v2 assembly busy, closed or at record cap",
+        )?;
+        self.pending = rows.pop_front();
+        Ok(true)
     }
 
     /// Give a target attachment operation the same original producer and row.

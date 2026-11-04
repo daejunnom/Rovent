@@ -642,10 +642,10 @@ fn verify_failure_evidence(
             return Err(invalid_partial("partial failure evidence rows"));
         }
         hash.update(&line);
-        let text =
-            std::str::from_utf8(&line[..n - 1]).map_err(|e| io::Error::other(e.to_string()))?;
-        let row: PartialFailureEvidenceRow =
-            rz_experiments::decode_json(text).map_err(|e| io::Error::other(e.to_string()))?;
+        let text = std::str::from_utf8(&line[..n - 1])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let row: PartialFailureEvidenceRow = rz_experiments::decode_json(text)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let teacher = row
             .teacher_evidence
             .as_object()
@@ -694,7 +694,7 @@ fn verify_failure_evidence(
             rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2::from_json(
                 &original_json,
             )
-            .map_err(|e| io::Error::other(e.to_string()))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let sequence = Some(original.0.native.retired_sequence);
         if row.schema != FAILURE_DOMAIN
             || row.error.is_empty()
@@ -961,6 +961,16 @@ fn read_partial_receipt_in(
     directory: &Dir,
     spec: &PartialCollectionSpec,
 ) -> io::Result<PartialCollectionReceipt> {
+    let receipt = read_partial_receipt_metadata_in(directory, spec)?;
+    verify_chunks(directory, spec, &receipt)?;
+    verify_failure_evidence(directory, spec, &receipt)?;
+    Ok(receipt)
+}
+
+fn read_partial_receipt_metadata_in(
+    directory: &Dir,
+    spec: &PartialCollectionSpec,
+) -> io::Result<PartialCollectionReceipt> {
     spec.validate(&spec.collection_plan_sha256)?;
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
@@ -982,8 +992,6 @@ fn read_partial_receipt_in(
         return Err(invalid_partial("partial receipt spec differs"));
     }
     stored.receipt.validate(spec)?;
-    verify_chunks(directory, spec, &stored.receipt)?;
-    verify_failure_evidence(directory, spec, &stored.receipt)?;
     Ok(stored.receipt)
 }
 
@@ -1029,80 +1037,255 @@ impl PartialCollectionReader {
     pub fn visit_chunk(
         &self,
         chunk_index: usize,
-        mut visit: impl FnMut(
+        visit: impl FnMut(
             &rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2,
         ) -> io::Result<()>,
     ) -> io::Result<usize> {
-        let receipt = &self.receipt;
-        let directory = &self.directory;
-        let pin = receipt
-            .chunks
-            .get(chunk_index)
-            .ok_or_else(|| invalid_partial("partial chunk index"))?;
-        let name = pin
-            .path
-            .strip_prefix("chunks/")
-            .ok_or_else(|| invalid_partial("partial chunk path"))?;
-        let chunk_dir = directory.open_dir_nofollow("chunks")?;
-        let mut options = OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
-        let file = chunk_dir.open_with(name, &options)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.len() != pin.bytes
-            || pin.bytes > rz_experiments::rovent_corpus::MAX_CHUNK_BYTES as u64
-        {
-            return Err(invalid_partial("partial chunk file/size"));
-        }
-        let mut raw = Vec::new();
-        file.take(pin.bytes + 1).read_to_end(&mut raw)?;
-        if raw.len() as u64 != pin.bytes
-            || format!("{:x}", Sha256::digest(&raw)) != pin.sha256
-            || raw.last() != Some(&b'\n')
-        {
-            return Err(invalid_partial("partial chunk bytes differ"));
-        }
-        let mut count = 0usize;
-        // Preflight all rows before callbacks. Both passes use the same buffer.
-        for line in raw.split_inclusive(|b| *b == b'\n') {
-            if line.len() > rz_experiments::pals_data_v3::GENERATION_MAX_ROW_BYTES + 1
-                || line.last() != Some(&b'\n')
-            {
-                return Err(invalid_partial("partial row bound or newline"));
-            }
-            let text = std::str::from_utf8(&line[..line.len() - 1])
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            let row = rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2::from_json(text)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-            let id = &row.0.record_sha256;
-            if row.sha256().map_err(|e| io::Error::other(e.to_string()))? != *id {
-                return Err(invalid_partial("partial row seal differs"));
-            }
-            match receipt.rows.get(id) {
-                Some(RowState::Valid {
-                    record_reference,
-                    bytes,
-                }) if record_reference == &pin.path && *bytes == line.len() as u64 => {}
-                _ => {
-                    return Err(invalid_partial(
-                        "partial inspection row identity/path/size differs",
-                    ));
-                }
-            }
-            count += 1;
-        }
-        if count as u64 != pin.rows {
-            return Err(invalid_partial("partial chunk row count"));
-        }
-        for line in raw.split_inclusive(|b| *b == b'\n') {
-            let text = std::str::from_utf8(&line[..line.len() - 1])
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            let row = rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2::from_json(text)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-            visit(&row)?;
-        }
-        Ok(count)
+        visit_partial_chunk_in(&self.directory, &self.receipt, chunk_index, visit)
     }
+}
+
+fn visit_partial_chunk_in(
+    directory: &Dir,
+    receipt: &PartialCollectionReceipt,
+    chunk_index: usize,
+    mut visit: impl FnMut(
+        &rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2,
+    ) -> io::Result<()>,
+) -> io::Result<usize> {
+    let pin = receipt
+        .chunks
+        .get(chunk_index)
+        .ok_or_else(|| invalid_partial("partial chunk index"))?;
+    let name = pin
+        .path
+        .strip_prefix("chunks/")
+        .ok_or_else(|| invalid_partial("partial chunk path"))?;
+    if name.len() != 12
+        || !name.ends_with(".jsonl")
+        || !name.as_bytes()[..6].iter().all(u8::is_ascii_digit)
+        || pin.bytes == 0
+        || pin.rows == 0
+        || !digest_string(&pin.sha256)
+    {
+        return Err(invalid_partial("partial chunk pin"));
+    }
+    let chunk_dir = directory.open_dir_nofollow("chunks")?;
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = chunk_dir.open_with(name, &options)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.len() != pin.bytes
+        || pin.bytes > rz_experiments::rovent_corpus::MAX_CHUNK_BYTES as u64
+    {
+        return Err(invalid_partial("partial chunk file/size"));
+    }
+    let mut raw = Vec::new();
+    file.take(pin.bytes + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 != pin.bytes
+        || format!("{:x}", Sha256::digest(&raw)) != pin.sha256
+        || raw.last() != Some(&b'\n')
+    {
+        return Err(invalid_partial("partial chunk bytes differ"));
+    }
+    let mut count = 0usize;
+    let mut seen_ids = BTreeSet::new();
+    // Preflight all rows before callbacks. Both passes use the same buffer.
+    for line in raw.split_inclusive(|b| *b == b'\n') {
+        if line.len() > rz_experiments::pals_data_v3::GENERATION_MAX_ROW_BYTES + 1
+            || line.last() != Some(&b'\n')
+        {
+            return Err(invalid_partial("partial row bound or newline"));
+        }
+        let text = std::str::from_utf8(&line[..line.len() - 1])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let row =
+            rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2::from_json(
+                text,
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let id = &row.0.record_sha256;
+        if row.sha256().map_err(|e| io::Error::other(e.to_string()))? != *id {
+            return Err(invalid_partial("partial row seal differs"));
+        }
+        if !seen_ids.insert(id.clone()) {
+            return Err(invalid_partial("duplicate partial row"));
+        }
+        match receipt.rows.get(id) {
+            Some(RowState::Valid {
+                record_reference,
+                bytes,
+            }) if record_reference == &pin.path && *bytes == line.len() as u64 => {}
+            _ => {
+                return Err(invalid_partial(
+                    "partial inspection row identity/path/size differs",
+                ));
+            }
+        }
+        count += 1;
+    }
+    let expected = receipt.rows.values().filter(|row| matches!(row, RowState::Valid { record_reference, .. } if record_reference == &pin.path)).count();
+    if count as u64 != pin.rows || count != expected {
+        return Err(invalid_partial("partial chunk row count"));
+    }
+    for line in raw.split_inclusive(|b| *b == b'\n') {
+        let text = std::str::from_utf8(&line[..line.len() - 1])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let row =
+            rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2::from_json(
+                text,
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        visit(&row)?;
+    }
+    Ok(count)
+}
+
+/// Status of the original failure-evidence file at the instant observed.
+/// An unavailable file remains a failure; it is not converted to success.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InspectionFailureEvidenceStatus {
+    NotApplicable,
+    VerifiedAtObservation,
+    Missing { detail: String },
+    Invalid { detail: String },
+    IoError { detail: String },
+}
+
+fn inspection_failure_status(
+    directory: &Dir,
+    spec: &PartialCollectionSpec,
+    receipt: &PartialCollectionReceipt,
+) -> InspectionFailureEvidenceStatus {
+    if receipt.failure_evidence.is_none() {
+        return InspectionFailureEvidenceStatus::NotApplicable;
+    }
+    match verify_failure_evidence(directory, spec, receipt) {
+        Ok(()) => InspectionFailureEvidenceStatus::VerifiedAtObservation,
+        Err(error) => {
+            let detail: String = error.to_string().chars().take(1024).collect();
+            match error.kind() {
+                io::ErrorKind::NotFound => InspectionFailureEvidenceStatus::Missing { detail },
+                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => {
+                    InspectionFailureEvidenceStatus::Invalid { detail }
+                }
+                _ => InspectionFailureEvidenceStatus::IoError { detail },
+            }
+        }
+    }
+}
+
+/// Metadata and selected chunks are inspection-only, with no training,
+/// original authority or physical-completion capability. Unlike the strict
+/// reader, an unavailable failure file is reported without blocking access to
+/// an independently verified valid chunk.
+pub struct PartialInspectionReader {
+    directory: Dir,
+    spec: PartialCollectionSpec,
+    receipt: PartialCollectionReceipt,
+    failure_status_at_open: InspectionFailureEvidenceStatus,
+}
+
+impl PartialInspectionReader {
+    pub fn open(parent: &Dir, spec: &PartialCollectionSpec) -> io::Result<Self> {
+        let directory = parent.open_dir_nofollow(DIRECTORY)?;
+        let receipt = read_partial_receipt_metadata_in(&directory, spec)?;
+        validate_inspection_chunk_metadata(spec, &receipt)?;
+        let failure_status_at_open = inspection_failure_status(&directory, spec, &receipt);
+        Ok(Self {
+            directory,
+            spec: spec.clone(),
+            receipt,
+            failure_status_at_open,
+        })
+    }
+    pub fn chunk_count(&self) -> usize {
+        self.receipt.chunks.len()
+    }
+    pub fn receipt(&self) -> &PartialCollectionReceipt {
+        &self.receipt
+    }
+    pub fn failure_status_at_open(&self) -> &InspectionFailureEvidenceStatus {
+        &self.failure_status_at_open
+    }
+    pub fn failure_status_current(&self) -> InspectionFailureEvidenceStatus {
+        inspection_failure_status(&self.directory, &self.spec, &self.receipt)
+    }
+    /// Verifies the whole selected chunk and its row seals before the first
+    /// callback, then invokes the callback from the same immutable buffer.
+    /// A callback error does not roll back effects of earlier callbacks.
+    pub fn visit_chunk(
+        &self,
+        chunk_index: usize,
+        visit: impl FnMut(
+            &rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2,
+        ) -> io::Result<()>,
+    ) -> io::Result<usize> {
+        visit_partial_chunk_in(&self.directory, &self.receipt, chunk_index, visit)
+    }
+}
+
+fn validate_inspection_chunk_metadata(
+    spec: &PartialCollectionSpec,
+    receipt: &PartialCollectionReceipt,
+) -> io::Result<()> {
+    let mut declared = BTreeMap::<&str, (u64, u64)>::new();
+    let mut total = 0u64;
+    for pin in &receipt.chunks {
+        let Some(name) = pin.path.strip_prefix("chunks/") else {
+            return Err(invalid_partial("partial chunk path"));
+        };
+        if name.len() != 12
+            || !name.ends_with(".jsonl")
+            || !name.as_bytes()[..6].iter().all(u8::is_ascii_digit)
+            || pin.bytes == 0
+            || pin.bytes > rz_experiments::rovent_corpus::MAX_CHUNK_BYTES as u64
+            || pin.rows == 0
+            || !digest_string(&pin.sha256)
+            || declared.insert(pin.path.as_str(), (0, 0)).is_some()
+        {
+            return Err(invalid_partial("partial chunk pin"));
+        }
+        total = total
+            .checked_add(pin.bytes)
+            .ok_or_else(|| invalid_partial("partial chunk bytes overflow"))?;
+    }
+    if receipt.failure_evidence.as_ref().is_some_and(|p| {
+        total
+            .checked_add(p.bytes)
+            .is_none_or(|n| n > spec.byte_limit)
+    }) || total > spec.byte_limit
+    {
+        return Err(invalid_partial("partial chunk budget"));
+    }
+    for row in receipt.rows.values() {
+        if let RowState::Valid {
+            record_reference,
+            bytes,
+        } = row
+        {
+            let entry = declared
+                .get_mut(record_reference.as_str())
+                .ok_or_else(|| invalid_partial("partial row chunk missing"))?;
+            entry.0 = entry
+                .0
+                .checked_add(1)
+                .ok_or_else(|| invalid_partial("partial row count overflow"))?;
+            entry.1 = entry
+                .1
+                .checked_add(*bytes)
+                .ok_or_else(|| invalid_partial("partial row bytes overflow"))?;
+        }
+    }
+    for pin in &receipt.chunks {
+        if declared.get(pin.path.as_str()) != Some(&(pin.rows, pin.bytes)) {
+            return Err(invalid_partial(
+                "partial chunk declaration/accounting differs",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Convenient single-visit wrapper; repeated visits should reuse a reader.
@@ -1371,6 +1554,101 @@ impl PartialCollectionAccounting {
 mod tests {
     use super::*;
 
+    #[test]
+    fn inspection_reports_missing_failure_and_never_visits_invalid_chunk() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "rz-independent-inspection-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let parent = Dir::open_ambient_dir(&path, cap_std::ambient_authority()).unwrap();
+        let output = create_partial_directory(&parent).unwrap();
+        output.create_dir("chunks").unwrap();
+        let chunk = b"{}\n"; // Deliberately invalid lock-v2 row, never authority.
+        std::fs::write(
+            path.join(DIRECTORY).join("chunks").join("000000.jsonl"),
+            chunk,
+        )
+        .unwrap();
+        let mut state = PartialCollectionAccounting::new(8, 4096).unwrap();
+        state.begin_row("row").unwrap();
+        state
+            .record_valid("row", "chunks/000000.jsonl", chunk.len() as u64)
+            .unwrap();
+        state.begin_row("failure-sequence-1").unwrap();
+        state
+            .record_failure(
+                "failure-sequence-1",
+                "failure-evidence.jsonl#failure-sequence-1",
+                20,
+            )
+            .unwrap();
+        let receipt = state
+            .finish(PartialEndReason::InputExhausted)
+            .ok()
+            .unwrap()
+            .with_chunks(vec![PartialChunkPin {
+                path: "chunks/000000.jsonl".into(),
+                bytes: chunk.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(chunk)),
+                rows: 1,
+            }])
+            .with_failure_evidence(PartialFailurePin {
+                path: FAILURE_FILE.into(),
+                bytes: 20,
+                sha256: "0".repeat(64),
+                rows: 1,
+            });
+        // Synthetic, metadata-only corruption fixture; the strict writer
+        // cannot and does not publish this fabricated receipt.
+        let stored = PartialStoredReceipt {
+            spec: spec(),
+            receipt,
+        };
+        std::fs::write(
+            path.join(DIRECTORY).join(FILE),
+            serde_json::to_vec(&stored).unwrap(),
+        )
+        .unwrap();
+        assert!(PartialCollectionReader::open(&parent, &spec()).is_err());
+        let reader = PartialInspectionReader::open(&parent, &spec()).unwrap();
+        assert_eq!(reader.chunk_count(), 1);
+        assert!(matches!(
+            reader.failure_status_at_open(),
+            InspectionFailureEvidenceStatus::Missing { .. }
+        ));
+        let mut calls = 0;
+        assert!(
+            reader
+                .visit_chunk(0, |_| {
+                    calls += 1;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(calls, 0);
+        std::fs::write(
+            path.join(DIRECTORY).join(FAILURE_FILE),
+            b"invalid failure data",
+        )
+        .unwrap();
+        assert!(matches!(
+            reader.failure_status_current(),
+            InspectionFailureEvidenceStatus::Invalid { .. }
+        ));
+        assert!(matches!(
+            reader.failure_status_at_open(),
+            InspectionFailureEvidenceStatus::Missing { .. }
+        ));
+        drop(reader);
+        drop(output);
+        drop(parent);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     fn spec() -> PartialCollectionSpec {
         PartialCollectionSpec {
             schema: PARTIAL_COLLECTION_SPEC_DOMAIN.into(),
@@ -1459,7 +1737,10 @@ mod tests {
         assert!(portable_report(&report));
         assert!(portable_attempt(&attempt));
         let mut malformed_report = report.clone();
-        malformed_report.as_object_mut().unwrap().remove("completion");
+        malformed_report
+            .as_object_mut()
+            .unwrap()
+            .remove("completion");
         assert!(!portable_report(&malformed_report));
         let mut malformed_attempt = attempt.clone();
         malformed_attempt["external"]["process"]["stdout_bytes"] = "missing".into();
@@ -1518,6 +1799,19 @@ mod tests {
             };
             let reader = PartialCollectionReader::open(&parent, &spec()).unwrap();
             assert!(!reader.verify_failure_evidence_current().unwrap());
+            let inspection = PartialInspectionReader::open(&parent, &spec()).unwrap();
+            assert!(
+                super::super::partial_followup_v1::visit_independent_partial_chunk(
+                    &inspection,
+                    0,
+                    FollowupResources::Isolated,
+                    PriorResourceState::Unknown,
+                    ProducerExit::Exited(PARTIAL_COLLECTION_EXIT_CODE),
+                    ProcessTreeState::GoneObserved,
+                    |_| panic!("empty receipt cannot yield a valid row"),
+                )
+                .is_err()
+            );
             let decide = |dep, resources| {
                 decide_partial_followup(
                     dep,
@@ -1528,6 +1822,13 @@ mod tests {
                     Some(&reader),
                 )
             };
+            assert_eq!(
+                decide(
+                    FollowupDependency::FailureEvidenceInspection,
+                    FollowupResources::Isolated,
+                ),
+                FollowupDecision::BlockedPartialEvidence
+            );
             assert_eq!(
                 decide(
                     FollowupDependency::PartialInspection,

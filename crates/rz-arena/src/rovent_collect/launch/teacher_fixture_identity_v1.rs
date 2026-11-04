@@ -26,6 +26,29 @@ pub struct TeacherFixtureIdentityV1 {
 }
 
 impl TeacherFixtureIdentityV1 {
+    /// Only the feature-gated fixture worker accepts this translation. It is
+    /// deliberately not an adapter to product preload, actor, or teacher pins.
+    #[cfg(all(target_os = "linux", feature = "test-fixtures"))]
+    pub fn worker_source(
+        &self,
+    ) -> Result<
+        rz_search::external_cpu::collection_teacher::fixture_worker::FixtureWorkerSource,
+        &'static str,
+    > {
+        self.validate()?;
+        Ok(
+            rz_search::external_cpu::collection_teacher::fixture_worker::FixtureWorkerSource {
+                schema: self.schema.clone(),
+                executable_sha256: self.executable_sha256.clone(),
+                executable_bytes: self.executable_bytes,
+                fixture_scenario: self.fixture_scenario.clone(),
+                scope: "test_elf_only".into(),
+                official_engine_identity: false,
+                training_eligible: false,
+            },
+        )
+    }
+
     /// Checks metadata only; actual opened descriptor, byte hash and custody
     /// remain the responsibility of a future feature-gated fixture adapter.
     pub fn from_json(input: &str) -> Result<Self, &'static str> {
@@ -57,6 +80,206 @@ impl TeacherFixtureIdentityV1 {
             return Err("fixture identity domain, bounds or scope invalid");
         }
         Ok(())
+    }
+}
+
+/// Original producer rows and fixture observations stay in this test-only
+/// custody. No API converts them into teacher labels or strict publications.
+#[cfg(all(
+    target_os = "linux",
+    feature = "test-fixtures",
+    feature = "pals-collection-onnx"
+))]
+pub struct FixtureProducerAdapter {
+    rows: Vec<(
+        super::super::RoventRetiredLockV2Record,
+        rz_search::external_cpu::collection_teacher::fixture_worker::FixtureTeacherObservation,
+    )>,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "test-fixtures",
+    feature = "pals-collection-onnx"
+))]
+pub struct FixtureAttachFailure {
+    pub error: String,
+    pub row: super::super::RoventRetiredLockV2Record,
+    pub observation:
+        rz_search::external_cpu::collection_teacher::fixture_worker::FixtureTeacherObservation,
+    pub panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "test-fixtures",
+    feature = "pals-collection-onnx"
+))]
+impl FixtureProducerAdapter {
+    pub fn new() -> Self {
+        Self { rows: Vec::new() }
+    }
+
+    /// The original producer performs the owner check; Rules replay and all
+    /// shared root/input fields must match this worker-issued one-shot view.
+    /// Errors and panics return both original objects without altering custody.
+    pub fn attach(
+        &mut self,
+        producer: &super::super::RoventCorpusProducerLockV2,
+        row: super::super::RoventRetiredLockV2Record,
+        observation: rz_search::external_cpu::collection_teacher::fixture_worker::FixtureTeacherObservation,
+    ) -> Result<(), Box<FixtureAttachFailure>> {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
+                if self.rows.len() >= 2 {
+                    return Err("fixture row capacity".into());
+                }
+                producer
+                    .validate_teacher_row(&row)
+                    .map_err(|e| e.to_string())?;
+                let input = &row.record.0.input;
+                let scope = observation.input_scope();
+                let root = row.admission.root_admission();
+                let parse = |s: &str| {
+                    rz_eval::asset::parse_sha256(s)
+                        .map(rz_contracts::Digest)
+                        .map_err(|e| e.to_string())
+                };
+                let seal = row.submitted_input_seal();
+                let actor = seal
+                    .teacher_actor_id
+                    .as_deref()
+                    .ok_or_else(|| "original teacher actor missing".to_owned())?;
+                if row.record.0.lineage.teacher_actor_id.as_deref() != Some(actor) {
+                    return Err("original teacher actor differs from lineage".into());
+                }
+                let pin = row
+                    .manifest_owner
+                    .registration
+                    .teachers
+                    .get(actor)
+                    .ok_or_else(|| "original registered teacher pin missing".to_owned())?;
+                // Same domain and payload as the original frozen actor constructor;
+                // the digest does not itself prove the fixture worker owns it.
+                let actor_digest = rz_experiments::pals_data_v3::generation_digest(
+                    "rz-rovent-frozen-teacher-actor/1",
+                    &serde_json::json!({"actor_id":actor,"teacher_pin":pin}),
+                )
+                .map_err(|e| e.to_string())?;
+                if scope.frozen_actor != parse(&actor_digest)? {
+                    return Err("original frozen teacher actor digest differs".into());
+                }
+                if !observation.original_registered_actor_proven() {
+                    return Err(
+                        "fixture worker does not own the original registered teacher actor".into(),
+                    );
+                }
+                let replay = row
+                    .original_teacher_query_position()
+                    .map_err(|e| e.to_string())?;
+                let root_digest = root.descriptor().digest().map_err(|e| e.to_string())?;
+                if observation.conditional_policy_target_known().is_none()
+                    || observation.training_eligible()
+                    || observation.official_engine_identity()
+                    || observation.has_root_restriction()
+                    || scope.authority != row.ticket.authority
+                    || scope.role != row.ticket.role
+                    || scope.input_sha256 != parse(&row.record.0.input_sha256)?
+                    || scope.view_sha256 != parse(&input.view_sha256)?
+                    || scope.source_sha256 != parse(&row.manifest_owner.registration.source_sha256)?
+                    || scope.rules_semantic != parse(&input.rules_anchor.rules_state_sha256)?
+                    || scope.input_lock != root.startup_lock_digest()
+                    || scope.root_admission != root_digest
+                    || scope.root_budget != row.admission.root_budget()
+                    || !observation.matches_position(&replay.snapshot())
+                {
+                    return Err("fixture observation differs from original root/input/Rules".into());
+                }
+                if let Some((first_row, first_observation)) = self.rows.first() {
+                    if !first_row.admission.same_original_admission(&row.admission)
+                        || !first_observation.same_fixture_worker(&observation)
+                        || first_observation.request_sequence() == observation.request_sequence()
+                        || first_row.record.0.native.retired_sequence
+                            == row.record.0.native.retired_sequence
+                    {
+                        return Err(
+                            "fixture observations differ in original root/worker or duplicate row"
+                                .into(),
+                        );
+                    }
+                }
+                self.rows
+                    .try_reserve(1)
+                    .map_err(|_| "fixture row custody allocation".to_owned())?;
+                Ok(())
+            }));
+        match result {
+            Ok(Ok(())) => {
+                self.rows.push((row, observation));
+                Ok(())
+            }
+            Ok(Err(error)) => Err(Box::new(FixtureAttachFailure {
+                error,
+                row,
+                observation,
+                panic: None,
+            })),
+            Err(panic) => Err(Box::new(FixtureAttachFailure {
+                error: "fixture row check panicked".into(),
+                row,
+                observation,
+                panic: Some(panic),
+            })),
+        }
+    }
+
+    /// Test-only observation, not a producer seal or completed native fence.
+    pub fn mixed_exact_and_unknown(&self) -> bool {
+        self.rows.len() == 2
+            && self
+                .rows
+                .iter()
+                .any(|(_, o)| o.conditional_policy_target_known() == Some(true))
+            && self
+                .rows
+                .iter()
+                .any(|(_, o)| o.conditional_policy_target_known() == Some(false))
+    }
+
+    /// Release only after the same real collection run confirms its original
+    /// fenced/settled owner and the same fixture worker confirms clean join.
+    /// Every check happens before mutating custody; failure retains all rows.
+    pub fn release_after_observed_fences(
+        &mut self,
+        run: &super::RoventPcCollectionRunV2,
+        worker: &rz_search::external_cpu::collection_teacher::fixture_worker::FixtureTeacherWorker,
+    ) -> Result<(), String> {
+        let owner = run.closed_owner().map_err(|e| e.to_string())?;
+        for (row, observation) in &self.rows {
+            if !worker.clean_join_matches(observation) {
+                return Err(
+                    "fixture worker clean join is absent or belongs to another owner".into(),
+                );
+            }
+            owner
+                .with_retired_producer(row, |producer| producer.validate_teacher_row(row))
+                .map_err(|e| e.to_string())?;
+        }
+        self.rows.clear();
+        Ok(())
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "test-fixtures",
+    feature = "pals-collection-onnx"
+))]
+impl Drop for FixtureProducerAdapter {
+    fn drop(&mut self) {
+        // The test adapter cannot prove device/owner retirement. Preserve its
+        // exact originals if its caller has not established another owner.
+        std::mem::forget(std::mem::take(&mut self.rows));
     }
 }
 
