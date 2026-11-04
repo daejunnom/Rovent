@@ -1883,6 +1883,13 @@ impl Drop for PcCollectionRecoverySlotV3 {
 #[derive(Clone)]
 pub struct RoventPcCollectionRecoveryKeyV3(Arc<PcCollectionRecoverySlotV3>);
 
+/// Observation failure for one original Collection recovery slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoventPcCollectionRecoveryErrorV3 {
+    Busy,
+    Poisoned,
+}
+
 /// Non-cloneable reservation for exactly one original outcome.
 pub(crate) struct PcCollectionOutcomeReservationV3 {
     slot: Option<Arc<PcCollectionRecoverySlotV3>>,
@@ -1974,9 +1981,21 @@ impl RoventPcCollectionRecoveryKeyV3 {
     }
 
     pub fn try_recover(&self) -> Result<Option<RoventPcCollectionResourceOutcomeV3>, &'static str> {
+        self.try_recover_typed().map_err(|failure| match failure {
+            RoventPcCollectionRecoveryErrorV3::Busy => "collection recovery slot busy",
+            RoventPcCollectionRecoveryErrorV3::Poisoned => "collection recovery slot poisoned",
+        })
+    }
+
+    /// A busy slot can be retried without interpreting it as an empty slot.
+    /// A poisoned slot remains untouched and distinct from both cases.
+    pub fn try_recover_typed(
+        &self,
+    ) -> Result<Option<RoventPcCollectionResourceOutcomeV3>, RoventPcCollectionRecoveryErrorV3>
+    {
         let mut slot = self.0.owners.try_lock().map_err(|failure| match failure {
-            std::sync::TryLockError::WouldBlock => "collection recovery slot busy",
-            std::sync::TryLockError::Poisoned(_) => "collection recovery slot poisoned",
+            std::sync::TryLockError::WouldBlock => RoventPcCollectionRecoveryErrorV3::Busy,
+            std::sync::TryLockError::Poisoned(_) => RoventPcCollectionRecoveryErrorV3::Poisoned,
         })?;
         let owners = slot.take();
         drop(slot);
