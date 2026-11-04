@@ -350,6 +350,19 @@ impl TeacherPolicyConsumerV3 {
             .map(|completed| completed.capsule.ticket())
     }
 
+    /// Read the original completion's admission and ticket while this
+    /// consumer guard remains held. This does not authorize publication.
+    pub(crate) fn original_completion_scope(
+        &self,
+    ) -> Option<(
+        &RoventCollectionRootAdmissionV3,
+        rz_contracts::pals_adaptive::RoleTicketEnvelope,
+    )> {
+        self.completed
+            .as_ref()
+            .map(|completed| (completed.capsule.admission(), completed.capsule.ticket()))
+    }
+
     /// The exact ticket selects its original retired row; a digest or the
     /// teacher completion alone does not establish retirement.
     pub(crate) fn sealed_ticket(&self) -> Option<rz_contracts::pals_adaptive::RoleTicketEnvelope> {
@@ -534,6 +547,11 @@ impl TeacherPolicyConsumerV3 {
         if self.appended_retained {
             return Ok(TeacherPolicyConsumerProgressV3::OutputHeld);
         }
+        let Some(completed) = self.completed.as_ref() else {
+            return Ok(TeacherPolicyConsumerProgressV3::NotReady);
+        };
+        let admission = completed.capsule.admission();
+        let ticket = completed.capsule.ticket();
         let mut pipeline = match self.pipeline.try_lock().map_err(invalid)? {
             Some(guard) => guard,
             None => return Ok(TeacherPolicyConsumerProgressV3::Busy),
@@ -543,21 +561,23 @@ impl TeacherPolicyConsumerV3 {
             return Ok(TeacherPolicyConsumerProgressV3::Unknown);
         }
         if !self.appended_in_output {
-            if !pipeline.transfer_appended() {
+            if !pipeline.transfer_appended(admission, &ticket) {
                 return Ok(TeacherPolicyConsumerProgressV3::OutputHeld);
             }
             self.appended_in_output = true;
         }
-        Ok(match pipeline.try_retain_completed(&self.retained)? {
-            PolicyRetentionOutcomeV3::Transferred => {
-                self.appended_retained = true;
-                TeacherPolicyConsumerProgressV3::AppendedEvidenceStored
-            }
-            PolicyRetentionOutcomeV3::Busy => TeacherPolicyConsumerProgressV3::Busy,
-            PolicyRetentionOutcomeV3::NotReady => TeacherPolicyConsumerProgressV3::NotReady,
-            PolicyRetentionOutcomeV3::OtherRoot => TeacherPolicyConsumerProgressV3::NotReady,
-            PolicyRetentionOutcomeV3::Capacity => TeacherPolicyConsumerProgressV3::OutputHeld,
-        })
+        Ok(
+            match pipeline.try_retain_completed(&self.retained, admission, &ticket)? {
+                PolicyRetentionOutcomeV3::Transferred => {
+                    self.appended_retained = true;
+                    TeacherPolicyConsumerProgressV3::AppendedEvidenceStored
+                }
+                PolicyRetentionOutcomeV3::Busy => TeacherPolicyConsumerProgressV3::Busy,
+                PolicyRetentionOutcomeV3::NotReady => TeacherPolicyConsumerProgressV3::NotReady,
+                PolicyRetentionOutcomeV3::OtherRoot => TeacherPolicyConsumerProgressV3::NotReady,
+                PolicyRetentionOutcomeV3::Capacity => TeacherPolicyConsumerProgressV3::OutputHeld,
+            },
+        )
     }
 
     /// Move the original completion only into the pre-registered root's
