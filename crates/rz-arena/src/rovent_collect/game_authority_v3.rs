@@ -51,15 +51,32 @@ struct GameEffectRecordV3 {
     active: bool,
 }
 
-/// Placeholder for a future original stage/session witness. This has no
-/// constructor until each real acquisition owner supplies its typed proof.
+/// The original typed stage/receive owners move together into this source.
+/// A stage source alone is never promoted to a game effect capability.
 pub(super) struct GameEffectSourceV3<S> {
     owner: Arc<GameAuthorityV3<S>>,
     root: RoventCollectionRootAdmissionV3,
     kind: GameEffectKindV3,
     stage: Arc<()>,
     actor: Option<Arc<()>>,
-    _requires_original_stage: Infallible,
+    original: GameEffectOriginalV3,
+}
+
+enum GameEffectOriginalV3 {
+    PcScope {
+        proof: super::pc_worker_v3::PcReceivedStageProofV3,
+        source: super::teacher::v3_session::TeacherScopeEffectSourceV3,
+    },
+}
+
+impl<S> GameEffectSourceV3<S> {
+    pub(super) fn pc_scope_source(
+        &self,
+    ) -> Option<&super::teacher::v3_session::TeacherScopeEffectSourceV3> {
+        match &self.original {
+            GameEffectOriginalV3::PcScope { source, .. } => Some(source),
+        }
+    }
 }
 
 /// Not constructible until the actual start primitive preserves its original
@@ -442,7 +459,7 @@ impl<S> GameAuthorityV3<S> {
 
     /// Candidate-only until each stage owner can issue an original source and
     /// actual outcome witness. No generic bool can resolve this claim.
-    pub(super) fn try_claim_effect(
+    fn try_claim_effect(
         self: &Arc<Self>,
         source: &GameEffectSourceV3<S>,
         destination: &mut Option<GameEffectClaimV3<S>>,
@@ -741,6 +758,108 @@ impl<S> GameAuthorityV3<S> {
 }
 
 impl GameAuthorityV3<super::pc_worker_v3::PcWorkerSupervisorV3> {
+    /// Move the original received-stage proof and nonclone scope source into
+    /// an already retained destination only after same-owner revalidation.
+    /// Neither Busy nor a rejection consumes either original input slot.
+    pub(super) fn try_issue_pc_scope_source_in_slot(
+        self: &Arc<Self>,
+        proof_slot: &mut Option<super::pc_worker_v3::PcReceivedStageProofV3>,
+        source_slot: &mut Option<super::teacher::v3_session::TeacherScopeEffectSourceV3>,
+        supervisor: &super::pc_worker_v3::PcWorkerSupervisorV3,
+        recovery: &super::pc_worker_v3::PcRootRecoveryV3,
+        root: &RoventCollectionRootAdmissionV3,
+        destination: &mut Option<GameEffectSourceV3<super::pc_worker_v3::PcWorkerSupervisorV3>>,
+        error_destination: &mut Option<&'static str>,
+    ) -> GameStepV3 {
+        if error_destination.is_some() {
+            return GameStepV3::Failed;
+        }
+        if destination.is_some() {
+            return GameStepV3::Busy;
+        }
+        let (Some(proof), Some(source)) = (proof_slot.as_ref(), source_slot.as_ref()) else {
+            return GameStepV3::Busy;
+        };
+        match proof.matches_game(self) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        if !proof.matches_admission(root) || !proof.matches_scope_source(source) {
+            return GameStepV3::Foreign;
+        }
+        match proof.try_revalidate_with_guards(supervisor, recovery) {
+            Ok(Some(true)) => {}
+            Ok(None) => return GameStepV3::Busy,
+            Ok(Some(false)) => return GameStepV3::Foreign,
+            Err(error) => {
+                *error_destination = Some(error);
+                return GameStepV3::Failed;
+            }
+        }
+        let owner = Arc::clone(self);
+        let root = root.clone();
+        let stage = Arc::clone(source.identity());
+        // Both source slots were checked above. No fallible operation or
+        // external callback occurs between their take and destination write.
+        let proof = proof_slot
+            .take()
+            .expect("validated original received proof");
+        let source = source_slot.take().expect("validated original scope source");
+        *destination = Some(GameEffectSourceV3 {
+            owner,
+            root,
+            kind: GameEffectKindV3::TeacherScope,
+            stage,
+            actor: None,
+            original: GameEffectOriginalV3::PcScope { proof, source },
+        });
+        GameStepV3::Ready
+    }
+
+    /// A source is not a dispatch/start permit. Revalidate its original
+    /// received stage under the caller's existing guards before game claim.
+    pub(super) fn try_claim_pc_scope(
+        self: &Arc<Self>,
+        source: &GameEffectSourceV3<super::pc_worker_v3::PcWorkerSupervisorV3>,
+        supervisor: &super::pc_worker_v3::PcWorkerSupervisorV3,
+        recovery: &super::pc_worker_v3::PcRootRecoveryV3,
+        destination: &mut Option<GameEffectClaimV3<super::pc_worker_v3::PcWorkerSupervisorV3>>,
+        error_destination: &mut Option<&'static str>,
+    ) -> GameStepV3 {
+        if error_destination.is_some() {
+            return GameStepV3::Failed;
+        }
+        let GameEffectOriginalV3::PcScope {
+            proof,
+            source: original,
+        } = &source.original;
+        if !Arc::ptr_eq(self, &source.owner) {
+            return GameStepV3::Foreign;
+        }
+        match proof.matches_game(self) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        if !proof.matches_admission(&source.root)
+            || !proof.matches_scope_source(original)
+            || !original.matches_stage_identity(&source.stage)
+        {
+            return GameStepV3::Foreign;
+        }
+        match proof.try_revalidate_with_guards(supervisor, recovery) {
+            Ok(Some(true)) => {}
+            Ok(None) => return GameStepV3::Busy,
+            Ok(Some(false)) => return GameStepV3::Foreign,
+            Err(error) => {
+                *error_destination = Some(error);
+                return GameStepV3::Failed;
+            }
+        }
+        self.try_claim_effect(source, destination)
+    }
+
     /// Only the original P-C bridge can create this nonclone native fence
     /// witness. It is admission evidence only, not worker or output proof.
     pub(super) fn try_seal_pc(
@@ -1329,6 +1448,10 @@ impl<S> GameEffectClaimV3<S> {
         {
             return GameStepV3::Foreign;
         }
+        self.try_complete_verified()
+    }
+
+    fn try_complete_verified(&mut self) -> GameStepV3 {
         if self.resolved {
             return GameStepV3::Existing;
         }
@@ -1362,6 +1485,58 @@ impl<S> GameEffectClaimV3<S> {
         state.effects[index].active = false;
         self.resolved = true;
         GameStepV3::Ready
+    }
+}
+
+impl GameEffectClaimV3<super::pc_worker_v3::PcWorkerSupervisorV3> {
+    /// Settle only the original scope's actual returned result. The outcome
+    /// remains in caller custody; this is not a physical retirement proof.
+    pub(super) fn try_complete_pc_scope(
+        &mut self,
+        source: &GameEffectSourceV3<super::pc_worker_v3::PcWorkerSupervisorV3>,
+        outcome: &super::teacher::v3_session::TeacherScopeEffectOutcomeV3,
+        supervisor: &super::pc_worker_v3::PcWorkerSupervisorV3,
+        recovery: &super::pc_worker_v3::PcRootRecoveryV3,
+        error_destination: &mut Option<&'static str>,
+    ) -> GameStepV3 {
+        if error_destination.is_some() {
+            return GameStepV3::Failed;
+        }
+        if !Arc::ptr_eq(&self.owner, &source.owner)
+            || !self.root.same_original_admission(&source.root)
+            || self.kind != GameEffectKindV3::TeacherScope
+            || source.kind != GameEffectKindV3::TeacherScope
+            || !Arc::ptr_eq(&self.stage, &source.stage)
+            || self.actor.is_some()
+            || source.actor.is_some()
+        {
+            return GameStepV3::Foreign;
+        }
+        let GameEffectOriginalV3::PcScope {
+            proof,
+            source: original,
+        } = &source.original;
+        match proof.matches_game(&self.owner) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        if !proof.matches_admission(&self.root)
+            || !proof.matches_scope_source(original)
+            || !original.matches_outcome(outcome)
+        {
+            return GameStepV3::Foreign;
+        }
+        match proof.try_revalidate_with_guards(supervisor, recovery) {
+            Ok(Some(true)) => {}
+            Ok(None) => return GameStepV3::Busy,
+            Ok(Some(false)) => return GameStepV3::Foreign,
+            Err(error) => {
+                *error_destination = Some(error);
+                return GameStepV3::Failed;
+            }
+        }
+        self.try_complete_verified()
     }
 }
 impl<S> Drop for GameEffectClaimV3<S> {
