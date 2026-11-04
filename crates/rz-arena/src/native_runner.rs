@@ -746,6 +746,9 @@ struct IndependentNoGameOwners {
     // One binding is moved into one custody owner. Its control owns the same
     // snapshot/execution/socket Arcs and the selected proxy FD.
     _binding: crate::pals_adaptive_launch::DirectNoGameBinding,
+    plan_sha256: String,
+    observation: Option<crate::process::OriginalSmokeUciObservation>,
+    quarantined_error: Option<ArenaError>,
 }
 
 #[cfg(target_os = "linux")]
@@ -757,7 +760,111 @@ pub(crate) struct PreparedIndependentNoGameOwner {
     // adapter must clear this before dispatch and restore it only on the
     // original owner's verified physical fence.
     physical_fence_confirmed: bool,
-    original_error: Option<String>,
+    evidence_transferred: bool,
+    original_error: Option<ArenaError>,
+    failures: Vec<String>,
+}
+
+/// Returned bytes and observations; neither is a physical-completion proof.
+#[cfg(target_os = "linux")]
+pub(crate) struct IndependentNoGameRawEvidence {
+    pub(crate) plan_sha256: String,
+    pub(crate) role: rz_experiments::NativeEngineRole,
+    // Values supplied to this original execution, not globally unique IDs.
+    pub(crate) owner_id: [u8; 16],
+    pub(crate) owner_epoch: u64,
+    pub(crate) process: Option<ProcessOutput>,
+    pub(crate) original_error: Option<ArenaError>,
+    pub(crate) failures: Vec<String>,
+    pub(crate) observation: Option<crate::process::OriginalSmokeUciObservation>,
+}
+
+#[cfg(target_os = "linux")]
+static NO_GAME_RAW_EVIDENCE: Mutex<Vec<IndependentNoGameRawEvidence>> = Mutex::new(Vec::new());
+#[cfg(target_os = "linux")]
+static NO_GAME_RAW_UNOBSERVABLE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static NO_GAME_RAW_WARNING: AtomicBool = AtomicBool::new(false);
+
+/// Transfer the uniquely matching completed scope for durable recovery. The
+/// original ID/epoch are caller-supplied, so ambiguous matches are refused.
+#[cfg(target_os = "linux")]
+pub(crate) fn take_independent_no_game_raw_evidence(
+    owner_id: [u8; 16],
+    owner_epoch: u64,
+    role: rz_experiments::NativeEngineRole,
+    plan_sha256: &str,
+) -> Result<Option<IndependentNoGameRawEvidence>, ArenaError> {
+    let mut slots = NO_GAME_RAW_EVIDENCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut matched = slots
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            e.owner_id == owner_id
+                && e.owner_epoch == owner_epoch
+                && e.role == role
+                && e.plan_sha256 == plan_sha256
+        })
+        .map(|(index, _)| index);
+    let Some(index) = matched.next() else {
+        return Ok(None);
+    };
+    if matched.next().is_some() {
+        return Err(ArenaError::Integrity(
+            "ambiguous NoGame raw evidence scope".into(),
+        ));
+    }
+    Ok(Some(slots.remove(index)))
+}
+
+/// A single recovery owner may explicitly transfer the entire collection,
+/// including duplicate identifiers, without silently choosing between them.
+#[cfg(target_os = "linux")]
+pub(crate) fn take_all_independent_no_game_raw_evidence() -> Vec<IndependentNoGameRawEvidence> {
+    std::mem::take(
+        &mut *NO_GAME_RAW_EVIDENCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn independent_no_game_unobservable_raw_retained() -> bool {
+    NO_GAME_RAW_UNOBSERVABLE.load(Ordering::Acquire)
+}
+
+/// Sticky warning, which a caller can surface without blocking owner drop.
+#[cfg(target_os = "linux")]
+pub(crate) fn independent_no_game_raw_warning_observed() -> bool {
+    NO_GAME_RAW_WARNING.load(Ordering::Acquire)
+}
+
+/// Diagnostics only: counts retained stdout/stderr bytes, not total memory.
+#[cfg(target_os = "linux")]
+pub(crate) fn independent_no_game_raw_evidence_usage() -> (usize, u64) {
+    let slots = NO_GAME_RAW_EVIDENCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let bytes = slots
+        .iter()
+        .fold(0u64, |sum, e| sum.saturating_add(no_game_raw_bytes(e)));
+    (slots.len(), bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn no_game_raw_bytes(evidence: &IndependentNoGameRawEvidence) -> u64 {
+    let process = evidence
+        .process
+        .as_ref()
+        .map_or(0, |p| p.stdout.len().saturating_add(p.stderr.len()));
+    let observation = evidence.observation.as_ref().map_or(0, |o| {
+        o.buffered_stdout()
+            .len()
+            .saturating_add(o.buffered_stderr().len())
+    });
+    u64::try_from(process.saturating_add(observation)).unwrap_or(u64::MAX)
 }
 
 #[cfg(target_os = "linux")]
@@ -779,12 +886,20 @@ impl PreparedIndependentNoGameOwner {
         if let Err(error) = checked {
             return Err((error, binding));
         }
+        let plan_sha256 = binding.snapshot().plan.sha256().to_owned();
         Ok(Self {
-            owners: Some(IndependentNoGameOwners { _binding: binding }),
+            owners: Some(IndependentNoGameOwners {
+                _binding: binding,
+                plan_sha256,
+                observation: None,
+                quarantined_error: None,
+            }),
             process: None,
             spawn_custody: crate::process::SpawnCustody::default(),
             physical_fence_confirmed: true,
+            evidence_transferred: false,
             original_error: None,
+            failures: Vec::new(),
         })
     }
 
@@ -797,17 +912,81 @@ impl PreparedIndependentNoGameOwner {
                     || process.pending_child.is_some()
             })
     }
+
+    /// A borrow transfers neither custody nor a completion assertion.
+    pub(crate) fn process(&self) -> Option<&ProcessOutput> {
+        self.process.as_ref()
+    }
+
+    /// May include bytes read before an interrupted supervisor returns.
+    pub(crate) fn observation(&self) -> Option<&crate::process::OriginalSmokeUciObservation> {
+        self.owners.as_ref()?.observation.as_ref()
+    }
+
+    /// Physical completion must be resolved before moving evidence away from
+    /// the original owner. The caller is responsible for durable storage.
+    pub(crate) fn take_raw_evidence(&mut self) -> Option<IndependentNoGameRawEvidence> {
+        if self.unresolved() || self.evidence_transferred {
+            return None;
+        }
+        let owners = self.owners.as_mut()?;
+        if self.process.is_none()
+            && self.original_error.is_none()
+            && self.failures.is_empty()
+            && owners.observation.is_none()
+        {
+            return None;
+        }
+        let role = owners._binding.snapshot().role;
+        let execution = owners._binding.execution();
+        self.evidence_transferred = true;
+        Some(IndependentNoGameRawEvidence {
+            plan_sha256: std::mem::take(&mut owners.plan_sha256),
+            role,
+            owner_id: execution.owner_id(),
+            owner_epoch: execution.owner_epoch(),
+            process: self.process.take(),
+            original_error: self.original_error.take(),
+            failures: std::mem::take(&mut self.failures),
+            observation: owners.observation.take(),
+        })
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for PreparedIndependentNoGameOwner {
     fn drop(&mut self) {
         if !self.unresolved() {
+            if let Some(evidence) = self.take_raw_evidence() {
+                let mut slots = NO_GAME_RAW_EVIDENCE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if slots.try_reserve(1).is_ok() {
+                    slots.push(evidence);
+                    let bytes = slots
+                        .iter()
+                        .fold(0u64, |sum, e| sum.saturating_add(no_game_raw_bytes(e)));
+                    if slots.len() >= GUARDED_EVIDENCE_CAPACITY
+                        || bytes >= GUARDED_EVIDENCE_PAYLOAD_LIMIT_BYTES
+                    {
+                        NO_GAME_RAW_WARNING.store(true, Ordering::Release);
+                    }
+                } else {
+                    // Preserve bytes even if the recovery handle cannot be
+                    // allocated, and explicitly report that limitation.
+                    NO_GAME_RAW_UNOBSERVABLE.store(true, Ordering::Release);
+                    std::mem::forget(evidence);
+                }
+            }
             return;
         }
         let physical_lifetime_unknown = !self.physical_fence_confirmed
             || self.spawn_custody.pending.load(Ordering::Acquire)
             || self.spawn_custody.child().is_some();
+        let error_description = self.original_error.as_ref().map(ToString::to_string);
+        if let Some(owners) = self.owners.as_mut() {
+            owners.quarantined_error = self.original_error.take();
+        }
         crate::native_launch::close_native_admission();
         let retained = Box::new(RetainedNativeScope {
             _owner: Box::new(
@@ -820,8 +999,8 @@ impl Drop for PreparedIndependentNoGameOwner {
             last_spawn_pid: self.spawn_custody.last_spawn_pid,
             physical_lifetime_unknown,
             receipt: None,
-            original_error: self.original_error.take(),
-            guarded_preflight_failures: Vec::new(),
+            original_error: error_description,
+            guarded_preflight_failures: std::mem::take(&mut self.failures),
             interrupted_by_unwind: std::thread::panicking(),
             guarded_probe_scope: None,
             _v6_supervisor: None,
