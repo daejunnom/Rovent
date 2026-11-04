@@ -68,6 +68,9 @@ pub(crate) enum FailedEvidence {
     },
     Quarantined(TeacherPolicyQuarantineV2),
     Sealed(SealedTeacherPolicyV2),
+    /// The original sealed completion failed conditional-policy eligibility.
+    /// Other failures may coexist; this never authorizes an inferred policy.
+    PolicyUnavailable(SealedTeacherPolicyV2),
     PreparationPanicked {
         sealed: SealedTeacherPolicyV2,
         panic: Box<dyn std::any::Any + Send>,
@@ -75,11 +78,29 @@ pub(crate) enum FailedEvidence {
 }
 
 impl FailedEvidence {
+    /// Separate an unavailable target from a worker failure without changing
+    /// ownership, publication eligibility, or physical-completion evidence.
+    pub(crate) fn classification(&self) -> &'static str {
+        match self {
+            Self::Captured { failure, .. } => failure.classification(),
+            Self::UnissuedRootRevoked => "unissued_after_root_revoke",
+            Self::PolicyUnavailable(_) => "conditional_policy_unknown_first_observed",
+            Self::SealRejected {
+                cause: TeacherPolicySealFailureV2::Native {
+                    kind: RoventTeacherPolicySealFailureKindV2::Cancelled,
+                    ..
+                },
+                ..
+            } => "native_seal_cancelled",
+            _ => "teacher_failure_or_unknown",
+        }
+    }
+
     /// Read only the same sealed owner retained after target preparation
     /// failed. This projection grants no target or physical-completion proof.
     pub(crate) fn sealed_observation(&self) -> Option<serde_json::Value> {
         let sealed = match self {
-            Self::Sealed(sealed) => sealed,
+            Self::Sealed(sealed) | Self::PolicyUnavailable(sealed) => sealed,
             Self::Captured { failure, .. } => return failure.sealed_observation(),
             _ => return None,
         };
@@ -157,7 +178,8 @@ impl FailedEvidence {
             | Self::SubmitPending(_)
             | Self::PendingCompleted { .. }
             | Self::Completion(_)
-            | Self::Sealed(_) => false,
+            | Self::Sealed(_)
+            | Self::PolicyUnavailable(_) => false,
         }
     }
     /// Read-only description. The actual completion and authority remain
@@ -185,6 +207,7 @@ impl FailedEvidence {
             },
             Self::Quarantined(_) => "seal_quarantined".into(),
             Self::Sealed(_) => "prepared_seal_rejected".into(),
+            Self::PolicyUnavailable(_) => "teacher_policy_eligibility_unknown".into(),
             Self::PreparationPanicked { .. } => "preparation_panicked".into(),
         }
     }
@@ -955,10 +978,13 @@ impl RetiredRowPumpV2 {
                             error,
                             sealed,
                             panic,
+                            policy_unavailable,
                         } = *rejected;
                         let evidence = if let Some(panic) = panic {
                             self.pending_failure = true;
                             FailedEvidence::PreparationPanicked { sealed, panic }
+                        } else if policy_unavailable {
+                            FailedEvidence::PolicyUnavailable(sealed)
                         } else {
                             FailedEvidence::Sealed(sealed)
                         };
@@ -1211,6 +1237,7 @@ impl RetiredRowPumpV2 {
                                     error,
                                     sealed,
                                     panic,
+                                    policy_unavailable,
                                 } = *rejected;
                                 CapturedStage::Failed {
                                     error,
@@ -1218,6 +1245,9 @@ impl RetiredRowPumpV2 {
                                         Some(panic) => {
                                             self.pending_failure = true;
                                             FailedEvidence::PreparationPanicked { sealed, panic }
+                                        }
+                                        None if policy_unavailable => {
+                                            FailedEvidence::PolicyUnavailable(sealed)
                                         }
                                         None => FailedEvidence::Sealed(sealed),
                                     },

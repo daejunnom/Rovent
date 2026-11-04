@@ -46,7 +46,12 @@ mod cohort_prepare;
 mod intervention;
 mod own_nnuec_lock_v2;
 pub(crate) mod own_publisher_v2;
+mod partial_collection_v1;
 mod pc_lock_v2;
+pub use partial_collection_v1::{
+    PartialCollectionReader, PartialCollectionReceipt, PartialCollectionSpec, read_partial_receipt,
+    visit_partial_chunk,
+};
 mod r_stream;
 mod resources;
 mod utility_stream;
@@ -451,6 +456,19 @@ fn read_pin(
         "Collection original input file SHA",
     )?;
     Ok(bytes)
+}
+
+/// Load a separately pinned partial-collection policy before any native work.
+/// The policy is bound to the exact original collection-plan digest.
+pub fn load_rovent_partial_collection_spec(
+    directory: &Dir,
+    pin: &RoventPublicationFile,
+    collection_plan_sha256: &str,
+) -> Result<PartialCollectionSpec, ArenaError> {
+    let bytes = read_pin(directory, pin, 64 << 10)?;
+    let text = std::str::from_utf8(&bytes).map_err(|error| invalid(error.to_string()))?;
+    PartialCollectionSpec::from_json(text, collection_plan_sha256)
+        .map_err(|error| invalid(error.to_string()))
 }
 
 impl RoventCollectionLaunchPlan {

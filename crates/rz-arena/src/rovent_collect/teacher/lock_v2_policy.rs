@@ -18,6 +18,9 @@ pub(crate) struct PrepareTeacherPolicyFailureV2 {
     pub(crate) error: ArenaError,
     pub(crate) sealed: SealedTeacherPolicyV2,
     pub(crate) panic: Option<Box<dyn std::any::Any + Send>>,
+    /// Conditional-policy eligibility failed first; later checks may also
+    /// fail. No authorization to synthesize a target or publish a partial row.
+    pub(crate) policy_unavailable: bool,
 }
 
 pub(crate) struct CommitTeacherPolicyFailureV2 {
@@ -32,6 +35,7 @@ pub(crate) fn prepare_teacher_policy_lock_v2(
     row: &RoventRetiredLockV2Record,
     sealed: SealedTeacherPolicyV2,
 ) -> Result<PreparedTeacherPolicyLockV2, Box<PrepareTeacherPolicyFailureV2>> {
+    let policy_unavailable = std::cell::Cell::new(false);
     let prepare = || -> Result<(GenerationPolicyTargetV3, RoventHeadSource), ArenaError> {
         if let Some(guard) = &sealed.speculative_guard {
             check(
@@ -113,8 +117,12 @@ pub(crate) fn prepare_teacher_policy_lock_v2(
         // unpublished calculation. The producer assigns the actual next
         // observation sequence at commit; neither temporary value is emitted.
         let projected_input = row_input.common_validation_projection();
-        let (ranked, depth) =
-            validate_completed_teacher_opinions(&projected_input, &sealed.registered.pin, outcome)?;
+        let (ranked, depth) = validate_completed_teacher_opinions_classified(
+            &projected_input,
+            &sealed.registered.pin,
+            outcome,
+            &policy_unavailable,
+        )?;
         prepare_completed_teacher_policy(
             &projected_input,
             &row.record.0.input_sha256,
@@ -141,11 +149,13 @@ pub(crate) fn prepare_teacher_policy_lock_v2(
             error,
             sealed,
             panic: None,
+            policy_unavailable: policy_unavailable.get(),
         })),
         Err(panic) => Err(Box::new(PrepareTeacherPolicyFailureV2 {
             error: invalid("V2 teacher policy preparation panicked"),
             sealed,
             panic: Some(panic),
+            policy_unavailable: false,
         })),
     }
 }

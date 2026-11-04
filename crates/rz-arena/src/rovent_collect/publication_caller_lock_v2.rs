@@ -25,6 +25,22 @@ pub struct RoventCorpusAssemblyLockV2 {
 }
 
 impl RoventCorpusAssemblyLockV2 {
+    /// Restrict the original writer's output cap before the first row. The
+    /// underlying writer counts metadata and source overhead conservatively.
+    pub(crate) fn restrict_output_limit(&mut self, limit: u64) -> Result<(), ArenaError> {
+        check(
+            self.records == 0
+                && self.pending.is_none()
+                && self.sealed.is_none()
+                && self.chunk.is_none()
+                && self.finished.is_none(),
+            "lock-v2 output limit must be restricted before assembly",
+        )?;
+        self.writer
+            .as_mut()
+            .ok_or_else(|| invalid("lock-v2 writer missing"))?
+            .restrict_output_limit(limit)
+    }
     /// Distinguish a full current chunk from validation, quota or duplicate
     /// errors while keeping the sealed original row in this assembly.
     pub(crate) fn chunk_flush_required(&self) -> Result<bool, ArenaError> {

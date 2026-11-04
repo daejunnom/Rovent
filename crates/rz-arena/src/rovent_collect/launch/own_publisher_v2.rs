@@ -145,6 +145,18 @@ pub(super) enum OwnOfferOutcomeV2 {
     Offered,
     FailedRetained,
 }
+
+/// One step of the separate, opt-in partial consumer. These observations
+/// prove neither complete publication nor physical retirement or training
+/// eligibility. A retained unavailable policy is only the first observed
+/// failure; later teacher validation has not necessarily run.
+#[allow(dead_code)]
+pub(super) enum PartialOfferOutcomeV2 {
+    Pending,
+    Offered,
+    PolicyUnavailableRetained,
+    BlockedFailureRetained,
+}
 pub(crate) enum OwnPumpPollV2 {
     Received,
     Empty,
@@ -338,6 +350,7 @@ impl OwnPumpConsumerV2 {
                 if entries.len() < 32 {
                     entries.push(serde_json::json!({"error":describe(error.to_string()),
                         "evidence":describe(evidence.diagnostic()),
+                        "classification":evidence.classification(),
                         "sealed_observation":evidence.sealed_observation(),
                         "original_question_id":row.record.0.input.question_id,
                         "original_job_id":row.record.0.input.job_id,
@@ -381,6 +394,46 @@ impl OwnPumpConsumerV2 {
                 || !state.commit_failures.is_empty()
                 || state.overflow_item.is_some(),
         ))
+    }
+
+    /// Identifies only failures still held by this consumer. The resulting
+    /// strings are observations, not persisted evidence or completion proof.
+    #[allow(dead_code)]
+    pub(super) fn try_partial_failure_ids(&self) -> Result<Option<Vec<String>>, ArenaError> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(ArenaError::Invalid("Own publisher custody poisoned".into()));
+            }
+        };
+        if !state.commit_failures.is_empty() || state.overflow_item.is_some() {
+            return Err(ArenaError::Invalid(
+                "partial failure custody is incomplete".into(),
+            ));
+        }
+        let mut ids = Vec::new();
+        ids.try_reserve(state.failed_items.len())
+            .map_err(|_| ArenaError::Invalid("partial failure id allocation".into()))?;
+        for item in &state.failed_items {
+            match item {
+                PumpItemV2::Failed {
+                    row,
+                    evidence:
+                        super::super::teacher::lock_v2_row_pump::FailedEvidence::PolicyUnavailable(_),
+                    ..
+                } => ids.push(format!(
+                    "failure-sequence-{}",
+                    row.record.0.native.retired_sequence
+                )),
+                _ => {
+                    return Err(ArenaError::Invalid(
+                        "partial has another retained failure".into(),
+                    ));
+                }
+            }
+        }
+        Ok(Some(ids))
     }
 
     /// Attach a prepared teacher opinion and offer the exact original row.
@@ -428,9 +481,76 @@ impl OwnPumpConsumerV2 {
             ArenaError,
         >,
     ) -> Result<OwnOfferOutcomeV2, ArenaError> {
+        match self.try_offer_front_with_mode(assembly, attach, false)? {
+            PartialOfferOutcomeV2::Pending => Ok(OwnOfferOutcomeV2::Pending),
+            PartialOfferOutcomeV2::Offered => Ok(OwnOfferOutcomeV2::Offered),
+            PartialOfferOutcomeV2::BlockedFailureRetained => Ok(OwnOfferOutcomeV2::FailedRetained),
+            PartialOfferOutcomeV2::PolicyUnavailableRetained => Err(ArenaError::Invalid(
+                "strict publisher unexpectedly used partial policy".into(),
+            )),
+        }
+    }
+
+    /// Process at most one item. Only the original unavailable-policy failure
+    /// may be set aside; its row, error and sealed owner remain in custody.
+    /// The caller must separately account for omitted rows, validate every
+    /// offered row, and use a distinct incomplete output/receipt contract.
+    #[allow(dead_code)]
+    pub(super) fn try_offer_front_partial_pc(
+        &self,
+        owner: &RoventCollectionOwnerLockV2,
+        assembly: &mut RoventCorpusAssemblyLockV2,
+        gate: &RoventCollectionCommitGateV2<
+            '_,
+            rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHandoffV2,
+        >,
+        handoff: &mut rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHandoffV2,
+    ) -> Result<PartialOfferOutcomeV2, ArenaError> {
+        self.try_offer_front_with_mode(
+            assembly,
+            |row, evidence| {
+                owner.try_with_fenced_pc_producer_mut(row, gate, handoff, |producer, row| {
+                    producer.attach_prepared_teacher_policy_v2(row, evidence)
+                })
+            },
+            true,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn try_offer_front_partial(
+        &self,
+        owner: &RoventCollectionOwnerLockV2,
+        assembly: &mut RoventCorpusAssemblyLockV2,
+        gate: &RoventCollectionCommitGateV2<'_, RoventNnuecCollectionHandoffV2>,
+        handoff: &mut RoventNnuecCollectionHandoffV2,
+    ) -> Result<PartialOfferOutcomeV2, ArenaError> {
+        self.try_offer_front_with_mode(
+            assembly,
+            |row, evidence| {
+                owner.try_with_fenced_own_producer_mut(row, gate, handoff, |producer, row| {
+                    producer.attach_prepared_teacher_policy_v2(row, evidence)
+                })
+            },
+            true,
+        )
+    }
+
+    fn try_offer_front_with_mode(
+        &self,
+        assembly: &mut RoventCorpusAssemblyLockV2,
+        attach: impl FnOnce(
+            &mut RoventRetiredLockV2Record,
+            &mut Option<PreparedTeacherPolicyLockV2>,
+        ) -> Result<
+            Option<Result<SealedTeacherPolicyV2, Box<CommitTeacherPolicyFailureV2>>>,
+            ArenaError,
+        >,
+        partial: bool,
+    ) -> Result<PartialOfferOutcomeV2, ArenaError> {
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnOfferOutcomeV2::Pending),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(PartialOfferOutcomeV2::Pending),
             Err(std::sync::TryLockError::Poisoned(_)) => {
                 return Err(ArenaError::Invalid("Own publisher custody poisoned".into()));
             }
@@ -438,8 +558,16 @@ impl OwnPumpConsumerV2 {
         // A drained queue requires no new evidence or failure custody. This
         // remains a valid terminal observation even when the last row filled
         // the configured record capacity exactly.
+        if partial && (!state.commit_failures.is_empty() || state.overflow_item.is_some()
+            || state.failed_items.iter().any(|item| !matches!(item,
+                PumpItemV2::Failed { evidence: super::super::teacher::lock_v2_row_pump::FailedEvidence::PolicyUnavailable(_), .. }))
+            || state.items.iter().any(|item| matches!(item, PumpItemV2::Failed { .. })
+                && !matches!(item, PumpItemV2::Failed {
+                    evidence: super::super::teacher::lock_v2_row_pump::FailedEvidence::PolicyUnavailable(_), .. }))) {
+            return Ok(PartialOfferOutcomeV2::BlockedFailureRetained);
+        }
         if state.items.is_empty() {
-            return Ok(OwnOfferOutcomeV2::Pending);
+            return Ok(PartialOfferOutcomeV2::Pending);
         }
         if state.teacher_evidence.len() >= state.maximum {
             return Err(ArenaError::Invalid(
@@ -460,6 +588,19 @@ impl OwnPumpConsumerV2 {
             .try_reserve(1)
             .map_err(|_| ArenaError::Invalid("Own failed row custody capacity".into()))?;
         if matches!(state.items.front(), Some(PumpItemV2::Failed { .. })) {
+            let unavailable = matches!(
+                state.items.front(),
+                Some(PumpItemV2::Failed {
+                    evidence:
+                        super::super::teacher::lock_v2_row_pump::FailedEvidence::PolicyUnavailable(
+                            _
+                        ),
+                    ..
+                })
+            );
+            if partial && !unavailable {
+                return Ok(PartialOfferOutcomeV2::BlockedFailureRetained);
+            }
             if state.failed_items.len() >= state.maximum {
                 return Err(ArenaError::Invalid(
                     "Own failed row custody capacity reached".into(),
@@ -471,10 +612,14 @@ impl OwnPumpConsumerV2 {
                 .map_err(|_| ArenaError::Invalid("Own failed row custody capacity".into()))?;
             let original = state.items.pop_front().expect("failed front checked");
             state.failed_items.push(original);
-            return Ok(OwnOfferOutcomeV2::FailedRetained);
+            return Ok(if partial {
+                PartialOfferOutcomeV2::PolicyUnavailableRetained
+            } else {
+                PartialOfferOutcomeV2::BlockedFailureRetained
+            });
         }
         let Some(item) = state.items.front_mut() else {
-            return Ok(OwnOfferOutcomeV2::Pending);
+            return Ok(PartialOfferOutcomeV2::Pending);
         };
         match item {
             PumpItemV2::Failed { .. } => {
@@ -497,7 +642,7 @@ impl OwnPumpConsumerV2 {
                 sealed,
             } if sealed.is_none() => {
                 let Some(result) = attach(row, evidence)? else {
-                    return Ok(OwnOfferOutcomeV2::Pending);
+                    return Ok(PartialOfferOutcomeV2::Pending);
                 };
                 match result {
                     Ok(original) => *sealed = Some(original),
@@ -508,7 +653,7 @@ impl OwnPumpConsumerV2 {
                             .pop_front()
                             .expect("commit failure front retained");
                         state.failed_items.push(row);
-                        return Ok(OwnOfferOutcomeV2::FailedRetained);
+                        return Ok(PartialOfferOutcomeV2::BlockedFailureRetained);
                     }
                 }
             }
@@ -522,7 +667,7 @@ impl OwnPumpConsumerV2 {
         let item = state.items.pop_front().expect("front checked");
         match item {
             PumpItemV2::Unlabeled { row } => match assembly.offer(row) {
-                Ok(()) => Ok(OwnOfferOutcomeV2::Offered),
+                Ok(()) => Ok(PartialOfferOutcomeV2::Offered),
                 Err(original) => {
                     let (error, row) = *original;
                     state.items.push_front(PumpItemV2::Unlabeled { row });
@@ -538,7 +683,7 @@ impl OwnPumpConsumerV2 {
                     if let Some(original) = sealed {
                         state.teacher_evidence.push(original);
                     }
-                    Ok(OwnOfferOutcomeV2::Offered)
+                    Ok(PartialOfferOutcomeV2::Offered)
                 }
                 Err(original) => {
                     let (error, row) = *original;
@@ -553,7 +698,7 @@ impl OwnPumpConsumerV2 {
             PumpItemV2::Committed { row, sealed } => match assembly.offer(row) {
                 Ok(()) => {
                     state.teacher_evidence.push(sealed);
-                    Ok(OwnOfferOutcomeV2::Offered)
+                    Ok(PartialOfferOutcomeV2::Offered)
                 }
                 Err(original) => {
                     let (error, row) = *original;

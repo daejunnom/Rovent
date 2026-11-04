@@ -234,6 +234,179 @@ pub struct RoventPcCollectionRunV2 {
 }
 
 impl RoventPcCollectionRunV2 {
+    /// Experimental partial export for a single settled root. A saved receipt
+    /// only describes the separately stored subset; it is not a corpus
+    /// publication, physical-completion receipt, or training authorization.
+    pub fn collect_partial_single_root(
+        &mut self,
+        spec: &super::partial_collection_v1::PartialCollectionSpec,
+        expected_plan_sha256: &str,
+        until: Instant,
+    ) -> Result<(), ArenaError> {
+        use super::own_publisher_v2::{OwnPumpPollV2, PartialOfferOutcomeV2};
+        use super::partial_collection_v1::{
+            PartialChunkPin, PartialCollectionAccounting, PartialEndReason, account_flushed_chunks,
+            create_partial_directory, write_partial_receipt,
+        };
+
+        spec.validate(expected_plan_sha256).map_err(io)?;
+        check(
+            (!self.speculative_teacher_requested || self.speculative_teacher_enabled)
+                && self.secondary_slots.is_empty()
+                && self.supervisor.is_none()
+                && self.supervisor_error.is_none()
+                && !self.publication_attempted
+                && self.pump_thread_joined
+                && self.pump_thread_failure.is_none()
+                && self.worker_exit.is_some()
+                && !self.worker_thread_panicked,
+            "partial collection requires a single original joined root",
+        )?;
+        self.closed_owner()?;
+        check(
+            matches!(self.bridge.try_has_deferred()?, Some(false))
+                && self.worker.try_lock().is_ok_and(|worker| {
+                    !worker.has_failure() && !worker.has_unpublished_pump_rows()
+                })
+                && self.owner.try_status()?.is_some_and(|status| {
+                    status.pending_retired_count == 0
+                        && status.game_reserved_slots == Some(0)
+                        && status.collection_disabled_first_ticket.is_none()
+                        && status.prior_disabled_first_tickets.is_empty()
+                })
+                && self.late_rows.is_empty(),
+            "partial collection retains unresolved native rows or capture",
+        )?;
+        let admission = self
+            .bridge
+            .installed_admission_for_recovery()
+            .ok_or_else(|| invalid("P/C partial original admission unavailable"))?
+            .clone();
+        let parent = self
+            .publication_directory
+            .parent()
+            .ok_or_else(|| invalid("P/C partial output parent"))?;
+        let leaf = self
+            .publication_directory
+            .file_name()
+            .ok_or_else(|| invalid("P/C partial output leaf"))?;
+        let root = Dir::open_ambient_dir(parent, cap_std::ambient_authority()).map_err(io)?;
+        self.publication_attempted = true;
+        root.create_dir(leaf).map_err(io)?;
+        let output = root.open_dir_nofollow(leaf).map_err(io)?;
+        let directory = create_partial_directory(&output).map_err(io)?;
+        directory.create_dir("chunks").map_err(io)?;
+        self.publication_dir = Some(directory);
+        self.publication_assembly = Some(RoventCorpusAssemblyLockV2::new(
+            &self.owner,
+            self.publication_dir
+                .as_ref()
+                .expect("partial original output owner"),
+            &self.publication_manifest,
+            &admission,
+            self.publication_maximum_records.min(spec.row_limit as u64),
+        )?);
+        self.publication_assembly
+            .as_mut()
+            .expect("partial assembly retained")
+            .restrict_output_limit(spec.byte_limit)?;
+        let mut assembly = self.publication_assembly.take().expect("partial assembly");
+        let result = (|| -> Result<(), ArenaError> {
+            loop {
+                check(Instant::now() < until, "P/C partial collection deadline")?;
+                let polled = self.pump_consumer.poll()?;
+                match self.try_offer_partial_consumer_item_for(
+                    &self.bridge,
+                    &self.worker,
+                    &self.pump_consumer,
+                    &mut assembly,
+                )? {
+                    PartialOfferOutcomeV2::Offered => {
+                        self.advance_game_row(&self.bridge, &self.worker, &mut assembly)?
+                    }
+                    PartialOfferOutcomeV2::PolicyUnavailableRetained => {}
+                    PartialOfferOutcomeV2::BlockedFailureRetained => {
+                        return Err(invalid("P/C partial has other retained failure"));
+                    }
+                    PartialOfferOutcomeV2::Pending => {
+                        let Some((items, _, _, _)) = self.pump_consumer.try_counts()? else {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        };
+                        if items != 0 {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        // The joined original worker still owns its sender;
+                        // channel disconnect is therefore not guaranteed.
+                        // The admission checks above prove both producers have
+                        // stopped and no original pump rows remain in flight.
+                        if matches!(polled, OwnPumpPollV2::Disconnected | OwnPumpPollV2::Empty) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+            let failures = self
+                .pump_consumer
+                .try_partial_failure_ids()?
+                .ok_or_else(|| invalid("P/C partial failure custody busy"))?;
+            check(
+                assembly.records() > 0,
+                "P/C partial contains no validated rows",
+            )?;
+            check(
+                self.owner.try_status()?.is_some_and(|status| {
+                    status.pending_retired_count == 0
+                        && status.game_reserved_slots == Some(0)
+                        && assembly
+                            .records()
+                            .checked_add(failures.len() as u64)
+                            .is_some_and(|total| {
+                                u64::try_from(status.game_retired_total).ok() == Some(total)
+                            })
+                }),
+                "P/C partial original row accounting differs",
+            )?;
+            assembly.flush()?;
+            let finished = assembly.finish()?;
+            let pins: Vec<PartialChunkPin> = finished
+                .index()
+                .chunks
+                .iter()
+                .map(|chunk| PartialChunkPin {
+                    path: chunk.path.clone(),
+                    bytes: chunk.bytes,
+                    sha256: chunk.sha256.clone(),
+                    rows: chunk.records,
+                })
+                .collect();
+            let directory = self
+                .publication_dir
+                .as_ref()
+                .expect("partial directory retained");
+            let mut accounting = PartialCollectionAccounting::new(spec.row_limit, spec.byte_limit)
+                .map_err(|e| invalid(format!("partial accounting: {e:?}")))?;
+            account_flushed_chunks(directory, spec, &mut accounting, &pins).map_err(io)?;
+            for id in failures {
+                accounting
+                    .begin_row(&id)
+                    .map_err(|e| invalid(format!("partial failure accounting: {e:?}")))?;
+                accounting
+                    .record_failure(&id, &format!("in-memory-custody:{id}"), 0)
+                    .map_err(|e| invalid(format!("partial failure accounting: {e:?}")))?;
+            }
+            let receipt = accounting
+                .finish(PartialEndReason::InputExhausted)
+                .map_err(|(e, _)| invalid(format!("partial accounting: {e:?}")))?
+                .with_chunks(pins);
+            write_partial_receipt(directory, spec, &receipt).map_err(io)?;
+            Ok(())
+        })();
+        self.publication_assembly = Some(assembly);
+        result
+    }
     /// Transfer bounded local diagnostics only after each original worker has
     /// exited. Unknown roots remain unknown and confer no completion rights.
     #[cfg(feature = "experimental-teacher-exact-observation")]
@@ -1418,6 +1591,42 @@ impl RoventPcCollectionRunV2 {
             return Ok(OwnOfferOutcomeV2::Pending);
         };
         consumer.try_offer_front_pc(&self.owner, assembly, &gate, &mut handoff)
+    }
+
+    /// One optional partial step under the same original root's commit gate.
+    /// This does not finish, publish, or attest the physical process; the
+    /// failed row and its sealed teacher owner remain with the consumer.
+    #[allow(dead_code)]
+    fn try_offer_partial_consumer_item_for(
+        &self,
+        bridge: &RoventPcCollectionBridgeV2,
+        worker: &Arc<Mutex<RoventPcCollectionWorkerV2>>,
+        consumer: &super::own_publisher_v2::OwnPumpConsumerV2,
+        assembly: &mut RoventCorpusAssemblyLockV2,
+    ) -> Result<super::own_publisher_v2::PartialOfferOutcomeV2, ArenaError> {
+        use super::own_publisher_v2::PartialOfferOutcomeV2;
+        let worker = match worker.try_lock() {
+            Ok(worker) => worker,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(PartialOfferOutcomeV2::Pending),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("P/C original collection worker poisoned"));
+            }
+        };
+        let Some(handoff) = worker.original_handoff() else {
+            return Ok(PartialOfferOutcomeV2::Pending);
+        };
+        let mut handoff = match handoff.try_lock() {
+            Ok(handoff) => handoff,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(PartialOfferOutcomeV2::Pending),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("P/C original handoff poisoned"));
+            }
+        };
+        let admission = handoff.parts_mut().0.clone();
+        let Some(gate) = bridge.try_begin_commit(&admission)? else {
+            return Ok(PartialOfferOutcomeV2::Pending);
+        };
+        consumer.try_offer_front_partial_pc(&self.owner, assembly, &gate, &mut handoff)
     }
 
     pub(super) fn try_advance_consumer_assembly(

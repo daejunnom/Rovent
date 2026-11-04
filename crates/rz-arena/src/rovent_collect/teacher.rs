@@ -377,6 +377,18 @@ fn validate_completed_teacher_opinions(
     pin: &RoventTeacherPin,
     outcome: &rz_search::external_cpu::ProfiledExternalOutcome,
 ) -> Result<(Vec<u16>, u16), ArenaError> {
+    validate_completed_teacher_opinions_classified(input, pin, outcome, &std::cell::Cell::new(false))
+}
+
+// Set only where the conditional-policy eligibility check first fails,
+// after earlier actor/profile checks. Later checks have not been performed;
+// this observation does not imply that no other failure exists.
+fn validate_completed_teacher_opinions_classified(
+    input: &GenerationInputV3,
+    pin: &RoventTeacherPin,
+    outcome: &rz_search::external_cpu::ProfiledExternalOutcome,
+    policy_unavailable: &std::cell::Cell<bool>,
+) -> Result<(Vec<u16>, u16), ArenaError> {
     let r = &outcome.report;
     let raw = &r.raw;
     // Preserve the same short-circuit eligibility checks while recording the
@@ -398,6 +410,7 @@ fn validate_completed_teacher_opinions(
         "teacher conditional policy target: options mismatch",
     )?;
     if !outcome.conditional_policy_target_known {
+        policy_unavailable.set(true);
         return Err(invalid(format!(
             "teacher conditional policy target: completed opinions unknown (completion={:?}, requested_multipv={}, observed_opinions={})",
             raw.completion,

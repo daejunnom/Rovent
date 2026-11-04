@@ -10,6 +10,7 @@ struct LockV2Cli {
     cleanup_ms: u64,
     sealed_teacher_slots: Vec<usize>,
     speculative_teacher: bool,
+    partial_spec: Option<rz_arena::rovent_collect::RoventPublicationFile>,
     original: Vec<String>,
 }
 
@@ -35,6 +36,9 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
                     | "--v2-cleanup-timeout-ms"
                     | "--v2-sealed-teacher-slots"
                     | "--v2-speculative-teacher"
+                    | "--v2-partial-spec"
+                    | "--v2-partial-spec-sha256"
+                    | "--v2-partial-spec-bytes"
             ) || value.is_empty()
                 || fields.insert(key.to_owned(), value.to_owned()).is_some()
             {
@@ -84,6 +88,26 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
         Some("true") => true,
         _ => return Err("speculative teacher must be true or false".into()),
     };
+    let partial_fields = (
+        fields.remove("--v2-partial-spec"),
+        fields.remove("--v2-partial-spec-sha256"),
+        fields.remove("--v2-partial-spec-bytes"),
+    );
+    let partial_spec = match partial_fields {
+        (None, None, None) => None,
+        (Some(path), Some(sha256), Some(bytes)) if mode == "pc" => {
+            Some(rz_arena::rovent_collect::RoventPublicationFile {
+                path,
+                sha256,
+                bytes: bytes.parse()?,
+            })
+        }
+        _ => {
+            return Err(
+                "partial collection requires all three pinned spec fields and pc mode".into(),
+            );
+        }
+    };
     if !input.is_absolute() || !output.is_absolute() || worker_ms == 0 || cleanup_ms < worker_ms {
         return Err(
             "absolute input/output and finite ordered worker/cleanup timeouts required".into(),
@@ -98,6 +122,7 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
         cleanup_ms,
         sealed_teacher_slots,
         speculative_teacher,
+        partial_spec,
         original,
     }))
 }
@@ -105,7 +130,8 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std::error::Error>> {
     use rz_arena::rovent_collect::launch::{
-        load_rovent_collection_lock_v2_plan, run_rovent_own_nnuec_collection_lock_v2,
+        load_rovent_collection_lock_v2_plan, load_rovent_partial_collection_spec,
+        run_rovent_own_nnuec_collection_lock_v2,
         run_rovent_pc_collection_lock_v2_with_speculative_teacher,
     };
     use std::time::{Duration, Instant};
@@ -118,6 +144,11 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
         .ok_or("cleanup deadline overflow")?;
     let directory = cap_std::fs::Dir::open_ambient_dir(&cli.input, cap_std::ambient_authority())?;
     let plan = load_rovent_collection_lock_v2_plan(&directory, &cli.plan)?;
+    let partial_spec = cli
+        .partial_spec
+        .as_ref()
+        .map(|pin| load_rovent_partial_collection_spec(&directory, pin, &cli.plan.sha256))
+        .transpose()?;
     if plan.output_directory != cli.output {
         return Err("V2 output directory differs from pinned plan".into());
     }
@@ -161,11 +192,18 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
                 .checked_add(Duration::from_millis(publication_timeout_ms))
                 .ok_or("publication deadline overflow")?
                 .min(cleanup_until);
-            let result = run.publish_single_root(until);
-            let (publication, publication_error) = match result {
-                Ok(true) => ("published", None),
-                Ok(false) => ("partial", None),
-                Err(error) => ("partial", Some(error.to_string())),
+            let (publication, publication_error) = match partial_spec.as_ref() {
+                Some(spec) => {
+                    match run.collect_partial_single_root(spec, &cli.plan.sha256, until) {
+                        Ok(()) => ("partial", None),
+                        Err(error) => ("partial", Some(error.to_string())),
+                    }
+                }
+                None => match run.publish_single_root(until) {
+                    Ok(true) => ("published", None),
+                    Ok(false) => ("partial", None),
+                    Err(error) => ("partial", Some(error.to_string())),
+                },
             };
             let failure_evidence = if publication != "published" {
                 match run.write_failure_evidence(publication_error.as_deref()) {
@@ -244,6 +282,7 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
     // actual durable corpus result. Process-tree completion and enforcement
     // of the native wall deadline remain the external supervisor's evidence.
     let in_process_complete = accepted && publication == "published" && publication_error.is_none();
+    let partial_receipt_written = partial_spec.is_some() && publication_error.is_none();
     let mut result = serde_json::json!({"schema":"rz-rovent-collection-cli-v2-observation/1", "mode":cli.mode,
         "root_capacity":root_capacity,
         "input_directory":cli.input, "output_directory":cli.output, "worker_timeout_ms":cli.worker_ms,
@@ -252,6 +291,18 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
         "owner_custody":"process_lifetime_only", "durable_recovery":"unavailable",
         "native_execution_deadline":"external_supervisor_required",
         "cli_acceptance":if in_process_complete { "complete_in_process" } else { "incomplete" }});
+    if let Some(pin) = cli.partial_spec.as_ref() {
+        result
+            .as_object_mut()
+            .expect("CLI observation is an object")
+            .insert(
+                "partial_collection_selection".into(),
+            serde_json::json!({"policy":"partial_policy_unavailable_v1", "spec":pin,
+                "receipt_status":if partial_receipt_written { "written" } else { "unavailable" },
+                "receipt_path":if partial_receipt_written { Some("partial_collection/partial_collection.json") } else { None },
+                "training_eligible":false,"physical_completion":"not_attested"}),
+            );
+    }
     if speculative_requested {
         result.as_object_mut().expect("CLI observation is an object").insert(
             "speculative_teacher_selection".into(),
@@ -330,7 +381,7 @@ fn main() -> std::process::ExitCode {
                 writeln!(std::io::stdout().lock(), "{ROVENT_COLLECTION_USAGE}")?;
                 writeln!(
                     std::io::stdout().lock(),
-                    "V2: --v2-mode=pc|own-nnuec --v2-plan=inputs/<plan.json> --v2-plan-sha256=<sha256> --v2-plan-bytes=<bytes> --v2-input-dir=<absolute> --v2-output-dir=<absolute> --v2-worker-timeout-ms=<ms> --v2-cleanup-timeout-ms=<ms> <original source/config/FD arguments>"
+                    "V2: --v2-mode=pc|own-nnuec --v2-plan=inputs/<plan.json> --v2-plan-sha256=<sha256> --v2-plan-bytes=<bytes> --v2-input-dir=<absolute> --v2-output-dir=<absolute> --v2-worker-timeout-ms=<ms> --v2-cleanup-timeout-ms=<ms> [--v2-partial-spec=<path> --v2-partial-spec-sha256=<sha256> --v2-partial-spec-bytes=<bytes>] <original source/config/FD arguments>"
                 )?;
                 writeln!(
                     std::io::stdout().lock(),
@@ -463,6 +514,7 @@ mod v2_cli_tests {
         assert_eq!(result.original, ["--process-epoch=1"]);
         assert!(result.sealed_teacher_slots.is_empty());
         assert!(!result.speculative_teacher);
+        assert!(result.partial_spec.is_none());
         let mut mixed = arguments();
         mixed.push("--collection-plan=inputs/old.json".into());
         assert!(parse_lock_v2(mixed).is_err());
@@ -477,6 +529,28 @@ mod v2_cli_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn partial_policy_requires_an_explicit_complete_pin_and_pc_mode() {
+        let mut selected = arguments();
+        selected.extend([
+            "--v2-partial-spec=inputs/partial.json".to_owned(),
+            "--v2-partial-spec-sha256=unused-at-parse".to_owned(),
+            "--v2-partial-spec-bytes=123".to_owned(),
+        ]);
+        assert!(
+            parse_lock_v2(selected.clone())
+                .unwrap()
+                .unwrap()
+                .partial_spec
+                .is_some()
+        );
+        selected[0] = "--v2-mode=own-nnuec".into();
+        assert!(parse_lock_v2(selected).is_err());
+        let mut missing = arguments();
+        missing.push("--v2-partial-spec=inputs/partial.json".into());
+        assert!(parse_lock_v2(missing).is_err());
     }
 
     #[test]

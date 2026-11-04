@@ -30,6 +30,22 @@ pub struct RoventCorpusWriterLockV2 {
 }
 
 impl RoventCorpusWriterLockV2 {
+    /// Set a tighter output budget before accepting any rows. This conservative
+    /// budget includes manifest, source and index overhead as well as chunks.
+    /// It cannot increase the original admitted lock's output limit.
+    pub(crate) fn restrict_output_limit(&mut self, limit: u64) -> Result<(), ArenaError> {
+        check(
+            self.index.record_count == 0 && self.buffer.is_empty() && self.index.chunks.is_empty(),
+            "writer /2 output limit can only be restricted before rows",
+        )?;
+        let effective = self.output_bytes_max.min(limit);
+        check(
+            self.total_bytes <= effective,
+            "writer /2 restricted initial output cap",
+        )?;
+        self.output_bytes_max = effective;
+        Ok(())
+    }
     /// Borrow the original bounded bytes already appended to this writer.
     /// Failure-only export cannot restore the original admission owners or
     /// prove corpus completion, and does not change the writer.
