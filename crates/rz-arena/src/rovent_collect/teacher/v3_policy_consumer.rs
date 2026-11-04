@@ -339,6 +339,17 @@ impl TeacherPolicyConsumerV3 {
         })
     }
 
+    /// Observe the ticket of the original completion retained in this owner.
+    /// This does not grant target authority or establish a completed row.
+    /// Callers acquire this consumer through its nonblocking `try_lock`.
+    pub(crate) fn original_completion_ticket(
+        &self,
+    ) -> Option<rz_contracts::pals_adaptive::RoleTicketEnvelope> {
+        self.completed
+            .as_ref()
+            .map(|completed| completed.capsule.ticket())
+    }
+
     /// The exact ticket selects its original retired row; a digest or the
     /// teacher completion alone does not establish retirement.
     pub(crate) fn sealed_ticket(&self) -> Option<rz_contracts::pals_adaptive::RoleTicketEnvelope> {
