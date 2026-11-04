@@ -362,10 +362,11 @@ impl RoventOwnCollectionBridgeV3 {
     /// Only the supervisor calls this; a request is the exact original root,
     /// not permission to renew its deadline or synthesize a replacement.
     pub(crate) fn try_next_root(&self) -> Result<Option<OwnRootRequestV3>, &'static str> {
-        let receiver = self
-            .request_receiver
-            .try_lock()
-            .map_err(|_| "Own /3 request receiver unavailable")?;
+        let receiver = match self.request_receiver.try_lock() {
+            Ok(receiver) => receiver,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err("Own /3 request receiver poisoned"),
+        };
         match receiver.try_recv() {
             Ok(value) => Ok(Some(value)),
             Err(mpsc::TryRecvError::Empty) => Ok(None),

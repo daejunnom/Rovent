@@ -80,6 +80,7 @@ pub(crate) struct OwnRootRecoveryV3 {
     pub(super) published: bool,
     pub(super) route_unlinked: bool,
     pub(super) failure: Option<String>,
+    pub(super) additional_failures: Vec<String>,
     pub(super) shutdown_failure: Option<AdaptiveCollectionError>,
     pub(super) shutdown_failure_count: u64,
     pub(super) pump_failure: Option<String>,
@@ -128,6 +129,7 @@ impl OwnRootRecoveryV3 {
             published: false,
             route_unlinked: false,
             failure: None,
+            additional_failures: Vec::new(),
             shutdown_failure: None,
             shutdown_failure_count: 0,
             pump_failure: None,
@@ -239,11 +241,27 @@ pub(crate) struct OwnWorkerSupervisorV3 {
     router: Arc<CaptureRouterV3>,
     pipeline: Option<PolicyRowPipelineOwnerV3>,
     pending_request: Option<OwnRootRequestV3>,
+    pending_request_error: Option<String>,
     roots: Vec<Arc<Mutex<OwnRootRecoveryV3>>>,
+    admissions: Vec<RoventCollectionRootAdmissionV3>,
+    transfers: Vec<OwnPublishTransferV3>,
+    deferred: Vec<Option<OwnDeferredOutcomeV3>>,
+    poisoned_roots: Vec<bool>,
     startup_deadline: Instant,
     cleanup_deadline: Instant,
     abort_revoke_pending: bool,
     abort_revoke_error: Option<String>,
+}
+
+enum OwnPublishTransferV3 {
+    Empty,
+    Publishing,
+    Returned(Result<OwnPrepareOutcomeV3, Box<dyn std::any::Any + Send>>),
+}
+
+enum OwnDeferredOutcomeV3 {
+    Failure(String),
+    Panic(Box<dyn std::any::Any + Send>),
 }
 
 impl OwnWorkerSupervisorV3 {
@@ -276,15 +294,36 @@ impl OwnWorkerSupervisorV3 {
             return Err("Own /3 supervisor deadline or capture owner mismatch");
         }
         let mut roots = Vec::new();
+        let mut admissions = Vec::new();
+        let mut transfers = Vec::new();
+        let mut deferred = Vec::new();
+        let mut poisoned_roots = Vec::new();
         roots
             .try_reserve_exact(usize::from(bridge.inputs().plan().maximum_roots))
             .map_err(|_| "Own /3 supervisor root allocation")?;
+        admissions
+            .try_reserve_exact(usize::from(bridge.inputs().plan().maximum_roots))
+            .map_err(|_| "Own /3 admission allocation")?;
+        transfers
+            .try_reserve_exact(usize::from(bridge.inputs().plan().maximum_roots))
+            .map_err(|_| "Own /3 transfer allocation")?;
+        deferred
+            .try_reserve_exact(usize::from(bridge.inputs().plan().maximum_roots))
+            .map_err(|_| "Own /3 deferred outcome allocation")?;
+        poisoned_roots
+            .try_reserve_exact(usize::from(bridge.inputs().plan().maximum_roots))
+            .map_err(|_| "Own /3 poison observation allocation")?;
         Ok(Self {
             bridge,
             router,
             pipeline: None,
             pending_request: None,
+            pending_request_error: None,
             roots,
+            admissions,
+            transfers,
+            deferred,
+            poisoned_roots,
             startup_deadline,
             cleanup_deadline,
             abort_revoke_pending: false,
@@ -306,56 +345,115 @@ impl OwnWorkerSupervisorV3 {
                 }
             }
         }
-        if self.pending_request.is_none()
-            && self.roots.len() < usize::from(self.bridge.inputs().plan().maximum_roots)
-        {
-            self.pending_request = self.bridge.try_next_root().map_err(str::to_owned)?;
-        }
-        if let Some(request) = self.pending_request.as_ref() {
-            if self.pipeline.is_none() {
-                let writer = RoventCorpusWriterLockV3::new_shared(
-                    self.bridge.inputs().manifest(),
-                    &request.admission,
-                )
-                .map_err(|error| error.to_string())?;
-                let pipeline = PolicyRowPipelineOwnerV3::new(writer);
-                self.bridge
-                    .register_pipeline(&pipeline)
-                    .map_err(str::to_owned)?;
-                self.pipeline = Some(pipeline);
-            }
-            match self
-                .bridge
-                .game()
-                .try_bind_pipeline(self.pipeline.as_ref().expect("original pipeline retained"))
-            {
-                super::game_authority_v3::GameStepV3::Ready
-                | super::game_authority_v3::GameStepV3::Existing => {}
-                super::game_authority_v3::GameStepV3::Busy => return Ok(()),
-                _ => return Err("Own /3 game pipeline binding rejected".into()),
-            }
-            for root in &self.roots {
-                match root.try_lock() {
-                    Ok(root) if root.matches_admission(&request.admission) => {
+        let pending_result =
+            (|| -> Result<(), String> {
+                if self.pending_request_error.is_some() {
+                    return Ok(());
+                }
+                if self.pending_request.is_none()
+                    && self.roots.len() < usize::from(self.bridge.inputs().plan().maximum_roots)
+                {
+                    self.pending_request = self.bridge.try_next_root().map_err(str::to_owned)?;
+                }
+                if let Some(request) = self.pending_request.as_ref() {
+                    if self.pipeline.is_none() {
+                        let writer = RoventCorpusWriterLockV3::new_shared(
+                            self.bridge.inputs().manifest(),
+                            &request.admission,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        let pipeline = PolicyRowPipelineOwnerV3::new(writer);
+                        self.bridge
+                            .register_pipeline(&pipeline)
+                            .map_err(str::to_owned)?;
+                        self.pipeline = Some(pipeline);
+                    }
+                    match self.bridge.game().try_bind_pipeline(
+                        self.pipeline.as_ref().expect("original pipeline retained"),
+                    ) {
+                        super::game_authority_v3::GameStepV3::Ready
+                        | super::game_authority_v3::GameStepV3::Existing => {}
+                        super::game_authority_v3::GameStepV3::Busy => return Ok(()),
+                        _ => return Err("Own /3 game pipeline binding rejected".into()),
+                    }
+                    if self
+                        .admissions
+                        .iter()
+                        .any(|root| root.same_original_admission(&request.admission))
+                    {
                         return Err("Own /3 duplicate original root".into());
                     }
-                    Ok(_) => {}
-                    Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+                    let original = request.clone();
+                    let original_admission = original.admission.clone();
+                    let recovery = OwnRootRecoveryV3::new(
+                        original,
+                        Arc::clone(self.bridge.inputs()),
+                        self.pipeline.as_ref().expect("pipeline retained").clone(),
+                    );
+                    self.roots.push(recovery);
+                    self.admissions.push(original_admission);
+                    self.transfers.push(OwnPublishTransferV3::Empty);
+                    self.deferred.push(None);
+                    self.poisoned_roots.push(false);
+                    self.pending_request.take();
+                }
+                Ok(())
+            })();
+        if let Err(error) = pending_result {
+            // Retain the actual request and its first preparation error while
+            // continuing cleanup of independent, already admitted roots.
+            self.pending_request_error = Some(error);
+        }
+        for (index, original) in self.roots.iter().enumerate() {
+            if self.poisoned_roots[index] {
+                continue;
+            }
+            if self.deferred[index].is_some() {
+                let mut root = match original.try_lock() {
+                    Ok(root) => root,
+                    // Poison is unknown, not permission to take or discard
+                    // the original deferred payload.
+                    Err(std::sync::TryLockError::WouldBlock) => continue,
                     Err(std::sync::TryLockError::Poisoned(_)) => {
-                        return Err("Own /3 recovery poisoned".into());
+                        self.poisoned_roots[index] = true;
+                        continue;
+                    }
+                };
+                if matches!(self.deferred[index], Some(OwnDeferredOutcomeV3::Panic(_)))
+                    && root.panic.is_some()
+                    && root.additional_panics.try_reserve(1).is_err()
+                {
+                    continue;
+                }
+                if matches!(self.deferred[index], Some(OwnDeferredOutcomeV3::Failure(_)))
+                    && root.failure.is_some()
+                    && root.additional_failures.try_reserve(1).is_err()
+                {
+                    continue;
+                }
+                match self.deferred[index]
+                    .take()
+                    .expect("deferred outcome retained")
+                {
+                    OwnDeferredOutcomeV3::Failure(error) => {
+                        if root.failure.is_none() {
+                            root.failure = Some(error);
+                        } else {
+                            root.additional_failures.push(error);
+                        }
+                    }
+                    OwnDeferredOutcomeV3::Panic(payload) => {
+                        root.retain_panic(payload);
+                        if root.failure.is_none() {
+                            root.failure = Some(
+                                "Own /3 supervisor step panicked; original state unknown".into(),
+                            );
+                        }
                     }
                 }
+                root.try_request_teacher_shutdown(self.cleanup_deadline);
+                continue;
             }
-            let original = request.clone();
-            let recovery = OwnRootRecoveryV3::new(
-                original,
-                Arc::clone(self.bridge.inputs()),
-                self.pipeline.as_ref().expect("pipeline retained").clone(),
-            );
-            self.roots.push(recovery);
-            self.pending_request.take();
-        }
-        for original in &self.roots {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if let Ok(mut root) = original.try_lock() {
                     if root.consumer_failure.is_some() {
@@ -366,6 +464,8 @@ impl OwnWorkerSupervisorV3 {
                     &self.bridge,
                     &self.router,
                     original,
+                    &mut self.transfers[index],
+                    &mut self.poisoned_roots[index],
                     self.startup_deadline,
                     self.cleanup_deadline,
                 )
@@ -374,56 +474,53 @@ impl OwnWorkerSupervisorV3 {
                 Ok(Ok(OwnPrepareStepV3::Published)) => {}
                 Ok(Ok(OwnPrepareStepV3::Pending)) => continue,
                 Ok(Ok(OwnPrepareStepV3::Failed)) => {
-                    if let Ok(mut root) = original.try_lock() {
-                        root.try_request_teacher_shutdown(self.cleanup_deadline);
+                    match original.try_lock() {
+                        Ok(mut root) => root.try_request_teacher_shutdown(self.cleanup_deadline),
+                        Err(std::sync::TryLockError::WouldBlock) => {}
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            self.poisoned_roots[index] = true
+                        }
                     }
                     continue;
                 }
                 Ok(Err(error)) => {
-                    let mut root = original.lock().map_err(|_| "Own /3 recovery poisoned")?;
-                    if root.failure.is_none() {
-                        root.failure = Some(error);
-                    }
-                    root.try_request_teacher_shutdown(self.cleanup_deadline);
+                    self.deferred[index] = Some(OwnDeferredOutcomeV3::Failure(error));
                     continue;
                 }
                 Err(payload) => {
-                    let mut root = original.lock().unwrap_or_else(|poison| poison.into_inner());
-                    root.retain_panic(payload);
-                    root.failure =
-                        Some("Own /3 supervisor step panicked; original state unknown".into());
-                    root.try_request_teacher_shutdown(self.cleanup_deadline);
+                    self.deferred[index] = Some(OwnDeferredOutcomeV3::Panic(payload));
                     continue;
                 }
             }
-            let admission = original
-                .lock()
-                .map_err(|_| "Own /3 recovery poisoned")?
-                .request
-                .admission
-                .clone();
+            let admission = match original.try_lock() {
+                Ok(root) => root.request.admission.clone(),
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.poisoned_roots[index] = true;
+                    continue;
+                }
+            };
             // Joining this one original worker is observed separately from
             // teacher aggregate, target publication and native closure.
             if let Err(error) = self.bridge.try_join_root(&admission) {
-                let mut root = original.lock().map_err(|_| "Own /3 recovery poisoned")?;
-                if root.failure.is_none() {
-                    root.failure = Some(error.into());
-                }
+                self.deferred[index] = Some(OwnDeferredOutcomeV3::Failure(error.into()));
+                continue;
             }
-            let already_unlinked = original
-                .try_lock()
-                .map(|root| root.route_unlinked)
-                .unwrap_or(true);
+            let already_unlinked = match original.try_lock() {
+                Ok(root) => root.route_unlinked,
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.poisoned_roots[index] = true;
+                    continue;
+                }
+            };
             if !already_unlinked {
                 match self.bridge.try_retire_route(&admission) {
                     Ok(Some(true)) => {}
                     Ok(Some(false) | None) => {}
                     Err(error) => {
-                        if let Ok(mut root) = original.try_lock() {
-                            if root.failure.is_none() {
-                                root.failure = Some(error.to_string());
-                            }
-                        }
+                        self.deferred[index] =
+                            Some(OwnDeferredOutcomeV3::Failure(error.to_string()));
                     }
                 }
             }
@@ -434,26 +531,100 @@ impl OwnWorkerSupervisorV3 {
 
 /// Resume the same root's staged acquisition. No stage is manufactured from
 /// a digest, and every failed/uncertain owner remains in the same recovery.
-pub(crate) fn prepare_own_root_step_v3(
+fn prepare_own_root_step_v3(
     bridge: &Arc<RoventOwnCollectionBridgeV3>,
     router: &Arc<CaptureRouterV3>,
     recovery: &Arc<Mutex<OwnRootRecoveryV3>>,
+    transfer: &mut OwnPublishTransferV3,
+    recovery_poisoned: &mut bool,
     startup_deadline: Instant,
     cleanup_deadline: Instant,
 ) -> Result<OwnPrepareStepV3, String> {
-    let admission = recovery
-        .lock()
-        .map_err(|_| "Own /3 recovery poisoned")?
-        .request
-        .admission
-        .clone();
+    if matches!(transfer, OwnPublishTransferV3::Publishing) {
+        // An interrupted call can never be reissued as if no publication ran.
+        return Ok(OwnPrepareStepV3::Pending);
+    }
+    if let OwnPublishTransferV3::Returned(outcome) = transfer {
+        let mut state = match recovery.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnPrepareStepV3::Pending),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                *recovery_poisoned = true;
+                return Ok(OwnPrepareStepV3::Pending);
+            }
+        };
+        let has_panic = matches!(outcome, Err(_) | Ok(OwnPrepareOutcomeV3::Panicked { .. }));
+        if has_panic && state.panic.is_some() && state.additional_panics.try_reserve(1).is_err() {
+            return Ok(OwnPrepareStepV3::Pending);
+        }
+        if matches!(outcome, Ok(OwnPrepareOutcomeV3::Rejected { .. }))
+            && state.failure.is_some()
+            && state.additional_failures.try_reserve(1).is_err()
+        {
+            return Ok(OwnPrepareStepV3::Pending);
+        }
+        let OwnPublishTransferV3::Returned(outcome) =
+            std::mem::replace(transfer, OwnPublishTransferV3::Empty)
+        else {
+            unreachable!("returned transfer was checked");
+        };
+        return match outcome {
+            Ok(OwnPrepareOutcomeV3::Prepared) => {
+                state.published = true;
+                Ok(OwnPrepareStepV3::Published)
+            }
+            Ok(OwnPrepareOutcomeV3::Busy(original)) => {
+                state.prepared = Some(original);
+                Ok(OwnPrepareStepV3::Pending)
+            }
+            Ok(OwnPrepareOutcomeV3::Rejected { reason, original }) => {
+                state.prepared = Some(original);
+                if state.failure.is_none() {
+                    state.failure = Some(reason);
+                } else {
+                    state.additional_failures.push(reason);
+                }
+                Ok(OwnPrepareStepV3::Failed)
+            }
+            Ok(OwnPrepareOutcomeV3::Panicked { original, payload }) => {
+                state.prepared = Some(original);
+                state.retain_panic(payload);
+                if state.failure.is_none() {
+                    state.failure = Some("Own /3 root preparation panicked".into());
+                }
+                Ok(OwnPrepareStepV3::Failed)
+            }
+            Err(payload) => {
+                state.retain_panic(payload);
+                if state.failure.is_none() {
+                    state.failure = Some("Own /3 prepared publication outcome unknown".into());
+                }
+                Ok(OwnPrepareStepV3::Failed)
+            }
+        };
+    }
+    let admission = match recovery.try_lock() {
+        Ok(root) => root.request.admission.clone(),
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnPrepareStepV3::Pending),
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            *recovery_poisoned = true;
+            return Ok(OwnPrepareStepV3::Pending);
+        }
+    };
     if !bridge
         .try_publish_recovery(&admission, recovery)
         .map_err(str::to_owned)?
     {
         return Ok(OwnPrepareStepV3::Pending);
     }
-    let mut state = recovery.lock().map_err(|_| "Own /3 recovery poisoned")?;
+    let mut state = match recovery.try_lock() {
+        Ok(state) => state,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnPrepareStepV3::Pending),
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            *recovery_poisoned = true;
+            return Ok(OwnPrepareStepV3::Pending);
+        }
+    };
     if state.failure.is_some() {
         return Ok(OwnPrepareStepV3::Failed);
     }
@@ -789,39 +960,13 @@ pub(crate) fn prepare_own_root_step_v3(
         });
     }
     let prepared = state.prepared.take().expect("original prepared root");
+    *transfer = OwnPublishTransferV3::Publishing;
     drop(state);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         bridge.try_publish_prepared(prepared)
     }));
-    let mut state = recovery.lock().map_err(|_| "Own /3 recovery poisoned")?;
-    match outcome {
-        Ok(OwnPrepareOutcomeV3::Prepared) => {
-            state.published = true;
-            Ok(OwnPrepareStepV3::Published)
-        }
-        Ok(OwnPrepareOutcomeV3::Busy(original)) => {
-            state.prepared = Some(original);
-            Ok(OwnPrepareStepV3::Pending)
-        }
-        Ok(OwnPrepareOutcomeV3::Rejected { reason, original }) => {
-            state.prepared = Some(original);
-            state.failure = Some(reason);
-            Ok(OwnPrepareStepV3::Failed)
-        }
-        Ok(OwnPrepareOutcomeV3::Panicked { original, payload }) => {
-            state.prepared = Some(original);
-            state.retain_panic(payload);
-            state.failure = Some("Own /3 root preparation panicked".into());
-            Ok(OwnPrepareStepV3::Failed)
-        }
-        Err(payload) => {
-            // Worker key and all pre-registered owners stay in the recovery;
-            // an unwind can never be reinterpreted as no physical start.
-            state.retain_panic(payload);
-            state.failure = Some("Own /3 prepared publication outcome unknown".into());
-            Ok(OwnPrepareStepV3::Failed)
-        }
-    }
+    *transfer = OwnPublishTransferV3::Returned(outcome);
+    Ok(OwnPrepareStepV3::Pending)
 }
 
 impl OwnRootRecoveryV3 {
