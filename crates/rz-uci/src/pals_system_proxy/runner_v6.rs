@@ -149,6 +149,7 @@ pub(super) struct PalsProxySupervisorV6 {
     pub session_release_panic: Option<Box<dyn Any + Send>>,
     runtime_finish_stream: Option<UnixStream>,
     session_release_stream: Option<UnixStream>,
+    reobserve_stream: Option<UnixStream>,
     runtime_finish_attempted: bool,
     session_release_attempted: bool,
     input_cleanup_start: Option<RelayInputCleanupStartV6>,
@@ -208,6 +209,7 @@ impl PalsProxySupervisorV6 {
             session_release_panic: None,
             runtime_finish_stream: None,
             session_release_stream: None,
+            reobserve_stream: None,
             runtime_finish_attempted: false,
             session_release_attempted: false,
             input_cleanup_start: None,
@@ -408,6 +410,18 @@ impl PalsProxySupervisorV6 {
                 .grant_original_image()?;
         }
         self.stage = ProxyStageV6::ImageAcknowledged;
+        if self.no_game_cleanup_deadline_selected {
+            // The child connects this separate control channel after the
+            // original deadline exchange and before its native factory.
+            // Keep it on this same supervisor for bounded later observations.
+            let until = self.child.as_ref().expect("spawned child").startup_until;
+            let stream = self
+                .child
+                .as_mut()
+                .expect("spawned child")
+                .accept_original_reobserve_stream(until, &self.cancelled)?;
+            self.reobserve_stream = Some(stream);
+        }
         self.check_run()?;
         self.stage = ProxyStageV6::AttachingInput;
         let input = self.child.as_mut().expect("spawned child").take_stdin()?;

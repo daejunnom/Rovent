@@ -365,6 +365,8 @@ pub struct DirectPalsChildV6 {
     cleanup_deadline_acknowledged: bool,
     finish_channel_attempted: bool,
     finish_channel_rejected: Option<parent::AuthenticatedChildChannel>,
+    reobserve_channel_attempted: bool,
+    reobserve_channel_rejected: Option<parent::AuthenticatedChildChannel>,
 }
 
 // Failed and partial grants are retained by the same child owner. Even a
@@ -617,6 +619,8 @@ impl DirectPalsChildV6 {
             cleanup_deadline_acknowledged: false,
             finish_channel_attempted: false,
             finish_channel_rejected: None,
+            reobserve_channel_attempted: false,
+            reobserve_channel_rejected: None,
         })
     }
 
@@ -803,8 +807,34 @@ impl DirectPalsChildV6 {
         until: Instant,
         cancelled: &AtomicBool,
     ) -> io::Result<std::os::unix::net::UnixStream> {
-        if self.finish_channel_attempted {
-            return Err(invalid("PALS finish channel already attempted"));
+        self.accept_original_control_stream(until, cancelled, false)
+    }
+
+    /// A separate one-shot recovery transport belongs to this same NoGame
+    /// child. A later observation does not extend its original work window.
+    fn accept_original_reobserve_stream(
+        &mut self,
+        until: Instant,
+        cancelled: &AtomicBool,
+    ) -> io::Result<std::os::unix::net::UnixStream> {
+        if !self.no_game_session_report || !self.cleanup_deadline_acknowledged {
+            return Err(invalid("NoGame child recovery channel is not admitted"));
+        }
+        self.accept_original_control_stream(until, cancelled, true)
+    }
+
+    fn accept_original_control_stream(
+        &mut self,
+        until: Instant,
+        cancelled: &AtomicBool,
+        reobserve: bool,
+    ) -> io::Result<std::os::unix::net::UnixStream> {
+        if if reobserve {
+            self.reobserve_channel_attempted
+        } else {
+            self.finish_channel_attempted
+        } {
+            return Err(invalid("PALS child control channel already attempted"));
         }
         let initial = self
             .channel
@@ -818,7 +848,11 @@ impl DirectPalsChildV6 {
         else {
             return Err(invalid("PALS direct child has no CUDA registration"));
         };
-        self.finish_channel_attempted = true;
+        if reobserve {
+            self.reobserve_channel_attempted = true;
+        } else {
+            self.finish_channel_attempted = true;
+        }
         let channel = parent::accept_and_authenticate_finish_child(
             self.listener
                 .as_ref()
@@ -840,7 +874,11 @@ impl DirectPalsChildV6 {
         ) {
             Ok(stream) => Ok(stream),
             Err((error, channel)) => {
-                self.finish_channel_rejected = Some(channel);
+                if reobserve {
+                    self.reobserve_channel_rejected = Some(channel);
+                } else {
+                    self.finish_channel_rejected = Some(channel);
+                }
                 Err(error)
             }
         }
