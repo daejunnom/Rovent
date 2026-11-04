@@ -1145,6 +1145,23 @@ impl<S> GameEffectClaimV3<S> {
             && source.matches_stage_identity(&self.stage)
     }
 
+    /// Matches one original actor in one original teacher session; it does
+    /// not attest queue receipt, actor readiness or physical completion.
+    pub(super) fn authorizes_teacher_actor(
+        &self,
+        source: &super::teacher::v3_session::TeacherActorEffectSourceV3,
+    ) -> bool {
+        !self.resolved
+            && !self.owner.unknown.load(Ordering::SeqCst)
+            && self.kind == GameEffectKindV3::TeacherActor
+            && source.matches_admission(&self.root)
+            && source.matches_session_identity(&self.stage)
+            && self
+                .actor
+                .as_ref()
+                .is_some_and(|actor| source.matches_actor_identity(actor))
+    }
+
     /// Consumes no result: the real stage/result witness remains with the
     /// caller. It is only an acquisition result, never a physical join.
     pub(super) fn try_complete(&mut self, result: &GameEffectOutcomeV3<S>) -> GameStepV3 {

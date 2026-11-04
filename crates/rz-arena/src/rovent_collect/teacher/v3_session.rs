@@ -41,6 +41,50 @@ struct ActorV3 {
     spawn_attempted: bool,
     spawn_accepted: bool,
     dispatch_claimed: bool,
+    effect_identity: Arc<()>,
+    effect_source_issued: bool,
+    effect_attempted: bool,
+}
+
+/// Original session/actor identity only; source issuance is not spawn or
+/// physical completion evidence.
+pub(crate) struct TeacherActorEffectSourceV3 {
+    session_identity: Arc<()>,
+    actor_identity: Arc<()>,
+    admission: RoventCollectionRootAdmissionV3,
+    actor_id: String,
+}
+pub(crate) struct TeacherActorEffectOutcomeV3 {
+    session_identity: Arc<()>,
+    actor_identity: Arc<()>,
+    admission: RoventCollectionRootAdmissionV3,
+    actor_id: String,
+}
+impl TeacherActorEffectSourceV3 {
+    pub(crate) fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
+        self.admission.same_original_admission(admission)
+    }
+    pub(crate) fn matches_session_identity(&self, identity: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.session_identity, identity)
+    }
+    pub(crate) fn matches_actor_identity(&self, identity: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.actor_identity, identity)
+    }
+    pub(crate) fn matches_outcome(&self, outcome: &TeacherActorEffectOutcomeV3) -> bool {
+        Arc::ptr_eq(&self.session_identity, &outcome.session_identity)
+            && Arc::ptr_eq(&self.actor_identity, &outcome.actor_identity)
+            && self.admission.same_original_admission(&outcome.admission)
+            && self.actor_id == outcome.actor_id
+    }
+}
+
+pub(crate) enum TeacherActorEffectFailureV3 {
+    Known {
+        error: TeacherStartErrorV3,
+        outcome: TeacherActorEffectOutcomeV3,
+    },
+    RejectedBeforeEntry(TeacherStartErrorV3),
+    Unknown(Box<dyn std::any::Any + Send>),
 }
 
 /// A failed one-shot claim returns the original scope or capability.
@@ -296,6 +340,7 @@ impl TeacherSessionStagingV3 {
         };
         self.ready = Some(Arc::new(Mutex::new(RoventCollectionTeacherSessionV3 {
             admission: preflight.admission,
+            effect_identity: Arc::new(()),
             manifest: preflight.manifest,
             registration: preflight.registration,
             manifest_digest: preflight.manifest_digest,
@@ -351,6 +396,7 @@ pub(crate) enum TeacherStartErrorV3 {
 
 pub(crate) struct RoventCollectionTeacherSessionV3 {
     admission: RoventCollectionRootAdmissionV3,
+    effect_identity: Arc<()>,
     // Retain the same caller-provided owner throughout the session. This does
     // not attest that the registration was loaded from a pinned file.
     manifest: Arc<RoventCorpusManifestLockV3>,
@@ -481,6 +527,9 @@ impl RoventCollectionTeacherSessionV3 {
                     spawn_attempted: false,
                     spawn_accepted: false,
                     dispatch_claimed: false,
+                    effect_identity: Arc::new(()),
+                    effect_source_issued: false,
+                    effect_attempted: false,
                 },
             );
         }
@@ -508,7 +557,128 @@ impl RoventCollectionTeacherSessionV3 {
         })
     }
 
+    /// Pins the exact original session/actor in a caller-owned source slot.
+    /// Dispatch receipt and a game effect claim remain independent.
+    pub(crate) fn issue_actor_effect_source(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV3,
+        actor_id: &str,
+        destination: &mut Option<TeacherActorEffectSourceV3>,
+    ) -> Result<(), TeacherStartErrorV3> {
+        if destination.is_some()
+            || self.closing
+            || !self.admission.same_original_admission(admission)
+        {
+            return Err(TeacherStartErrorV3::Invalid(
+                "teacher effect source owner/state differs".into(),
+            ));
+        }
+        let actor = self
+            .actors
+            .get_mut(actor_id)
+            .ok_or_else(|| TeacherStartErrorV3::Invalid("teacher actor absent".into()))?;
+        if actor.effect_source_issued || actor.spawn_attempted {
+            return Err(TeacherStartErrorV3::Invalid(
+                "teacher effect source already issued or attempted".into(),
+            ));
+        }
+        let source = TeacherActorEffectSourceV3 {
+            session_identity: Arc::clone(&self.effect_identity),
+            actor_identity: Arc::clone(&actor.effect_identity),
+            admission: self.admission.clone(),
+            actor_id: actor_id.to_owned(),
+        };
+        actor.effect_source_issued = true;
+        *destination = Some(source);
+        Ok(())
+    }
+
     pub(crate) fn start_actor(
+        &mut self,
+        actor_id: &str,
+        startup_deadline: Instant,
+        cleanup_ceiling: Instant,
+        custodian: &mut TeacherRecoveryCustodianV3,
+    ) -> Result<TeacherRecoveryKeyV3, TeacherStartErrorV3> {
+        if self
+            .actors
+            .get(actor_id)
+            .is_some_and(|actor| actor.effect_source_issued)
+        {
+            return Err(TeacherStartErrorV3::Invalid(
+                "teacher actor effect source requires guarded start".into(),
+            ));
+        }
+        self.start_actor_original(actor_id, startup_deadline, cleanup_ceiling, custodian)
+    }
+
+    /// Once a source is issued, invoke the original start only with the same
+    /// game claim. Result/error/panic are deposited directly in caller-owned
+    /// custody. Unknown never manufactures a start outcome or physical join.
+    pub(crate) fn start_actor_with_effect_source<S>(
+        &mut self,
+        source: &TeacherActorEffectSourceV3,
+        guard: &super::super::game_authority_v3::GameEffectClaimV3<S>,
+        startup_deadline: Instant,
+        cleanup_ceiling: Instant,
+        custodian: &mut TeacherRecoveryCustodianV3,
+        destination: &mut Option<
+            Result<
+                (TeacherRecoveryKeyV3, TeacherActorEffectOutcomeV3),
+                TeacherActorEffectFailureV3,
+            >,
+        >,
+    ) -> bool {
+        if destination.is_some() {
+            return false;
+        }
+        let Some(actor) = self.actors.get(&source.actor_id) else {
+            *destination = Some(Err(TeacherActorEffectFailureV3::RejectedBeforeEntry(
+                TeacherStartErrorV3::Invalid("teacher actor absent".into()),
+            )));
+            return true;
+        };
+        if actor.effect_attempted {
+            return false;
+        }
+        if !actor.effect_source_issued
+            || !Arc::ptr_eq(&self.effect_identity, &source.session_identity)
+            || !Arc::ptr_eq(&actor.effect_identity, &source.actor_identity)
+            || !self.admission.same_original_admission(&source.admission)
+            || !guard.authorizes_teacher_actor(source)
+        {
+            *destination = Some(Err(TeacherActorEffectFailureV3::RejectedBeforeEntry(
+                TeacherStartErrorV3::Invalid("teacher actor effect authority differs".into()),
+            )));
+            return true;
+        }
+        let outcome = TeacherActorEffectOutcomeV3 {
+            session_identity: Arc::clone(&source.session_identity),
+            actor_identity: Arc::clone(&source.actor_identity),
+            admission: source.admission.clone(),
+            actor_id: source.actor_id.clone(),
+        };
+        self.actors
+            .get_mut(&source.actor_id)
+            .expect("validated actor")
+            .effect_attempted = true;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.start_actor_original(
+                &source.actor_id,
+                startup_deadline,
+                cleanup_ceiling,
+                custodian,
+            )
+        }));
+        *destination = Some(match result {
+            Ok(Ok(key)) => Ok((key, outcome)),
+            Ok(Err(error)) => Err(TeacherActorEffectFailureV3::Known { error, outcome }),
+            Err(payload) => Err(TeacherActorEffectFailureV3::Unknown(payload)),
+        });
+        true
+    }
+
+    fn start_actor_original(
         &mut self,
         actor_id: &str,
         startup_deadline: Instant,
