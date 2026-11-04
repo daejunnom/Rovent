@@ -15,7 +15,9 @@ import stat
 class OutputSpool:
     """Keep a bounded prefix, including bytes awaiting a failed write.
 
-    The descriptor must name a new empty regular file owned by the caller.
+    The descriptor must name a new empty regular file whose contents are not
+    concurrently modified by the caller or another actor.  Descriptor and size
+    checks do not prove that ownership or detect same-size external overwrites.
     Writes use a positional offset so changes to the caller's file position do
     not reorder the captured stream.  Written bytes mean OS-accepted writes,
     not fsync or durable-storage evidence.  A disk error is sticky evidence,
@@ -107,6 +109,11 @@ class OutputSpool:
         }
 
     def close(self) -> None:
+        """Release this descriptor only; this is not output acceptance.
+
+        The caller must separately inspect EOF, read and write errors,
+        truncation, pending data, and any required durability evidence.
+        """
         if self._pending:
             raise RuntimeError("output bytes remain owned by the spool")
         if self._fd is not None:
