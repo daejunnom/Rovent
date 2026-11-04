@@ -1287,6 +1287,14 @@ pub struct RoventPcSessionDriver {
     storage: Mutex<Option<Box<SessionStorageLifecycle>>>,
 }
 impl RoventPcSessionDriver {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn collection_cleanup_observation_v3(
+        &self,
+    ) -> Option<super::pc_collection_v3::RoventPcCleanupObservationV3> {
+        self.collection_v3
+            .as_ref()
+            .map(|state| state.cleanup_observation())
+    }
     /// A release observation is tied to the same closed session and its
     /// matching original finish report and immutable snapshot.
     pub(crate) fn session_release_observation(

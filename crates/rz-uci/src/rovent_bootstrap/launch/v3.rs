@@ -2616,6 +2616,9 @@ pub(super) fn run_native_admitted(
     }
     type SessionReleaseProbe =
         Box<dyn Fn() -> Option<crate::pals_adaptive::NativeSessionReleaseObservation>>;
+    type PcCleanupProbe =
+        Box<dyn Fn() -> Option<super::super::pc_collection_v3::RoventPcCleanupObservationV3>>;
+    let mut observe_pc_cleanup: Option<PcCleanupProbe> = None;
     // Research-only observation uses the very same model owner and physical
     // ticket path. It is never enabled by the normal engine configuration.
     let mut numeric_observer: Option<super::super::V3SystemNumericObserver> = None;
@@ -3399,6 +3402,12 @@ pub(super) fn run_native_admitted(
             };
             attach_storage!(driver, custody);
             let completion = driver.physical_close_observation();
+            if collection.is_some() {
+                let original_driver = Arc::clone(&driver);
+                observe_pc_cleanup = Some(Box::new(move || {
+                    original_driver.collection_cleanup_observation_v3()
+                }));
+            }
             let original_driver = Arc::clone(&driver);
             let observe_release: SessionReleaseProbe =
                 Box::new(move || original_driver.session_release_observation());
@@ -3442,6 +3451,42 @@ pub(super) fn run_native_admitted(
         }
     }
     let session_release = observe_release.and_then(|probe| probe());
+    if let Some(probe) = observe_pc_cleanup {
+        use super::super::pc_collection_v3::RoventPcCleanupObservationV3 as Cleanup;
+        let failure = match probe() {
+            Some(Cleanup::NoFailureObserved) => serde_json::json!({"status": "not_observed"}),
+            Some(Cleanup::FirstFailure {
+                kind,
+                detail,
+                recovered,
+            }) => serde_json::json!({
+                "status": "observed", "kind": kind, "detail": detail,
+                "same_marker_cleanup_later_confirmed": recovered,
+            }),
+            Some(Cleanup::Unknown) | None => serde_json::json!({"status": "unknown"}),
+        };
+        let value = serde_json::json!({
+            "domain": "rz-rovent-pc-collection-cleanup-observation/1",
+            "process_id": std::process::id(), "process_epoch": arguments.process_epoch,
+            "lock_sha256": lock.canonical_sha256,
+            "first_failure": failure,
+            "scope": "same process-local P/C collection session; diagnostic only",
+            "physical_completion_or_release_authority": false,
+        });
+        match receipt_writer.as_deref() {
+            Some(writer) => {
+                if let Err(failure) = writer.write_bytes(
+                    "collection-cleanup-observation.v1.json",
+                    value.to_string().as_bytes(),
+                ) {
+                    eprintln!("collection cleanup observation warning: {failure}");
+                }
+            }
+            None => {
+                eprintln!("collection cleanup observation unavailable: no original receipt writer")
+            }
+        }
+    }
     if session_release.is_some() {
         scope.mark_session_released();
     }

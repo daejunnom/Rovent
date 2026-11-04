@@ -34,6 +34,17 @@ pub(crate) struct RoventPcCollectionStateV3 {
     panics: Mutex<Vec<Box<dyn Any + Send>>>,
 }
 
+/// Diagnostic snapshot only; this does not grant release or completion authority.
+pub(crate) enum RoventPcCleanupObservationV3 {
+    NoFailureObserved,
+    FirstFailure {
+        kind: &'static str,
+        detail: Option<String>,
+        recovered: bool,
+    },
+    Unknown,
+}
+
 impl RoventPcCollectionStateV3 {
     pub(crate) fn new(
         origin: RoventNativeCollectionOriginV3,
@@ -62,6 +73,57 @@ impl RoventPcCollectionStateV3 {
         } else {
             // Never drop an unclassified original owner on allocation failure.
             std::mem::forget(payload);
+        }
+    }
+
+    pub(crate) fn cleanup_observation(&self) -> RoventPcCleanupObservationV3 {
+        // Match the cleanup writer's lock order and never stall the product.
+        let Ok(active) = self.deferred_cleanup.try_lock() else {
+            return RoventPcCleanupObservationV3::Unknown;
+        };
+        let Ok(history) = self.prior_cleanup_failures.try_lock() else {
+            return RoventPcCleanupObservationV3::Unknown;
+        };
+        let (first, recovered) = match history.first() {
+            Some(first) => (first, true),
+            None => match active.as_ref() {
+                Some(first) => (first, false),
+                None => return RoventPcCleanupObservationV3::NoFailureObserved,
+            },
+        };
+        let Ok(first) = first.try_lock() else {
+            return RoventPcCleanupObservationV3::Unknown;
+        };
+        let (kind, detail) = match first.failure() {
+            RoventPcDeferredCleanupFailureV3::Busy => ("busy", None),
+            RoventPcDeferredCleanupFailureV3::Error(error) => (
+                "error",
+                Some(
+                    crate::search_driver::SearchSessionFailure::debug("RoventPcV3Cleanup", error)
+                        .detail,
+                ),
+            ),
+            RoventPcDeferredCleanupFailureV3::Panic(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&'static str>().copied());
+                (
+                    "panic",
+                    message.map(|message| {
+                        crate::search_driver::SearchSessionFailure::debug(
+                            "RoventPcV3CleanupPanic",
+                            &message,
+                        )
+                        .detail
+                    }),
+                )
+            }
+        };
+        RoventPcCleanupObservationV3::FirstFailure {
+            kind,
+            detail,
+            recovered,
         }
     }
 }
