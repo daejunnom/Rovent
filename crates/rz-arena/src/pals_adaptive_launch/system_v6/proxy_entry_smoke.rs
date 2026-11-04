@@ -225,6 +225,10 @@ fn smoke_sources() -> &'static [(&'static str, &'static [u8])] {
             include_bytes!("../../../../rz-contracts/src/pals/proxy_entry_smoke_cancel_v1.rs"),
         ),
         (
+            "proxy_reobserve_wire",
+            include_bytes!("../../../../rz-contracts/src/pals/proxy_reobserve_v1.rs"),
+        ),
+        (
             "proxy_smoke",
             include_bytes!("../../../../rz-uci/src/pals_system_proxy/proxy_entry_smoke_v1.rs"),
         ),
