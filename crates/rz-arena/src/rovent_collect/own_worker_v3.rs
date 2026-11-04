@@ -17,7 +17,10 @@ use super::teacher::v3_policy_consumer::{
     TeacherPolicyConsumerOwnerV3, TeacherPolicyConsumerProgressV3, TeacherPolicyConsumerStartV3,
     TeacherProcessedOwnerV3,
 };
-use super::teacher::v3_pump::{TeacherPumpSetupErrorV3, TeacherPumpV3};
+use super::teacher::v3_pump::{
+    TeacherClosedCustodyStartV3, TeacherClosedCustodyV3, TeacherClosedDrainV3,
+    TeacherClosedHandoffV3, TeacherPumpSetupErrorV3, TeacherPumpV3,
+};
 use super::teacher::v3_session::{
     RoventCollectionTeacherSessionV3, TeacherPrepareErrorV3, TeacherSessionStageStateV3,
     TeacherSessionStagingV3, TeacherStartErrorV3,
@@ -46,6 +49,8 @@ pub(crate) struct OwnRootRecoveryV3 {
     pub(super) receiver: Option<Arc<Mutex<SpeculativeReceiverV3>>>,
     pub(super) owner: Option<RoventCollectionOwnerLockV3>,
     pub(super) pump: Option<Arc<Mutex<TeacherPumpV3>>>,
+    pub(super) closed_custody: Option<TeacherClosedCustodyV3>,
+    pub(super) closed_custody_setup_unknown: bool,
     pub(super) consumer: Option<TeacherPolicyConsumerOwnerV3>,
     // One root-owned phase; only a successful step advances this cursor.
     pub(super) consumer_phase: u8,
@@ -91,6 +96,13 @@ pub(crate) struct OwnRootRecoveryV3 {
     pub(super) shutdown_failure_count: u64,
     pub(super) pump_failure: Option<String>,
     pub(super) pump_failure_count: u64,
+    pub(super) pump_admission_closed: bool,
+    pub(super) closed_input_pending: bool,
+    pub(super) closed_input_error: Option<String>,
+    pub(super) closed_handoff_pending: bool,
+    pub(super) closed_handoff_error: Option<String>,
+    pub(super) target_revoke_pending: bool,
+    pub(super) target_revoke_error: Option<String>,
 }
 
 impl OwnRootRecoveryV3 {
@@ -109,6 +121,8 @@ impl OwnRootRecoveryV3 {
             receiver: None,
             owner: None,
             pump: None,
+            closed_custody: None,
+            closed_custody_setup_unknown: false,
             consumer: None,
             consumer_phase: 0,
             processed: None,
@@ -141,6 +155,13 @@ impl OwnRootRecoveryV3 {
             shutdown_failure_count: 0,
             pump_failure: None,
             pump_failure_count: 0,
+            pump_admission_closed: false,
+            closed_input_pending: false,
+            closed_input_error: None,
+            closed_handoff_pending: false,
+            closed_handoff_error: None,
+            target_revoke_pending: false,
+            target_revoke_error: None,
         }))
     }
 
@@ -206,6 +227,10 @@ impl OwnRootRecoveryV3 {
                 .receiver
                 .as_ref()
                 .is_some_and(|original| Arc::ptr_eq(original, pump.receiver()))
+            || !self
+                .closed_custody
+                .as_ref()
+                .is_some_and(|original| pump.owns_closed_custody(original))
         {
             return Ok(Some(false));
         }
@@ -479,6 +504,7 @@ impl OwnWorkerSupervisorV3 {
                     if root.consumer_failure.is_some() {
                         root.try_retain_known_rejection();
                     }
+                    root.try_drain_closed_input();
                 }
                 prepare_own_root_step_v3(
                     &self.bridge,
@@ -855,6 +881,34 @@ fn prepare_own_root_step_v3(
             }
         }
     }
+    if state.closed_custody.is_none() {
+        if state.closed_custody_setup_unknown {
+            state.failure = Some("Own /3 closed custody setup outcome unknown".into());
+            return Ok(OwnPrepareStepV3::Failed);
+        }
+        state.closed_custody_setup_unknown = true;
+        let pump = state.pump.as_ref().expect("original pump retained");
+        let route = state.route.as_ref().expect("original route retained");
+        match TeacherClosedCustodyV3::try_new(
+            pump,
+            route,
+            state.inputs.plan().teacher_tickets_per_root as usize,
+        ) {
+            Ok(TeacherClosedCustodyStartV3::Ready(custody)) => {
+                state.closed_custody = Some(custody);
+                state.closed_custody_setup_unknown = false;
+            }
+            Ok(TeacherClosedCustodyStartV3::Busy) => {
+                state.closed_custody_setup_unknown = false;
+                return Ok(OwnPrepareStepV3::Pending);
+            }
+            Err(error) => {
+                state.closed_custody_setup_unknown = false;
+                state.failure = Some(error.to_string());
+                return Ok(OwnPrepareStepV3::Failed);
+            }
+        }
+    }
     if state.worker.is_none() && state.prepared.is_none() {
         if state.worker_stage.is_none() {
             match RoventBoardCollectionWorkerStageV3::prepare(admission.clone()) {
@@ -1215,10 +1269,21 @@ impl OwnRootRecoveryV3 {
     fn try_request_teacher_shutdown(&mut self, deadline: Instant) {
         if let Some(route) = &self.route {
             route.cancel_all();
+            match route.try_revoke_all_targets() {
+                Ok(Some(())) => self.target_revoke_pending = false,
+                Ok(None) => self.target_revoke_pending = true,
+                Err(error) => {
+                    self.target_revoke_pending = true;
+                    if self.target_revoke_error.is_none() {
+                        self.target_revoke_error = Some(error.to_string());
+                    }
+                }
+            }
         }
         if let Some(pump) = &self.pump {
             if let Ok(mut pump) = pump.try_lock() {
                 pump.close_admission();
+                self.pump_admission_closed = true;
             }
         }
         let Some(stage) = self.stage.as_ref() else {
@@ -1240,11 +1305,75 @@ impl OwnRootRecoveryV3 {
         }
     }
 
+    /// Retain at most one undispatched original capsule per pass in the same
+    /// pump. Empty is only a queue observation; sender fencing, target revoke
+    /// and physical completion remain independent.
+    fn try_drain_closed_input(&mut self) {
+        if !self.pump_admission_closed {
+            return;
+        }
+        let Some(pump) = self.pump.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let mut pump = match pump.try_lock() {
+            Ok(pump) => pump,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.closed_input_pending = true;
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                self.closed_input_pending = true;
+                self.closed_input_error = Some("Own /3 closed pump poisoned".into());
+                return;
+            }
+        };
+        if self.closed_input_error.is_none() {
+            match pump.try_closed_drain() {
+                Ok(TeacherClosedDrainV3::EmptyNow | TeacherClosedDrainV3::Disconnected) => {
+                    self.closed_input_pending = false;
+                }
+                Ok(
+                    TeacherClosedDrainV3::Retained
+                    | TeacherClosedDrainV3::InputHeld
+                    | TeacherClosedDrainV3::Busy
+                    | TeacherClosedDrainV3::PendingDispatch
+                    | TeacherClosedDrainV3::Capacity,
+                ) => self.closed_input_pending = true,
+                Err(error) => {
+                    self.closed_input_pending = true;
+                    self.closed_input_error = Some(error);
+                }
+            }
+        }
+        if self.closed_handoff_error.is_none() {
+            let (Some(route), Some(custody)) = (&self.route, &self.closed_custody) else {
+                self.closed_handoff_pending = true;
+                return;
+            };
+            match pump.try_handoff_closed(route, custody) {
+                Ok(TeacherClosedHandoffV3::Empty) => self.closed_handoff_pending = false,
+                Ok(
+                    TeacherClosedHandoffV3::Transferred
+                    | TeacherClosedHandoffV3::Busy
+                    | TeacherClosedHandoffV3::Capacity
+                    | TeacherClosedHandoffV3::RevokeRequired,
+                ) => {
+                    self.closed_handoff_pending = true;
+                }
+                Err(error) => {
+                    self.closed_handoff_pending = true;
+                    self.closed_handoff_error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
     /// Retire the actual teacher scope only after all physical workers join;
     /// a pending query, unconsumed completion or missing aggregate stays held.
     fn try_drain_teacher(&mut self, handoff: &RoventBoardRootHandoffV3, deadline: Instant) -> bool {
         self.try_drive_consumer();
         self.try_request_teacher_shutdown(deadline);
+        self.try_drain_closed_input();
         let Some(stage) = self.stage.as_ref().map(Arc::clone) else {
             return false;
         };
