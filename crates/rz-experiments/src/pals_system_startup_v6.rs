@@ -507,9 +507,11 @@ mod tests {
         };
         let mut runtime_component = component("system-runtime/test");
         runtime_component.options = options.canonical_runtime_options(&runtime);
-        let mut resources = PalsResourcePlanV5::default();
-        resources.gpu_count = 1;
-        resources.gpu_model = Some("declared-test-gpu".into());
+        let resources = PalsResourcePlanV5 {
+            gpu_count: 1,
+            gpu_model: Some("declared-test-gpu".into()),
+            ..Default::default()
+        };
         let model = PalsModelSpecificationV5 {
             profile: "virtual_review_v1".into(),
             model_schema: PALS_V5_MODEL_SCHEMA.into(),

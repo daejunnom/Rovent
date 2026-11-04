@@ -12,8 +12,16 @@ pub(crate) use no_capture_v3::RoventNoCaptureIssueErrorV3;
 pub use no_capture_v3::RoventNoCaptureRootCapabilityV3;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 mod versioned;
-#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
 pub use versioned::*;
+// The public V3 items are Linux-only; other supported targets need the
+// versioned V2 types internally but have nothing public to re-export.
+#[cfg(all(
+    feature = "pals-adaptive",
+    feature = "onnx-cpu",
+    not(target_os = "linux")
+))]
+pub(crate) use versioned::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdaptiveCollectionStage {
