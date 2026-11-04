@@ -67,6 +67,74 @@ pub(crate) enum TeacherClosedDrainV3 {
 // for the separate sender/callback fence; do not discard any capsule.
 const CLOSED_CAPSULE_CAPACITY: usize = 17;
 
+/// This owner must be installed in the original root recovery before a
+/// worker starts and retained after route unlink. Its capsules are canceled
+/// inputs, not terminal outputs or physical-completion evidence.
+#[derive(Clone)]
+pub(crate) struct TeacherClosedCustodyV3(Arc<Mutex<TeacherClosedCustodyStateV3>>);
+
+struct TeacherClosedCustodyStateV3 {
+    pump_identity: Arc<()>,
+    route: SpeculativeRootV3,
+    originals: Vec<Arc<SubmittedTeacherQueryV3>>,
+    capacity: usize,
+}
+
+pub(crate) enum TeacherClosedCustodyStartV3 {
+    Ready(TeacherClosedCustodyV3),
+    Busy,
+}
+
+pub(crate) enum TeacherClosedHandoffV3 {
+    Transferred,
+    Empty,
+    Busy,
+    Capacity,
+    RevokeRequired,
+}
+
+impl TeacherClosedCustodyV3 {
+    /// Bind to the exact pump and receiver route before the worker starts.
+    pub(crate) fn try_new(
+        pump: &Arc<Mutex<TeacherPumpV3>>,
+        route: &SpeculativeRootV3,
+        capacity: usize,
+    ) -> Result<TeacherClosedCustodyStartV3, ArenaError> {
+        if !(1..=65_536).contains(&capacity) {
+            return Err(invalid("V3 closed input custody capacity invalid"));
+        }
+        let mut pump = match pump.try_lock() {
+            Ok(pump) => pump,
+            Err(TryLockError::WouldBlock) => return Ok(TeacherClosedCustodyStartV3::Busy),
+            Err(TryLockError::Poisoned(_)) => return Err(invalid("V3 teacher pump poisoned")),
+        };
+        let receiver = match pump.receiver.try_lock() {
+            Ok(receiver) => receiver,
+            Err(TryLockError::WouldBlock) => return Ok(TeacherClosedCustodyStartV3::Busy),
+            Err(TryLockError::Poisoned(_)) => return Err(invalid("V3 teacher receiver poisoned")),
+        };
+        if !receiver.matches_original_route(route) {
+            return Err(invalid("V3 closed input custody route differs"));
+        }
+        drop(receiver);
+        if pump.registered_closed_custody.is_some() {
+            return Err(invalid("V3 closed input custody already registered"));
+        }
+        let custody = Self(Arc::new(Mutex::new(TeacherClosedCustodyStateV3 {
+            pump_identity: Arc::clone(&pump.closed_custody_identity),
+            route: route.clone(),
+            originals: Vec::new(),
+            capacity,
+        })));
+        pump.registered_closed_custody = Some(custody.clone());
+        Ok(TeacherClosedCustodyStartV3::Ready(custody))
+    }
+
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 pub(crate) struct TeacherPumpSetupErrorV3 {
     pub error: String,
     pub receiver: Arc<Mutex<SpeculativeReceiverV3>>,
@@ -86,6 +154,8 @@ pub(crate) struct TeacherPumpV3 {
     held: Option<Arc<SubmittedTeacherQueryV3>>,
     // Same root pump is retained by the supervisor throughout shutdown.
     closed_capsules: Vec<Arc<SubmittedTeacherQueryV3>>,
+    closed_custody_identity: Arc<()>,
+    registered_closed_custody: Option<TeacherClosedCustodyV3>,
     completed: Option<TeacherCompletedV3>,
     terminal_backlog: Vec<TeacherCompletedV3>,
     rejected: Option<Box<TeacherRejectedV3>>,
@@ -141,6 +211,8 @@ impl TeacherPumpV3 {
             pending_delivery_ack: false,
             held: None,
             closed_capsules: Vec::new(),
+            closed_custody_identity: Arc::new(()),
+            registered_closed_custody: None,
             completed: None,
             terminal_backlog: Vec::new(),
             rejected: None,
@@ -472,6 +544,70 @@ impl TeacherPumpV3 {
     pub(crate) fn take_rejected(&mut self) -> Option<Box<TeacherRejectedV3>> {
         self.rejected.take()
     }
+    /// Identity observation only; caller still verifies original recovery,
+    /// route revocation, callback fence and worker join independently.
+    pub(crate) fn owns_closed_custody(&self, custody: &TeacherClosedCustodyV3) -> bool {
+        self.registered_closed_custody
+            .as_ref()
+            .is_some_and(|original| original.same_owner(custody))
+    }
+
+    /// Transfer one original undispatched input to the pre-registered same
+    /// root recovery owner. Gate revocation and exact-ticket cancellation
+    /// precede transfer; neither operation proves sender fencing or a worker
+    /// terminal. All Busy/Capacity/error paths retain the original capsule.
+    pub(crate) fn try_handoff_closed(
+        &mut self,
+        route: &SpeculativeRootV3,
+        custody: &TeacherClosedCustodyV3,
+    ) -> Result<TeacherClosedHandoffV3, ArenaError> {
+        if !self.closed {
+            return Err(invalid("V3 closed input handoff requires closed admission"));
+        }
+        let mut destination = match custody.0.try_lock() {
+            Ok(destination) => destination,
+            Err(TryLockError::WouldBlock) => return Ok(TeacherClosedHandoffV3::Busy),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(invalid("V3 closed input custody poisoned"));
+            }
+        };
+        if !self
+            .registered_closed_custody
+            .as_ref()
+            .is_some_and(|original| original.same_owner(custody))
+            || !Arc::ptr_eq(&self.closed_custody_identity, &destination.pump_identity)
+            || !destination.route.same_original_route(route)
+        {
+            return Err(invalid("V3 closed input original owner differs"));
+        }
+        if !route.target_revocation().is_revoked() {
+            return Ok(TeacherClosedHandoffV3::RevokeRequired);
+        }
+        let Some(capsule) = self.closed_capsules.last() else {
+            return Ok(TeacherClosedHandoffV3::Empty);
+        };
+        if !route.matches_admission(capsule.admission()) {
+            return Err(invalid("V3 closed input admission differs"));
+        }
+        if destination.originals.len() >= destination.capacity {
+            return Ok(TeacherClosedHandoffV3::Capacity);
+        }
+        destination
+            .originals
+            .try_reserve(1)
+            .map_err(|_| invalid("V3 closed input custody allocation failed"))?;
+        match route.try_cancel_ticket(&capsule.ticket())? {
+            Some(()) => {}
+            None => return Ok(TeacherClosedHandoffV3::Busy),
+        }
+        // The source and pre-reserved destination remain under their original
+        // owners; there is no fallible operation between pop and push.
+        destination
+            .originals
+            .push(self.closed_capsules.pop().expect("closed input retained"));
+        Ok(TeacherClosedHandoffV3::Transferred)
+    }
+
     /// Retain at most one original undispatched capsule per call after
     /// closing admission. The same root supervisor must retain this pump;
     /// these slots are evidence, not a sender fence or physical completion.
