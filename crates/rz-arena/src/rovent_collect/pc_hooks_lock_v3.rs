@@ -1434,7 +1434,10 @@ impl PcV3LaunchClosure {
         let mut observers = Vec::new();
         if observers.try_reserve_exact(roots.len()).is_err() { return Ok(None); }
         for root in roots {
-            if !root.requires_observer { continue; }
+            // Physical no-worker/no-dispatch evidence does not classify a
+            // missing collection root as eligible for game publication.
+            // A separate same-root semantic outcome is required first.
+            if !root.requires_observer { return Ok(None); }
             let Some(owner) = &root.observer else { return Ok(None); };
             let token = match owner.try_observe_root_drained(&root.admission, &pipeline)? {
                 super::observer_lock_v3::ObserverRootDrainAttemptV3::Ready(token) => token,
