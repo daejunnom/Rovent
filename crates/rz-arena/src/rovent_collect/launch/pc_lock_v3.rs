@@ -3,6 +3,9 @@
 //! These are original pinned declarations, not evidence that native work,
 //! teachers, physical cleanup, or publication have completed.
 use super::*;
+use crate::rovent_collect::capture_router_v3::CaptureRouterV3;
+use crate::rovent_collect::pc_hooks_lock_v3::RoventPcCollectionBridgeV3;
+use crate::rovent_collect::pc_worker_v3::PcWorkerSupervisorV3;
 use crate::rovent_collect::teacher::v3_session::TeacherRosterEntryV3;
 use rz_experiments::rovent_corpus_lock_v3::record::RoventCorpusManifestLockV3;
 use rz_experiments::{RoventActor, RoventInputLockV3, RoventPurpose, RoventResearcher};
@@ -160,6 +163,73 @@ pub struct PreparedPcCollectionInputsV3 {
     plan: RoventCollectionLockV3LaunchPlan,
     manifest: Arc<RoventCorpusManifestLockV3>,
     purpose: CollectionInputsPurposeV3,
+}
+
+/// Original owners prepared before resource admission. Constructing this
+/// bundle starts no thread, model, GPU or teacher process. The supervisor is
+/// only a finite-step state owner; a separately verified resource-admitted
+/// caller must retain it before starting any worker.
+#[allow(dead_code)]
+pub(crate) struct PcCollectionOwnersV3 {
+    inputs: Arc<PreparedPcCollectionInputsV3>,
+    router: Arc<CaptureRouterV3>,
+    bridge: Arc<RoventPcCollectionBridgeV3>,
+    native: Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    supervisor: Arc<Mutex<PcWorkerSupervisorV3>>,
+}
+
+#[allow(dead_code)]
+impl PcCollectionOwnersV3 {
+    pub(crate) fn prepare(
+        inputs: Arc<PreparedPcCollectionInputsV3>,
+        execution_ceiling: Instant,
+        cleanup_ceiling: Instant,
+    ) -> Result<Self, ArenaError> {
+        check(
+            inputs.purpose == CollectionInputsPurposeV3::Pc,
+            "P-C V3 plan purpose differs",
+        )?;
+        let (router, observer) = CaptureRouterV3::channel();
+        let bridge = RoventPcCollectionBridgeV3::new(Arc::clone(&inputs), router.registration())
+            .map_err(invalid)?;
+        let hooks: Arc<dyn rz_uci::rovent_bootstrap::pc_collection_v3::RoventPcCollectionHooksV3> =
+            bridge.clone();
+        let native = Arc::new(
+            rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3::new(
+                inputs.plan().teacher_sources.clone(),
+                Vec::new(),
+                hooks,
+                Box::new(observer),
+            ),
+        );
+        bridge.bind_native_owner(&native).map_err(invalid)?;
+        let supervisor = PcWorkerSupervisorV3::new(
+            Arc::clone(&bridge),
+            Arc::clone(&router),
+            execution_ceiling,
+            cleanup_ceiling,
+        )
+        .map_err(invalid)?;
+        Ok(Self {
+            inputs,
+            router,
+            bridge,
+            native,
+            supervisor: Arc::new(Mutex::new(supervisor)),
+        })
+    }
+
+    pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> {
+        &self.inputs
+    }
+    pub(crate) fn native(
+        &self,
+    ) -> &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3> {
+        &self.native
+    }
+    pub(crate) fn supervisor(&self) -> &Arc<Mutex<PcWorkerSupervisorV3>> {
+        &self.supervisor
+    }
 }
 
 /// An original managed output directory and its `chunks` child, retained with
