@@ -412,16 +412,25 @@ impl TeacherPolicyConsumerV3 {
         if !self.prepared_transferred {
             return Ok(TeacherPolicyConsumerProgressV3::NotReady);
         }
-        Ok(match self.observer.try_prepare_pipeline(&self.pipeline)? {
-            PipelinePreparationV3::Ready => TeacherPolicyConsumerProgressV3::CandidateReady,
-            PipelinePreparationV3::Busy => TeacherPolicyConsumerProgressV3::Busy,
-            PipelinePreparationV3::NotReady => TeacherPolicyConsumerProgressV3::NotReady,
-            PipelinePreparationV3::Failed => TeacherPolicyConsumerProgressV3::Rejected,
-            PipelinePreparationV3::Unknown => {
-                self.authority_unknown = true;
-                TeacherPolicyConsumerProgressV3::Unknown
-            }
-        })
+        let Some(completed) = self.completed.as_ref() else {
+            return Ok(TeacherPolicyConsumerProgressV3::NotReady);
+        };
+        let ticket = completed.capsule.ticket();
+        Ok(
+            match self
+                .observer
+                .try_prepare_pipeline(&self.pipeline, &ticket)?
+            {
+                PipelinePreparationV3::Ready => TeacherPolicyConsumerProgressV3::CandidateReady,
+                PipelinePreparationV3::Busy => TeacherPolicyConsumerProgressV3::Busy,
+                PipelinePreparationV3::NotReady => TeacherPolicyConsumerProgressV3::NotReady,
+                PipelinePreparationV3::Failed => TeacherPolicyConsumerProgressV3::Rejected,
+                PipelinePreparationV3::Unknown => {
+                    self.authority_unknown = true;
+                    TeacherPolicyConsumerProgressV3::Unknown
+                }
+            },
+        )
     }
 
     /// Move the exact ticket's unique target capability directly from its
@@ -432,14 +441,18 @@ impl TeacherPolicyConsumerV3 {
         if self.authority_unknown {
             return Ok(TeacherPolicyConsumerProgressV3::Unknown);
         }
-        if self.completed.is_none() {
+        let Some(completed) = self.completed.as_ref() else {
             return Ok(TeacherPolicyConsumerProgressV3::NotReady);
-        }
+        };
+        let ticket = completed.capsule.ticket();
         if !self.prepared_transferred {
             return Ok(TeacherPolicyConsumerProgressV3::NotReady);
         }
         Ok(
-            match self.observer.try_take_pipeline_capability(&self.pipeline)? {
+            match self
+                .observer
+                .try_take_pipeline_capability(&self.pipeline, &ticket)?
+            {
                 PipelineCapabilityV3::Busy => TeacherPolicyConsumerProgressV3::Busy,
                 PipelineCapabilityV3::NotReady => TeacherPolicyConsumerProgressV3::NotReady,
                 PipelineCapabilityV3::Outcome(outcome) => match outcome {
@@ -468,11 +481,19 @@ impl TeacherPolicyConsumerV3 {
         if !self.prepared_transferred {
             return Ok(TeacherPolicyConsumerProgressV3::NotReady);
         }
+        if self.policy_appended {
+            return Ok(TeacherPolicyConsumerProgressV3::OutputHeld);
+        }
+        let Some(completed) = self.completed.as_ref() else {
+            return Ok(TeacherPolicyConsumerProgressV3::NotReady);
+        };
+        let ticket = completed.capsule.ticket();
+        let admission = completed.capsule.admission();
         let mut pipeline = match self.pipeline.try_lock().map_err(invalid)? {
             Some(guard) => guard,
             None => return Ok(TeacherPolicyConsumerProgressV3::Busy),
         };
-        Ok(match pipeline.try_append() {
+        Ok(match pipeline.try_append(admission, &ticket) {
             PolicyPipelineProgressV3::Appended => {
                 self.policy_appended = true;
                 TeacherPolicyConsumerProgressV3::Appended
