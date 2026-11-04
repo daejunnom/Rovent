@@ -714,6 +714,60 @@ impl<S> GameDispatchReceiptV3<S> {
     }
 }
 
+/// Bounded aggregation of equivalent known-Full observations only. The
+/// original game owner permanently binds one dispatch channel; abort-observed,
+/// sent, disconnected and uncertain work never enter this summary.
+pub(super) struct GameDispatchFullSummaryV3<S> {
+    count: u64,
+    last: GameDispatchReceiptV3<S>,
+}
+impl<S> GameDispatchFullSummaryV3<S> {
+    pub(super) fn count(&self) -> u64 {
+        self.count
+    }
+    pub(super) fn last(&self) -> &GameDispatchReceiptV3<S> {
+        &self.last
+    }
+
+    /// Both slots belong to the caller. On mismatch, abort or overflow no
+    /// value moves and the original receipt is retained for separate handling.
+    pub(super) fn try_merge_in_slots(
+        summary: &mut Option<Self>,
+        receipt: &mut Option<GameDispatchReceiptV3<S>>,
+    ) -> GameStepV3 {
+        let Some(next) = receipt.as_ref() else {
+            return GameStepV3::Busy;
+        };
+        if next.outcome != GameDispatchOutcomeV3::Full || next.abort_observed {
+            return GameStepV3::Foreign;
+        }
+        if let Some(original) = summary.as_ref() {
+            if !Arc::ptr_eq(&original.last.owner, &next.owner)
+                || !original.last.root.same_original_admission(&next.root)
+                || !original.last.envelope.same_original(&next.envelope)
+                || original.last.outcome != GameDispatchOutcomeV3::Full
+                || original.last.abort_observed
+            {
+                return GameStepV3::Foreign;
+            }
+            let Some(count) = original.count.checked_add(1) else {
+                return GameStepV3::Unknown;
+            };
+            let next = receipt.take().expect("checked original Full receipt");
+            let original = summary.as_mut().expect("checked original Full summary");
+            original.last = next;
+            original.count = count;
+        } else {
+            let next = receipt.take().expect("checked original Full receipt");
+            *summary = Some(Self {
+                count: 1,
+                last: next,
+            });
+        }
+        GameStepV3::Ready
+    }
+}
+
 pub(super) struct GameDispatchClaimV3<S> {
     owner: Arc<GameAuthorityV3<S>>,
     root: RoventCollectionRootAdmissionV3,
