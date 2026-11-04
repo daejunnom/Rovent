@@ -1,6 +1,10 @@
 //! Actual CPU owner/native command-loop lifecycle on terminal Rules inputs.
 //! Terminal lifecycle, opt-in authored root ranking and full-role goal profile;
 //! all role outputs are deterministic mock work with no NN/GPU inference.
+#[cfg(feature = "pals-adaptive")]
+#[path = "own_v3_tests.rs"]
+mod own_v3_tests;
+
 use super::*;
 use crate::contracts::SessionScope;
 use crate::pals_native::ticketed::{

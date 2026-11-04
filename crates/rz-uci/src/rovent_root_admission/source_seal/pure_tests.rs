@@ -126,6 +126,58 @@ fn input_lock_v3(position: &Position) -> rz_experiments::RoventOriginalInputLock
     rz_experiments::RoventOriginalInputLock::from_v3(Arc::new(lock)).unwrap()
 }
 
+/// Test-only separate Own-R declaration. It does not alter the PC fixture or
+/// assert that its synthetic source identities are installed product assets.
+pub(crate) fn own_input_lock_v3(position: &Position) -> rz_experiments::RoventOriginalInputLock {
+    use rz_contracts::rovent::ExecutionMode;
+    use rz_experiments::{
+        RoventActor, RoventResearcher, RoventRootTieDeclarationV2, RoventRootTiePolicyV2,
+    };
+    let base = input_lock_v3(position);
+    let mut manifest = base.v3().unwrap().manifest.clone();
+    manifest.engine.mode = ExecutionMode::CpuPcr;
+    manifest.engine.researcher = Some(RoventResearcher::Own {
+        implementation_sha256: "a".repeat(64),
+        search_configuration_sha256: "b".repeat(64),
+    });
+    manifest.resources.pools[0].actors.insert(RoventActor::OwnR);
+    manifest.coordinator.cpu_credit_limit = 64;
+    manifest.own_r_root_tie = RoventRootTieDeclarationV2::Own {
+        policy: RoventRootTiePolicyV2::LegacyFirstSearched,
+        expected_search_identity: "test-only-owned-cpu".into(),
+        expected_worker_conditions_sha256: "c".repeat(64),
+    };
+    rz_experiments::RoventOriginalInputLock::from_v3(Arc::new(manifest.lock().unwrap())).unwrap()
+}
+
+/// Creates a real start capability from the supplied go, using one clock.
+pub(crate) fn context_for_go(
+    clock: &ProcessClock,
+    go: GoLimits,
+    root: u64,
+) -> SearchSessionContext {
+    let authority = SearchAuthority {
+        epoch: clock.epoch(),
+        game: GameGeneration(1),
+        root: RootGeneration(root),
+        implementation: Digest([9; 32]),
+    };
+    match issue_start(
+        &Position::startpos(),
+        go,
+        authority,
+        clock,
+        clock.runtime_clock().origin(),
+        start_settings(),
+        Duration::from_millis(500),
+    )
+    .unwrap()
+    {
+        FixtureStart::Started(context) => context,
+        FixtureStart::RulesOnly(_) => panic!("ongoing Rules fixture did not issue actual Start"),
+    }
+}
+
 #[test]
 fn v3_source_preserves_actual_owner_and_rejects_original_cancel_and_expiry() {
     let position = Position::startpos();

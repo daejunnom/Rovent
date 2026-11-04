@@ -1017,4 +1017,4 @@ impl StoppedInitial {
 
 #[cfg(test)]
 #[path = "source_seal/pure_tests.rs"]
-mod pure_tests;
+pub(crate) mod pure_tests;
