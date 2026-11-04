@@ -12,7 +12,7 @@ use rz_search::external_cpu::collection_teacher::{
 use rz_uci::rovent_external_launch::VerifiedRoventExternalStartup;
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 
 /// This object and the original session must be retained together by the root
@@ -136,9 +136,10 @@ impl TeacherDispatchOwnerV3 {
         if self.pending.is_some() {
             reject!(invalid("V3 teacher actor has pending work"));
         }
-        let mut session = match self.session.lock() {
+        let mut session = match self.session.try_lock() {
             Ok(session) => session,
-            Err(_) => reject!(invalid("V3 teacher session lock poisoned")),
+            Err(TryLockError::WouldBlock) => return Ok(TeacherSubmitV3::AuthorityBusy(capsule)),
+            Err(TryLockError::Poisoned(_)) => reject!(invalid("V3 teacher session lock poisoned")),
         };
         let input = capsule.input_seal();
         let admission = session.original_admission();
@@ -384,10 +385,11 @@ impl TeacherDispatchOwnerV3 {
         if pending.completion_panic.is_some() {
             return Err("V3 teacher completion observation is uncertain".into());
         }
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| "V3 teacher session lock poisoned".to_string())?;
+        let mut session = match self.session.try_lock() {
+            Ok(session) => session,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err("V3 teacher session lock poisoned".into()),
+        };
         let lifecycle = session
             .lifecycle_mut(&self.actor_id)
             .ok_or("V3 teacher lifecycle missing")?;
