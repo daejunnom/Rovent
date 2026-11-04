@@ -12,6 +12,9 @@ use std::time::Instant;
 /// A value does not itself prove that any physical operation completed.
 #[cfg(feature = "contracts")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// Scope identities travel with physical work without allocating. Boxing the
+// ticket would change that lifetime/ownership contract and remove Copy.
+#[allow(clippy::large_enum_variant)]
 pub enum PhysicalWorkScope {
     Ticket {
         ticket: rz_contracts::pals_adaptive::RoleTicketEnvelope,

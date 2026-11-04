@@ -376,30 +376,6 @@ impl PalsCudaControlPolicy {
         })
     }
 
-    /// System-library evidence has a distinct domain and never masquerades as
-    /// the historical nineteen-file bundle. The caller must use profiles from
-    /// its actual owned sessions and separately establish physical completion.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn verify_system_virtual_profiles(
-        &self,
-        profiles: &BTreeMap<String, Vec<u8>>,
-        placements: Vec<PalsGraphPlacement>,
-        runtime: &OrtRuntime,
-        declared_device_id: i32,
-    ) -> Result<SystemVirtualReviewCudaPlacementWitness, BackendError> {
-        match self.observe_system_virtual_profiles(
-            profiles,
-            placements,
-            runtime,
-            declared_device_id,
-        )? {
-            super::super::virtual_review::SystemPlacementObservation::Verified(w) => Ok(*w),
-            _ => Err(policy_error(
-                "system CUDA runtime mappings could not be verified",
-            )),
-        }
-    }
-
     #[cfg(target_os = "linux")]
     pub(crate) fn observe_system_virtual_profiles(
         &self,

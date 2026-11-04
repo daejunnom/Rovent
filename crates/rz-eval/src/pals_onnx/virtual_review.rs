@@ -2588,7 +2588,7 @@ impl PalsVirtualReviewOnnxBackend {
             #[cfg(target_os = "linux")]
             VirtualReviewNativeCommand::ObserveSystemVirtualCudaPlacement => self
                 .observe_system_virtual_cuda_placement()
-                .map(|w| VirtualReviewNativeResult::SystemVirtualCudaPlacementObserved(w)),
+                .map(VirtualReviewNativeResult::SystemVirtualCudaPlacementObserved),
             #[cfg(target_os = "linux")]
             VirtualReviewNativeCommand::VerifySystemVirtualCudaPlacement => {
                 self.verify_system_virtual_cuda_placement().map(|w| {

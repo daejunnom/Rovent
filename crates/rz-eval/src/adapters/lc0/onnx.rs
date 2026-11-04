@@ -715,6 +715,8 @@ impl OrtRuntime {
         observe: bool,
         strict: bool,
     ) -> Result<(Option<NativeMappingObservation>, CudaRuntimeMappingEvidence), BackendError> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = strict;
         // Existing clones must observe the first latched failure too. A later
         // filesystem/map change cannot turn a poisoned process runtime into a
         // valid constructor input, or replace its original typed cause.
@@ -1597,6 +1599,9 @@ impl OnnxBackend {
         Ok((metadata, backend))
     }
 
+    // The optional hooks carry distinct startup ownership and observation
+    // roles; keeping them explicit preserves the existing call boundaries.
+    #[allow(clippy::too_many_arguments)]
     fn load_model(
         runtime: &OrtRuntime,
         asset: &AssetMetadata,
