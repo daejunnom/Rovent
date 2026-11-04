@@ -85,6 +85,37 @@ def _finish_owned_group(child, on_tick, graceful_deadline, absolute_deadline):
         return False, None, error
 
 
+def _await_original_cleanup_release(start, poll, on_tick, deadline):
+    """Request and observe one original owner without blocking channel service.
+
+    The caller supplies nonblocking callbacks. False is pending, not release;
+    only the literal True authorizes a subsequent owned-group drain.
+    """
+    try:
+        if time.monotonic() >= deadline:
+            return False, {"kind": "deadline", "error_type": "TimeoutError",
+                           "message": "cleanup deadline expired before stop request"}
+        start()
+        while time.monotonic() < deadline:
+            if on_tick is not None:
+                on_tick()
+            if time.monotonic() >= deadline:
+                break
+            released = poll()
+            if released is True:
+                if time.monotonic() < deadline:
+                    return True, None
+                break
+            if released is not False:
+                raise ValueError("cleanup poll must return True or False")
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        return False, {"kind": "deadline", "error_type": "TimeoutError",
+                       "message": "original cleanup owner release was not observed"}
+    except BaseException as exc:
+        return False, {"kind": "callback", "error_type": type(exc).__name__,
+                       "message": str(exc)}
+
+
 class OwnedProcessGroup:
     """Keep the original Popen and unreaped group identity across an unknown drain.
 
@@ -213,13 +244,15 @@ def _check_before_spawn(argv, cwd, pass_fds, stdout):
 def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=None, on_spawn=None,
               verify_before_spawn=False, absolute_deadline=None, deadline_observation=None,
               on_tick=None, owned_group=None, graceful_drain_deadline=None, on_stop=None,
-              output_handoff=None, cleanup_absolute_deadline=None):
+              output_handoff=None, cleanup_absolute_deadline=None,
+              cleanup_request_start=None, cleanup_request_poll=None):
     if os.name == "nt":
         if (pass_fds or stdout is not None or on_spawn is not None or verify_before_spawn
                 or absolute_deadline is not None or deadline_observation is not None
                 or on_tick is not None or owned_group is not None or graceful_drain_deadline is not None
                 or on_stop is not None or output_handoff is not None
-                or cleanup_absolute_deadline is not None):
+                or cleanup_absolute_deadline is not None or cleanup_request_start is not None
+                or cleanup_request_poll is not None):
             raise RuntimeError("explicit descriptor handoff requires Linux")
         return _run_windows(argv, cwd, env, timeout, admission_check)
     if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
@@ -228,6 +261,13 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
         raise ValueError("on_tick must be callable")
     if on_stop is not None and (owned_group is None or not callable(on_stop)):
         raise ValueError("on_stop must be callable and requires owned_group")
+    if cleanup_request_start is not None or cleanup_request_poll is not None:
+        from managed_output_child_handoff import ManagedCollectionOutputHandoffV2
+        if (not callable(cleanup_request_start) or not callable(cleanup_request_poll)
+                or on_stop is not None or owned_group is None
+                or cleanup_absolute_deadline is None
+                or type(output_handoff) is not ManagedCollectionOutputHandoffV2):
+            raise ValueError("nonblocking cleanup requires the original V3 owner and both callbacks")
     if owned_group is not None:
         if type(owned_group) is not OwnedProcessGroup:
             raise ValueError("owned_group must be an OwnedProcessGroup")
@@ -449,6 +489,18 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
                 if failure is None:
                     failure = f"{type(exc).__name__}: {exc}"
         stop_result = None
+        if requested_exit is not None and cleanup_request_start is not None:
+            owned_group.stop_cause = {"requested_exit_code": requested_exit,
+                                      "original_supervisor_error": failure}
+            stop_result, stop_error = _await_original_cleanup_release(
+                cleanup_request_start, cleanup_request_poll, on_tick, cleanup_absolute_deadline)
+            owned_group.stop_error = stop_error
+            if stop_error is not None and failure is None:
+                failure = f"{stop_error['error_type']}: {stop_error['message']}"
+            if stop_result is True:
+                # The same owner explicitly released: reserve the remaining
+                # registered window for signaling and observing this group.
+                graceful_drain_deadline = time.monotonic()
         if requested_exit is not None and on_stop is not None:
             owned_group.stop_cause = {"requested_exit_code": requested_exit,
                                       "original_supervisor_error": failure}

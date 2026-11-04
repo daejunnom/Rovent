@@ -13,7 +13,7 @@ from unittest import mock
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from managed_process import OwnedProcessGroup, ProcessNotSpawned, run_group
+from managed_process import OwnedProcessGroup, ProcessNotSpawned, _await_original_cleanup_release, run_group
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux process-group FD handoff only")
@@ -23,6 +23,45 @@ class ManagedProcessSpawnTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name).resolve()
         self.python = str(Path(sys.executable).resolve())
+
+    def test_nonblocking_cleanup_keeps_servicing_until_original_release(self):
+        clock = {"now": 1.0}
+        events = []
+        replies = iter((False, False, True))
+        def tick():
+            events.append("ack")
+        def poll():
+            events.append("poll")
+            return next(replies)
+        with mock.patch("managed_process.time.monotonic", side_effect=lambda: clock["now"]), \
+             mock.patch("managed_process.time.sleep", side_effect=lambda delay: clock.__setitem__("now", clock["now"] + delay)):
+            released, error = _await_original_cleanup_release(
+                lambda: events.append("request"), poll, tick, 2.0)
+        self.assertTrue(released)
+        self.assertIsNone(error)
+        self.assertEqual(events, ["request", "ack", "poll", "ack", "poll", "ack", "poll"])
+
+    def test_nonblocking_cleanup_retains_timeout_and_callback_failure(self):
+        clock = {"now": 1.0}
+        with mock.patch("managed_process.time.monotonic", side_effect=lambda: clock["now"]), \
+             mock.patch("managed_process.time.sleep", side_effect=lambda delay: clock.__setitem__("now", clock["now"] + delay)):
+            released, error = _await_original_cleanup_release(lambda: None, lambda: False, None, 1.1)
+        self.assertFalse(released)
+        self.assertEqual(error["kind"], "deadline")
+        def failed_ack():
+            raise OSError("ack failed")
+        released, error = _await_original_cleanup_release(
+            lambda: None, lambda: True, failed_ack, time.monotonic() + 1)
+        self.assertFalse(released)
+        self.assertEqual((error["error_type"], error["message"]), ("OSError", "ack failed"))
+
+    def test_nonblocking_cleanup_rejects_other_runner_modes_before_spawn(self):
+        with mock.patch("managed_process.subprocess.Popen") as popen:
+            with self.assertRaises(ValueError):
+                run_group([self.python], self.root, os.environ.copy(), 10, lambda: None,
+                          owned_group=OwnedProcessGroup(), cleanup_request_start=lambda: None,
+                          cleanup_request_poll=lambda: True)
+        popen.assert_not_called()
 
     def test_preflight_error_keeps_original_cause_and_does_not_spawn(self):
         callbacks = []
