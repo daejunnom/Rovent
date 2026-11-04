@@ -11,7 +11,7 @@ use std::{
     any::Any,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, TryLockError,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
 };
@@ -33,6 +33,12 @@ pub enum PriorityCancelAcknowledgment {
 pub enum PriorityCancelApplicationFailure {
     OwnerPoisoned,
     CancelPanicked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PriorityCancelPanicAccessError {
+    Busy,
+    Poisoned,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +101,21 @@ impl PriorityCancelHandle {
             owner_closed: self.0.owner_closed.load(Ordering::Acquire),
             physical_completion_observed: false,
         }
+    }
+
+    /// Inspect the retained original cancellation panic without taking or
+    /// printing its payload. Contention and poison remain explicit; neither
+    /// permits a retry, owner release or physical-completion inference.
+    pub fn with_original_cancel_panic<R>(
+        &self,
+        inspect: impl FnOnce(&(dyn Any + Send)) -> R,
+    ) -> Result<Option<R>, PriorityCancelPanicAccessError> {
+        let guard = match self.0.original_panic.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Err(PriorityCancelPanicAccessError::Busy),
+            Err(TryLockError::Poisoned(_)) => return Err(PriorityCancelPanicAccessError::Poisoned),
+        };
+        Ok(guard.as_deref().map(inspect))
     }
 }
 
@@ -159,5 +180,23 @@ impl PriorityCancelObserver {
         {
             self.0.failure.store(1, Ordering::Release);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_panic_can_be_inspected_without_consumption() {
+        let (_owner, handle) = PriorityCancelOwner::new(ProcessEpoch(1));
+        *handle.0.original_panic.lock().unwrap() = Some(Box::new(7_u64));
+        for _ in 0..2 {
+            assert_eq!(
+                handle.with_original_cancel_panic(|value| value.downcast_ref::<u64>().copied()),
+                Ok(Some(Some(7)))
+            );
+        }
+        assert!(!handle.observe().physical_completion_observed);
     }
 }

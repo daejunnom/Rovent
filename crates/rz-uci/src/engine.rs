@@ -7,7 +7,7 @@ mod priority_cancel;
 #[cfg(feature = "pals-adaptive")]
 pub use priority_cancel::{
     PriorityCancelAcknowledgment, PriorityCancelApplicationFailure, PriorityCancelHandle,
-    PriorityCancelObservation, PriorityCancelRequest,
+    PriorityCancelObservation, PriorityCancelPanicAccessError, PriorityCancelRequest,
 };
 mod driver_output;
 use driver_output::DriverOutputEnvelope;
