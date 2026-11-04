@@ -26,7 +26,7 @@ pub(super) enum CancelPoll {
     AcknowledgementWritten,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct CancelFailureObservation {
     pub kind: io::ErrorKind,
     pub message: String,
@@ -92,6 +92,16 @@ impl CancelReceiverV1 {
 
     pub(super) fn first_failure(&self) -> Option<&CancelFailureObservation> {
         self.first_failure.as_ref()
+    }
+
+    /// Match the exact window token and cleanup bound used by the supervisor.
+    /// This does not authenticate the stream's peer or establish role identity.
+    pub(super) fn matches_window(
+        &self,
+        cancelled: &Arc<AtomicBool>,
+        cleanup_until: Instant,
+    ) -> bool {
+        Arc::ptr_eq(&self.run_cancelled, cancelled) && self.cleanup_until == cleanup_until
     }
 
     fn check_cleanup_deadline(&mut self, now: Instant) -> io::Result<()> {
@@ -234,6 +244,19 @@ mod tests {
             cleanup_cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
+    #[test]
+    fn receiver_matches_only_the_original_run_token_and_cleanup_bound() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let window = window();
+        let receiver = CancelReceiverV1::from_original_window(stream, scope(), &window)
+            .ok()
+            .unwrap();
+        assert!(receiver.matches_window(&window.cancelled, window.cleanup_until));
+        let unrelated_token = Arc::new(AtomicBool::new(false));
+        assert!(!receiver.matches_window(&unrelated_token, window.cleanup_until));
+        assert!(!receiver.matches_window(&window.cancelled, window.run_until));
+    }
+
     #[test]
     fn fragmented_request_duplicate_and_cleanup_token_are_distinct() {
         let (stream, mut owner) = UnixStream::pair().unwrap();

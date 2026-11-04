@@ -6,6 +6,7 @@
 use super::{
     DirectPalsChildV6, PalsDirectChildInputPipeV6, PalsDirectChildObservationV6,
     PalsImageGrantObservationV6, PalsProxyBinaryPinV6, PalsProxyLaunchV6,
+    cancel_control_v1::{CancelFailureObservation, CancelReceiverV1},
     finish::{self, PalsRuntimeFinishClaimV6, PalsSessionReleaseClaimV6},
     relay::{
         PalsUciRelayV6, RelayInputCleanupReportV6, RelayInputCleanupStartV6,
@@ -60,6 +61,8 @@ pub(super) struct ProxySupervisorObservationV6 {
     pub input_cleanup_start: Option<RelayInputCleanupStartV6>,
     pub input_cleanup_stop: Option<RelayInputCleanupStopV6>,
     pub physical_completion: &'static str,
+    /// Transport failure only; not a cancellation or physical completion.
+    pub cancel_control_failure: Option<CancelFailureObservation>,
 }
 
 #[must_use = "retain the original child, relay and process while physical completion is unknown"]
@@ -80,6 +83,8 @@ pub(super) struct PalsProxySupervisorV6 {
     cleanup_max_ms: u64,
     cancelled: Arc<AtomicBool>,
     finish_cancelled: Arc<AtomicBool>,
+    // The exact channel remains with this original supervisor even on error.
+    cancel_receiver: Option<CancelReceiverV1>,
     max_line: usize,
     pub stage: ProxyStageV6,
     pub failed_stage: Option<ProxyStageV6>,
@@ -133,6 +138,7 @@ impl PalsProxySupervisorV6 {
             bound_reference,
             cancelled,
             finish_cancelled,
+            cancel_receiver: None,
             max_line,
             stage: ProxyStageV6::Configured,
             failed_stage: None,
@@ -152,6 +158,31 @@ impl PalsProxySupervisorV6 {
             session_release_attempted: false,
             input_cleanup_start: None,
             input_cleanup_stop: None,
+        }
+    }
+
+    /// The caller must first authenticate this dedicated channel to the
+    /// original arena owner and role. Window identity alone is not that proof.
+    /// On mismatch return the same receiver and stream without dropping them.
+    pub(super) fn attach_caller_authenticated_cancel(
+        &mut self,
+        receiver: CancelReceiverV1,
+    ) -> Result<(), CancelReceiverV1> {
+        if self.stage != ProxyStageV6::Configured
+            || self.cancel_receiver.is_some()
+            || !receiver.matches_window(&self.cancelled, self.finish_until)
+        {
+            return Err(receiver);
+        }
+        self.cancel_receiver = Some(receiver);
+        Ok(())
+    }
+
+    fn poll_cancel_control(&mut self) {
+        if let Some(receiver) = self.cancel_receiver.as_mut() {
+            // A transport failure is retained on this receiver and reported
+            // separately; output drain and child supervision must continue.
+            let _ = receiver.poll();
         }
     }
 
@@ -189,6 +220,7 @@ impl PalsProxySupervisorV6 {
         if self.stage != ProxyStageV6::Configured {
             return self.stage;
         }
+        self.poll_cancel_control();
         match catch_unwind(AssertUnwindSafe(|| self.start_inner())) {
             Ok(Ok(())) => self.stage,
             Ok(Err(error)) => {
@@ -292,6 +324,12 @@ impl PalsProxySupervisorV6 {
     /// One nonblocking observation. Cancellation stops new UCI input but
     /// leaves output draining to its original finite deadline.
     pub(super) fn poll(&mut self) -> io::Result<ProxySupervisorObservationV6> {
+        self.poll_cancel_control();
+        let cancel_control_failure = self
+            .cancel_receiver
+            .as_ref()
+            .and_then(CancelReceiverV1::first_failure)
+            .cloned();
         let mut cleanup_stop = None;
         let relay = self.relay.as_mut().map(|relay| {
             let observation = relay.poll();
@@ -325,6 +363,7 @@ impl PalsProxySupervisorV6 {
             input_cleanup_start: self.input_cleanup_start,
             input_cleanup_stop: cleanup_stop,
             physical_completion: "unknown",
+            cancel_control_failure,
         })
     }
 
