@@ -16,9 +16,8 @@ use rz_uci::pals_native::ticketed::{
 };
 use std::cell::Cell;
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
-    mpsc,
+    atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    mpsc, Arc, Mutex,
 };
 
 /// A ticket's independent speculative handoff state. It never proves NN
@@ -573,6 +572,45 @@ impl RoventNativeCaptureRegistration {
         root.route.installed.store(false, Ordering::Release);
         roots.remove(index);
         Ok(Some(true))
+    }
+
+    /// Own uses its own joined custody and native fence, never a PC proof.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn try_unlink_finished_speculative_root_v3_own(
+        &self,
+        root: &SpeculativeRootV3,
+        proof: &super::own_hooks_lock_v3::RoventOwnTeacherRouteRetirementV3,
+    ) -> Result<Option<bool>, ArenaError> {
+        let registered = match self.registered.try_lock() {
+            Ok(value) => value,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("capture registrations poisoned"))
+            }
+        };
+        let mut roots = match self.speculative_roots_v3.try_lock() {
+            Ok(value) => value,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v3 speculative root custody poisoned"))
+            }
+        };
+        if !root.same_registration_owner(&self.speculative_owner_v3)
+            || registered.values().any(|entry| matches!(entry,
+                RegisteredInputCapture::LockV3 { admission, .. } if root.matches_admission(admission)))
+        {
+            return Ok(Some(false));
+        }
+        let Some(index) = roots
+            .iter()
+            .position(|entry| entry.same_original_route(root))
+        else {
+            return Ok(Some(false));
+        };
+        proof.with_original_route(root, || {
+            root.route.installed.store(false, Ordering::Release);
+            roots.remove(index);
+        })
     }
     pub(super) fn same_original_owner(&self, other: &Self) -> bool {
         let same = Arc::ptr_eq(&self.registered, &other.registered)

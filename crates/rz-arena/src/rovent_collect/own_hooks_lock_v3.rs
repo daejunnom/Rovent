@@ -12,7 +12,7 @@ use super::policy_row_pipeline_v3::PolicyRowPipelineOwnerV3;
 use super::speculative_route_v3::SpeculativeRootV3;
 use super::teacher::v3_pump::TeacherPumpV3;
 use super::teacher::v3_session::TeacherSessionStagingV3;
-use super::{ArenaError, invalid};
+use super::{invalid, ArenaError};
 use rz_search::pals::engine::adaptive_port::AdaptivePortQuestion;
 use rz_uci::pals_adaptive::{
     AdaptiveCollectionBoundaryV2, AdaptiveCollectionObserverBoxV3,
@@ -27,7 +27,7 @@ use rz_uci::pals_adaptive::{
 use rz_uci::pals_native::ticketed::VirtualReviewTicketOutput;
 use rz_uci::rovent_bootstrap::{RoventNativeBackend, RoventStartupControl};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak, mpsc};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, TryLockError, Weak};
 
 type Output = VirtualReviewTicketOutput;
 type Backend = RoventNativeBackend<AdaptivePortQuestion>;
@@ -63,6 +63,132 @@ struct State {
     maximum_roots: usize,
     maximum_workers: usize,
     maximum_teacher_roots: usize,
+}
+
+/// Own-specific retirement proof. It retains the same bridge, recovery and
+/// pump and rechecks their original owners immediately before route unlink.
+pub(crate) struct RoventOwnTeacherRouteRetirementV3 {
+    bridge: Arc<RoventOwnCollectionBridgeV3>,
+    route: SpeculativeRootV3,
+    recovery: Arc<Mutex<OwnRootRecoveryV3>>,
+    pump: Arc<Mutex<TeacherPumpV3>>,
+}
+
+impl RoventOwnTeacherRouteRetirementV3 {
+    pub(crate) fn with_original_route(
+        &self,
+        requested: &SpeculativeRootV3,
+        _unlink: impl FnOnce(),
+    ) -> Result<Option<bool>, ArenaError> {
+        if !self.route.same_original_route(requested) {
+            return Ok(Some(false));
+        }
+        let state = match self.bridge.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err(invalid("Own /3 root custody poisoned")),
+        };
+        let Some(slot) = state
+            .slots
+            .iter()
+            .find(|slot| self.route.matches_admission(&slot.admission))
+        else {
+            return Ok(Some(false));
+        };
+        if !slot.join_complete
+            || slot.join_unknown
+            || slot.join_failure.is_some()
+            || slot.join_panic.is_some()
+            || !slot
+                .route
+                .as_ref()
+                .is_some_and(|route| route.same_original_route(&self.route))
+            || !slot
+                .recovery
+                .as_ref()
+                .is_some_and(|root| Arc::ptr_eq(root, &self.recovery))
+        {
+            return Ok(Some(false));
+        }
+        let recovery = match self.recovery.try_lock() {
+            Ok(root) => root,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err(invalid("Own /3 recovery poisoned")),
+        };
+        if !recovery.matches_admission(&slot.admission)
+            || !recovery
+                .route
+                .as_ref()
+                .is_some_and(|route| route.same_original_route(&self.route))
+            || !recovery
+                .pump
+                .as_ref()
+                .is_some_and(|pump| Arc::ptr_eq(pump, &self.pump))
+            || recovery.consumer_phase != 0
+            || recovery.consumer_failure.is_some()
+            || recovery.persistence_failure.is_some()
+        {
+            return Ok(Some(false));
+        }
+        let _consumer = match &recovery.consumer {
+            Some(owner) => match owner.try_lock() {
+                Ok(Some(guard)) => Some(guard),
+                Ok(None) => return Ok(None),
+                Err(error) => return Err(invalid(error)),
+            },
+            None => None,
+        };
+        let Some(returned) = &slot.returned else {
+            return Ok(Some(false));
+        };
+        let custody = match returned.try_lock() {
+            Ok(custody) => custody,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(invalid("Own /3 returned custody poisoned"))
+            }
+        };
+        if !slot
+            .worker_key
+            .as_ref()
+            .is_some_and(|key| custody.matches_worker(key))
+            || !slot
+                .handoff
+                .as_ref()
+                .is_some_and(|handoff| custody.matches_handoff(handoff))
+        {
+            return Ok(Some(false));
+        }
+        let mut handoff = match custody.handoff().try_lock() {
+            Ok(handoff) => handoff,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err(invalid("Own /3 handoff poisoned")),
+        };
+        let (admission, _, settlement, fence) = handoff.parts_mut();
+        if !admission.same_original_admission(&slot.admission)
+            || settlement.is_err()
+            || !fence.permits_semantic_closure()
+            || !handoff
+                .teacher_aggregate_ack()
+                .is_some_and(|ack| ack.matches_admission(&slot.admission))
+        {
+            return Ok(Some(false));
+        }
+        let pump = match self.pump.try_lock() {
+            Ok(pump) => pump,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err(invalid("Own /3 teacher pump poisoned")),
+        };
+        match pump.try_retirement_ready(&self.route)? {
+            Some(true) => {
+                // A native callback can prepare and send outside the ticket
+                // accounting lock. Until its whole-return fence is proven or
+                // a same-route send gate is held, do not unlink the route.
+                Ok(Some(false))
+            }
+            other => Ok(other),
+        }
+    }
 }
 
 /// Both this hook and its external supervisor retain this same Arc. The
@@ -126,6 +252,53 @@ pub(crate) enum OwnReserveOutcomeV3 {
 }
 
 impl RoventOwnCollectionBridgeV3 {
+    /// This removes only the exact completed native capture route. All root,
+    /// returned custody and retained output owners stay in their original
+    /// slots; unlinking is not launch settlement or permission to delete.
+    pub(crate) fn try_retire_route(
+        self: &Arc<Self>,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<Option<bool>, ArenaError> {
+        let (route, recovery) = {
+            let state = match self.state.try_lock() {
+                Ok(state) => state,
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(invalid("Own /3 root custody poisoned"))
+                }
+            };
+            let Some(slot) = state
+                .slots
+                .iter()
+                .find(|slot| slot.admission.same_original_admission(admission))
+            else {
+                return Ok(Some(false));
+            };
+            let (Some(route), Some(recovery)) = (&slot.route, &slot.recovery) else {
+                return Ok(Some(false));
+            };
+            (route.clone(), Arc::clone(recovery))
+        };
+        let pump = {
+            let original = match recovery.try_lock() {
+                Ok(original) => original,
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Poisoned(_)) => return Err(invalid("Own /3 recovery poisoned")),
+            };
+            let Some(pump) = &original.pump else {
+                return Ok(Some(false));
+            };
+            Arc::clone(pump)
+        };
+        let proof = RoventOwnTeacherRouteRetirementV3 {
+            bridge: Arc::clone(self),
+            route: route.clone(),
+            recovery,
+            pump,
+        };
+        self.registration
+            .try_unlink_finished_speculative_root_v3_own(&route, &proof)
+    }
     /// Called before native startup. No worker or teacher is started here.
     pub(crate) fn new(
         registration: RoventNativeCaptureRegistration,
