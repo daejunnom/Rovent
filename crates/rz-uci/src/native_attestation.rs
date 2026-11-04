@@ -436,7 +436,10 @@ impl TerminationReceiptV1 {
                 .is_some_and(|report| actual_cpu_observed(startup, report)),
             physical_drain: drain.into(),
             report: wire_report,
-            original_service_failure: service.map(causes::engine),
+            original_service_failure: service
+                .map(causes::engine)
+                .transpose()
+                .map_err(AttestationError::from)?,
             collection_failure: collection.map(causes::contract),
             retained_owner_and_evidence: retained,
         })

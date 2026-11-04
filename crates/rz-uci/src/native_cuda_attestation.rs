@@ -481,7 +481,10 @@ impl CudaTerminationReceiptV1 {
             actual_rules_search_backup_observed: actual_cuda && backup,
             physical_drain: drain.into(),
             report: wire_report,
-            original_service_failure: service.map(causes::engine),
+            original_service_failure: service
+                .map(causes::engine)
+                .transpose()
+                .map_err(AttestationError::from)?,
             collection_failure: collection.map(causes::contract),
             runtime_mapping_failure: result
                 .as_ref()

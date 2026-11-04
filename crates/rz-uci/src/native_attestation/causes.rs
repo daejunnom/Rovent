@@ -382,10 +382,6 @@ pub enum CauseNodeV1 {
         code: TextFingerprintV1,
     },
     EngineWorkerPanic,
-    /// Additive bounded projection; the original io::Error stays in EngineError.
-    EngineTimerSpawn {
-        error_kind: String,
-    },
     EngineDrainTimeout,
     EngineUndeliveredDiagnostics {
         diagnostics: CauseListV1,
@@ -709,9 +705,9 @@ impl Budget {
                 }),
             },
             EngineError::WorkerPanic => CauseNodeV1::EngineWorkerPanic,
-            EngineError::TimerSpawn(error) => CauseNodeV1::EngineTimerSpawn {
-                error_kind: format!("{:?}", error.kind()),
-            },
+            EngineError::TimerSpawn(_) => {
+                unreachable!("V1 projection preflight rejects timer spawn")
+            }
             EngineError::DrainTimeout => CauseNodeV1::EngineDrainTimeout,
             EngineError::UndeliveredDiagnostics(receipts) => {
                 CauseNodeV1::EngineUndeliveredDiagnostics {
@@ -758,8 +754,46 @@ pub(crate) fn contract(error: &ContractError) -> CauseReceiptV1 {
 pub(crate) fn backend(error: &BackendError) -> CauseReceiptV1 {
     project(|budget| budget.backend(error, 1))
 }
-pub(crate) fn engine(error: &EngineError) -> CauseReceiptV1 {
-    project(|budget| budget.engine(error, 1))
+/// V1 cannot describe an operating-system timer spawn failure. Reject the
+/// complete receipt rather than inventing an older cause or a budget omission.
+/// The borrowed original EngineError remains with the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CauseProjectionError {
+    TimerSpawnUnsupportedV1,
+}
+impl From<CauseProjectionError> for super::AttestationError {
+    fn from(_: CauseProjectionError) -> Self {
+        Self::contract(
+            "v1_engine_cause_projection",
+            ContractError::new(
+                ContractCode::UnsupportedContract,
+                ContractStage::Output,
+                "V1 cannot represent a timer thread spawn failure",
+            ),
+        )
+    }
+}
+pub(crate) fn engine(error: &EngineError) -> Result<CauseReceiptV1, CauseProjectionError> {
+    let mut pending = vec![error];
+    while let Some(current) = pending.pop() {
+        match current {
+            EngineError::TimerSpawn(_) => {
+                return Err(CauseProjectionError::TimerSpawnUnsupportedV1);
+            }
+            EngineError::Cleanup { primary, cleanup } => {
+                pending.push(primary);
+                pending.extend(cleanup);
+            }
+            EngineError::Transport(transport) => {
+                if let ServeFailure::Handler(original) = &transport.failure {
+                    pending.push(original);
+                }
+                pending.extend(&transport.cleanup_failures);
+            }
+            _ => {}
+        }
+    }
+    Ok(project(|budget| budget.engine(error, 1)))
 }
 pub(crate) fn native(receipt: &NativeDiagnosticReceipt) -> CauseReceiptV1 {
     project(|budget| budget.native(receipt, 1))
@@ -774,13 +808,41 @@ mod tests {
     const PRIVATE_TEXT: &str = "C:\\private-person\\native-runtime\\credentials-never-publish";
 
     #[test]
+    fn v1_rejects_nested_timer_spawn_without_replacing_original_error() {
+        let original = EngineError::Transport(Box::new(ServeError {
+            failure: ServeFailure::Handler(EngineError::Cleanup {
+                primary: Box::new(EngineError::DrainTimeout),
+                cleanup: vec![EngineError::TimerSpawn(std::io::Error::from_raw_os_error(
+                    11,
+                ))],
+            }),
+            cleanup_failures: Vec::new(),
+            diagnostics: Vec::new(),
+        }));
+        assert!(matches!(
+            engine(&original),
+            Err(CauseProjectionError::TimerSpawnUnsupportedV1)
+        ));
+        let EngineError::Transport(transport) = &original else {
+            panic!("transport lost")
+        };
+        let ServeFailure::Handler(EngineError::Cleanup { cleanup, .. }) = &transport.failure else {
+            panic!("cleanup lost")
+        };
+        let EngineError::TimerSpawn(error) = &cleanup[0] else {
+            panic!("spawn cause lost")
+        };
+        assert_eq!(error.raw_os_error(), Some(11));
+    }
+
+    #[test]
     fn driver_close_keeps_unknown_completion_and_redacts_dynamic_detail() {
         let original = EngineError::SearchDriverClose(crate::search_driver::SearchSessionFailure {
             physical_completion: crate::search_driver::DriverPhysicalCompletion::Unknown,
             code: "PhysicalCompletionUnknown",
             detail: PRIVATE_TEXT.into(),
         });
-        let projected = engine(&original);
+        let projected = engine(&original).unwrap();
         assert!(matches!(
             &projected.projection,
             CauseNodeV1::EngineSearchDriverClose {
@@ -865,7 +927,7 @@ mod tests {
             )])),
             cleanup: vec![EngineError::DrainTimeout],
         };
-        let receipt = engine(&error);
+        let receipt = engine(&error).unwrap();
         assert!(!receipt.projection_truncated);
         let CauseNodeV1::EngineCleanup { primary, cleanup } = &receipt.projection else {
             panic!("compound cause")
@@ -1016,7 +1078,7 @@ mod tests {
                 message: PRIVATE_TEXT.into(),
             }],
         }));
-        let value = serde_json::to_value(engine(&transport)).unwrap();
+        let value = serde_json::to_value(engine(&transport).unwrap()).unwrap();
         assert_eq!(
             value["projection"]["failure"]["cause"]["error_kind"],
             "BrokenPipe"
@@ -1036,7 +1098,7 @@ mod tests {
                 cleanup: vec![EngineError::WorkerPanic],
             };
         }
-        let deep_receipt = engine(&deep);
+        let deep_receipt = engine(&deep).unwrap();
         assert!(deep_receipt.projection_truncated);
         let deep_json = serde_json::to_string(&deep_receipt).unwrap();
         assert!(deep_json.contains("\"state\":\"omitted\",\"reason\":\"depth\""));
@@ -1045,7 +1107,7 @@ mod tests {
             primary: Box::new(EngineError::DrainTimeout),
             cleanup: (0..200).map(|_| EngineError::WorkerPanic).collect(),
         };
-        let receipt = engine(&wide);
+        let receipt = engine(&wide).unwrap();
         assert!(receipt.projection_truncated);
         assert_eq!(receipt.projected_nodes, MAX_NODES);
         let CauseNodeV1::EngineCleanup { cleanup, .. } = receipt.projection else {
