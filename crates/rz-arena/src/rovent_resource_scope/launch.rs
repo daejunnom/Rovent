@@ -2162,8 +2162,15 @@ impl RoventPcCollectionResourceOutcomeV3 {
         #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
         if let Some(proof) = self.driver_joined.as_ref() {
             if !self.driver_released {
-                if !proof.release_after_settlement(permit)? {
-                    return Ok(None);
+                use crate::rovent_collect::launch::{PcDriverEvidenceErrorV3, PcDriverPollV3};
+                match proof
+                    .try_release_after_settlement(permit)
+                    .map_err(|error| match error {
+                        PcDriverEvidenceErrorV3::Poisoned(reason)
+                        | PcDriverEvidenceErrorV3::Invalid(reason) => reason,
+                    })? {
+                    PcDriverPollV3::Pending | PcDriverPollV3::Ready(false) => return Ok(None),
+                    PcDriverPollV3::Ready(true) => {}
                 }
                 self.driver_released = true;
                 match self.native.as_mut() {

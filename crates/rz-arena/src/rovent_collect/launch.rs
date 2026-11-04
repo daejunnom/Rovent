@@ -72,7 +72,9 @@ mod r_stream;
 mod resources;
 mod utility_stream;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
-pub(crate) use super::pc_worker_v3::PcSupervisorJoinedProofV3;
+pub(crate) use super::pc_worker_v3::{
+    PcDriverEvidenceErrorV3, PcDriverPollV3, PcSupervisorJoinedProofV3,
+};
 pub use cohort::{
     RoventUtilityCohortLaunchFailure, RoventUtilityCohortLaunchPlan,
     RoventUtilityCohortLaunchReceipt, run_rovent_utility_cohort,
