@@ -369,6 +369,26 @@ impl PolicyRowPipelineV3 {
         self.failure.as_ref()
     }
 
+    /// `None` means no root/ticket owner is present (for example, a writer
+    /// failure before a row). An unrelated live row is ordinary NotReady.
+    pub(super) fn scope_matches(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+        ticket: &rz_contracts::pals_adaptive::RoleTicketEnvelope,
+    ) -> Option<bool> {
+        if let Some(pending) = &self.pending {
+            return Some(
+                pending
+                    .original_admission()
+                    .same_original_admission(admission)
+                    && pending.ticket() == *ticket,
+            );
+        }
+        self.row.as_ref().map(|row| {
+            row.admission().same_original_admission(admission) && row.ticket() == *ticket
+        })
+    }
+
     /// Unknown never authorizes retry, dropping the writer, or publication.
     pub(super) fn is_uncertain(&self) -> bool {
         matches!(
