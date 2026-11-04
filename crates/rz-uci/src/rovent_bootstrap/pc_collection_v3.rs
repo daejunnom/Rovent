@@ -29,6 +29,7 @@ pub(crate) struct RoventPcCollectionStateV3 {
     pub(crate) deferred_cleanup: Mutex<Option<Arc<Mutex<RoventPcDeferredCleanupV3>>>>,
     pub(crate) prior_cleanup_failures: Mutex<Vec<Arc<Mutex<RoventPcDeferredCleanupV3>>>>,
     pub(crate) cleanup_context: Mutex<Option<crate::search_driver::SearchSessionContext>>,
+    pub(crate) recovery_root: Mutex<Option<super::pc_collection_v3_root::PcCollectionRootRunV3>>,
     pub(crate) admission_failure: Mutex<Option<RoventPcCollectionAdmissionFailureV3>>,
     pub(crate) panics: Mutex<(Option<Box<dyn Any + Send>>, Option<Box<dyn Any + Send>>)>,
 }
@@ -48,6 +49,7 @@ impl RoventPcCollectionStateV3 {
             deferred_cleanup: Mutex::new(None),
             prior_cleanup_failures: Mutex::new(Vec::new()),
             cleanup_context: Mutex::new(None),
+            recovery_root: Mutex::new(None),
             admission_failure: Mutex::new(None),
             panics: Mutex::new((None, None)),
         }

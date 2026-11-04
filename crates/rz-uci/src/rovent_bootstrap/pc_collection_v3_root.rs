@@ -23,6 +23,11 @@ pub(crate) struct PcCollectionRootRunV3 {
     started: bool,
     revoked: bool,
     uncertain: bool,
+    handoff_sent: bool,
+    custody_take_uncertain: bool,
+    custody_return_uncertain: bool,
+    custody_returned: bool,
+    settled: bool,
 }
 
 impl PcCollectionRootRunV3 {
@@ -417,70 +422,146 @@ impl PcCollectionRootRunV3 {
             .ok_or(AdaptiveManagerError::Invalid(
                 "P/C V3 handoff original root absent",
             ))?;
-        let sender = match catch_unwind(AssertUnwindSafe(|| {
-            state.hooks.handoff_sender_root(original)
-        })) {
-            Ok(result) => result?,
-            Err(payload) => {
-                state.panics.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
-                return Err(AdaptiveManagerError::Invalid(
-                    "P/C V3 handoff callback panicked",
-                ));
+        if self.settled {
+            return Ok(());
+        }
+        // A taken observer cannot be recreated from the manager. Reuse the
+        // exact handoff retained before sending it, even after a failed send.
+        let existing = state
+            .handoff
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .cloned();
+        let handoff = if let Some(handoff) = existing {
+            handoff
+        } else {
+            // Obtain the sender before taking the observer. A failing or
+            // panicking callback therefore leaves it in the original manager.
+            let sender = match catch_unwind(AssertUnwindSafe(|| {
+                state.hooks.handoff_sender_root(original)
+            })) {
+                Ok(result) => result?,
+                Err(payload) => {
+                    state.panics.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                    return Err(AdaptiveManagerError::Invalid(
+                        "P/C V3 handoff callback panicked",
+                    ));
+                }
+            };
+            let (admission, observer, settlement) =
+                manager
+                    .take_collection_observer_v3()?
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "P/C V3 original observer unavailable",
+                    ))?;
+            let handoff = Arc::new(Mutex::new(RoventPcCollectionHandoffV3::new(
+                admission, observer, settlement, physical,
+            )));
+            *state.handoff.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&handoff));
+            if !handoff
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .admission
+                .same_original_admission(original)
+            {
+                return Err(AdaptiveManagerError::Invalid("P/C V3 handoff root differs"));
             }
+            if sender.try_send(Arc::clone(&handoff)).is_err() {
+                return Err(AdaptiveManagerError::AuxiliaryPending);
+            }
+            self.handoff_sent = true;
+            handoff
         };
-        let (admission, observer, settlement) =
-            manager
-                .take_collection_observer_v3()?
-                .ok_or(AdaptiveManagerError::Invalid(
-                    "P/C V3 original observer unavailable",
-                ))?;
-        let handoff = Arc::new(Mutex::new(RoventPcCollectionHandoffV3::new(
-            admission, observer, settlement, physical,
-        )));
-        *state.handoff.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&handoff));
         if !handoff
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .admission
             .same_original_admission(original)
         {
-            return Err(AdaptiveManagerError::Invalid("P/C V3 handoff root differs"));
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C V3 retained handoff root differs",
+            ));
         }
-        if sender.try_send(Arc::clone(&handoff)).is_err() {
-            return Err(AdaptiveManagerError::AuxiliaryPending);
-        }
-        let signal = manager.activity_signal();
-        let custody = loop {
-            let version = signal.version();
-            match catch_unwind(AssertUnwindSafe(|| {
-                state.hooks.try_take_root_custody(&handoff)
+        if !self.handoff_sent {
+            let sender = match catch_unwind(AssertUnwindSafe(|| {
+                state.hooks.handoff_sender_root(original)
             })) {
-                Ok(Ok(Some(owner))) => {
-                    let matches = owner.matches_handoff(&handoff);
-                    let owner = Arc::new(Mutex::new(owner));
-                    *state.custody.lock().unwrap_or_else(|p| p.into_inner()) =
-                        Some(Arc::clone(&owner));
-                    if !matches {
-                        return Err(AdaptiveManagerError::Invalid("P/C V3 joined root differs"));
-                    }
-                    break owner;
-                }
-                Ok(Ok(None)) if Instant::now() < context.shutdown_deadline => {
-                    signal.wait_changed(
-                        version,
-                        context
-                            .shutdown_deadline
-                            .saturating_duration_since(Instant::now())
-                            .min(Duration::from_millis(10)),
-                    );
-                }
-                Ok(Ok(None)) => return Err(AdaptiveManagerError::AuxiliaryPending),
-                Ok(Err(error)) => return Err(error),
+                Ok(result) => result?,
                 Err(payload) => {
                     state.panics.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
                     return Err(AdaptiveManagerError::Invalid(
-                        "P/C V3 custody callback panicked",
+                        "P/C V3 handoff callback panicked",
                     ));
+                }
+            };
+            if sender.try_send(Arc::clone(&handoff)).is_err() {
+                return Err(AdaptiveManagerError::AuxiliaryPending);
+            }
+            self.handoff_sent = true;
+        }
+        let signal = manager.activity_signal();
+        let existing = state
+            .custody
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .cloned();
+        let custody = if let Some(owner) = existing {
+            if !owner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .matches_handoff(&handoff)
+            {
+                return Err(AdaptiveManagerError::Invalid(
+                    "P/C V3 retained joined root differs",
+                ));
+            }
+            owner
+        } else {
+            if self.custody_take_uncertain {
+                return Err(AdaptiveManagerError::Invalid(
+                    "P/C V3 worker custody transfer unresolved",
+                ));
+            }
+            loop {
+                let version = signal.version();
+                match catch_unwind(AssertUnwindSafe(|| {
+                    state.hooks.try_take_root_custody(&handoff)
+                })) {
+                    Ok(Ok(Some(owner))) => {
+                        let matches = owner.matches_handoff(&handoff);
+                        let owner = Arc::new(Mutex::new(owner));
+                        *state.custody.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(Arc::clone(&owner));
+                        if !matches {
+                            return Err(AdaptiveManagerError::Invalid(
+                                "P/C V3 joined root differs",
+                            ));
+                        }
+                        break owner;
+                    }
+                    Ok(Ok(None)) if Instant::now() < context.shutdown_deadline => {
+                        signal.wait_changed(
+                            version,
+                            context
+                                .shutdown_deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(10)),
+                        );
+                    }
+                    Ok(Ok(None)) => return Err(AdaptiveManagerError::AuxiliaryPending),
+                    Ok(Err(error)) => {
+                        self.custody_take_uncertain = true;
+                        return Err(error);
+                    }
+                    Err(payload) => {
+                        self.custody_take_uncertain = true;
+                        state.panics.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                        return Err(AdaptiveManagerError::Invalid(
+                            "P/C V3 custody callback panicked",
+                        ));
+                    }
                 }
             }
         };
@@ -492,32 +573,46 @@ impl PcCollectionRootRunV3 {
         {
             return Err(AdaptiveManagerError::AuxiliaryPending);
         }
-        loop {
-            let version = signal.version();
-            match catch_unwind(AssertUnwindSafe(|| {
-                state.hooks.return_root_custody(Arc::clone(&custody))
-            })) {
-                Ok(Ok(RoventPcCustodyReturnV3::Accepted)) => break,
-                Ok(Ok(RoventPcCustodyReturnV3::Busy))
-                    if Instant::now() < context.shutdown_deadline =>
-                {
-                    signal.wait_changed(
-                        version,
-                        context
-                            .shutdown_deadline
-                            .saturating_duration_since(Instant::now())
-                            .min(Duration::from_millis(10)),
-                    );
-                }
-                Ok(Ok(RoventPcCustodyReturnV3::Busy)) => {
-                    return Err(AdaptiveManagerError::AuxiliaryPending);
-                }
-                Ok(Err(error)) => return Err(error),
-                Err(payload) => {
-                    state.panics.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
-                    return Err(AdaptiveManagerError::Invalid(
-                        "P/C V3 return callback panicked",
-                    ));
+        if self.custody_return_uncertain {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C V3 worker return unresolved",
+            ));
+        }
+        if !self.custody_returned {
+            loop {
+                let version = signal.version();
+                match catch_unwind(AssertUnwindSafe(|| {
+                    state.hooks.return_root_custody(Arc::clone(&custody))
+                })) {
+                    Ok(Ok(RoventPcCustodyReturnV3::Accepted)) => {
+                        self.custody_returned = true;
+                        break;
+                    }
+                    Ok(Ok(RoventPcCustodyReturnV3::Busy))
+                        if Instant::now() < context.shutdown_deadline =>
+                    {
+                        signal.wait_changed(
+                            version,
+                            context
+                                .shutdown_deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(10)),
+                        );
+                    }
+                    Ok(Ok(RoventPcCustodyReturnV3::Busy)) => {
+                        return Err(AdaptiveManagerError::AuxiliaryPending);
+                    }
+                    Ok(Err(error)) => {
+                        self.custody_return_uncertain = true;
+                        return Err(error);
+                    }
+                    Err(payload) => {
+                        self.custody_return_uncertain = true;
+                        state.panics.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                        return Err(AdaptiveManagerError::Invalid(
+                            "P/C V3 return callback panicked",
+                        ));
+                    }
                 }
             }
         }
@@ -531,6 +626,7 @@ impl PcCollectionRootRunV3 {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take();
+        self.settled = true;
         state.outstanding.store(false, Ordering::Release);
         Ok(())
     }

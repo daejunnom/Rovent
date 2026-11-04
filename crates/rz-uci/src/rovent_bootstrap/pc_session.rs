@@ -3798,6 +3798,10 @@ impl RoventPcSessionDriver {
                         .unwrap_or_else(|p| p.into_inner())
                         .0 = Some(payload);
                 }
+                *collection
+                    .recovery_root
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(v3_root);
                 *state = State::Manager(manager);
                 self.closed.store(true, Ordering::Release);
                 let mut failure = SearchSessionFailure::debug("RoventPcV3CollectionRevoke", &error);
@@ -3894,6 +3898,10 @@ impl RoventPcSessionDriver {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .0 = Some(payload);
+                *collection
+                    .recovery_root
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(v3_root);
                 *state = State::Manager(manager);
                 self.closed.store(true, Ordering::Release);
                 return Err(physical_unknown_at(
@@ -3918,6 +3926,13 @@ impl RoventPcSessionDriver {
             ));
         }
         if !matches!(&run_result, Some(Ok(()))) {
+            #[cfg(target_os = "linux")]
+            if let Some(collection) = &self.collection_v3 {
+                *collection
+                    .recovery_root
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(v3_root);
+            }
             *state = State::Manager(manager);
             self.closed.store(true, Ordering::Release);
             return Err(match run_result {
@@ -3932,6 +3947,13 @@ impl RoventPcSessionDriver {
         let physical = match manager.shutdown_receipt() {
             Ok(receipt) if receipt.permits_semantic_closure() => receipt,
             Ok(receipt) => {
+                #[cfg(target_os = "linux")]
+                if let Some(collection) = &self.collection_v3 {
+                    *collection
+                        .recovery_root
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(v3_root);
+                }
                 *state = State::Manager(manager);
                 self.closed.store(true, Ordering::Release);
                 return Err(physical_unknown_at(
@@ -3949,6 +3971,13 @@ impl RoventPcSessionDriver {
                 ));
             }
             Err(error) => {
+                #[cfg(target_os = "linux")]
+                if let Some(collection) = &self.collection_v3 {
+                    *collection
+                        .recovery_root
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(v3_root);
+                }
                 *state = State::Manager(manager);
                 self.closed.store(true, Ordering::Release);
                 return Err(physical_unknown_at("RoventPcShutdownReceipt", error));
@@ -3961,6 +3990,10 @@ impl RoventPcSessionDriver {
                     .cleanup_context
                     .lock()
                     .unwrap_or_else(|p| p.into_inner()) = Some(context.clone());
+                *collection
+                    .recovery_root
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(v3_root);
                 *state = State::Manager(manager);
                 self.closed.store(true, Ordering::Release);
                 return Err(SearchSessionFailure::debug(
@@ -4849,19 +4882,59 @@ impl RoventPcSessionDriver {
                             .unwrap_or_else(|p| p.into_inner())
                             .clone();
                         if let Some(context) = pending_context {
-                            let has_marker = collection
-                                .no_capture
+                            let recovery = collection
+                                .recovery_root
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
-                                .is_some();
-                            if has_marker {
-                                let mut recovery =
-                                    super::pc_collection_v3_root::PcCollectionRootRunV3::default();
+                                .take();
+                            if let Some(mut recovery) = recovery {
+                                let now = Instant::now();
+                                let observation = RoventPcRevokeObservationV2 {
+                                    origin: RoventPcRevokeOriginV2::RunEnded,
+                                    elapsed_from_start: context.original_time_budget.and_then(
+                                        |budget| now.checked_duration_since(budget.start),
+                                    ),
+                                    context_acceptance: match context.accepts() {
+                                        Ok(true) => RoventPcContextAcceptanceV2::Accepted,
+                                        Ok(false) => RoventPcContextAcceptanceV2::Rejected,
+                                        Err(_) => RoventPcContextAcceptanceV2::Unavailable,
+                                    },
+                                    soft_expired: context.soft_expired(now),
+                                    manager_phase: manager.phase(),
+                                    goal: manager
+                                        .driver()
+                                        .port()
+                                        .rovent_frontier_receipt()
+                                        .map(|receipt| receipt.snapshot.goal),
+                                    role_calls_admitted: manager.role_call_budget_usage().0,
+                                    role_calls_reserved: manager.role_call_budget_usage().1,
+                                    role_call_limit: manager.role_call_limit(),
+                                    role_call_limit_reached: manager.role_call_limit_reached(),
+                                    manager_failures: manager.failures().count(),
+                                    driver_complete_at_revoke: manager.driver_is_complete(),
+                                };
+                                if let Err(error) =
+                                    recovery.revoke_after_run(collection, &context, observation)
+                                {
+                                    *collection
+                                        .recovery_root
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner()) = Some(recovery);
+                                    *state = State::Manager(manager);
+                                    return Err(SearchSessionFailure::debug(
+                                        "RoventPcV3RevokeRecovery",
+                                        &error,
+                                    ));
+                                }
                                 if let Err(error) = recovery.settle_after_shutdown(
                                     collection,
                                     &mut manager,
                                     &context,
                                 ) {
+                                    *collection
+                                        .recovery_root
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner()) = Some(recovery);
                                     *state = State::Manager(manager);
                                     return Err(SearchSessionFailure::debug(
                                         "RoventPcV3CleanupRecovery",
