@@ -1198,6 +1198,42 @@ impl SupervisorStartCustodyV3 {
         Ok(())
     }
 
+    /// Validate the borrowed original proof before moving it directly from
+    /// its retained slot into this custody. No fallible operation follows
+    /// the move; an error leaves the original slot untouched.
+    pub(crate) fn authorize_from_slot(
+        &mut self,
+        slot: &mut Option<super::pc_hooks_lock_v3::PcSupervisorStopAuthorizationV3>,
+    ) -> Result<(), &'static str> {
+        let authorization = slot.as_ref().ok_or("P-C stop authorization absent")?;
+        let native = self
+            .native
+            .as_ref()
+            .ok_or("P-C supervisor native owner absent")?;
+        if self.stop_authorization.is_some() {
+            return Err("P-C supervisor stop already authorized");
+        }
+        if !authorization.matches_original(&self.supervisor, native) {
+            return Err("P-C supervisor stop authorization differs");
+        }
+        let running = self.state == SupervisorThreadStateV3::Running;
+        if !running {
+            let abnormal_join = match self.state {
+                SupervisorThreadStateV3::Joined => self.result.as_ref().is_some_and(Result::is_err),
+                SupervisorThreadStateV3::JoinPanicked => self.panic.is_some(),
+                _ => false,
+            };
+            if !abnormal_join || self.thread.is_some() || !self.admitted.load(Ordering::Acquire) {
+                return Err("P-C supervisor abnormal join not established");
+            }
+        }
+        self.stop_authorization = slot.take();
+        if running {
+            self.stop.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
     /// Associate the same quiescence proof with a driver which actually
     /// joined after an error or panic before a stop request could be sent.
     /// This retains its original result and does not assert collection, GPU,
