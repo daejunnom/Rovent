@@ -11,7 +11,7 @@ use super::observer_lock_v3::RoventCollectionOwnerLockV3;
 use super::pc_worker_v3::{ClaimedUnstartedPollV3, PcConsumerRetirementV3, PcRootRecoveryV3, PcWorkerSupervisorV3};
 use super::{ArenaError, invalid};
 use rz_uci::pals_adaptive::{AdaptiveCollectionBoundaryV2, AdaptiveCollectionError, AdaptiveCollectionObserverBoxV3,
-    AdaptiveManagerError, RoventCollectionRootAdmissionV3, RoventNoCaptureRootCapabilityV3,
+    AdaptiveManagerError, RoleOnlyCollectionV3InstallAttempt, RoventCollectionRootAdmissionV3, RoventNoCaptureRootCapabilityV3,
     RoventRoleOnlyNoCaptureFenceV3, RoventTeacherScopePhysicalAckV3};
 use rz_uci::rovent_bootstrap::pc_collection_v3::{
     RoventPcCollectionAdmissionFailureV3, RoventPcCollectionAdmissionOutcomeV3,
@@ -1028,8 +1028,24 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
             // be creating a worker before it publishes the prepared bundle.
             return Ok(RoventPcCollectionAdmissionOutcomeV3::PendingUncertain { admission });
         };
-        match port.install(admission, observer) {
-            Ok(()) => { slot.installed = true; Ok(RoventPcCollectionAdmissionOutcomeV3::Installed) }
+        match port.try_install(admission, observer) {
+            Ok(RoleOnlyCollectionV3InstallAttempt::Installed) => {
+                slot.installed = true;
+                Ok(RoventPcCollectionAdmissionOutcomeV3::Installed)
+            }
+            Ok(RoleOnlyCollectionV3InstallAttempt::Busy { admission, observer }) => {
+                if !admission.same_original_admission(&slot.admission) {
+                    return Err(RoventPcCollectionAdmissionFailureV3 {
+                        error: AdaptiveManagerError::Invalid("P-C V3 busy admission owner differs"),
+                        admission: admission.clone(),
+                        owners: Box::new((admission, observer)),
+                    });
+                }
+                // The supervisor may already own physical work for this
+                // root. Keep this exact observer and retry the same admission.
+                slot.observer = Some(observer);
+                Ok(RoventPcCollectionAdmissionOutcomeV3::PendingUncertain { admission })
+            }
             Err(original) => Err(RoventPcCollectionAdmissionFailureV3 {
                 error: original.error.clone(), admission: original.admission.clone(), owners: Box::new(original),
             }),
