@@ -169,12 +169,7 @@ pub fn prepare_expected_utility_cohort_source_pins(
     let read_reservation = source_read_reservation(&lock, request, &selection)?;
     // This is a real current mapped-binary/source comparison, not runtime or
     // model execution. It cannot turn a metadata result into a Ready event.
-    let binary = lock
-        .manifest
-        .engine
-        .binary
-        .open_verified_at(&root, 128 << 20)
-        .map_err(|failure| error("Binary", failure))?;
+    let binary = super::open_declared_original_binary(&root, &lock.manifest.engine.binary)?;
     let boundary = verify_actual_process_boundary(
         &lock,
         &lock.manifest.engine.binary,
@@ -346,9 +341,9 @@ fn source_read_reservation(
         &request.native_assets,
         2,
     )?;
-    // Original binary open, verify_binary_descriptor, and /proc/self/exe
-    // observation each read the same declared payload on the successful path.
-    reads.add("binary.open_verified_at", &lock.manifest.engine.binary, 1)?;
+    // The no-follow original binary open pins metadata without reading the
+    // payload. Descriptor verification and /proc/self/exe observation each
+    // read the same declared payload once on the successful path.
     reads.add(
         "binary.verify_binary_descriptor",
         &lock.manifest.engine.binary,

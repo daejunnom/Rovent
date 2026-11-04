@@ -28,10 +28,6 @@ use std::{
 
 pub const PROCESS_SOURCE_COMPONENT: &str = "rovent_process_boundary";
 pub const PROCESS_SOURCE_SCOPE: &str = "startup-boundary-and-registered-components/1";
-// Same bounded executable profile as ExecutableIdentityV1::observe().
-#[cfg(target_os = "linux")]
-const MAX_EXECUTABLE_BYTES: u64 = 128 << 20;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessBoundaryFailure {
     UnsupportedMappedExecutable,
@@ -1163,15 +1159,14 @@ fn verify_actual_process_observation<S: SourceCommitView>(
     #[cfg(target_os = "linux")]
     {
         let root_identity = verify_private_cwd(private_cwd, original_root)?;
-        let is_v3 = matches!(source_profile, SourceProfile::SystemV3(_));
-        let binary_identity = verify_binary_descriptor(binary, original_binary, control, is_v3)?;
-        let observed = if is_v3 {
-            ExecutableIdentityV1::observe_exact_with_control(binary.bytes, || {
-                check_control(control).is_ok()
-            })
-        } else {
-            ExecutableIdentityV1::observe()
-        };
+        // The original lock's exact, positive binary byte declaration is the
+        // per-file read budget in every domain. Hash the retained descriptor
+        // and mapped executable under the original startup control; a global
+        // size constant is not an execution's declared resource budget.
+        let binary_identity = verify_binary_descriptor(binary, original_binary, control)?;
+        let observed = ExecutableIdentityV1::observe_exact_with_control(binary.bytes, || {
+            check_control(control).is_ok()
+        });
         let executable = match observed {
             Ok(executable) => executable,
             Err(error) => {
@@ -1325,7 +1320,6 @@ fn verify_binary_descriptor(
     artifact: &ArtifactRef,
     file: &File,
     control: &RoventStartupControl,
-    v3_exact_budget: bool,
 ) -> Result<DescriptorIdentity, ProcessBoundaryError> {
     check_control(control)?;
     artifact.validate().map_err(|_| {
@@ -1336,9 +1330,7 @@ fn verify_binary_descriptor(
     })?;
     let before = descriptor_identity(file)?;
     require(
-        before.bytes == artifact.bytes
-            && before.bytes != 0
-            && (v3_exact_budget || before.bytes <= MAX_EXECUTABLE_BYTES),
+        before.bytes == artifact.bytes && before.bytes != 0,
         ProcessBoundaryFailure::BinaryDescriptor,
         "original binary exceeds its exact bounded declaration",
     )?;

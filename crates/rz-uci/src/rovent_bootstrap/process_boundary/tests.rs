@@ -733,24 +733,61 @@ mod linux {
     }
 
     #[test]
-    fn original_binary_hash_preserves_cursor_and_rejects_changed_bytes_and_bounds() {
+    fn original_binary_hash_preserves_cursor_and_rejects_changed_bytes_and_length() {
         let fixture = Fixture::new();
         let bytes = b"unexecuted original binary fixture";
         let (artifact, mut file) = fixture.binary(bytes);
         file.seek(SeekFrom::Start(7)).unwrap();
-        verify_binary_descriptor(&artifact, &file, &control(), false).unwrap();
+        verify_binary_descriptor(&artifact, &file, &control()).unwrap();
         assert_eq!(file.stream_position().unwrap(), 7);
-        let mut too_big = artifact.clone();
-        too_big.bytes = MAX_EXECUTABLE_BYTES + 1;
+        let mut wrong_length = artifact.clone();
+        wrong_length.bytes = artifact.bytes + 1;
         assert_eq!(
-            verify_binary_descriptor(&too_big, &file, &control(), false)
+            verify_binary_descriptor(&wrong_length, &file, &control())
                 .unwrap_err()
                 .kind,
             ProcessBoundaryFailure::BinaryDescriptor
         );
         fs::write(fixture.root.join("binary"), vec![b'x'; bytes.len()]).unwrap();
         assert_eq!(
-            verify_binary_descriptor(&artifact, &file, &control(), false)
+            verify_binary_descriptor(&artifact, &file, &control())
+                .unwrap_err()
+                .kind,
+            ProcessBoundaryFailure::BinaryDescriptor
+        );
+    }
+
+    #[test]
+    fn declared_binary_larger_than_historical_limit_is_verified_by_exact_identity() {
+        let fixture = Fixture::new();
+        let (mut artifact, file) = fixture.binary(&[0]);
+        // Sparse zeros exercise the real historical 128 MiB failure without
+        // retaining a large generated file after this owned fixture is gone.
+        let declared_bytes = (128_u64 << 20) + 1;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(fixture.root.join("binary"))
+            .unwrap()
+            .set_len(declared_bytes)
+            .unwrap();
+        let zeros = [0_u8; 64 << 10];
+        let mut hash = Sha256::new();
+        let mut remaining = declared_bytes;
+        while remaining != 0 {
+            let count = remaining.min(zeros.len() as u64) as usize;
+            hash.update(&zeros[..count]);
+            remaining -= count as u64;
+        }
+        artifact.bytes = declared_bytes;
+        artifact.sha256 = hex(hash.finalize().into());
+        let mut bounded = control();
+        bounded.until = Instant::now() + Duration::from_secs(120);
+        bounded.cleanup_until = bounded.until + Duration::from_secs(1);
+        verify_binary_descriptor(&artifact, &file, &bounded).unwrap();
+
+        artifact.sha256 = "0".repeat(64);
+        assert_eq!(
+            verify_binary_descriptor(&artifact, &file, &bounded)
                 .unwrap_err()
                 .kind,
             ProcessBoundaryFailure::BinaryDescriptor
@@ -765,7 +802,7 @@ mod linux {
         let control = control();
         control.cancellation.store(true, Ordering::Release);
         assert_eq!(
-            verify_binary_descriptor(&artifact, &file, &control, false)
+            verify_binary_descriptor(&artifact, &file, &control)
                 .unwrap_err()
                 .kind,
             ProcessBoundaryFailure::Cancelled

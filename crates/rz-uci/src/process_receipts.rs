@@ -82,8 +82,8 @@ impl ExecutableIdentityV1 {
         Self::observe_with_budget(MAX_EXECUTABLE_BYTES, false, || true)
     }
 
-    /// V3 binds the mapped executable's complete bytes to its original
-    /// ArtifactRef and original startup control rather than a global ceiling.
+    /// Bind the mapped executable's complete bytes to the original artifact
+    /// declaration and startup control rather than a global ceiling.
     /// The callback is checked between reads; a single OS read is not preempted.
     pub(crate) fn observe_exact_with_control(
         declared_bytes: u64,

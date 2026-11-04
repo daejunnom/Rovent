@@ -52,6 +52,33 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Keep the original descriptor and defer its full controlled SHA check to
+// the process boundary, as in the system-runtime route. The ArtifactRef's
+// exact positive byte count is a per-file declaration, not a global quota.
+fn open_declared_original_binary(
+    root: &Dir,
+    artifact: &ArtifactRef,
+) -> Result<File, RoventLaunchError> {
+    #[cfg(target_os = "linux")]
+    {
+        v3::open_original_binary_v3(root, artifact)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // This route requires Linux mapped-image identity. Reject before
+        // opening or hashing an unsupported platform's declared artifact.
+        let _ = (root, artifact);
+        Err(error(
+            "ProcessBoundary",
+            super::process_boundary::ProcessBoundaryError {
+                kind: super::process_boundary::ProcessBoundaryFailure::UnsupportedMappedExecutable,
+                stage: "this platform does not provide the Linux mapped-executable proof",
+                io_kind: None,
+            },
+        ))
+    }
+}
+
 const SELECTION_DOMAIN: &str = "rz-rovent-native-assets/1";
 const EXTERNAL_SELECTION_DOMAIN: &str = "rz-rovent-external-r-sources/1";
 const MAX_LOCK_BYTES: u64 = 1 << 20;
@@ -1729,12 +1756,7 @@ fn run_inner<'a>(
         cleanup_until,
         cancellation: Arc::new(AtomicBool::new(false)),
     };
-    let binary = lock
-        .manifest
-        .engine
-        .binary
-        .open_verified_at(&root, 128 << 20)
-        .map_err(|failure| error("Binary", failure))?;
+    let binary = open_declared_original_binary(&root, &lock.manifest.engine.binary)?;
     let process_owners = LaunchProcessOwners::verify(
         RoventProcessBoundaryInputs {
             lock: Arc::clone(&lock),
@@ -2311,12 +2333,7 @@ fn run_v2_native<'a>(
         registered.map_err(|failure| error("PhysicalCompletionUnknown", failure))?;
     }
     let clock = ProcessClock::new(ProcessEpoch(arguments.process_epoch));
-    let binary = lock
-        .manifest
-        .engine
-        .binary
-        .open_verified_at(&root, 128 << 20)
-        .map_err(|failure| error("Binary", failure))?;
+    let binary = open_declared_original_binary(&root, &lock.manifest.engine.binary)?;
     let boundary = verify_actual_owned_process_boundary_v2(RoventProcessBoundaryInputsV2 {
         lock: Arc::clone(&lock),
         original_binary: binary,

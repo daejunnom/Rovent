@@ -1387,10 +1387,13 @@ fn direct_selection(
 }
 
 /// Pin the declared original executable beneath the already-owned root.
-/// Hashing and mapped-executable identity are performed by the V3 process
-/// boundary under the same original cancellation and startup deadline.
+/// The shared process boundary hashes this same descriptor and the mapped
+/// executable under the original cancellation and startup deadline.
 #[cfg(target_os = "linux")]
-fn open_original_binary_v3(root: &Dir, artifact: &ArtifactRef) -> Result<File, RoventLaunchError> {
+pub(super) fn open_original_binary_v3(
+    root: &Dir,
+    artifact: &ArtifactRef,
+) -> Result<File, RoventLaunchError> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
     use cap_std::fs::OpenOptionsExt;
     artifact
