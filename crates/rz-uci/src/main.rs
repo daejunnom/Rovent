@@ -1,5 +1,11 @@
 use rz_contracts::ProcessEpoch;
 use rz_uci::search_driver::SearchSessionDriver;
+// This helper only requests UCI quit; it does not open the guarded system
+// CUDA CLI or confer physical completion. The parent-owned integration must
+// join it and retain the original session on an unknown outcome.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+#[path = "native_bootstrap/system_cuda/timed_quit.rs"]
+mod lc0_timed_quit;
 #[cfg(feature = "onnx-cpu")]
 use rz_uci::{
     EngineIdentity,
