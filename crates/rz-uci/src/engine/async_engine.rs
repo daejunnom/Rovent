@@ -39,6 +39,16 @@ struct InPlaceStagedEngine {
     session: Option<Session<RulesUciPort>>,
     timer_stop: Arc<std::sync::atomic::AtomicBool>,
     timer: Option<JoinHandle<()>>,
+    timer_joined: bool,
+    timer_panic: Option<Box<dyn std::any::Any + Send>>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InPlaceTimerRetirement {
+    NoStagedTimer,
+    Waiting,
+    Joined,
+    WorkerPanicked,
+    AlreadyTransferred,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InPlaceTransferStatus {
@@ -137,6 +147,13 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
         if self
             .staged
             .as_ref()
+            .is_some_and(|stage| stage.timer_joined || stage.timer_panic.is_some())
+        {
+            return InPlaceTimerStatus::RetainedFailure;
+        }
+        if self
+            .staged
+            .as_ref()
             .is_some_and(|stage| stage.timer.is_some())
         {
             return InPlaceTimerStatus::Started;
@@ -174,6 +191,8 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
                 session: Some(session),
                 timer_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 timer: None,
+                timer_joined: false,
+                timer_panic: None,
             });
         }
         let Some(close_owner) = self
@@ -234,6 +253,49 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
             }
         }
     }
+    /// Retire only a staged timer that never entered the run. This requests
+    /// stop once and polls the original JoinHandle without waiting; it does
+    /// not close the native session or infer physical device completion.
+    pub fn try_retire_staged_timer(&mut self) -> InPlaceTimerRetirement {
+        if self.transferred {
+            return InPlaceTimerRetirement::AlreadyTransferred;
+        }
+        let Some(stage) = self.staged.as_mut() else {
+            return InPlaceTimerRetirement::NoStagedTimer;
+        };
+        if stage.timer_panic.is_some() {
+            return InPlaceTimerRetirement::WorkerPanicked;
+        }
+        if stage.timer_joined {
+            return InPlaceTimerRetirement::Joined;
+        }
+        let Some(timer) = stage.timer.as_ref() else {
+            return InPlaceTimerRetirement::NoStagedTimer;
+        };
+        stage.timer_stop.store(true, Ordering::Release);
+        if !timer.is_finished() {
+            return InPlaceTimerRetirement::Waiting;
+        }
+        let Some(timer) = stage.timer.take() else {
+            return InPlaceTimerRetirement::NoStagedTimer;
+        };
+        match timer.join() {
+            Ok(()) => {
+                stage.timer_joined = true;
+                InPlaceTimerRetirement::Joined
+            }
+            Err(payload) => {
+                stage.timer_panic = Some(payload);
+                InPlaceTimerRetirement::WorkerPanicked
+            }
+        }
+    }
+    pub fn has_staged_timer_panic(&self) -> bool {
+        self.staged
+            .as_ref()
+            .is_some_and(|stage| stage.timer_panic.is_some())
+    }
+
     /// Transfer the staged exact session/timer and original event/output
     /// endpoints only after every input is present. Any missing field restores
     /// previously taken owners to this same slot; this is not native startup.
