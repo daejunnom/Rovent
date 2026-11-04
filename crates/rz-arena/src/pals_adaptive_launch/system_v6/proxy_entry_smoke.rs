@@ -234,50 +234,12 @@ impl ProxyEntryFunctionalSmokeReceiptV1 {
         if self.domain != RECEIPT_DOMAIN
             || self.smoke_spec_sha256 != lock.spec_sha256
             || self.eligible_for_paired_or_performance_acceptance
-            || [
-                &self.os_spawn_observation,
-                &self.os_spawn_to_entry,
-                &self.role_game_authority,
-                &self.grant_policy_binding,
-                &self.cancel_ack,
-                &self.process_completion,
-                &self.physical_completion,
-                &self.running_proxy_source,
-            ]
-            .iter()
-            .any(|value| value.as_str() != "unknown")
         {
-            return Err(invalid("smoke receipt domain or observation differs"));
+            return Err(invalid("smoke receipt domain or lock differs"));
         }
-        if let ProxyEntryObservationV1::ProxySelfReported { clock_scope, .. } = &self.entry
-            && clock_scope != "proxy_local_monotonic_elapsed_entry_to_binding"
-        {
-            return Err(invalid("smoke receipt entry clock scope differs"));
-        }
-        let source_unknown = self.selected_compiled_source_domain == "unknown"
-            && self.selected_compiled_source_sha256.is_none()
-            && self.selected_compiled_source_labels.is_empty();
-        if !source_unknown && self.selected_compiled_source_domain != SMOKE_SOURCE_DOMAIN {
-            return Err(invalid("smoke receipt source domain invalid"));
-        }
-        if self
-            .selected_compiled_source_sha256
-            .as_ref()
-            .is_some_and(|value| !lowercase_hex(value, 64))
-            || self.selected_compiled_source_labels.len() > 64
-        {
-            return Err(invalid("smoke receipt source observation invalid"));
-        }
-        let mut labels = std::collections::HashSet::new();
-        for label in &self.selected_compiled_source_labels {
-            if label.is_empty()
-                || label.len() > 128
-                || label.chars().any(char::is_control)
-                || !labels.insert(label)
-            {
-                return Err(invalid("smoke receipt source labels invalid"));
-            }
-        }
+        // Observation text, including source or physical status, is untrusted
+        // data. The parser preserves it and confers no completion authority;
+        // real lifecycle evidence is consumed by a separate owner-bound path.
         Ok(())
     }
 
@@ -541,13 +503,14 @@ mod tests {
             ProxyEntryFunctionalSmokeReceiptV1::parse(duplicate_entry.as_bytes(), &lock).is_err()
         );
         receipt.physical_completion = "confirmed".into();
-        assert!(
-            ProxyEntryFunctionalSmokeReceiptV1::parse(
-                &serde_json::to_vec(&receipt).unwrap(),
-                &lock
-            )
-            .is_err()
-        );
+        let parsed = ProxyEntryFunctionalSmokeReceiptV1::parse(
+            &serde_json::to_vec(&receipt).unwrap(),
+            &lock,
+        )
+        .unwrap();
+        // This is a preserved untrusted claim, never a verified physical fence.
+        assert_eq!(parsed.physical_completion, "confirmed");
+        assert!(!parsed.eligible_for_paired_or_performance_acceptance);
         receipt.physical_completion = "unknown".into();
         receipt.smoke_spec_sha256 = format!("{:x}", Sha256::digest(b"another smoke spec"));
         assert!(
