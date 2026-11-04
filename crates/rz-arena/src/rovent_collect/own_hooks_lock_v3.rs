@@ -20,6 +20,7 @@ use rz_uci::pals_adaptive::{
 };
 use rz_uci::pals_native::ticketed::VirtualReviewTicketOutput;
 use rz_uci::rovent_bootstrap::{RoventNativeBackend, RoventStartupControl};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError, mpsc};
 
 type Output = VirtualReviewTicketOutput;
@@ -31,6 +32,7 @@ type Custody = RoventBoardCollectionRootCustodyV3<Output>;
 struct RootSlot {
     admission: RoventCollectionRootAdmissionV3,
     requested: bool,
+    revoked: Arc<AtomicBool>,
     installed: bool,
     owner: Option<RoventCollectionOwnerLockV3>,
     observer: Option<Observer>,
@@ -57,8 +59,20 @@ pub(crate) struct RoventOwnCollectionBridgeV3 {
     registration: RoventNativeCaptureRegistration,
     startup: OnceLock<RoventStartupControl>,
     state: Mutex<State>,
-    request_sender: mpsc::SyncSender<RoventCollectionRootAdmissionV3>,
-    request_receiver: Mutex<mpsc::Receiver<RoventCollectionRootAdmissionV3>>,
+    request_sender: mpsc::SyncSender<OwnRootRequestV3>,
+    request_receiver: Mutex<mpsc::Receiver<OwnRootRequestV3>>,
+}
+
+/// Carries the same root's irrevocable cancellation observation to the
+/// supervisor. It must be checked before each acquisition or worker start.
+pub(crate) struct OwnRootRequestV3 {
+    pub admission: RoventCollectionRootAdmissionV3,
+    revoked: Arc<AtomicBool>,
+}
+impl OwnRootRequestV3 {
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
 }
 
 /// A rejected preparation returns every original object to its supervisor.
@@ -114,9 +128,7 @@ impl RoventOwnCollectionBridgeV3 {
 
     /// Only the supervisor calls this; a request is the exact original root,
     /// not permission to renew its deadline or synthesize a replacement.
-    pub(crate) fn try_next_root(
-        &self,
-    ) -> Result<Option<RoventCollectionRootAdmissionV3>, &'static str> {
+    pub(crate) fn try_next_root(&self) -> Result<Option<OwnRootRequestV3>, &'static str> {
         let receiver = self
             .request_receiver
             .try_lock()
@@ -135,12 +147,7 @@ impl RoventOwnCollectionBridgeV3 {
     /// The caller creates the actual worker and teacher owner outside the
     /// manager. Rejection keeps the whole prepared owner with the caller.
     pub(crate) fn try_publish_prepared(&self, original: OwnPreparedRootV3) -> OwnPrepareOutcomeV3 {
-        match original
-            .admission
-            .root_admission()
-            .original_context()
-            .try_accepts()
-        {
+        match original.admission.root_admission().try_accepts_original() {
             Ok(true) => {}
             Ok(false) => {
                 return OwnPrepareOutcomeV3::Rejected {
@@ -225,7 +232,12 @@ impl RoventOwnCollectionBridgeV3 {
                 original,
             };
         };
-        if !slot.requested || slot.installed || slot.worker.is_some() || slot.observer.is_some() {
+        if !slot.requested
+            || slot.revoked.load(Ordering::Acquire)
+            || slot.installed
+            || slot.worker.is_some()
+            || slot.observer.is_some()
+        {
             return OwnPrepareOutcomeV3::Rejected {
                 reason: "Own /3 root already prepared".into(),
                 original,
@@ -426,6 +438,7 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
                 state.slots.push(RootSlot {
                     admission: admission.clone(),
                     requested: false,
+                    revoked: Arc::new(AtomicBool::new(false)),
                     installed: false,
                     owner: None,
                     observer: None,
@@ -444,7 +457,10 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
         };
         let slot = &mut state.slots[index];
         if !slot.requested {
-            match self.request_sender.try_send(admission.clone()) {
+            match self.request_sender.try_send(OwnRootRequestV3 {
+                admission: admission.clone(),
+                revoked: Arc::clone(&slot.revoked),
+            }) {
                 Ok(()) => slot.requested = true,
                 Err(mpsc::TrySendError::Full(_)) => {
                     return Ok(RoventBoardCollectionAdmissionOutcomeV3::Pending { admission });
@@ -464,7 +480,9 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
             return Ok(RoventBoardCollectionAdmissionOutcomeV3::Installed);
         }
         let Some(observer) = slot.observer.take() else {
-            return Ok(RoventBoardCollectionAdmissionOutcomeV3::Pending { admission });
+            // Once queued, the supervisor may have acquired original route or
+            // worker custody even before the observer is installed.
+            return Ok(RoventBoardCollectionAdmissionOutcomeV3::PendingUncertain { admission });
         };
         match port.install(admission, observer) {
             Ok(()) => {
@@ -481,7 +499,7 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
                     // Nothing entered the observer. Preserve and retry this
                     // same observer rather than inventing a fresh owner.
                     slot.observer = Some(original.observer);
-                    return Ok(RoventBoardCollectionAdmissionOutcomeV3::Pending {
+                    return Ok(RoventBoardCollectionAdmissionOutcomeV3::PendingUncertain {
                         admission: original.admission,
                     });
                 }
@@ -524,13 +542,12 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
             .iter()
             .find(|slot| slot.admission.same_original_admission(admission))
             .ok_or(AdaptiveManagerError::Invalid("Own /3 revoke root absent"))?;
-        let route = slot
-            .route
-            .as_ref()
-            .ok_or(AdaptiveManagerError::AuxiliaryPending)?;
+        slot.revoked.store(true, Ordering::Release);
         // Cancel admission to new teacher work. This does not prove that any
         // previously admitted physical work or native callback has stopped.
-        route.cancel_all();
+        if let Some(route) = &slot.route {
+            route.cancel_all();
+        }
         Ok(())
     }
 
