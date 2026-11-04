@@ -18,6 +18,18 @@ use std::{
     path::Path,
 };
 
+/// Check both endpoint views against the same original owner before the V6
+/// supervisor proceeds. This is a pinned-input observation, not a spawn,
+/// independent executable attestation, receipt, or physical-completion proof.
+pub(crate) fn verify_original_proxy_snapshots(
+    owner: &NativeLaunchOwner<LockedPalsSystemArenaPairV6>,
+) -> Result<(), ArenaError> {
+    for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+        PalsV6EndpointSnapshot::from_original(owner, role)?;
+    }
+    Ok(())
+}
+
 fn invalid(detail: &'static str) -> ArenaError {
     ArenaError::Integrity(detail.into())
 }

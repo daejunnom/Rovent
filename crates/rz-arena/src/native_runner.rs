@@ -543,6 +543,9 @@ pub(crate) trait NativeV6Control: Send {
 pub(crate) struct NativeV6Supervisor {
     execution: Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>,
     control: Arc<Mutex<Box<dyn NativeV6Control>>>,
+    // If pinned input inspection fails, retain the same owner/control in the
+    // normal failure bundle without starting preflight or a child.
+    original_pin_error: Option<ArenaError>,
 }
 
 /// Rejected construction returns the exact original control owner. The
@@ -584,6 +587,7 @@ impl NativeV6Supervisor {
         Ok(Self {
             execution: Arc::clone(execution),
             control: Arc::new(Mutex::new(control)),
+            original_pin_error: None,
         })
     }
 }
@@ -1697,11 +1701,13 @@ pub(crate) fn run_native_pair_for<S: NativeProviderDeclaration>(
 pub(crate) fn run_native_pair_for_v6_controlled(
     owner: NativeLaunchOwner<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>,
     cancel: Option<&AtomicBool>,
-    supervisor: NativeV6Supervisor,
+    mut supervisor: NativeV6Supervisor,
 ) -> Result<
     NativePairOutput<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>,
     Box<NativePairFailure<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>>,
 > {
+    supervisor.original_pin_error =
+        crate::pals_adaptive_launch::verify_original_proxy_snapshots(&owner).err();
     run_native_pair_inner(owner, cancel, Some(supervisor))
 }
 
@@ -1728,7 +1734,14 @@ fn run_native_pair_inner<S: NativeProviderDeclaration>(
         v6_supervisor: supervisor,
     };
     #[cfg(target_os = "linux")]
-    let result = linux::run(&mut bundle, cancel);
+    let result = match bundle
+        .v6_supervisor
+        .as_mut()
+        .and_then(|supervisor| supervisor.original_pin_error.take())
+    {
+        Some(error) => Err(error),
+        None => linux::run(&mut bundle, cancel),
+    };
     #[cfg(not(target_os = "linux"))]
     let result: Result<(NativePairReceipt<S::Audit>, rz_experiments::ArtifactRef), ArenaError> = {
         let _ = cancel;
