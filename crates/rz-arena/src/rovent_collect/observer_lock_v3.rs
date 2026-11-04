@@ -6,7 +6,8 @@
 //! preserve it on errors. This is not a teacher or GPU completion receipt.
 use super::capture_router_v3::{CapturePollV3, CaptureRouterV3, FailurePollV3};
 use super::native_capture::{
-    LockV3RegistrationAttempt, RoventFailedCapturedInput, RoventUnstartedRouteRollbackV3,
+    LockV3CancelAttempt, LockV3RegistrationAttempt, RoventFailedCapturedInput,
+    RoventUnstartedRouteRollbackV3,
 };
 use super::producer_v3::{
     RoventCorpusProducerLockV3, RoventInputCaptureReservationV3, RoventRetiredLockV3Record,
@@ -54,6 +55,7 @@ struct State {
     registration: RoventNativeCaptureRegistration,
     router: Arc<CaptureRouterV3>,
     admission: Option<RoventCollectionRootAdmissionV3>,
+    prepared_admission: Option<RoventCollectionRootAdmissionV3>,
     route_admission: Option<RoventCollectionRootAdmissionV3>,
     speculative_root: Option<SpeculativeRootV3>,
     producer: Option<RoventCorpusProducerLockV3>,
@@ -103,6 +105,7 @@ impl RoventCollectionOwnerLockV3 {
                 registration,
                 router,
                 admission: None,
+                prepared_admission: None,
                 route_admission: None,
                 speculative_root: None,
                 producer: None,
@@ -123,6 +126,60 @@ impl RoventCollectionOwnerLockV3 {
     pub(crate) fn capture_registration(&self) -> RoventNativeCaptureRegistration {
         self.registration.clone()
     }
+    /// Prepare the original root on a worker before installing the observer.
+    /// This can replay history and initialize the producer, so the manager
+    /// must not call it as part of its synchronous install callback. A lock
+    /// collision returns None without changing the original owner.
+    pub(crate) fn try_prepare_original_admission(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<Option<()>, ArenaError> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err(invalid("lock-v3 owner poisoned")),
+        };
+        check(
+            state.admission.is_none() && !state.settled,
+            "lock-v3 owner already admitted",
+        )?;
+        if let Some(original) = &state.prepared_admission {
+            check(
+                original.same_original_admission(admission),
+                "lock-v3 prepared admission changed",
+            )?;
+            return Ok(Some(()));
+        }
+        check(
+            state
+                .route_admission
+                .as_ref()
+                .is_none_or(|original| original.same_original_admission(admission))
+                && state.producer.is_none()
+                && state.position.is_none(),
+            "lock-v3 preparation differs from original route",
+        )?;
+        let snapshot = admission.rules().rules().snapshot();
+        let history = snapshot
+            .uci_replay(16_384)
+            .map_err(|e| invalid(e.to_string()))?
+            .moves;
+        let position = Position::from_snapshot(
+            snapshot,
+            rz_position::PositionLimits {
+                max_history_positions: 16_385,
+                ..rz_position::PositionLimits::default()
+            },
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+        let producer =
+            RoventCorpusProducerLockV3::new_shared(Arc::clone(&state.manifest), admission.clone())?;
+        state.history = history;
+        state.position = Some(position);
+        state.producer = Some(producer);
+        state.prepared_admission = Some(admission.clone());
+        Ok(Some(()))
+    }
     /// Must be installed before this root registers its first ticket.
     /// None denotes a retryable owner-lock collision, not route installation.
     pub(crate) fn try_attach_speculative_root(
@@ -140,6 +197,10 @@ impl RoventCollectionOwnerLockV3 {
                 .admission
                 .as_ref()
                 .is_none_or(|original| original.same_original_admission(admission))
+                && state
+                    .prepared_admission
+                    .as_ref()
+                    .is_none_or(|original| original.same_original_admission(admission))
                 && state
                     .route_admission
                     .as_ref()
@@ -312,6 +373,51 @@ impl State {
             .as_mut()
             .ok_or_else(|| invalid("lock-v3 root not admitted"))
     }
+
+    /// Process the same fenced ticket list incrementally. Busy keeps the
+    /// current ticket and its reservation untouched; earlier completed
+    /// cleanup remains indexed by exact ticket so retry cannot duplicate it.
+    fn try_settle_tickets(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV3,
+        tickets: &[RoleTicketEnvelope],
+    ) -> Result<AdaptiveCollectionBoundaryV2, ArenaError> {
+        self.producer()?.validate_admission(admission)?;
+        for ticket in tickets {
+            if let Some(original) = self.handled.get(&ticket.id) {
+                check(original == ticket, "lock-v3 settled ticket differs")?;
+                continue;
+            }
+            if let Some(staged) = self.staged.get(&ticket.id) {
+                check(staged.ticket == *ticket, "lock-v3 staged ticket differs")?;
+            }
+            if let Some(pending) = self.pending.get(&ticket.id) {
+                check(pending.ticket == *ticket, "lock-v3 pending ticket differs")?;
+            }
+            let unstarted = match self
+                .registration
+                .cancel_unstarted_lock_v3(ticket, admission)?
+            {
+                LockV3CancelAttempt::Busy => return Ok(AdaptiveCollectionBoundaryV2::Busy),
+                LockV3CancelAttempt::Missing => None,
+                LockV3CancelAttempt::Canceled(reservation) => Some(reservation),
+            };
+            if let Some(staged) = self.staged.remove(&ticket.id) {
+                self.producer()?
+                    .discard_reserved_input(staged.reservation.sequence());
+            }
+            if let Some(reservation) = unstarted {
+                self.producer()?
+                    .discard_reserved_input(reservation.sequence());
+            }
+            if let Some(pending) = self.pending.remove(&ticket.id) {
+                self.producer()?.discard_reserved_input(pending.sequence);
+                self.producer()?.discard_unpublished(ticket.id);
+            }
+            self.handled.insert(ticket.id, *ticket);
+        }
+        Ok(AdaptiveCollectionBoundaryV2::Ready)
+    }
     fn try_drain(&mut self) -> Result<AdaptiveCollectionBoundaryV2, ArenaError> {
         let admission = self
             .admission
@@ -421,7 +527,13 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
     ) -> Result<(), AdaptiveCollectionError> {
         self.apply(AdaptiveCollectionStage::Dispatch, |state| {
             check(
-                state.admission.is_none() && state.producer.is_none(),
+                state.admission.is_none()
+                    && state.producer.is_some()
+                    && state.position.is_some()
+                    && state
+                        .prepared_admission
+                        .as_ref()
+                        .is_some_and(|original| original.same_original_admission(admission)),
                 "lock-v3 owner permits one original root only",
             )?;
             check(
@@ -431,26 +543,6 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
                     .is_none_or(|original| original.same_original_admission(admission)),
                 "lock-v3 admitted root differs from sealed speculative route",
             )?;
-            let snapshot = admission.rules().rules().snapshot();
-            let history = snapshot
-                .uci_replay(16_384)
-                .map_err(|e| invalid(e.to_string()))?
-                .moves;
-            let position = Position::from_snapshot(
-                snapshot,
-                rz_position::PositionLimits {
-                    max_history_positions: 16_385,
-                    ..rz_position::PositionLimits::default()
-                },
-            )
-            .map_err(|e| invalid(e.to_string()))?;
-            let producer = RoventCorpusProducerLockV3::new_shared(
-                Arc::clone(&state.manifest),
-                admission.clone(),
-            )?;
-            state.history = history;
-            state.position = Some(position);
-            state.producer = Some(producer);
             state.admission = Some(admission.clone());
             Ok(())
         })
@@ -690,35 +782,9 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
                 }
                 return Err(error);
             }
-            for ticket in tickets {
-                if let Some(original) = state.handled.get(&ticket.id) {
-                    check(original == ticket, "lock-v3 settled ticket differs")?;
-                    continue;
-                }
-                if let Some(staged) = state.staged.get(&ticket.id) {
-                    check(staged.ticket == *ticket, "lock-v3 staged ticket differs")?;
-                }
-                if let Some(staged) = state.staged.remove(&ticket.id) {
-                    state
-                        .producer()?
-                        .discard_reserved_input(staged.reservation.sequence());
-                }
-                if let Some(reservation) = state
-                    .registration
-                    .cancel_unstarted_lock_v3(ticket, &admission)?
-                {
-                    state
-                        .producer()?
-                        .discard_reserved_input(reservation.sequence());
-                }
-                if let Some(pending) = state.pending.get(&ticket.id) {
-                    check(pending.ticket == *ticket, "lock-v3 pending ticket differs")?;
-                }
-                if let Some(pending) = state.pending.remove(&ticket.id) {
-                    state.producer()?.discard_reserved_input(pending.sequence);
-                    state.producer()?.discard_unpublished(ticket.id);
-                }
-                state.handled.insert(ticket.id, *ticket);
+            if state.try_settle_tickets(&admission, tickets)? == AdaptiveCollectionBoundaryV2::Busy
+            {
+                return Err(invalid("lock-v3 fenced ticket cleanup busy"));
             }
             check(
                 state.staged.is_empty()
@@ -872,35 +938,9 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
                 }
             }
             // No caller settlement evidence has been applied before this point.
-            for ticket in tickets {
-                if let Some(original) = state.handled.get(&ticket.id) {
-                    check(original == ticket, "lock-v3 settled ticket differs")?;
-                    continue;
-                }
-                if let Some(staged) = state.staged.get(&ticket.id) {
-                    check(staged.ticket == *ticket, "lock-v3 staged ticket differs")?;
-                }
-                if let Some(staged) = state.staged.remove(&ticket.id) {
-                    state
-                        .producer()?
-                        .discard_reserved_input(staged.reservation.sequence());
-                }
-                if let Some(reservation) = state
-                    .registration
-                    .cancel_unstarted_lock_v3(ticket, &admission)?
-                {
-                    state
-                        .producer()?
-                        .discard_reserved_input(reservation.sequence());
-                }
-                if let Some(pending) = state.pending.get(&ticket.id) {
-                    check(pending.ticket == *ticket, "lock-v3 pending ticket differs")?;
-                }
-                if let Some(pending) = state.pending.remove(&ticket.id) {
-                    state.producer()?.discard_reserved_input(pending.sequence);
-                    state.producer()?.discard_unpublished(ticket.id);
-                }
-                state.handled.insert(ticket.id, *ticket);
+            if state.try_settle_tickets(&admission, tickets)? == AdaptiveCollectionBoundaryV2::Busy
+            {
+                return Ok(AdaptiveCollectionBoundaryV2::Busy);
             }
             check(
                 state.staged.is_empty()
