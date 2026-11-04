@@ -59,6 +59,7 @@ struct PcScopeEffectSlotsV3 {
     outcome: Option<Result<super::teacher::v3_session::TeacherScopeEffectOutcomeV3,
         super::teacher::v3_session::TeacherScopeEffectClaimFailureV3>>,
     unclaimed_proof: Option<super::teacher::v3_session::TeacherScopeUnclaimedProofV3>,
+    before_source_proof: Option<super::teacher::v3_session::TeacherScopeBeforeSourceProofV3>,
     issue_error: Option<TeacherSessionClaimErrorV3>,
     source_error: Option<&'static str>,
     claim_error: Option<&'static str>,
@@ -70,7 +71,7 @@ struct PcScopeEffectSlotsV3 {
 }
 impl PcScopeEffectSlotsV3 {
     fn new() -> Self {
-        Self { proof: None, teacher_source: None, game_source: None, claim: None, outcome: None, unclaimed_proof: None,
+        Self { proof: None, teacher_source: None, game_source: None, claim: None, outcome: None, unclaimed_proof: None, before_source_proof: None,
             issue_error: None, source_error: None, claim_error: None, completion_error: None,
             source_step: None, claim_step: None, completion_step: None, finished: false }
     }
@@ -296,12 +297,19 @@ impl PcRootRecoveryV3 {
             Err(_) => return Err("P-C V3 unclaimed scope slots poisoned"),
         };
         let PcScopeEffectSlotsV3 { teacher_source, game_source, claim, outcome,
-            claim_step, unclaimed_proof, .. } = &mut *slots;
+            claim_step, unclaimed_proof, before_source_proof, .. } = &mut *slots;
         if claim.is_some() || outcome.is_some()
             || !matches!(*claim_step, None | Some(G::Busy | G::Aborted | G::Closed))
         { return Ok(Some(false)); }
         let source = teacher_source.as_ref().or_else(|| game_source.as_ref().and_then(|owner| owner.pc_scope_source()));
-        let Some(source) = source else { return Ok(Some(false)); };
+        let Some(source) = source else {
+            if game_source.is_some() || unclaimed_proof.is_some() { return Ok(Some(false)); }
+            if let Some(proof) = before_source_proof.as_ref() {
+                return Ok(Some(proof.matches_original(&stage, &self.admission)));
+            }
+            return Ok(Some(stage.seal_unclaimed_scope_before_source(&self.admission, before_source_proof)));
+        };
+        if before_source_proof.is_some() { return Ok(Some(false)); }
         if let Some(proof) = unclaimed_proof.as_ref() {
             return Ok(Some(proof.matches_original(&stage, source, &self.admission)));
         }
@@ -331,8 +339,13 @@ impl PcRootRecoveryV3 {
             || !matches!(slots.claim_step, None | Some(G::Busy | G::Aborted | G::Closed))
         { return Ok(Some(false)); }
         let source = slots.teacher_source.as_ref().or_else(|| slots.game_source.as_ref().and_then(|owner| owner.pc_scope_source()));
-        let (Some(source), Some(proof)) = (source, slots.unclaimed_proof.as_ref()) else { return Ok(Some(false)); };
-        Ok(Some(proof.matches_original(&stage, source, &self.admission)))
+        match source {
+            Some(source) if slots.before_source_proof.is_none() => Ok(Some(slots.unclaimed_proof.as_ref()
+                .is_some_and(|proof| proof.matches_original(&stage, source, &self.admission)))),
+            None if slots.game_source.is_none() && slots.unclaimed_proof.is_none() => Ok(Some(slots.before_source_proof.as_ref()
+                .is_some_and(|proof| proof.matches_original(&stage, &self.admission)))),
+            _ => Ok(Some(false)),
+        }
     }
 
     /// Seal only a known pre-route root whose own session physically retired.
