@@ -232,6 +232,7 @@ fn control_panic_retains_session_without_implicit_shutdown_retry() {
     assert!(!driver.session_closed());
     let parts = driver.into_parts();
     assert!(parts.sealed);
+    assert!(!parts.shutdown_requested);
     finish_empty(parts.output);
 }
 
@@ -255,6 +256,47 @@ fn explicit_unknown_control_retains_session_without_reducer_or_dispatch() {
     assert_eq!(exit.status, AsyncServeStatus::RetainedWithoutClose);
     assert!(driver.pending().is_empty());
     assert!(!driver.session_closed());
+    let retry: rz_uci::runner::async_events::AsyncServeExit<&'static str> =
+        driver.drive(|| AsyncControl::Continue);
+    assert!(matches!(
+        retry.failure,
+        Some(AsyncServeFailure::OriginalStateSealed)
+    ));
+    let parts = driver.into_parts();
+    assert!(parts.sealed);
+    finish_empty(parts.output);
+}
+
+#[test]
+fn cooperative_yield_keeps_live_session_and_resumes_same_driver() {
+    let owner = match AsyncOutputOwner::start(Vec::<u8>::new(), Vec::<u8>::new(), 2, 4096) {
+        Ok(owner) => owner,
+        Err(_) => panic!("cannot create fixture output owner"),
+    };
+    let (sender, events) = mpsc::sync_channel(2);
+    sender.send(Event::Line("uci".into())).unwrap();
+    sender.send(Event::Line("quit".into())).unwrap();
+    let mut driver = AsyncServeDriver::new(
+        session(),
+        events,
+        owner,
+        4096,
+        Duration::from_millis(1),
+        handle_event,
+        |_| Ok::<_, &'static str>(()),
+    );
+    assert_eq!(
+        driver.drive(|| AsyncControl::Yield).status,
+        AsyncServeStatus::Yielded
+    );
+    assert!(!driver.session_closed());
+    assert!(!driver.shutdown_requested());
+    assert!(driver.pending().is_empty());
+    assert_eq!(
+        driver.drive(|| AsyncControl::Continue).status,
+        AsyncServeStatus::OutputQueued
+    );
+    assert!(driver.session_closed());
     let parts = driver.into_parts();
     assert!(parts.sealed);
     finish_empty(parts.output);
@@ -333,5 +375,39 @@ fn encoding_limit_preserves_original_and_closes_original_session() {
     assert!(driver.session_closed());
     let parts = driver.into_parts();
     assert!(parts.sealed);
+    finish_empty(parts.output);
+}
+
+#[test]
+fn output_failure_does_not_force_close_while_owner_defers_eof() {
+    let owner = match AsyncOutputOwner::start(Vec::<u8>::new(), Vec::<u8>::new(), 1, 4096) {
+        Ok(owner) => owner,
+        Err(_) => panic!("cannot create fixture output owner"),
+    };
+    let (sender, events) = mpsc::sync_channel(1);
+    sender.send(Event::Line("uci".into())).unwrap();
+    let mut driver = AsyncServeDriver::new(
+        session(),
+        events,
+        owner,
+        1,
+        Duration::from_millis(1),
+        |session, event| {
+            if matches!(event, Event::EndOfInput) {
+                rz_uci::SessionResult::default()
+            } else {
+                handle_event(session, event)
+            }
+        },
+        |_| Ok::<_, &'static str>(()),
+    );
+    let exit = driver.drive(|| AsyncControl::Continue);
+    assert_eq!(exit.status, AsyncServeStatus::Failed);
+    assert!(matches!(exit.failure, Some(AsyncServeFailure::Encoding(_))));
+    assert!(!driver.session_closed());
+    assert_eq!(driver.pending().len(), 2);
+    let parts = driver.into_parts();
+    assert!(parts.sealed);
+    assert!(parts.shutdown_requested);
     finish_empty(parts.output);
 }

@@ -23,6 +23,8 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AsyncControl {
     Continue,
+    /// Yield the same live driver without closing its session or admission.
+    Yield,
     /// Ask the original reducer to close; queued output still remains ordered.
     Shutdown,
     /// Close the reducer and return any still-pending output to its caller.
@@ -268,7 +270,6 @@ fn close_original<P, H, F, E>(
     dispatch: &mut F,
     pending: &mut VecDeque<PendingEvent<P::Snapshot>>,
     cleanup: &mut Vec<AsyncServeFailure<E>>,
-    force_error_fallback: bool,
 ) -> Option<AsyncServeFailure<E>>
 where
     P: PositionPort,
@@ -279,31 +280,14 @@ where
         return None;
     }
     let handled = catch_unwind(AssertUnwindSafe(|| handle(session, Event::EndOfInput)));
-    let mut result = match handled {
+    let result = match handled {
         Ok(result) => result,
         Err(payload) => return Some(AsyncServeFailure::HandlerPanic(payload)),
     };
     let mut failure = None;
-    if force_error_fallback {
-        // The synchronous runner uses this fallback only when an earlier
-        // failure requires emergency revocation. On a normal close, the
-        // Owner can defer EOF until its pending physical result drains.
-        let fallback = catch_unwind(AssertUnwindSafe(|| session.end_of_input()));
-        match fallback {
-            Ok(fallback) => {
-                result.protocol.extend(fallback.protocol);
-                result.diagnostics.extend(fallback.diagnostics);
-                result.effects.extend(fallback.effects);
-            }
-            Err(payload) => {
-                pending.push_back(PendingEvent {
-                    original: result,
-                    encoded: None,
-                });
-                return Some(AsyncServeFailure::HandlerPanic(payload));
-            }
-        }
-    }
+    // Respect the original Owner if it deferred EOF for an outstanding
+    // physical result. Unlike the legacy synchronous error fallback, this
+    // opt-in path retains that Owner and does not force the Session closed.
     let (event, dispatch_failure, extra) = dispatch_result(result, dispatch);
     pending.push_back(event);
     cleanup.extend(extra.into_iter().map(AsyncServeFailure::Dispatch));
@@ -315,6 +299,28 @@ where
         }
     }
     failure
+}
+
+fn close_once<P, H, F, E>(
+    session: &mut Session<P>,
+    handle: &mut H,
+    dispatch: &mut F,
+    pending: &mut VecDeque<PendingEvent<P::Snapshot>>,
+    cleanup: &mut Vec<AsyncServeFailure<E>>,
+    issued: &mut bool,
+) -> Option<AsyncServeFailure<E>>
+where
+    P: PositionPort,
+    H: FnMut(&mut Session<P>, Event) -> SessionResult<P::Snapshot>,
+    F: FnMut(Effect<P::Snapshot>) -> Result<(), E>,
+{
+    if *issued || session.is_closed() {
+        return None;
+    }
+    // A panicking handler remains an issued but unknown attempt, not a
+    // reason to issue EOF a second time.
+    *issued = true;
+    close_original(session, handle, dispatch, pending, cleanup)
 }
 
 /// Internal driver step: the caller retains the same borrowed sources and FIFO.
@@ -359,6 +365,13 @@ where
                 };
             }
         };
+        if control == AsyncControl::Yield {
+            return AsyncServeExit {
+                status: AsyncServeStatus::Yielded,
+                failure: None,
+                cleanup_failures: cleanup,
+            };
+        }
         if control == AsyncControl::RetainWithoutClose {
             return AsyncServeExit {
                 status: AsyncServeStatus::RetainedWithoutClose,
@@ -366,15 +379,14 @@ where
                 cleanup_failures: cleanup,
             };
         }
-        if control != AsyncControl::Continue && !*shutdown_requested {
-            *shutdown_requested = true;
-            if let Some(error) = close_original(
+        if control != AsyncControl::Continue {
+            if let Some(error) = close_once(
                 session,
                 &mut handle,
                 &mut dispatch,
                 &mut pending,
                 &mut cleanup,
-                false,
+                shutdown_requested,
             ) {
                 return AsyncServeExit {
                     status: AsyncServeStatus::Failed,
@@ -391,13 +403,13 @@ where
             };
         }
         if output.observation().failed {
-            if let Some(error) = close_original(
+            if let Some(error) = close_once(
                 session,
                 &mut handle,
                 &mut dispatch,
                 &mut pending,
                 &mut cleanup,
-                true,
+                shutdown_requested,
             ) {
                 cleanup.push(error);
             }
@@ -412,13 +424,13 @@ where
                 match encode_event_output(&front.original, max_output_bytes) {
                     Ok(batch) => front.encoded = Some(batch),
                     Err(error) => {
-                        if let Some(error) = close_original(
+                        if let Some(error) = close_once(
                             session,
                             &mut handle,
                             &mut dispatch,
                             &mut pending,
                             &mut cleanup,
-                            true,
+                            shutdown_requested,
                         ) {
                             cleanup.push(error);
                         }
@@ -446,13 +458,13 @@ where
                 }
                 Err(SubmitError::TooLarge(batch)) => {
                     pending.front_mut().expect("pending front retained").encoded = Some(batch);
-                    if let Some(error) = close_original(
+                    if let Some(error) = close_once(
                         session,
                         &mut handle,
                         &mut dispatch,
                         &mut pending,
                         &mut cleanup,
-                        true,
+                        shutdown_requested,
                     ) {
                         cleanup.push(error);
                     }
@@ -464,13 +476,13 @@ where
                 }
                 Err(SubmitError::Closed(batch)) => {
                     pending.front_mut().expect("pending front retained").encoded = Some(batch);
-                    if let Some(error) = close_original(
+                    if let Some(error) = close_once(
                         session,
                         &mut handle,
                         &mut dispatch,
                         &mut pending,
                         &mut cleanup,
-                        true,
+                        shutdown_requested,
                     ) {
                         cleanup.push(error);
                     }
@@ -502,6 +514,12 @@ where
                 Event::EndOfInput
             }
         };
+        if matches!(&event, Event::EndOfInput)
+            || matches!(&event, Event::Line(line)
+                if matches!(crate::parse(line, session.parser_limits()), Ok(crate::Command::Quit)))
+        {
+            *shutdown_requested = true;
+        }
         let result = match catch_unwind(AssertUnwindSafe(|| handle(session, event))) {
             Ok(result) => result,
             Err(payload) => {
@@ -517,13 +535,13 @@ where
         cleanup.extend(extra.into_iter().map(AsyncServeFailure::Dispatch));
         if let Some(error) = failure {
             if !matches!(&error, AsyncDispatchFailure::Panic(_)) {
-                if let Some(error) = close_original(
+                if let Some(error) = close_once(
                     session,
                     &mut handle,
                     &mut dispatch,
                     &mut pending,
                     &mut cleanup,
-                    true,
+                    shutdown_requested,
                 ) {
                     cleanup.push(error);
                 }
