@@ -308,6 +308,21 @@ impl PcRootQuotaLedgerV3 {
 type PcHandoffV3 = Arc<Mutex<RoventPcCollectionHandoffV3>>;
 type PcObserverV3 = AdaptiveCollectionObserverBoxV3<PcPortQuestion, VirtualReviewTicketOutput>;
 
+/// A root actually received from this bridge's original bounded channel.
+/// Receipt alone does not prove worker start, completion, or GPU activity.
+pub(super) struct PcReceivedRootV3 {
+    admission: RoventCollectionRootAdmissionV3,
+    bridge: Weak<RoventPcCollectionBridgeV3>,
+}
+
+impl PcReceivedRootV3 {
+    pub(super) fn admission(&self) -> &RoventCollectionRootAdmissionV3 { &self.admission }
+    pub(super) fn matches_original(&self, bridge: &Arc<RoventPcCollectionBridgeV3>, admission: &RoventCollectionRootAdmissionV3) -> bool {
+        Weak::ptr_eq(&self.bridge, &Arc::downgrade(bridge))
+            && self.admission.same_original_admission(admission)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PcRootDispatchV3 {
     BeforeDispatch,
@@ -817,6 +832,30 @@ impl RoventPcCollectionBridgeV3 {
         match receiver.try_recv() {
             Ok(value) => Ok(Some(value)),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err("P-C V3 request channel closed"),
+        }
+    }
+
+    /// Receive into the supervisor's already owned slot. Busy and Empty are
+    /// observations, and the actual admission never leaves that slot after
+    /// the successful bounded receive.
+    pub(super) fn try_receive_root_into(
+        &self,
+        destination: &mut Option<PcReceivedRootV3>,
+    ) -> Result<Option<bool>, &'static str> {
+        if destination.is_some() { return Err("P-C V3 receive destination occupied"); }
+        let receiver = match self.request_receiver.try_lock() {
+            Ok(receiver) => receiver,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 request receiver poisoned"),
+        };
+        let bridge = self.self_weak.clone();
+        match receiver.try_recv() {
+            Ok(admission) => {
+                *destination = Some(PcReceivedRootV3 { admission, bridge });
+                Ok(Some(true))
+            },
+            Err(mpsc::TryRecvError::Empty) => Ok(Some(false)),
             Err(mpsc::TryRecvError::Disconnected) => Err("P-C V3 request channel closed"),
         }
     }
@@ -1596,7 +1635,9 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
                 },
                 super::game_authority_v3::GameStepV3::Aborted => {
                     slot.game_registered = true;
-                    if !reservation.transfer_abort_receipt(&mut slot.game_abort) {
+                    let retained = slot.game_abort.as_ref().is_some_and(|receipt|
+                        receipt.matches_game(&self.game) && receipt.matches_original(&admission));
+                    if !retained && !reservation.transfer_abort_receipt(&mut slot.game_abort) {
                         return Err(failure(AdaptiveManagerError::Invalid("P-C V3 original abort receipt unavailable"), admission));
                     }
                     slot.game_reservation.take();
