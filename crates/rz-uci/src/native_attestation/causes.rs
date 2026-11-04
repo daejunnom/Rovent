@@ -382,6 +382,10 @@ pub enum CauseNodeV1 {
         code: TextFingerprintV1,
     },
     EngineWorkerPanic,
+    /// Additive bounded projection; the original io::Error stays in EngineError.
+    EngineTimerSpawn {
+        error_kind: String,
+    },
     EngineDrainTimeout,
     EngineUndeliveredDiagnostics {
         diagnostics: CauseListV1,
@@ -705,6 +709,9 @@ impl Budget {
                 }),
             },
             EngineError::WorkerPanic => CauseNodeV1::EngineWorkerPanic,
+            EngineError::TimerSpawn(error) => CauseNodeV1::EngineTimerSpawn {
+                error_kind: format!("{:?}", error.kind()),
+            },
             EngineError::DrainTimeout => CauseNodeV1::EngineDrainTimeout,
             EngineError::UndeliveredDiagnostics(receipts) => {
                 CauseNodeV1::EngineUndeliveredDiagnostics {
