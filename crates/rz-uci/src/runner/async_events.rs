@@ -5,7 +5,7 @@
 //! observable at a caller-selected finite tick. This closure is not itself an
 //! engine admission latch, a physical cancellation acknowledgment, or a GPU
 //! fence. Production wiring must supply the original session-close authority
-//! and retain the returned pending events and output owner on every exit.
+//! and retain the same driver and output owner on every unfinished exit.
 
 use super::async_output::{
     AsyncOutputOwner, OutputBatch, OutputEncodingError, SubmitError, encode_event_output,
@@ -27,6 +27,9 @@ pub enum AsyncControl {
     Shutdown,
     /// Close the reducer and return any still-pending output to its caller.
     ReturnPending,
+    /// The original control/owner may have failed. Return without invoking
+    /// any reducer or dispatch again; session and physical state stay unknown.
+    RetainWithoutClose,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +39,8 @@ pub enum AsyncServeStatus {
     OutputQueued,
     /// The caller requested return with original pending evidence retained.
     Yielded,
+    /// Caller retains the still-open or otherwise unknown original session.
+    RetainedWithoutClose,
     Failed,
 }
 
@@ -49,6 +54,7 @@ pub enum AsyncDispatchFailure<E> {
 #[derive(Debug)]
 pub enum AsyncServeFailure<E> {
     InvalidPollInterval,
+    OriginalStateSealed,
     ControlPanic(Box<dyn Any + Send>),
     HandlerPanic(Box<dyn Any + Send>),
     Dispatch(AsyncDispatchFailure<E>),
@@ -66,12 +72,147 @@ pub struct PendingEvent<S> {
 }
 
 #[must_use]
-pub struct AsyncServeExit<S, E> {
+pub struct AsyncServeExit<E> {
     pub status: AsyncServeStatus,
-    /// FIFO: current event first, followed by any original close output.
-    pub pending: VecDeque<PendingEvent<S>>,
     pub failure: Option<AsyncServeFailure<E>>,
     pub cleanup_failures: Vec<AsyncServeFailure<E>>,
+}
+
+/// Pins one original session, event receiver, output owner and reducer pair
+/// across yields. The pending FIFO and close-issued state never move to a new
+/// invocation or a caller-supplied replacement owner.
+#[must_use]
+pub struct AsyncServeDriver<P, O, D, H, F>
+where
+    P: PositionPort,
+    O: Write + Send + 'static,
+    D: Write + Send + 'static,
+{
+    session: Session<P>,
+    events: Receiver<Event>,
+    output: AsyncOutputOwner<O, D>,
+    max_output_bytes: usize,
+    poll_interval: Duration,
+    handle: H,
+    dispatch: F,
+    pending: VecDeque<PendingEvent<P::Snapshot>>,
+    shutdown_requested: bool,
+    input_disconnected: bool,
+    sealed: bool,
+}
+
+/// Explicit recovery of the same original resources; `sealed` does not grant
+/// permission to restart or infer physical completion.
+pub struct AsyncServeParts<P, O, D, H, F>
+where
+    P: PositionPort,
+    O: Write + Send + 'static,
+    D: Write + Send + 'static,
+{
+    pub session: Session<P>,
+    pub events: Receiver<Event>,
+    pub output: AsyncOutputOwner<O, D>,
+    pub handle: H,
+    pub dispatch: F,
+    pub pending: VecDeque<PendingEvent<P::Snapshot>>,
+    pub shutdown_requested: bool,
+    pub input_disconnected: bool,
+    pub sealed: bool,
+}
+
+impl<P, O, D, H, F> AsyncServeDriver<P, O, D, H, F>
+where
+    P: PositionPort,
+    O: Write + Send + 'static,
+    D: Write + Send + 'static,
+    H: FnMut(&mut Session<P>, Event) -> SessionResult<P::Snapshot>,
+{
+    pub fn new(
+        session: Session<P>,
+        events: Receiver<Event>,
+        output: AsyncOutputOwner<O, D>,
+        max_output_bytes: usize,
+        poll_interval: Duration,
+        handle: H,
+        dispatch: F,
+    ) -> Self {
+        Self {
+            session,
+            events,
+            output,
+            max_output_bytes,
+            poll_interval,
+            handle,
+            dispatch,
+            pending: VecDeque::new(),
+            shutdown_requested: false,
+            input_disconnected: false,
+            sealed: false,
+        }
+    }
+
+    /// Borrow original pending records without transferring or reissuing them.
+    pub fn pending(&self) -> &VecDeque<PendingEvent<P::Snapshot>> {
+        &self.pending
+    }
+    pub fn session_closed(&self) -> bool {
+        self.session.is_closed()
+    }
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+    }
+    pub fn output(&self) -> &AsyncOutputOwner<O, D> {
+        &self.output
+    }
+
+    /// Explicitly hand back all original owners and pending records. This is
+    /// neither output delivery nor permission to release an active writer.
+    pub fn into_parts(self) -> AsyncServeParts<P, O, D, H, F> {
+        AsyncServeParts {
+            session: self.session,
+            events: self.events,
+            output: self.output,
+            handle: self.handle,
+            dispatch: self.dispatch,
+            pending: self.pending,
+            shutdown_requested: self.shutdown_requested,
+            input_disconnected: self.input_disconnected,
+            sealed: self.sealed,
+        }
+    }
+
+    /// A normal Yielded result may resume only through this same driver.
+    /// Failed/unknown results seal it against implicit retries.
+    pub fn drive<C, E>(&mut self, poll: C) -> AsyncServeExit<E>
+    where
+        F: FnMut(Effect<P::Snapshot>) -> Result<(), E>,
+        C: FnMut() -> AsyncControl,
+    {
+        if self.sealed {
+            return AsyncServeExit {
+                status: AsyncServeStatus::Failed,
+                failure: Some(AsyncServeFailure::OriginalStateSealed),
+                cleanup_failures: Vec::new(),
+            };
+        }
+        let exit = serve_events_with_async_handler(
+            &mut self.session,
+            &self.events,
+            &self.output,
+            self.max_output_bytes,
+            self.poll_interval,
+            poll,
+            &mut self.handle,
+            &mut self.dispatch,
+            &mut self.pending,
+            &mut self.shutdown_requested,
+            &mut self.input_disconnected,
+        );
+        if exit.status != AsyncServeStatus::Yielded {
+            self.sealed = true;
+        }
+        exit
+    }
 }
 
 fn dispatch_result<S, F, E>(
@@ -87,8 +228,9 @@ where
 {
     let mut failure = None;
     let mut cleanup = Vec::new();
+    let mut dispatch_panicked = false;
     for effect in std::mem::take(&mut result.effects) {
-        if failure.is_some() && !matches!(effect, Effect::Shutdown) {
+        if failure.is_some() && (dispatch_panicked || !matches!(effect, Effect::Shutdown)) {
             // The original effect was not dispatched after a failure.
             result.effects.push(effect);
             continue;
@@ -97,7 +239,10 @@ where
         let error = match dispatched {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(AsyncDispatchFailure::Error(error)),
-            Err(payload) => Some(AsyncDispatchFailure::Panic(payload)),
+            Err(payload) => {
+                dispatch_panicked = true;
+                Some(AsyncDispatchFailure::Panic(payload))
+            }
         };
         if let Some(error) = error {
             if failure.is_none() {
@@ -123,6 +268,7 @@ fn close_original<P, H, F, E>(
     dispatch: &mut F,
     pending: &mut VecDeque<PendingEvent<P::Snapshot>>,
     cleanup: &mut Vec<AsyncServeFailure<E>>,
+    force_error_fallback: bool,
 ) -> Option<AsyncServeFailure<E>>
 where
     P: PositionPort,
@@ -133,26 +279,30 @@ where
         return None;
     }
     let handled = catch_unwind(AssertUnwindSafe(|| handle(session, Event::EndOfInput)));
-    let (mut result, handler_failure) = match handled {
-        Ok(result) => (result, None),
-        Err(payload) => (
-            SessionResult::default(),
-            Some(AsyncServeFailure::HandlerPanic(payload)),
-        ),
+    let mut result = match handled {
+        Ok(result) => result,
+        Err(payload) => return Some(AsyncServeFailure::HandlerPanic(payload)),
     };
-    // Preserve the normal runner's EOF fallback, including its evidence.
-    let fallback = catch_unwind(AssertUnwindSafe(|| session.end_of_input()));
-    let mut failure = handler_failure;
-    match fallback {
-        Ok(fallback) => {
-            result.protocol.extend(fallback.protocol);
-            result.diagnostics.extend(fallback.diagnostics);
-            result.effects.extend(fallback.effects);
+    let mut failure = None;
+    if force_error_fallback {
+        // The synchronous runner uses this fallback only when an earlier
+        // failure requires emergency revocation. On a normal close, the
+        // Owner can defer EOF until its pending physical result drains.
+        let fallback = catch_unwind(AssertUnwindSafe(|| session.end_of_input()));
+        match fallback {
+            Ok(fallback) => {
+                result.protocol.extend(fallback.protocol);
+                result.diagnostics.extend(fallback.diagnostics);
+                result.effects.extend(fallback.effects);
+            }
+            Err(payload) => {
+                pending.push_back(PendingEvent {
+                    original: result,
+                    encoded: None,
+                });
+                return Some(AsyncServeFailure::HandlerPanic(payload));
+            }
         }
-        Err(payload) if failure.is_none() => {
-            failure = Some(AsyncServeFailure::HandlerPanic(payload))
-        }
-        Err(payload) => cleanup.push(AsyncServeFailure::HandlerPanic(payload)),
     }
     let (event, dispatch_failure, extra) = dispatch_result(result, dispatch);
     pending.push_back(event);
@@ -167,21 +317,21 @@ where
     failure
 }
 
-/// Serve using the original reducer and an externally owned output worker.
-/// `poll` must be nonblocking. An external session-close request must be tied
-/// to the same engine's admission latch before it is used as shutdown control.
-/// On `Yielded`/`Failed`, retain this return value and `output` together; no
-/// automatic retry, output drop, thread join, or physical completion is implied.
-pub fn serve_events_with_async_handler<P, O, D, H, F, C, E>(
+/// Internal driver step: the caller retains the same borrowed sources and FIFO.
+/// `poll` must be nonblocking; no output or physical completion is implied.
+fn serve_events_with_async_handler<P, O, D, H, F, C, E>(
     session: &mut Session<P>,
     events: &Receiver<Event>,
     output: &AsyncOutputOwner<O, D>,
     max_output_bytes: usize,
     poll_interval: Duration,
     mut poll: C,
-    mut handle: H,
-    mut dispatch: F,
-) -> AsyncServeExit<P::Snapshot, E>
+    mut handle: &mut H,
+    mut dispatch: &mut F,
+    mut pending: &mut VecDeque<PendingEvent<P::Snapshot>>,
+    shutdown_requested: &mut bool,
+    input_disconnected: &mut bool,
+) -> AsyncServeExit<E>
 where
     P: PositionPort,
     O: Write + Send + 'static,
@@ -190,12 +340,10 @@ where
     F: FnMut(Effect<P::Snapshot>) -> Result<(), E>,
     C: FnMut() -> AsyncControl,
 {
-    let mut pending = VecDeque::new();
     let mut cleanup = Vec::new();
     if poll_interval.is_zero() {
         return AsyncServeExit {
             status: AsyncServeStatus::Failed,
-            pending,
             failure: Some(AsyncServeFailure::InvalidPollInterval),
             cleanup_failures: cleanup,
         };
@@ -204,46 +352,43 @@ where
         let control = match catch_unwind(AssertUnwindSafe(&mut poll)) {
             Ok(control) => control,
             Err(payload) => {
-                if let Some(error) = close_original(
-                    session,
-                    &mut handle,
-                    &mut dispatch,
-                    &mut pending,
-                    &mut cleanup,
-                ) {
-                    cleanup.push(error);
-                }
                 return AsyncServeExit {
                     status: AsyncServeStatus::Failed,
-                    pending,
                     failure: Some(AsyncServeFailure::ControlPanic(payload)),
                     cleanup_failures: cleanup,
                 };
             }
         };
-        if control != AsyncControl::Continue {
+        if control == AsyncControl::RetainWithoutClose {
+            return AsyncServeExit {
+                status: AsyncServeStatus::RetainedWithoutClose,
+                failure: None,
+                cleanup_failures: cleanup,
+            };
+        }
+        if control != AsyncControl::Continue && !*shutdown_requested {
+            *shutdown_requested = true;
             if let Some(error) = close_original(
                 session,
                 &mut handle,
                 &mut dispatch,
                 &mut pending,
                 &mut cleanup,
+                false,
             ) {
                 return AsyncServeExit {
                     status: AsyncServeStatus::Failed,
-                    pending,
                     failure: Some(error),
                     cleanup_failures: cleanup,
                 };
             }
-            if control == AsyncControl::ReturnPending {
-                return AsyncServeExit {
-                    status: AsyncServeStatus::Yielded,
-                    pending,
-                    failure: None,
-                    cleanup_failures: cleanup,
-                };
-            }
+        }
+        if control == AsyncControl::ReturnPending {
+            return AsyncServeExit {
+                status: AsyncServeStatus::Yielded,
+                failure: None,
+                cleanup_failures: cleanup,
+            };
         }
         if output.observation().failed {
             if let Some(error) = close_original(
@@ -252,12 +397,12 @@ where
                 &mut dispatch,
                 &mut pending,
                 &mut cleanup,
+                true,
             ) {
                 cleanup.push(error);
             }
             return AsyncServeExit {
                 status: AsyncServeStatus::Failed,
-                pending,
                 failure: Some(AsyncServeFailure::OutputWorkerFailed),
                 cleanup_failures: cleanup,
             };
@@ -273,12 +418,12 @@ where
                             &mut dispatch,
                             &mut pending,
                             &mut cleanup,
+                            true,
                         ) {
                             cleanup.push(error);
                         }
                         return AsyncServeExit {
                             status: AsyncServeStatus::Failed,
-                            pending,
                             failure: Some(AsyncServeFailure::Encoding(error)),
                             cleanup_failures: cleanup,
                         };
@@ -307,12 +452,12 @@ where
                         &mut dispatch,
                         &mut pending,
                         &mut cleanup,
+                        true,
                     ) {
                         cleanup.push(error);
                     }
                     return AsyncServeExit {
                         status: AsyncServeStatus::Failed,
-                        pending,
                         failure: Some(AsyncServeFailure::OutputTooLarge),
                         cleanup_failures: cleanup,
                     };
@@ -325,12 +470,12 @@ where
                         &mut dispatch,
                         &mut pending,
                         &mut cleanup,
+                        true,
                     ) {
                         cleanup.push(error);
                     }
                     return AsyncServeExit {
                         status: AsyncServeStatus::Failed,
-                        pending,
                         failure: Some(AsyncServeFailure::OutputClosed),
                         cleanup_failures: cleanup,
                     };
@@ -341,31 +486,27 @@ where
             output.request_close();
             return AsyncServeExit {
                 status: AsyncServeStatus::OutputQueued,
-                pending,
                 failure: None,
                 cleanup_failures: cleanup,
             };
         }
+        if *input_disconnected {
+            thread::park_timeout(poll_interval);
+            continue;
+        }
         let event = match events.recv_timeout(poll_interval) {
             Ok(event) => event,
             Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => Event::EndOfInput,
+            Err(RecvTimeoutError::Disconnected) => {
+                *input_disconnected = true;
+                Event::EndOfInput
+            }
         };
         let result = match catch_unwind(AssertUnwindSafe(|| handle(session, event))) {
             Ok(result) => result,
             Err(payload) => {
-                if let Some(error) = close_original(
-                    session,
-                    &mut handle,
-                    &mut dispatch,
-                    &mut pending,
-                    &mut cleanup,
-                ) {
-                    cleanup.push(error);
-                }
                 return AsyncServeExit {
                     status: AsyncServeStatus::Failed,
-                    pending,
                     failure: Some(AsyncServeFailure::HandlerPanic(payload)),
                     cleanup_failures: cleanup,
                 };
@@ -375,18 +516,20 @@ where
         pending.push_back(event);
         cleanup.extend(extra.into_iter().map(AsyncServeFailure::Dispatch));
         if let Some(error) = failure {
-            if let Some(error) = close_original(
-                session,
-                &mut handle,
-                &mut dispatch,
-                &mut pending,
-                &mut cleanup,
-            ) {
-                cleanup.push(error);
+            if !matches!(&error, AsyncDispatchFailure::Panic(_)) {
+                if let Some(error) = close_original(
+                    session,
+                    &mut handle,
+                    &mut dispatch,
+                    &mut pending,
+                    &mut cleanup,
+                    true,
+                ) {
+                    cleanup.push(error);
+                }
             }
             return AsyncServeExit {
                 status: AsyncServeStatus::Failed,
-                pending,
                 failure: Some(AsyncServeFailure::Dispatch(error)),
                 cleanup_failures: cleanup,
             };

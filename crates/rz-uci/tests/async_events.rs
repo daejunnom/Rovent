@@ -1,9 +1,7 @@
 use rz_uci::runner::async_events::{
-    AsyncControl, AsyncServeFailure, AsyncServeStatus, serve_events_with_async_handler,
+    AsyncControl, AsyncServeDriver, AsyncServeFailure, AsyncServeStatus,
 };
-use rz_uci::runner::async_output::{
-    AsyncOutputOwner, OutputBatch, SubmitError, encode_event_output,
-};
+use rz_uci::runner::async_output::{AsyncOutputOwner, OutputBatch};
 use rz_uci::{
     Diagnostic, Effect, EngineIdentity, Event, ParserLimits, PositionPort, PositionSpec,
     PreparedPosition, Session, handle_event,
@@ -114,23 +112,13 @@ fn full_output_retains_current_and_close_output_in_original_order() {
     let (sender, events) = mpsc::sync_channel(2);
     sender.send(Event::Line("uci".into())).unwrap();
     let calls = Cell::new(0);
-    let mut session = session();
-    let mut shutdown_seen = false;
-    let mut exit = serve_events_with_async_handler(
-        &mut session,
-        &events,
-        &owner,
+    let shutdown_seen = Cell::new(false);
+    let mut driver = AsyncServeDriver::new(
+        session(),
+        events,
+        owner,
         4096,
         Duration::from_millis(1),
-        || {
-            let count = calls.get();
-            calls.set(count + 1);
-            if count >= 2 {
-                AsyncControl::ReturnPending
-            } else {
-                AsyncControl::Continue
-            }
-        },
         |session, event| {
             if matches!(event, Event::EndOfInput) {
                 let mut result = handle_event(session, event);
@@ -146,41 +134,48 @@ fn full_output_retains_current_and_close_output_in_original_order() {
         },
         |effect| {
             if matches!(effect, Effect::Shutdown) {
-                shutdown_seen = true;
+                shutdown_seen.set(true);
             }
             Ok::<_, &'static str>(())
         },
     );
+    let exit = driver.drive(|| {
+        let count = calls.get();
+        calls.set(count + 1);
+        if count >= 2 {
+            AsyncControl::ReturnPending
+        } else {
+            AsyncControl::Continue
+        }
+    });
     {
         let (mutex, condition) = &*gate;
         mutex.lock().unwrap().1 = true;
         condition.notify_all();
     }
     assert_eq!(exit.status, AsyncServeStatus::Yielded);
-    assert!(session.is_closed() && shutdown_seen);
-    assert_eq!(exit.pending.len(), 2);
-    assert_eq!(exit.pending[0].original.protocol.last().unwrap(), "uciok");
-    assert!(exit.pending[0].encoded.is_some());
-    assert_eq!(exit.pending[1].original.protocol, vec!["close-evidence"]);
-    assert_eq!(exit.pending[1].original.diagnostics[0].message, "retained");
+    assert!(driver.session_closed() && shutdown_seen.get());
+    assert_eq!(driver.pending().len(), 2);
+    assert_eq!(
+        driver.pending()[0].original.protocol.last().unwrap(),
+        "uciok"
+    );
+    assert!(driver.pending()[0].encoded.is_some());
+    assert_eq!(
+        driver.pending()[1].original.protocol,
+        vec!["close-evidence"]
+    );
+    assert_eq!(
+        driver.pending()[1].original.diagnostics[0].message,
+        "retained"
+    );
     let until = Instant::now() + Duration::from_secs(3);
-    while let Some(mut item) = exit.pending.pop_front() {
-        let mut batch = item
-            .encoded
-            .take()
-            .unwrap_or_else(|| encode_event_output(&item.original, 4096).unwrap());
-        loop {
-            match owner.try_submit(batch) {
-                Ok(()) => break,
-                Err(SubmitError::Full(original)) if Instant::now() < until => {
-                    batch = original;
-                    thread::yield_now();
-                }
-                _ => panic!("fixture could not drain pending output"),
-            }
-        }
-    }
-    owner.request_close();
+    let resumed = driver.drive(|| AsyncControl::Continue);
+    assert_eq!(resumed.status, AsyncServeStatus::OutputQueued);
+    assert!(driver.pending().is_empty());
+    let parts = driver.into_parts();
+    assert!(parts.pending.is_empty());
+    let owner = parts.output;
     let mut owner = owner;
     let result = loop {
         owner = match owner.try_recover() {
@@ -205,20 +200,18 @@ fn full_output_retains_current_and_close_output_in_original_order() {
 }
 
 #[test]
-fn control_panic_preserves_close_dispatch_failure_and_output() {
+fn control_panic_retains_session_without_implicit_shutdown_retry() {
     let owner = match AsyncOutputOwner::start(Vec::<u8>::new(), Vec::<u8>::new(), 1, 4096) {
         Ok(owner) => owner,
         Err(_) => panic!("cannot create fixture output owner"),
     };
     let (_sender, events) = mpsc::sync_channel(1);
-    let mut session = session();
-    let exit = serve_events_with_async_handler(
-        &mut session,
-        &events,
-        &owner,
+    let mut driver = AsyncServeDriver::new(
+        session(),
+        events,
+        owner,
         4096,
         Duration::from_millis(1),
-        || panic!("fixture control panic"),
         handle_event,
         |effect| -> Result<(), &'static str> {
             if matches!(effect, Effect::Shutdown) {
@@ -228,15 +221,88 @@ fn control_panic_preserves_close_dispatch_failure_and_output() {
             }
         },
     );
+    let exit = driver.drive(|| panic!("fixture control panic"));
     assert_eq!(exit.status, AsyncServeStatus::Failed);
     assert!(matches!(
         exit.failure,
         Some(AsyncServeFailure::ControlPanic(_))
     ));
-    assert_eq!(exit.cleanup_failures.len(), 1);
-    assert_eq!(exit.pending.len(), 1);
-    assert!(session.is_closed());
-    finish_empty(owner);
+    assert!(exit.cleanup_failures.is_empty());
+    assert!(driver.pending().is_empty());
+    assert!(!driver.session_closed());
+    let parts = driver.into_parts();
+    assert!(parts.sealed);
+    finish_empty(parts.output);
+}
+
+#[test]
+fn explicit_unknown_control_retains_session_without_reducer_or_dispatch() {
+    let owner = match AsyncOutputOwner::start(Vec::<u8>::new(), Vec::<u8>::new(), 1, 4096) {
+        Ok(owner) => owner,
+        Err(_) => panic!("cannot create fixture output owner"),
+    };
+    let (_sender, events) = mpsc::sync_channel(1);
+    let mut driver = AsyncServeDriver::new(
+        session(),
+        events,
+        owner,
+        4096,
+        Duration::from_millis(1),
+        |_, _| -> rz_uci::SessionResult<()> { panic!("reducer must not run") },
+        |_| -> Result<(), &'static str> { panic!("dispatch must not run") },
+    );
+    let exit = driver.drive(|| AsyncControl::RetainWithoutClose);
+    assert_eq!(exit.status, AsyncServeStatus::RetainedWithoutClose);
+    assert!(driver.pending().is_empty());
+    assert!(!driver.session_closed());
+    let parts = driver.into_parts();
+    assert!(parts.sealed);
+    finish_empty(parts.output);
+}
+
+#[test]
+fn deferred_owner_close_is_not_forced_or_reissued_after_yield() {
+    let owner = match AsyncOutputOwner::start(Vec::<u8>::new(), Vec::<u8>::new(), 1, 4096) {
+        Ok(owner) => owner,
+        Err(_) => panic!("cannot create fixture output owner"),
+    };
+    let (_sender, events) = mpsc::sync_channel(1);
+    let eof_count = Cell::new(0);
+    let mut driver = AsyncServeDriver::new(
+        session(),
+        events,
+        owner,
+        4096,
+        Duration::from_millis(1),
+        |session, event| {
+            if matches!(event, Event::EndOfInput) {
+                eof_count.set(eof_count.get() + 1);
+                // Stand in for an Owner waiting on its original physical fence.
+                rz_uci::SessionResult::default()
+            } else {
+                handle_event(session, event)
+            }
+        },
+        |_| Ok::<_, &'static str>(()),
+    );
+    assert_eq!(
+        driver.drive(|| AsyncControl::ReturnPending).status,
+        AsyncServeStatus::Yielded
+    );
+    assert!(driver.shutdown_requested());
+    assert!(!driver.session_closed());
+    assert_eq!(eof_count.get(), 1);
+    assert_eq!(
+        driver.drive(|| AsyncControl::ReturnPending).status,
+        AsyncServeStatus::Yielded
+    );
+    assert!(!driver.session_closed());
+    assert_eq!(eof_count.get(), 1);
+    let parts = driver.into_parts();
+    assert_eq!(parts.pending.len(), 1);
+    assert!(parts.shutdown_requested);
+    assert!(!parts.sealed);
+    finish_empty(parts.output);
 }
 
 #[test]
@@ -247,21 +313,25 @@ fn encoding_limit_preserves_original_and_closes_original_session() {
     };
     let (sender, events) = mpsc::sync_channel(1);
     sender.send(Event::Line("uci".into())).unwrap();
-    let mut session = session();
-    let exit = serve_events_with_async_handler(
-        &mut session,
-        &events,
-        &owner,
+    let mut driver = AsyncServeDriver::new(
+        session(),
+        events,
+        owner,
         1,
         Duration::from_millis(1),
-        || AsyncControl::Continue,
         handle_event,
         |_| Ok::<_, &'static str>(()),
     );
+    let exit = driver.drive(|| AsyncControl::Continue);
     assert_eq!(exit.status, AsyncServeStatus::Failed);
     assert!(matches!(exit.failure, Some(AsyncServeFailure::Encoding(_))));
-    assert_eq!(exit.pending.len(), 2);
-    assert_eq!(exit.pending[0].original.protocol.last().unwrap(), "uciok");
-    assert!(session.is_closed());
-    finish_empty(owner);
+    assert_eq!(driver.pending().len(), 2);
+    assert_eq!(
+        driver.pending()[0].original.protocol.last().unwrap(),
+        "uciok"
+    );
+    assert!(driver.session_closed());
+    let parts = driver.into_parts();
+    assert!(parts.sealed);
+    finish_empty(parts.output);
 }
