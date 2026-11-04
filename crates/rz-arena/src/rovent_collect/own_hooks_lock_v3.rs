@@ -4,12 +4,15 @@
 //! An external supervisor owns preparation, teacher processes, worker joins,
 //! and publication. This bridge does not attest their successful completion.
 
+use super::launch::PreparedPcCollectionInputsV3;
 use super::native_capture::RoventNativeCaptureRegistration;
 use super::observer_lock_v3::RoventCollectionOwnerLockV3;
 use super::own_worker_v3::OwnRootRecoveryV3;
+use super::policy_row_pipeline_v3::PolicyRowPipelineOwnerV3;
 use super::speculative_route_v3::SpeculativeRootV3;
 use super::teacher::v3_pump::TeacherPumpV3;
 use super::teacher::v3_session::TeacherSessionStagingV3;
+use super::{ArenaError, invalid};
 use rz_search::pals::engine::adaptive_port::AdaptivePortQuestion;
 use rz_uci::pals_adaptive::{
     AdaptiveCollectionBoundaryV2, AdaptiveCollectionObserverBoxV3,
@@ -24,7 +27,7 @@ use rz_uci::pals_adaptive::{
 use rz_uci::pals_native::ticketed::VirtualReviewTicketOutput;
 use rz_uci::rovent_bootstrap::{RoventNativeBackend, RoventStartupControl};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, TryLockError, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak, mpsc};
 
 type Output = VirtualReviewTicketOutput;
 type Backend = RoventNativeBackend<AdaptivePortQuestion>;
@@ -51,6 +54,7 @@ struct RootSlot {
     join_failure: Option<RoventBoardCollectionWorkerJoinFailureV3>,
     join_panic: Option<Box<dyn std::any::Any + Send>>,
     join_unknown: bool,
+    join_complete: bool,
 }
 
 struct State {
@@ -64,8 +68,10 @@ struct State {
 /// Both this hook and its external supervisor retain this same Arc. The
 /// supervisor is responsible for settling or retaining every root worker.
 pub(crate) struct RoventOwnCollectionBridgeV3 {
+    inputs: Arc<PreparedPcCollectionInputsV3>,
     registration: RoventNativeCaptureRegistration,
     startup: OnceLock<RoventStartupControl>,
+    pipeline: OnceLock<PolicyRowPipelineOwnerV3>,
     state: Mutex<State>,
     request_sender: mpsc::SyncSender<OwnRootRequestV3>,
     request_receiver: Mutex<mpsc::Receiver<OwnRootRequestV3>>,
@@ -73,6 +79,7 @@ pub(crate) struct RoventOwnCollectionBridgeV3 {
 
 /// Carries the same root's irrevocable cancellation observation to the
 /// supervisor. It must be checked before each acquisition or worker start.
+#[derive(Clone)]
 pub(crate) struct OwnRootRequestV3 {
     pub admission: RoventCollectionRootAdmissionV3,
     revoked: Arc<AtomicBool>,
@@ -80,6 +87,9 @@ pub(crate) struct OwnRootRequestV3 {
 impl OwnRootRequestV3 {
     pub(crate) fn is_revoked(&self) -> bool {
         self.revoked.load(Ordering::Acquire)
+    }
+    pub(crate) fn revocation_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.revoked)
     }
 }
 
@@ -91,7 +101,8 @@ pub(crate) struct OwnPreparedRootV3 {
     pub worker: RoventBoardCollectionWorkerV3,
     pub stage: Arc<Mutex<TeacherSessionStagingV3>>,
     pub pump: Arc<Mutex<TeacherPumpV3>>,
-    pub recovery: Arc<Mutex<OwnRootRecoveryV3>>,
+    pub pipeline: PolicyRowPipelineOwnerV3,
+    pub recovery: Weak<Mutex<OwnRootRecoveryV3>>,
 }
 pub(crate) enum OwnPrepareOutcomeV3 {
     Prepared,
@@ -118,28 +129,35 @@ impl RoventOwnCollectionBridgeV3 {
     /// Called before native startup. No worker or teacher is started here.
     pub(crate) fn new(
         registration: RoventNativeCaptureRegistration,
-        maximum_roots: usize,
-        maximum_workers: usize,
-        maximum_teacher_roots: usize,
-    ) -> Result<Arc<Self>, &'static str> {
+        inputs: Arc<PreparedPcCollectionInputsV3>,
+        lock: &rz_experiments::RoventInputLockV3,
+        directory: &cap_std::fs::Dir,
+        lock_file: &std::fs::File,
+    ) -> Result<Arc<Self>, ArenaError> {
+        inputs.validate_original_own_boundary(lock, directory, lock_file)?;
+        let maximum_roots = usize::from(inputs.plan().maximum_roots);
+        let maximum_workers = usize::from(inputs.plan().maximum_root_workers);
+        let maximum_teacher_roots = usize::from(inputs.plan().maximum_simultaneous_teacher_roots);
         if !(1..=64).contains(&maximum_roots)
             || !(1..=maximum_roots).contains(&maximum_workers)
             || !(1..=maximum_workers).contains(&maximum_teacher_roots)
         {
-            return Err("Own /3 root capacity");
+            return Err(invalid("Own /3 root capacity"));
         }
         let mut slots = Vec::new();
         let mut deferred = Vec::new();
         slots
             .try_reserve_exact(maximum_roots)
-            .map_err(|_| "Own /3 root allocation")?;
+            .map_err(|_| invalid("Own /3 root allocation"))?;
         deferred
             .try_reserve_exact(maximum_roots)
-            .map_err(|_| "Own /3 cleanup allocation")?;
+            .map_err(|_| invalid("Own /3 cleanup allocation"))?;
         let (request_sender, request_receiver) = mpsc::sync_channel(maximum_roots);
         Ok(Arc::new(Self {
+            inputs,
             registration,
             startup: OnceLock::new(),
+            pipeline: OnceLock::new(),
             state: Mutex::new(State {
                 slots,
                 deferred,
@@ -168,6 +186,30 @@ impl RoventOwnCollectionBridgeV3 {
 
     pub(crate) fn startup(&self) -> Option<&RoventStartupControl> {
         self.startup.get()
+    }
+    /// Register one actual game writer pipeline, retained before any root
+    /// receives it. The same opaque owner must be used by every root.
+    pub(crate) fn register_pipeline(
+        &self,
+        pipeline: &PolicyRowPipelineOwnerV3,
+    ) -> Result<(), &'static str> {
+        if let Some(existing) = self.pipeline.get() {
+            return if existing.same_owner(pipeline) {
+                Ok(())
+            } else {
+                Err("Own /3 game pipeline changed")
+            };
+        }
+        self.pipeline
+            .set(pipeline.clone())
+            .map_err(|_| "Own /3 pipeline registration raced")
+    }
+    pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> {
+        &self.inputs
+    }
+
+    pub(crate) fn capture_registration(&self) -> &RoventNativeCaptureRegistration {
+        &self.registration
     }
 
     /// Reserve independent root-worker and teacher-process capacity before
@@ -261,6 +303,7 @@ impl RoventOwnCollectionBridgeV3 {
             return Err("Own /3 original request absent");
         };
         if !original.matches_admission(admission)
+            || !Arc::ptr_eq(&original.inputs, &self.inputs)
             || !Arc::ptr_eq(&original.request.revoked, &slot.revoked)
             || slot.revoked.load(Ordering::Acquire)
         {
@@ -276,6 +319,12 @@ impl RoventOwnCollectionBridgeV3 {
     /// The caller creates the actual worker and teacher owner outside the
     /// manager. Rejection keeps the whole prepared owner with the caller.
     pub(crate) fn try_publish_prepared(&self, original: OwnPreparedRootV3) -> OwnPrepareOutcomeV3 {
+        let Some(original_recovery) = original.recovery.upgrade() else {
+            return OwnPrepareOutcomeV3::Rejected {
+                reason: "Own /3 original recovery absent".into(),
+                original,
+            };
+        };
         match original.admission.root_admission().try_accepts_original() {
             Ok(true) => {}
             Ok(false) => {
@@ -295,6 +344,10 @@ impl RoventOwnCollectionBridgeV3 {
             }
         }
         if !original.worker.matches_admission(&original.admission)
+            || !self
+                .pipeline
+                .get()
+                .is_some_and(|pipeline| pipeline.same_owner(&original.pipeline))
             || !original.route.matches_admission(&original.admission)
             || !self.registration.owns_speculative_root_v3(&original.route)
             || !original
@@ -340,14 +393,14 @@ impl RoventOwnCollectionBridgeV3 {
                 || !slot
                     .recovery
                     .as_ref()
-                    .is_some_and(|owner| Arc::ptr_eq(owner, &original.recovery))
+                    .is_some_and(|owner| Arc::ptr_eq(owner, &original_recovery))
             {
                 return OwnPrepareOutcomeV3::Rejected {
                     reason: "Own /3 root or recovery unavailable".into(),
                     original,
                 };
             }
-            let recovery_owner = Arc::clone(&original.recovery);
+            let recovery_owner = Arc::clone(&original_recovery);
             let matches = match recovery_owner.try_lock() {
                 Ok(recovery) => match recovery.try_matches_prepared(
                     &original.admission,
@@ -355,6 +408,7 @@ impl RoventOwnCollectionBridgeV3 {
                     &original.owner,
                     &original.stage,
                     &original.pump,
+                    &original.pipeline,
                     &original.worker.recovery_key(),
                 ) {
                     Ok(Some(value)) => value,
@@ -380,6 +434,20 @@ impl RoventOwnCollectionBridgeV3 {
                     original,
                 };
             }
+        }
+        let bound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            original.owner.try_bind_policy_pipeline(&original.pipeline)
+        }));
+        match bound {
+            Ok(Ok(Some(()))) => {}
+            Ok(Ok(None)) => return OwnPrepareOutcomeV3::Busy(original),
+            Ok(Err(error)) => {
+                return OwnPrepareOutcomeV3::Rejected {
+                    reason: error.to_string(),
+                    original,
+                };
+            }
+            Err(payload) => return OwnPrepareOutcomeV3::Panicked { original, payload },
         }
         let attached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             original
@@ -451,14 +519,14 @@ impl RoventOwnCollectionBridgeV3 {
         if !slot
             .recovery
             .as_ref()
-            .is_some_and(|owner| Arc::ptr_eq(owner, &original.recovery))
+            .is_some_and(|owner| Arc::ptr_eq(owner, &original_recovery))
         {
             return OwnPrepareOutcomeV3::Rejected {
                 reason: "Own /3 original recovery not registered".into(),
                 original,
             };
         }
-        let recovery_owner = Arc::clone(&original.recovery);
+        let recovery_owner = Arc::clone(&original_recovery);
         let matches_original = match recovery_owner.try_lock() {
             Ok(recovery) => match recovery.try_matches_prepared(
                 &original.admission,
@@ -466,6 +534,7 @@ impl RoventOwnCollectionBridgeV3 {
                 &original.owner,
                 &original.stage,
                 &original.pump,
+                &original.pipeline,
                 &original.worker.recovery_key(),
             ) {
                 Ok(Some(value)) => value,
@@ -504,6 +573,7 @@ impl RoventOwnCollectionBridgeV3 {
             worker,
             stage: _,
             pump: _,
+            pipeline: _,
             recovery: _,
         } = original;
         slot.observer = Some(observer);
@@ -520,16 +590,17 @@ impl RoventOwnCollectionBridgeV3 {
         &self,
         admission: &RoventCollectionRootAdmissionV3,
     ) -> Result<bool, &'static str> {
-        let mut state = self
-            .state
-            .try_lock()
-            .map_err(|_| "Own /3 root custody busy")?;
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => return Err("Own /3 root custody poisoned"),
+        };
         let slot = state
             .slots
             .iter_mut()
             .find(|slot| slot.admission.same_original_admission(admission))
             .ok_or("Own /3 original root missing")?;
-        if slot.joined.is_some() {
+        if slot.join_complete {
             return Ok(true);
         }
         if slot.join_unknown {
@@ -543,6 +614,7 @@ impl RoventOwnCollectionBridgeV3 {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.try_join(handoff)));
         match result {
             Ok(Ok(Some(custody))) => {
+                slot.join_complete = true;
                 slot.joined = Some(custody);
                 Ok(true)
             }
@@ -705,6 +777,7 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
                     join_failure: None,
                     join_panic: None,
                     join_unknown: false,
+                    join_complete: false,
                 });
                 state.slots.len() - 1
             }
