@@ -746,10 +746,79 @@ struct IndependentNoGameOwners {
     // One binding is moved into one custody owner. Its control owns the same
     // snapshot/execution/socket Arcs and the selected proxy FD.
     _binding: crate::pals_adaptive_launch::DirectNoGameBinding,
+    envelope: IndependentNoGameSupervisorEnvelope,
     plan_sha256: String,
     observation: Option<crate::process::OriginalSmokeUciObservation>,
     quarantined_error: Option<ArenaError>,
     grants: Arc<Mutex<[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]>>,
+}
+
+/// Limits and tree-watch declaration derived from this selected snapshot.
+/// These values do not apply CPU, memory, affinity or any physical fence.
+#[cfg(target_os = "linux")]
+struct IndependentNoGameSupervisorEnvelope {
+    limits: crate::process::ProcessLimits,
+    watch: crate::process::OwnedArtifactTreeWatch,
+}
+
+#[cfg(target_os = "linux")]
+impl IndependentNoGameSupervisorEnvelope {
+    fn from_original(
+        binding: &crate::pals_adaptive_launch::DirectNoGameBinding,
+    ) -> Result<Self, ArenaError> {
+        let snapshot = binding.snapshot();
+        let input = snapshot.plan.input();
+        let budget = &input.budget;
+        let inputs = snapshot
+            .receipts
+            .iter()
+            .try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
+            .ok_or_else(|| ArenaError::Budget("NoGame snapshot bytes overflow".into()))?;
+        if inputs > budget.max_input_bytes {
+            return Err(ArenaError::Budget(
+                "NoGame snapshot exceeds original input budget".into(),
+            ));
+        }
+        let watched_bytes = inputs
+            .checked_add(budget.max_runtime_bytes)
+            .and_then(|sum| sum.checked_add(budget.max_output_bytes))
+            .ok_or_else(|| ArenaError::Budget("NoGame watched bytes overflow".into()))?;
+        if watched_bytes > budget.max_artifact_bytes {
+            return Err(ArenaError::Budget(
+                "NoGame watched bytes exceed original artifact budget".into(),
+            ));
+        }
+        let max_files = usize::try_from(budget.max_runtime_files)
+            .ok()
+            .and_then(|n| n.checked_add(snapshot.pins.len()))
+            .and_then(|n| n.checked_add(snapshot.input_subdirectories.len()))
+            .and_then(|n| n.checked_add(2))
+            .ok_or_else(|| ArenaError::Budget("NoGame watched entry count overflow".into()))?;
+        let max_depth = usize::from(budget.max_runtime_depth)
+            .checked_add(1)
+            .ok_or_else(|| ArenaError::Budget("NoGame watched depth overflow".into()))?;
+        let window = &input.endpoint.startup_lock.config.window;
+        let envelope = Self {
+            limits: crate::process::ProcessLimits {
+                wall_ms: window.wall_time_max_ms,
+                shutdown_grace_ms: window.cleanup_max_ms.div_ceil(2),
+                max_output_bytes: budget.max_output_bytes,
+                max_child_processes: budget.max_child_processes,
+            },
+            watch: crate::process::OwnedArtifactTreeWatch {
+                max_total_bytes: watched_bytes,
+                max_file_bytes: budget
+                    .max_input_bytes
+                    .max(budget.max_runtime_bytes)
+                    .max(budget.max_output_bytes),
+                max_files,
+                max_depth,
+            },
+        };
+        envelope.limits.validate()?;
+        envelope.watch.validate()?;
+        Ok(envelope)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -944,10 +1013,15 @@ impl PreparedIndependentNoGameOwner {
         if let Err(error) = checked {
             return Err((error, binding));
         }
+        let envelope = match IndependentNoGameSupervisorEnvelope::from_original(&binding) {
+            Ok(envelope) => envelope,
+            Err(error) => return Err((error, binding)),
+        };
         let plan_sha256 = binding.snapshot().plan.sha256().to_owned();
         Ok(Self {
             owners: Some(IndependentNoGameOwners {
                 _binding: binding,
+                envelope,
                 plan_sha256,
                 observation: None,
                 quarantined_error: None,
@@ -990,8 +1064,6 @@ impl PreparedIndependentNoGameOwner {
     fn supervise_admitted(
         &mut self,
         _admission: &IndependentNoGameDispatchAdmission,
-        limits: crate::process::ProcessLimits,
-        watch: &crate::process::OwnedArtifactTreeWatch,
         cancel: Option<&AtomicBool>,
     ) -> IndependentNoGameSupervisorOutcome {
         if self.evidence_transferred || self.unresolved() {
@@ -1043,9 +1115,9 @@ impl PreparedIndependentNoGameOwner {
             binding.proxy().as_ref(),
             binding.arguments(),
             &binding.snapshot().cwd,
-            limits,
+            owners.envelope.limits,
             cancel,
-            watch,
+            &owners.envelope.watch,
             window,
             &mut self.spawn_custody,
             &mut run,
