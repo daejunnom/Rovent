@@ -783,6 +783,72 @@ impl PcReceivedStageProofV3 {
     }
 }
 
+/// Same received root, original ready session and exact actor slot. A source
+/// identity is not an actor start, a terminal result or a physical fence.
+pub(super) struct PcReceivedActorProofV3 {
+    stage_proof: PcReceivedStageProofV3,
+    session: Weak<Mutex<RoventCollectionTeacherSessionV3>>,
+    session_identity: Weak<()>,
+    actor_identity: Weak<()>,
+}
+
+impl PcReceivedActorProofV3 {
+    pub(super) fn matches_game(&self, game: &Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>>) -> Option<bool> {
+        self.stage_proof.matches_game(game)
+    }
+    pub(super) fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
+        self.stage_proof.matches_admission(admission)
+    }
+    pub(super) fn matches_actor_source(&self, source: &super::teacher::v3_session::TeacherActorEffectSourceV3) -> bool {
+        Weak::ptr_eq(&self.session_identity, &source.session_identity_weak())
+            && Weak::ptr_eq(&self.actor_identity, &Arc::downgrade(source.actor_identity()))
+            && source.matches_admission(&self.stage_proof.admission)
+    }
+    pub(super) fn try_from_guards(
+        supervisor: &PcWorkerSupervisorV3,
+        recovery: &PcRootRecoveryV3,
+        stage_owner: &Arc<Mutex<TeacherSessionStagingV3>>,
+        stage: &TeacherSessionStagingV3,
+        session_owner: &Arc<Mutex<RoventCollectionTeacherSessionV3>>,
+        session: &RoventCollectionTeacherSessionV3,
+        source: &super::teacher::v3_session::TeacherActorEffectSourceV3,
+    ) -> Result<Option<Self>, &'static str> {
+        let Some(stage_proof) = PcReceivedStageProofV3::try_from_guards(supervisor, recovery, stage_owner, stage)? else {
+            return Ok(None);
+        };
+        let Some(original_session) = stage.session() else { return Ok(None); };
+        if !Arc::ptr_eq(&original_session, session_owner)
+            || !stage.ready_session_effect_identity_weak().is_some_and(|id| Weak::ptr_eq(&id, &source.session_identity_weak()))
+            || !session.matches_actor_effect_source(source)
+        { return Err("P-C V3 original actor session differs"); }
+        Ok(Some(Self {
+            stage_proof,
+            session: Arc::downgrade(session_owner),
+            session_identity: source.session_identity_weak(),
+            actor_identity: Arc::downgrade(source.actor_identity()),
+        }))
+    }
+    pub(super) fn try_revalidate_with_guards(
+        &self,
+        supervisor: &PcWorkerSupervisorV3,
+        recovery: &PcRootRecoveryV3,
+        stage: &TeacherSessionStagingV3,
+        session: &RoventCollectionTeacherSessionV3,
+        source: &super::teacher::v3_session::TeacherActorEffectSourceV3,
+    ) -> Result<Option<bool>, &'static str> {
+        match self.stage_proof.try_revalidate_with_guards(supervisor, recovery)? {
+            Some(true) => {}, other => return Ok(other),
+        }
+        let original_session = self.session.upgrade().ok_or("P-C V3 actor session owner unavailable")?;
+        if !Weak::ptr_eq(&self.stage_proof.scope_identity, &stage.scope_effect_identity_weak())
+            || !stage.session().is_some_and(|original| Arc::ptr_eq(&original, &original_session))
+            || !stage.ready_session_effect_identity_weak().is_some_and(|id| Weak::ptr_eq(&id, &self.session_identity))
+            || !self.matches_actor_source(source) || !session.matches_actor_effect_source(source)
+        { return Ok(Some(false)); }
+        Ok(Some(true))
+    }
+}
+
 /// A registered supervisor task is retained before any thread can start.
 /// Join of this driver is independent of teacher/native/GPU completion.
 pub(crate) struct SupervisorStartCustodyV3 {
