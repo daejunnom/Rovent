@@ -86,6 +86,24 @@ pub(super) struct RoventRetiredLockV3Record {
     admission: RoventCollectionRootAdmissionV3,
     ticket: RoleTicketEnvelope,
 }
+impl RoventRetiredLockV3Record {
+    /// Borrow the original accepted row for target preparation. This does not
+    /// transfer producer custody, publish the row, or authorize a target.
+    pub(super) fn record(
+        &self,
+    ) -> &rz_experiments::rovent_corpus_lock_v3::record::RoventTrainingRecordLockV3 {
+        &self.record
+    }
+    pub(super) fn admission(&self) -> &RoventCollectionRootAdmissionV3 {
+        &self.admission
+    }
+    pub(super) fn ticket(&self) -> RoleTicketEnvelope {
+        self.ticket
+    }
+    pub(super) fn manifest(&self) -> &Arc<RoventCorpusManifestLockV3> {
+        &self.manifest_owner
+    }
+}
 pub(super) struct RoventCorpusProducerLockV3 {
     manifest: Arc<RoventCorpusManifestLockV3>,
     admission: RoventCollectionRootAdmissionV3,
