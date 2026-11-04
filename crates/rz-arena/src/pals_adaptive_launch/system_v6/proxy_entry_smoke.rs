@@ -208,6 +208,10 @@ fn smoke_sources() -> &'static [(&'static str, &'static [u8])] {
             include_bytes!("smoke_deadline_control.rs"),
         ),
         (
+            "arena_smoke_cancel",
+            include_bytes!("smoke_cancel_sender.rs"),
+        ),
+        (
             "arena_direct_smoke_launch",
             include_bytes!("direct_smoke_launch.rs"),
         ),
@@ -215,6 +219,10 @@ fn smoke_sources() -> &'static [(&'static str, &'static [u8])] {
         (
             "smoke_grant_wire",
             include_bytes!("../../../../rz-contracts/src/pals/proxy_entry_smoke_grant_v1.rs"),
+        ),
+        (
+            "smoke_cancel_wire",
+            include_bytes!("../../../../rz-contracts/src/pals/proxy_entry_smoke_cancel_v1.rs"),
         ),
         (
             "proxy_smoke",
@@ -245,6 +253,18 @@ fn smoke_sources() -> &'static [(&'static str, &'static [u8])] {
         (
             "proxy_smoke_lock",
             include_bytes!("../../../../rz-uci/src/pals_system_proxy/proxy_entry_smoke_lock_v1.rs"),
+        ),
+        (
+            "proxy_smoke_cancel",
+            include_bytes!(
+                "../../../../rz-uci/src/pals_system_proxy/proxy_entry_smoke_cancel_v1.rs"
+            ),
+        ),
+        (
+            "proxy_smoke_supervisor",
+            include_bytes!(
+                "../../../../rz-uci/src/pals_system_proxy/proxy_entry_smoke_supervisor_v1.rs"
+            ),
         ),
         (
             "proxy_module",

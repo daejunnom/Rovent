@@ -39,6 +39,10 @@ use std::{
     time::Instant,
 };
 
+#[path = "smoke_cancel_sender.rs"]
+mod smoke_cancel_sender;
+pub(crate) use smoke_cancel_sender::SmokeCancelProgress;
+
 struct SmokePeer {
     stream: UnixStream,
     challenge_written: usize,
@@ -88,6 +92,8 @@ pub(crate) struct SmokeDeadlineControl {
     peer: Option<SmokePeer>,
     retained_grants: Vec<SmokePeer>,
     first_failure: Option<String>,
+    cancel_peer: Option<smoke_cancel_sender::SmokeCancelPeer>,
+    cancel_failure: Option<ArenaError>,
     // Drop after listener and every retained/partial stream.
     _retained_permit: Option<Arc<NoGameBindingPermit>>,
 }
@@ -214,6 +220,8 @@ impl SmokeDeadlineControl {
             peer: None,
             retained_grants: Vec::new(),
             first_failure: None,
+            cancel_peer: None,
+            cancel_failure: None,
             _retained_permit: Some(Arc::clone(permit)),
         })
     }
@@ -302,6 +310,8 @@ impl SmokeDeadlineControl {
             peer: None,
             retained_grants: Vec::new(),
             first_failure: None,
+            cancel_peer: None,
+            cancel_failure: None,
             _retained_permit: None,
         })
     }
