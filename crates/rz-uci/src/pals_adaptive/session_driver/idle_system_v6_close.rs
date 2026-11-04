@@ -71,6 +71,11 @@ where
                 SearchSessionFailure::physical_completion_unknown(),
             );
         }
+        if owners.v6_finish_attempted {
+            return PalsV6IdleFinish::Unavailable(
+                SearchSessionFailure::physical_completion_unknown(),
+            );
+        }
         #[cfg(feature = "onnx-cpu")]
         if owners.profiled_retirement.is_some()
             || !matches!(&owners.researcher_source, SessionResearcherSource::Legacy)
@@ -79,6 +84,7 @@ where
                 SearchSessionFailure::physical_completion_unknown(),
             );
         }
+        owners.v6_finish_attempted = true;
         self.closed.store(true, Ordering::Release);
         let result = catch_unwind(AssertUnwindSafe(|| {
             self.finish_idle_physical_owners(owners, until)?;

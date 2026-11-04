@@ -4,7 +4,11 @@ use super::*;
 /// A panic does not establish shutdown. A missing source slot marks custody
 /// unknown, including the unlikely event of an unwind after transfer.
 #[must_use]
-pub(crate) enum PalsV6Admission<B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>> {
+pub(crate) enum PalsV6Admission<B>
+where
+    B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
+    B::Output: ProposerRankingOutput,
+{
     Admitted(AdaptiveSessionDriver<B>),
     Rejected(SearchSessionFailure),
     Panicked {

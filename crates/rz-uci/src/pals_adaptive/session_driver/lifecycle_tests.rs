@@ -1483,6 +1483,11 @@ fn system_v6_borrowed_idle_finish_retains_owner_when_physical_finish_is_unknown(
         PalsV6IdleFinish::Panicked(_) => panic!("finish unexpectedly panicked"),
     }
     assert_eq!(facts.finishes.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        driver.finish_pals_system_v6_idle_borrowed(Instant::now() + Duration::from_secs(3)),
+        PalsV6IdleFinish::Unavailable(_)
+    ));
+    assert_eq!(facts.finishes.load(Ordering::Acquire), 1);
     let state = driver.state.lock().unwrap();
     let SessionState::Idle(owners) = &*state else {
         panic!("failed finish must preserve the original idle owner");

@@ -320,6 +320,8 @@ struct IdleOwners<B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>> {
     researcher_source: SessionResearcherSource,
     continuation: Option<AdaptiveSequenceContinuation>,
     native_finished: Option<bool>,
+    #[cfg(all(target_os = "linux", feature = "onnx-cuda", feature = "pals-adaptive"))]
+    v6_finish_attempted: bool,
     // Retain the one-time transfer separately from the immutable snapshot.
     native_finish_report: Option<crate::pals_native::ticketed::TicketNativeFinishReport>,
     native_finish_snapshot: Option<crate::pals_native::ticketed::TicketNativeFinishReport>,
@@ -1074,6 +1076,12 @@ where
                         unexpected_archive_owner: None,
                         continuation: Some(continuation),
                         native_finished,
+                        #[cfg(all(
+                            target_os = "linux",
+                            feature = "onnx-cuda",
+                            feature = "pals-adaptive"
+                        ))]
+                        v6_finish_attempted: false,
                         native_finish_report: None,
                         native_finish_snapshot: None,
                         native_session_release,
@@ -1124,6 +1132,12 @@ where
                         unexpected_archive_owner: None,
                         continuation: Some(continuation),
                         native_finished,
+                        #[cfg(all(
+                            target_os = "linux",
+                            feature = "onnx-cuda",
+                            feature = "pals-adaptive"
+                        ))]
+                        v6_finish_attempted: false,
                         native_finish_report: None,
                         native_finish_snapshot: None,
                         native_session_release,
@@ -1172,6 +1186,12 @@ where
                         unexpected_archive_owner: None,
                         continuation: Some(continuation),
                         native_finished,
+                        #[cfg(all(
+                            target_os = "linux",
+                            feature = "onnx-cuda",
+                            feature = "pals-adaptive"
+                        ))]
+                        v6_finish_attempted: false,
                         native_finish_report: None,
                         native_finish_snapshot: None,
                         native_session_release,
@@ -1220,6 +1240,12 @@ where
                         unexpected_archive_owner: None,
                         continuation: Some(continuation),
                         native_finished,
+                        #[cfg(all(
+                            target_os = "linux",
+                            feature = "onnx-cuda",
+                            feature = "pals-adaptive"
+                        ))]
+                        v6_finish_attempted: false,
                         native_finish_report: None,
                         native_finish_snapshot: None,
                         native_session_release,
@@ -1647,11 +1673,10 @@ where
             }
             _ => ProcessWorkJournal::new_pals(resolver),
         };
-        // Reserve every heap allocation and construct all fallible journals
-        // before taking either original owner slot. `Box::write` below only
-        // initializes this already-allocated storage; it does not allocate.
-        let prepared_engine = Box::<PalsEngine<AdaptivePortModel>>::new_uninit();
-        let prepared_owners = Box::<IdleOwners<B>>::new_uninit();
+        // Construct fallible journals and capacity-checked collections before
+        // taking either original owner slot. The remaining Box allocations
+        // cannot be made recoverable on the crate's Rust 1.85 MSRV without
+        // unsafe code; allocator abort is not an unwind or a completion fence.
         let completion = Mutex::new(CompletionJournal::new(
             clock.epoch(),
             options.implementation,
@@ -1680,29 +1705,28 @@ where
             external,
             checker_metadata,
         } = sources;
-        let engine = Box::write(prepared_engine, engine);
-        let owners = Box::write(
-            prepared_owners,
-            IdleOwners {
-                native,
-                engine: Some(engine),
-                unexpected_archive_owner: None,
-                cpu,
-                external,
-                researcher_source,
-                continuation: None,
-                native_finished: None,
-                native_finish_report: None,
-                native_finish_snapshot: None,
-                native_session_release: None,
-                native_joined: false,
-                external_finished: None,
-                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                profiled_retirement: None,
-                #[cfg(feature = "pals-adaptive")]
-                rovent_idle_custody: RoventPcrIdleCustody::StartupReady,
-            },
-        );
+        let engine = Box::new(engine);
+        let owners = Box::new(IdleOwners {
+            native,
+            engine: Some(engine),
+            unexpected_archive_owner: None,
+            cpu,
+            external,
+            researcher_source,
+            continuation: None,
+            native_finished: None,
+            #[cfg(all(target_os = "linux", feature = "onnx-cuda", feature = "pals-adaptive"))]
+            v6_finish_attempted: false,
+            native_finish_report: None,
+            native_finish_snapshot: None,
+            native_session_release: None,
+            native_joined: false,
+            external_finished: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            profiled_retirement: None,
+            #[cfg(feature = "pals-adaptive")]
+            rovent_idle_custody: RoventPcrIdleCustody::StartupReady,
+        });
         Ok(Self {
             completion,
             options,
