@@ -676,10 +676,17 @@ where
         manager: &mut AdaptiveSessionManager<B>,
     ) -> Result<(), AdaptiveManagerError> {
         if let Some(error) = manager.first_v2_collection_failure() {
-            let mut first = self
-                .first_collection_error
-                .try_lock()
-                .map_err(|_| AdaptiveManagerError::AuxiliaryPending)?;
+            let mut first =
+                self.first_collection_error
+                    .try_lock()
+                    .map_err(|error| match error {
+                        std::sync::TryLockError::WouldBlock => {
+                            AdaptiveManagerError::AuxiliaryPending
+                        }
+                        std::sync::TryLockError::Poisoned(_) => AdaptiveManagerError::Invalid(
+                            "V3 own collection error custody poisoned",
+                        ),
+                    })?;
             if first.is_none() {
                 *first = Some(error.clone());
             }
@@ -687,7 +694,12 @@ where
         let mut slot = self
             .failed_evidence
             .try_lock()
-            .map_err(|_| AdaptiveManagerError::AuxiliaryPending)?;
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => AdaptiveManagerError::AuxiliaryPending,
+                std::sync::TryLockError::Poisoned(_) => {
+                    AdaptiveManagerError::Invalid("V3 own failed evidence custody poisoned")
+                }
+            })?;
         if slot.is_some() {
             return Ok(());
         }
