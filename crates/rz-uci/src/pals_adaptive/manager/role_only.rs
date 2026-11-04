@@ -2554,8 +2554,8 @@ where
                 if mismatch || failure {
                     self.record_failure(AdaptiveManagerError::NativeShutdown {
                         event_physical_shutdown_confirmed: physical_shutdown_confirmed,
-                        snapshot: snapshot.clone(),
-                        transferred: transferred.clone(),
+                        snapshot: snapshot.clone().map(Box::new),
+                        transferred: transferred.clone().map(Box::new),
                     });
                 }
                 self.native_finish_report = match transferred {

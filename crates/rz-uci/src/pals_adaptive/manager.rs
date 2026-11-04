@@ -262,12 +262,14 @@ impl NativeSessionReleaseObservation {
 
 #[derive(Clone, Debug)]
 pub enum AdaptiveManagerError {
-    NativeObservation(TicketNativeObservationFailure),
+    // Observation failures carry the original full ticket. Store them out of
+    // line only on the error path, keeping the complete evidence and ticket.
+    NativeObservation(Box<TicketNativeObservationFailure>),
     /// Original shutdown causes; neither substitutes for the physical fence.
     NativeShutdown {
         event_physical_shutdown_confirmed: bool,
-        snapshot: Option<crate::pals_native::ticketed::TicketNativeFinishReport>,
-        transferred: Option<crate::pals_native::ticketed::TicketNativeFinishReport>,
+        snapshot: Option<Box<crate::pals_native::ticketed::TicketNativeFinishReport>>,
+        transferred: Option<Box<crate::pals_native::ticketed::TicketNativeFinishReport>>,
     },
     Collection(AdaptiveCollectionError),
     Coordinator(CoordinatorError),
@@ -3897,7 +3899,9 @@ where
                 }
                 || failure.disposition == TicketNativeObservationDisposition::RequiredAfterPhysical
             {
-                Some(AdaptiveManagerError::NativeObservation(failure.clone()))
+                Some(AdaptiveManagerError::NativeObservation(Box::new(
+                    failure.clone(),
+                )))
             } else {
                 None
             };
@@ -3906,7 +3910,9 @@ where
             {
                 self.native_observation_failures.push(failure.clone());
             } else if gate.is_none() {
-                gate = Some(AdaptiveManagerError::NativeObservation(failure.clone()));
+                gate = Some(AdaptiveManagerError::NativeObservation(Box::new(
+                    failure.clone(),
+                )));
             }
             if gate.is_none() || matches!(&error, Some(AdaptiveManagerError::PhysicalUnknown)) {
                 gate = error.or(gate);
@@ -5406,8 +5412,8 @@ where
                     if mismatch || failure {
                         self.record_failure(AdaptiveManagerError::NativeShutdown {
                             event_physical_shutdown_confirmed: physical_shutdown_confirmed,
-                            snapshot: snapshot.clone(),
-                            transferred: transferred.clone(),
+                            snapshot: snapshot.clone().map(Box::new),
+                            transferred: transferred.clone().map(Box::new),
                         });
                     }
                     self.native_finish_report = match transferred {
