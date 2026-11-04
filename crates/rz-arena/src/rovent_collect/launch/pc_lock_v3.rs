@@ -256,6 +256,18 @@ impl PcCollectionOwnersV3 {
         SupervisorStartCustodyV3::seal_no_worker(&self.driver_custody, &self.native)
     }
 
+    /// Release only the same original, sealed no-worker driver registration.
+    /// This does not release native, GPU, output, or resource custody.
+    pub(crate) fn release_sealed_unstarted_driver(
+        &self,
+        proof: &crate::rovent_collect::pc_worker_v3::PcSupervisorNoWorkerProofV3,
+    ) -> Result<bool, &'static str> {
+        if !proof.matches_original(&self.driver_custody, &self.supervisor, &self.native) {
+            return Err("P-C no-worker proof belongs to another owner");
+        }
+        SupervisorStartCustodyV3::release_no_worker(&self.driver_custody)
+    }
+
     /// Resource validation is separate and precedes any worker start.
     pub(crate) fn validate_original_boundary(
         &self,
