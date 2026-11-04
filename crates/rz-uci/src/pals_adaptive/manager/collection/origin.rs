@@ -165,7 +165,7 @@ fn collection_ready_identity<Q: crate::pals_adaptive::NativeQuestionProjection, 
 // capability is converted or reconstructed by this shared check.
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 macro_rules! check_collection_frontier {
-    ($loaded:expr, $preload:expr, $lock:expr, $frontier:expr, $root:expr, $budget:expr, $policy:expr, $version:expr) => {{
+    ($loaded:expr, $preload:expr, $lock:expr, $frontier:expr, $root:expr, $budget:expr, $policy:expr, $version:expr, $accepted:expr) => {{
         use rz_runtime::contracts::ContractClock;
         let registration = $frontier.registration();
         let root_state = registration.root_rules.snapshot().identity();
@@ -179,10 +179,7 @@ macro_rules! check_collection_frontier {
             || registration.selective_policy != $policy
             || registration.model_namespace.as_ref() != &$loaded.namespace
             || root_state != registration.root_moves.root_identity()
-            || !$root
-                .original_context()
-                .accepts()
-                .map_err(|error| reject(error.to_string()))?
+            || !$accepted
             || $root.startup_lock_digest() != $loaded.input_lock
             || $root.authority() != registration.authority
             || $root
@@ -205,7 +202,8 @@ macro_rules! check_collection_frontier {
             return Err(reject(format!(
                 "actual attached Frontier differs from original {} Collection scope",
                 $version
-            )));
+            ))
+            .into());
         }
         $root
             .descriptor()
@@ -882,7 +880,11 @@ impl RoventCollectionRootAdmissionV2 {
             root_admission,
             root_budget,
             selective_policy,
-            "/2"
+            "/2",
+            root_admission
+                .original_context()
+                .accepts()
+                .map_err(|error| reject(error.to_string()))?
         );
         let descriptor_digest = root_admission
             .descriptor()
@@ -1125,6 +1127,72 @@ impl RoventCollectionRootAdmissionV2 {
 /// retains the original /3 lock and Ready worker. It does not grant teacher
 /// scope or imply physical completion.
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+#[derive(Debug)]
+pub(crate) enum RoventV3FrontierAttachFailure {
+    /// The original authority lock is temporarily held; no attach occurred.
+    Busy,
+    Rejected(AdaptiveCollectionError),
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+impl From<AdaptiveCollectionError> for RoventV3FrontierAttachFailure {
+    fn from(error: AdaptiveCollectionError) -> Self {
+        Self::Rejected(error)
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+pub(crate) fn try_v3_frontier_attach_accepts(
+    context: &crate::search_driver::SearchSessionContext,
+) -> Result<bool, RoventV3FrontierAttachFailure> {
+    let closed = || {
+        if context.cancellation.is_canceled()
+            || context
+                .control
+                .cancellation
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Some(AdaptiveCollectionError::new(
+                AdaptiveCollectionStage::Accepted,
+                "RootCanceled",
+                "original /3 root was canceled during attach",
+            ))
+        } else if std::time::Instant::now() >= context.control.deadline {
+            Some(AdaptiveCollectionError::new(
+                AdaptiveCollectionStage::Accepted,
+                "RootDeadline",
+                "original /3 root deadline elapsed during attach",
+            ))
+        } else {
+            None
+        }
+    };
+    if let Some(error) = closed() {
+        return Err(error.into());
+    }
+    match context.try_accepts() {
+        Ok(true) => Ok(true),
+        Ok(false) => Err(closed()
+            .unwrap_or_else(|| {
+                AdaptiveCollectionError::new(
+                    AdaptiveCollectionStage::Accepted,
+                    "RootAuthorityClosed",
+                    "original /3 root authority changed during attach",
+                )
+            })
+            .into()),
+        Err(error) if error.code == rz_contracts::ErrorCode::ResourceExhausted => {
+            if let Some(error) = closed() {
+                Err(error.into())
+            } else {
+                Err(RoventV3FrontierAttachFailure::Busy)
+            }
+        }
+        Err(error) => Err(reject(error.to_string()).into()),
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
 #[derive(Clone)]
 pub struct RoventCollectionRootAdmissionV3 {
     original: RoventNativeCollectionOriginV3,
@@ -1191,6 +1259,58 @@ impl RoventCollectionRootAdmissionV3 {
         root_budget: Digest,
         selective_policy: Digest,
     ) -> Result<Self, AdaptiveCollectionError> {
+        match Self::from_attached_frontier_inner(
+            original,
+            frontier,
+            root_admission,
+            root_budget,
+            selective_policy,
+            false,
+        ) {
+            Ok(value) => Ok(value),
+            Err(RoventV3FrontierAttachFailure::Rejected(error)) => Err(error),
+            Err(RoventV3FrontierAttachFailure::Busy) => {
+                Err(reject("original /3 root authority is busy"))
+            }
+        }
+    }
+
+    /// A retryable attach borrows the same original root; Busy changes no
+    /// loaded/root identity and is never a reconstructed admission.
+    pub(crate) fn try_from_attached_frontier(
+        original: &RoventNativeCollectionOriginV3,
+        frontier: &RoventFrontier,
+        root_admission: &Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV3>,
+        root_budget: Digest,
+        selective_policy: Digest,
+    ) -> Result<Self, RoventV3FrontierAttachFailure> {
+        Self::from_attached_frontier_inner(
+            original,
+            frontier,
+            Arc::clone(root_admission),
+            root_budget,
+            selective_policy,
+            true,
+        )
+    }
+
+    fn from_attached_frontier_inner(
+        original: &RoventNativeCollectionOriginV3,
+        frontier: &RoventFrontier,
+        root_admission: Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV3>,
+        root_budget: Digest,
+        selective_policy: Digest,
+        nonblocking: bool,
+    ) -> Result<Self, RoventV3FrontierAttachFailure> {
+        let accepts = || -> Result<bool, RoventV3FrontierAttachFailure> {
+            let context = root_admission.original_context();
+            if !nonblocking {
+                return context
+                    .accepts()
+                    .map_err(|error| reject(error.to_string()).into());
+            }
+            try_v3_frontier_attach_accepts(context)
+        };
         let loaded = &original.original;
         let preload = loaded
             .sources
@@ -1208,7 +1328,8 @@ impl RoventCollectionRootAdmissionV3 {
             root_admission,
             root_budget,
             selective_policy,
-            "/3"
+            "/3",
+            accepts()?
         );
         let descriptor_digest = root_admission
             .descriptor()
@@ -1234,12 +1355,8 @@ impl RoventCollectionRootAdmissionV3 {
             &raw,
         )
         .map_err(|error| reject(error.to_string()))?;
-        if !root_admission
-            .original_context()
-            .accepts()
-            .map_err(|error| reject(error.to_string()))?
-        {
-            return Err(reject("original /3 root revoked during attach"));
+        if !accepts()? {
+            return Err(reject("original /3 root revoked during attach").into());
         }
         let _ = loaded.first_root.set(Arc::clone(&root_admission));
         Ok(Self {
