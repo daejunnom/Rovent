@@ -17,11 +17,12 @@ type Driver<O, D> = AsyncServeDriver<RulesUciPort, O, D, Handler, Dispatch>;
 /// session is not a running engine, a native authorization, or GPU evidence.
 pub struct AsyncEngineStartSlot<O: Write + Send + 'static, D: Write + Send + 'static> {
     process: EngineProcess,
-    events: Receiver<Event>,
+    events: Option<Receiver<Event>>,
     sender: SyncSender<Event>,
-    output: AsyncOutputOwner<O, D>,
+    output: Option<AsyncOutputOwner<O, D>>,
     close: PriorityCloseHandle,
     settings: EngineSettings,
+    transferred: bool,
     preflight: Option<(
         crate::contracts::SessionScope,
         crate::contracts::ContractSessionOwner,
@@ -32,13 +33,21 @@ pub struct AsyncEngineStartSlot<O: Write + Send + 'static, D: Write + Send + 'st
 }
 struct InPlaceStagedEngine {
     owner: Arc<Mutex<Owner>>,
-    session: Session<RulesUciPort>,
+    session: Option<Session<RulesUciPort>>,
     timer_stop: Arc<std::sync::atomic::AtomicBool>,
     timer: Option<JoinHandle<()>>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InPlaceTransferStatus {
+    NotReady,
+    AlreadyTransferred,
+    MissingResource,
+    InvalidBounds,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InPlaceTimerStatus {
     NotReady,
+    AlreadyTransferred,
     Started,
     RetainedFailure,
     IdentityMismatch,
@@ -46,6 +55,7 @@ pub enum InPlaceTimerStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InPlacePreflightStatus {
     Ready,
+    AlreadyTransferred,
     RetainedFailure,
     IdentityMismatch,
 }
@@ -60,11 +70,12 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
     ) -> Self {
         Self {
             process,
-            events,
+            events: Some(events),
             sender,
-            output,
+            output: Some(output),
             close,
             settings,
+            transferred: false,
             preflight: None,
             preflight_failure: None,
             staged: None,
@@ -73,6 +84,9 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
     /// Calls only the shared pre-worker setup while all original inputs stay
     /// in this slot. An original failure is retained and is not retried.
     pub fn preflight(&mut self) -> InPlacePreflightStatus {
+        if self.transferred {
+            return InPlacePreflightStatus::AlreadyTransferred;
+        }
         if self.preflight_failure.is_some() {
             return InPlacePreflightStatus::RetainedFailure;
         }
@@ -107,6 +121,9 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
         const ORIGINAL_SLOT_DROP_RECOVERY_IMPLEMENTED: bool = false;
         if !ORIGINAL_SLOT_DROP_RECOVERY_IMPLEMENTED {
             return InPlaceTimerStatus::NotReady;
+        }
+        if self.transferred {
+            return InPlaceTimerStatus::AlreadyTransferred;
         }
         if self.preflight_failure.is_some() {
             return InPlaceTimerStatus::RetainedFailure;
@@ -148,7 +165,7 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
             }));
             self.staged = Some(InPlaceStagedEngine {
                 owner,
-                session,
+                session: Some(session),
                 timer_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 timer: None,
             });
@@ -211,11 +228,117 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
             }
         }
     }
+    /// Transfer the staged exact session/timer and original event/output
+    /// endpoints only after every input is present. Any missing field restores
+    /// previously taken owners to this same slot; this is not native startup.
+    pub fn try_take_run(
+        &mut self,
+        max_output_bytes: usize,
+        poll_interval: Duration,
+    ) -> Result<AsyncEngineRun<O, D>, InPlaceTransferStatus> {
+        // The original slot must first have a recoverable Drop/unknown path.
+        const ORIGINAL_SLOT_DROP_RECOVERY_IMPLEMENTED: bool = false;
+        if !ORIGINAL_SLOT_DROP_RECOVERY_IMPLEMENTED {
+            return Err(InPlaceTransferStatus::NotReady);
+        }
+        if self.transferred {
+            return Err(InPlaceTransferStatus::AlreadyTransferred);
+        }
+        if max_output_bytes == 0 || poll_interval.is_zero() {
+            return Err(InPlaceTransferStatus::InvalidBounds);
+        }
+        if self.preflight_failure.is_some() {
+            return Err(InPlaceTransferStatus::NotReady);
+        }
+        let Some(stage) = self.staged.as_mut() else {
+            return Err(InPlaceTransferStatus::NotReady);
+        };
+        let Some(close_owner) = self
+            .process
+            .priority_close
+            .as_ref()
+            .filter(|owner| owner.matches(&self.close))
+        else {
+            return Err(InPlaceTransferStatus::MissingResource);
+        };
+        let observer = close_owner.observer();
+        let handler_owner = Arc::clone(&stage.owner);
+        let handler: Handler = Box::new(move |session, event| {
+            handler_owner
+                .lock()
+                .expect("UCI owner")
+                .handle(session, event)
+        });
+        let dispatch_owner = Arc::clone(&stage.owner);
+        let sender = self.sender.clone();
+        let dispatch: Dispatch = Box::new(move |effect| {
+            let mut original = dispatch_owner
+                .lock()
+                .map_err(|_| failure(contract::ErrorCode::BackendFailure, "UCI owner poisoned"))?;
+            if matches!(&effect, Effect::Start { .. }) && observer.closed_under_owner_lock() {
+                return Err(failure(
+                    contract::ErrorCode::Canceled,
+                    "priority admission is closed",
+                )
+                .into());
+            }
+            original.dispatch(effect, &sender)
+        });
+        let Some(events) = self.events.take() else {
+            return Err(InPlaceTransferStatus::MissingResource);
+        };
+        let Some(output) = self.output.take() else {
+            self.events = Some(events);
+            return Err(InPlaceTransferStatus::MissingResource);
+        };
+        let Some(session) = stage.session.take() else {
+            self.events = Some(events);
+            self.output = Some(output);
+            return Err(InPlaceTransferStatus::MissingResource);
+        };
+        let Some(timer) = stage.timer.take() else {
+            self.events = Some(events);
+            self.output = Some(output);
+            stage.session = Some(session);
+            return Err(InPlaceTransferStatus::MissingResource);
+        };
+        let Some(close_owner) = self.process.priority_close.take() else {
+            self.events = Some(events);
+            self.output = Some(output);
+            stage.session = Some(session);
+            stage.timer = Some(timer);
+            return Err(InPlaceTransferStatus::MissingResource);
+        };
+        let driver = AsyncServeDriver::new(
+            session,
+            events,
+            output,
+            max_output_bytes,
+            poll_interval,
+            handler,
+            dispatch,
+        );
+        let run = AsyncEngineRun {
+            driver,
+            _owner: Arc::clone(&stage.owner),
+            timer_stop: Arc::clone(&stage.timer_stop),
+            timer: Some(timer),
+            timer_joined: false,
+            cleanup_failure: None,
+            timer_panic: None,
+            output_recovery: None,
+            _priority_close_owner: close_owner,
+            close: self.close.clone(),
+            last_exit: None,
+        };
+        self.transferred = true;
+        Ok(run)
+    }
     pub fn preflight_failure(&self) -> Option<&EngineError> {
         self.preflight_failure.as_ref()
     }
-    pub fn output_observation(&self) -> OutputSnapshot {
-        self.output.observation()
+    pub fn output_observation(&self) -> Option<OutputSnapshot> {
+        self.output.as_ref().map(AsyncOutputOwner::observation)
     }
     pub fn close_observation(&self) -> PriorityCloseObservation {
         self.close.observe()
