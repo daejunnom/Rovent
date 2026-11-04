@@ -85,8 +85,8 @@ pub use pc_lock_v2::{
 };
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 pub use pc_lock_v3::{
-    PreparedPcCollectionInputsV3, RoventCollectionLockV3LaunchPlan,
-    ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN,
+    PcCollectionCliV3, PreparedPcCollectionInputsV3, RoventCollectionLockV3LaunchPlan,
+    ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN, parse_pc_collection_cli_v3,
 };
 pub use r_stream::{RoventRCollectionAncestor, RoventRCollectionPlan};
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";

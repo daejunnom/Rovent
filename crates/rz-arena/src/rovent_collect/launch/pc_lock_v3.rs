@@ -12,6 +12,72 @@ pub const ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN: &str = "rz-rovent-collection-lo
 const PLAN_MAX_BYTES: u64 = 256 << 10;
 const MANIFEST_MAX_BYTES: u64 = 16 << 20;
 
+/// The selector consumes only the /3 caller options; all native arguments
+/// retain their original order and still pass through the native parser.
+pub struct PcCollectionCliV3 {
+    pub plan_pin: RoventPublicationFile,
+    pub native_arguments: Vec<String>,
+}
+
+pub fn parse_pc_collection_cli_v3(
+    arguments: Vec<String>,
+) -> Result<Option<PcCollectionCliV3>, ArenaError> {
+    if !arguments.iter().any(|arg| arg.starts_with("--v3-")) {
+        return Ok(None);
+    }
+    let mut fields = BTreeMap::new();
+    let mut native_arguments = Vec::new();
+    for argument in arguments {
+        if argument.starts_with("--v3-") {
+            let (key, value) = argument
+                .split_once('=')
+                .ok_or_else(|| invalid("Collection /3 options require =value"))?;
+            check(
+                matches!(
+                    key,
+                    "--v3-mode" | "--v3-plan" | "--v3-plan-sha256" | "--v3-plan-bytes"
+                ) && !value.is_empty()
+                    && fields.insert(key.to_owned(), value.to_owned()).is_none(),
+                "unknown, empty or duplicate Collection /3 option",
+            )?;
+        } else {
+            check(
+                !argument.starts_with("--v2-")
+                    && !argument.starts_with("--collection-plan")
+                    && !argument.starts_with("--utility-cohort-plan")
+                    && !argument.starts_with("--utility-intervention-plan")
+                    && !argument.starts_with("--prepare-utility-cohort-pins"),
+                "Collection /3 and other collection selectors cannot be mixed",
+            )?;
+            native_arguments.push(argument);
+        }
+    }
+    let mut take = |key: &str| {
+        fields
+            .remove(key)
+            .ok_or_else(|| invalid(format!("missing {key}")))
+    };
+    check(take("--v3-mode")? == "pc", "unsupported Collection /3 mode")?;
+    let plan_pin = RoventPublicationFile {
+        path: take("--v3-plan")?,
+        sha256: take("--v3-plan-sha256")?,
+        bytes: take("--v3-plan-bytes")?
+            .parse()
+            .map_err(|_| invalid("Collection /3 plan bytes"))?,
+    };
+    plan_pin.validate()?;
+    check(
+        plan_pin.path.starts_with("inputs/")
+            && valid_relative(&plan_pin.path)
+            && plan_pin.bytes <= PLAN_MAX_BYTES,
+        "Collection /3 original plan pin",
+    )?;
+    Ok(Some(PcCollectionCliV3 {
+        plan_pin,
+        native_arguments,
+    }))
+}
+
 /// Separate, explicitly pinned Collection resource and roster declaration.
 /// Worker limits, mailbox capacity and native role tickets are distinct.
 #[derive(Clone, Serialize, Deserialize)]
@@ -23,6 +89,8 @@ pub struct RoventCollectionLockV3LaunchPlan {
     pub metadata: RoventCollectionMetadata,
     pub teacher_sources: Vec<RoventTeacherSourceSelection>,
     pub teacher_slots: Vec<RoventCollectionTeacherSlot>,
+    pub teacher_constraint: ExternalGoConstraint,
+    pub teacher_soft_quantum_ns: u64,
     pub maximum_roots: u16,
     /// Maximum simultaneously owned collection root workers, including ones
     /// whose physical retirement remains unresolved.
@@ -33,6 +101,8 @@ pub struct RoventCollectionLockV3LaunchPlan {
     pub teacher_mailbox_capacity: u32,
     pub teacher_tickets_per_root: u32,
     pub maximum_records: u64,
+    pub output_directory: PathBuf,
+    pub publication_timeout_ms: u64,
 }
 
 /// The actual file descriptor and exact verified bytes remain alive with the
@@ -175,11 +245,38 @@ impl PreparedPcCollectionInputsV3 {
                     <= rz_experiments::rovent_corpus::MAX_CORPUS_ROWS as u32
                 && (1..=rz_experiments::rovent_corpus::MAX_CORPUS_ROWS as u64)
                     .contains(&self.plan.maximum_records)
+                && (1..=30_000).contains(&self.plan.publication_timeout_ms)
+                && self.plan.output_directory.is_absolute()
+                && self.plan.output_directory.components().all(|part| {
+                    matches!(
+                        part,
+                        Component::RootDir | Component::Prefix(_) | Component::Normal(_)
+                    )
+                })
                 && !self.plan.teacher_slots.is_empty()
                 && self.plan.teacher_slots.len() == self.manifest.registration.teachers.len()
                 && self.plan.teacher_sources.len() == self.manifest.registration.teachers.len(),
             "Collection /3 finite P-C plan or teacher coverage",
         )?;
+        check(
+            Duration::from_nanos(self.plan.teacher_soft_quantum_ns)
+                >= rz_search::external_cpu::EXTERNAL_MIN_QUANTUM
+                && self.plan.teacher_soft_quantum_ns <= 1_000_000_000,
+            "Collection /3 teacher soft quantum",
+        )?;
+        match self.plan.teacher_constraint {
+            ExternalGoConstraint::Depth { depth } => check(depth > 0, "teacher depth")?,
+            ExternalGoConstraint::Nodes { reported_nodes } => {
+                check(reported_nodes > 0, "teacher nodes")?
+            }
+            ExternalGoConstraint::Combined {
+                depth,
+                reported_nodes,
+            } => check(depth > 0 && reported_nodes > 0, "teacher combined limit")?,
+            ExternalGoConstraint::MoveTime { milliseconds } => {
+                check(milliseconds > 0, "teacher time")?
+            }
+        }
         check(
             generation_identifier(&self.plan.metadata.game_id)
                 && generation_identifier(&self.plan.metadata.opening_id)
@@ -284,5 +381,37 @@ impl PreparedPcCollectionInputsV3 {
                 collection_owner: slot.collection_owner,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn v3_selector_keeps_native_arguments_and_rejects_mixed_or_duplicate_inputs() {
+        let digest = format!("{:x}", Sha256::digest(b"plan input"));
+        let arguments = vec![
+            "--v3-mode=pc".to_owned(),
+            "--v3-plan=inputs/plan.json".to_owned(),
+            format!("--v3-plan-sha256={digest}"),
+            "--v3-plan-bytes=1".to_owned(),
+            "--process-epoch=9".to_owned(),
+        ];
+        let parsed = parse_pc_collection_cli_v3(arguments.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.native_arguments, ["--process-epoch=9"]);
+        let mut mixed = arguments.clone();
+        mixed.push("--v2-mode=pc".into());
+        assert!(parse_pc_collection_cli_v3(mixed).is_err());
+        let mut duplicate = arguments;
+        duplicate.push("--v3-mode=pc".into());
+        assert!(parse_pc_collection_cli_v3(duplicate).is_err());
+        assert!(
+            parse_pc_collection_cli_v3(vec!["--process-epoch=9".into()])
+                .unwrap()
+                .is_none()
+        );
     }
 }
