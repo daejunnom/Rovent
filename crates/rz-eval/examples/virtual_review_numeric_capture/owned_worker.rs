@@ -125,9 +125,10 @@ pub(super) fn spawn(
                     }
                     // This is the first ORT native boundary. `startup.runtime`
                     // remains held by the worker closure on error or unwind.
-                    let runtime = match OrtRuntime::load_system_cuda_with_checked_entry(
-                        &startup.runtime,
-                        || {
+                    // The same custody marks entry before invoking its loader,
+                    // including the branch with a reused runtime latch.
+                    let runtime =
+                        match custody.load_system_cuda_for_capture(&startup.runtime, || {
                             if Instant::now() >= startup.until {
                                 Err(error(
                                     FailureKind::BackendUnavailable,
@@ -136,11 +137,10 @@ pub(super) fn spawn(
                             } else {
                                 Ok(())
                             }
-                        },
-                    ) {
-                        Ok(runtime) => runtime,
-                        Err(cause) => return PhysicalRun::Quarantined(cause),
-                    };
+                        }) {
+                            Ok(runtime) => runtime,
+                            Err(cause) => return PhysicalRun::Quarantined(cause),
+                        };
                     let actual_runtime_sha256 = runtime.binary_digest();
                     if let Err((cause, returned)) = custody.install_runtime(runtime) {
                         rejected_runtime = Some(returned);

@@ -17,6 +17,7 @@ if sys.platform == "linux":
     import fcntl
     from managed_process import ProcessNotSpawned, run_group
     from virtual_system_numeric_run import snapshot_file
+    from virtual_custody_transport import CustodyTransport
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux memfd/process-group ownership only")
@@ -37,6 +38,54 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
         self.addCleanup(os.close, image_fd)
         self.assertEqual(observed, data)
         return source, image_fd, data
+
+    def test_custody_transport_reobserves_same_child_without_device_fence(self):
+        channel = CustodyTransport()
+        self.addCleanup(channel.close)
+        channel.child.send(b"PENDING")
+        channel.poll()
+        self.assertEqual(channel.state["requests"], 0)
+        channel.child.send(b"UNKNOWN")
+        channel.poll()
+        self.assertEqual(channel.child.recv(64), b"REOBSERVE")
+        channel.child.send(b"PENDING")
+        channel.poll()
+        self.assertEqual(channel.child.recv(64), b"REOBSERVE")
+        channel.child.send(b"SESSION_RELEASED")
+        channel.poll()
+        self.assertEqual(channel.state["events"], ["PENDING", "UNKNOWN", "PENDING", "SESSION_RELEASED"])
+        self.assertEqual(channel.state["scope"], "same_child_process_only")
+        self.assertNotIn("gpu_physical_completion", channel.state)
+
+    def test_custody_transport_rejects_oversize_and_unrecognized_messages(self):
+        for packet in (b"UNKNOWN-UNTRUSTED", b"X" * 65):
+            with self.subTest(packet=packet):
+                channel = CustodyTransport()
+                try:
+                    channel.child.send(packet)
+                    channel.poll()
+                    self.assertEqual(channel.state["error"], "invalid_or_excess_custody_packet")
+                    self.assertEqual(channel.state["requests"], 0)
+                    self.assertEqual(channel.state["status"], "unobserved")
+                finally:
+                    channel.close()
+
+    def test_custody_transport_rejects_unannounced_release(self):
+        channel = CustodyTransport()
+        self.addCleanup(channel.close)
+        channel.child.send(b"SESSION_RELEASED")
+        channel.poll()
+        self.assertEqual(channel.state["error"], "invalid_custody_sequence")
+        self.assertEqual(channel.state["status"], "unobserved")
+
+    def test_custody_transport_keeps_no_native_and_recovery_distinct(self):
+        channel = CustodyTransport()
+        self.addCleanup(channel.close)
+        channel.child.send(b"NO_NATIVE_ENTRY")
+        channel.poll()
+        self.assertEqual(channel.state["status"], "no_native_entry")
+        self.assertEqual(channel.state["requests"], 0)
+        self.assertEqual(channel.state["scope"], "same_child_process_only")
 
     def test_sealed_snapshot_keeps_actual_bytes_when_source_changes(self):
         source, image_fd, data = self.snapshot()

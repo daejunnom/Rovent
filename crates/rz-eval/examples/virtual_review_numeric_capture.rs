@@ -414,9 +414,8 @@ fn system_startup_custody(
         None
     };
     let sources = VirtualReviewHeldFileSources::new(manifest, graphs);
-    Ok(VirtualReviewStartupCustody::new(
-        std::sync::Arc::new(sources),
-        profile,
+    Ok(VirtualReviewStartupCustody::new_for_system_cuda_capture(
+        sources, profile,
     ))
 }
 
@@ -1183,6 +1182,36 @@ struct SystemCaptureWorker {
     pending: Option<owned_worker::Lease>,
     late_completion: Option<std::result::Result<owned_worker::CaptureReply, BackendError>>,
     release: Option<SessionReleased>,
+    no_native_entry: bool,
+    supervisor: std::os::unix::net::UnixDatagram,
+    quarantined: bool,
+}
+
+/// Duplicate only the explicitly inherited supervisor descriptor. Ownership of
+/// the original worker, its lease and its recovery key remains in this process.
+#[cfg(target_os = "linux")]
+fn system_supervisor_socket() -> Result<std::os::unix::net::UnixDatagram> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    extern "C" {
+        fn dup(fd: i32) -> i32;
+    }
+    let raw = std::env::var("ROVEZERO_CUSTODY_FD")?.parse::<i32>()?;
+    if raw < 3 {
+        return Err("invalid inherited custody descriptor".into());
+    }
+    // SAFETY: dup validates the numeric descriptor and returns a new owned
+    // descriptor or -1. No Rust reference is created for an invalid input.
+    let duplicate = unsafe { dup(raw) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: a successful dup returns a new open descriptor owned here.
+    let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
+    let socket = std::os::unix::net::UnixDatagram::from(duplicate);
+    socket.local_addr()?;
+    socket.peer_addr()?;
+    socket.set_nonblocking(true)?;
+    Ok(socket)
 }
 
 #[cfg(target_os = "linux")]
@@ -1275,6 +1304,17 @@ impl Error for CaptureAndCleanupFailure {
 
 #[cfg(target_os = "linux")]
 impl SystemCaptureWorker {
+    fn send_supervisor(&self, packet: &[u8]) {
+        if let Err(error) = self.supervisor.send(packet) {
+            // A transport failure is evidence, never a substitute for the
+            // original native/cleanup error or for a physical completion.
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "RZ_CUSTODY_TRANSPORT_ERROR={error}"
+            );
+        }
+    }
+
     fn wait(
         &mut self,
         mut lease: owned_worker::Lease,
@@ -1284,6 +1324,7 @@ impl SystemCaptureWorker {
             match lease.poll() {
                 PhysicalPoll::Ready(result) => return Ok(result?),
                 PhysicalPoll::Quarantined => {
+                    self.quarantined = true;
                     let cause = match lease.quarantine_cause() {
                         Ok(cause) => cause,
                         Err(cause) => Some(cause),
@@ -1360,6 +1401,7 @@ impl SystemCaptureWorker {
                         self.pending.take();
                     }
                     PhysicalPoll::Quarantined => {
+                        self.quarantined = true;
                         let cause = match lease.quarantine_cause() {
                             Ok(cause) => cause,
                             Err(cause) => Some(cause),
@@ -1398,9 +1440,15 @@ impl SystemCaptureWorker {
                             }
                         }
                     }
-                    self.release = Some(worker.session_release().ok_or(
-                        "system worker joined without original owner session-release proof",
-                    )?);
+                    if let Some(proof) = worker.session_release() {
+                        self.release = Some(proof);
+                    } else if worker.no_native_entry_release() {
+                        self.no_native_entry = true;
+                    } else {
+                        return Err(
+                            "system worker joined without original owner release proof".into()
+                        );
+                    }
                     return Ok(());
                 }
                 Poll::Ready(Err(error)) => return Err(Box::new(error)),
@@ -1411,6 +1459,142 @@ impl SystemCaptureWorker {
                     return Err("system worker did not join within cleanup deadline; original owner retained".into());
                 }
             }
+        }
+    }
+
+    /// Keep the original worker, lease and key owned by this process while the
+    /// parent requests bounded re-observations. No socket packet is a fence.
+    fn finish_supervised(&mut self, work_until: Instant, cleanup_until: Instant) -> Result<()> {
+        self.send_supervisor(b"PENDING");
+        let first_error = match self.finish(Instant::now()) {
+            Ok(()) => {
+                self.send_release_proof();
+                return Ok(());
+            }
+            Err(error) => error,
+        };
+        let mut unknown_sent = false;
+        let mut requests = 0u32;
+        let mut pending_observe = None;
+        let mut pending_release = None;
+        let mut released = false;
+        let mut quarantine_error = None;
+        while Instant::now() < cleanup_until {
+            match self.finish(Instant::now()) {
+                Ok(()) => {
+                    self.send_release_proof();
+                    return Ok(());
+                }
+                Err(error) if self.quarantined && quarantine_error.is_none() => {
+                    quarantine_error = Some(error);
+                }
+                Err(_) => {}
+            }
+            let quarantined = self.quarantined;
+            if !unknown_sent && (quarantined || Instant::now() >= work_until) {
+                self.send_supervisor(b"UNKNOWN");
+                unknown_sent = true;
+            }
+            let mut packet = [0u8; 64];
+            match self.supervisor.recv(&mut packet) {
+                Ok(length) if &packet[..length] == b"REOBSERVE" && requests < 32 => {
+                    requests += 1;
+                    if self.finish(Instant::now()).is_ok() {
+                        self.send_release_proof();
+                        return Ok(());
+                    }
+                    if quarantined
+                        && pending_observe.is_none()
+                        && pending_release.is_none()
+                        && !released
+                    {
+                        if let Some(key) = self.recovery_key.as_ref() {
+                            pending_observe = key.begin_reobserve(cleanup_until).ok();
+                        }
+                    }
+                    self.send_supervisor(b"PENDING");
+                }
+                Ok(_) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "RZ_CUSTODY_TRANSPORT_ERROR=invalid_packet_or_request_limit"
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "RZ_CUSTODY_TRANSPORT_ERROR={error}"
+                    );
+                }
+            }
+            if let Some(observation) = pending_observe.as_mut() {
+                match observation.poll() {
+                    Poll::Ready(rz_eval::worker::PhysicalRecoveryObservation::Confirmed) => {
+                        pending_observe = None;
+                        if let Some(key) = self.recovery_key.as_ref() {
+                            if let Some(proof) = key.latest_confirmation() {
+                                pending_release = key.begin_release(&proof, cleanup_until).ok();
+                            }
+                        }
+                    }
+                    Poll::Ready(rz_eval::worker::PhysicalRecoveryObservation::Unknown) => {
+                        pending_observe = None
+                    }
+                    Poll::Pending => {}
+                }
+            }
+            if let Some(release) = pending_release.as_mut() {
+                match release.poll() {
+                    Poll::Ready(rz_eval::worker::PhysicalRecoveryObservation::Confirmed) => {
+                        pending_release = None;
+                        released = true;
+                    }
+                    Poll::Ready(rz_eval::worker::PhysicalRecoveryObservation::Unknown) => {
+                        pending_release = None
+                    }
+                    Poll::Pending => {}
+                }
+            }
+            if released
+                && self
+                    .recovery_key
+                    .as_ref()
+                    .is_some_and(|key| matches!(key.finish_confirmed(), Poll::Ready(Ok(()))))
+            {
+                self.send_supervisor(b"OWNER_RECOVERED");
+                // The capture error remains an error; this proves only this
+                // exact owner's release, not device-wide completion.
+                return Err(match quarantine_error {
+                    Some(error) => Box::new(CaptureAndCleanupFailure {
+                        primary_stage: "physical_quarantine",
+                        primary: error,
+                        cleanup: first_error,
+                    }),
+                    None => first_error,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !unknown_sent {
+            self.send_supervisor(b"UNKNOWN");
+        }
+        self.send_supervisor(b"UNRESOLVED");
+        Err(match quarantine_error {
+            Some(error) => Box::new(CaptureAndCleanupFailure {
+                primary_stage: "physical_quarantine",
+                primary: error,
+                cleanup: first_error,
+            }),
+            None => first_error,
+        })
+    }
+
+    fn send_release_proof(&self) {
+        if self.no_native_entry {
+            self.send_supervisor(b"NO_NATIVE_ENTRY");
+        } else if self.release.is_some() {
+            self.send_supervisor(b"SESSION_RELEASED");
         }
     }
 }
@@ -1453,11 +1637,11 @@ fn stats(worker: &mut Worker, until: Instant) -> Result<PalsBackendStats> {
         _ => Err("incorrect stats completion".into()),
     }
 }
-fn finish(worker: &mut Worker, until: Instant) -> Result<()> {
+fn finish(worker: &mut Worker, work_until: Instant, until: Instant) -> Result<()> {
     match worker {
         Worker::Legacy(worker) => finish_legacy(worker, until),
         #[cfg(target_os = "linux")]
-        Worker::System(worker) => worker.finish(until),
+        Worker::System(worker) => worker.finish_supervised(work_until, until),
     }
 }
 
@@ -1887,6 +2071,9 @@ fn execute(config: Config) -> Result<()> {
         }
         #[cfg(target_os = "linux")]
         PreparedRuntime::System(runtime) => {
+            // Admission must establish the supervisor channel before any
+            // reservation, worker creation, or ORT entry.
+            let supervisor = system_supervisor_socket()?;
             let custody = system_startup_custody(
                 &config.export_manifest,
                 &summary,
@@ -1939,7 +2126,11 @@ fn execute(config: Config) -> Result<()> {
                 pending: None,
                 late_completion: None,
                 release: None,
+                no_native_entry: false,
+                supervisor,
+                quarantined: false,
             };
+            owner.send_supervisor(b"PENDING");
             let started = match owner.start(until) {
                 Ok(started) => started,
                 Err(startup) => {
@@ -1948,7 +2139,7 @@ fn execute(config: Config) -> Result<()> {
                         .checked_add(Duration::from_secs(config.cleanup_seconds))
                         .unwrap_or(registered)
                         .min(registered);
-                    return match owner.finish(cleanup_until) {
+                    return match owner.finish_supervised(until, cleanup_until) {
                         Ok(()) => Err(startup),
                         Err(cleanup) => Err(Box::new(CaptureAndCleanupFailure {
                             primary_stage: "startup",
@@ -2176,7 +2367,7 @@ fn execute(config: Config) -> Result<()> {
     } else {
         Instant::now() + Duration::from_secs(config.cleanup_seconds)
     };
-    let joined = finish(&mut worker, cleanup_until);
+    let joined = finish(&mut worker, until, cleanup_until);
     let outputs = match (work, joined) {
         (Ok(outputs), Ok(())) => outputs,
         (Err(work), Err(join)) => {

@@ -21,6 +21,7 @@ from managed_outputs import OutputLease
 from managed_process import ProcessNotSpawned, run_group
 from managed_storage import checked
 from pals_followup_run import outside_git, sha, unique_object, observe_resources
+from virtual_custody_transport import CustodyTransport
 
 
 def snapshot_file(path: Path, expected: str, maximum: int, deadline: float, *, content=False, exact_size=None, seal=True):
@@ -204,18 +205,28 @@ def main(argv=None):
             raise TimeoutError("preparation window elapsed before native dispatch")
         receipt["dispatch_attempted"] = True
         receipt["producer_tree_gone"] = "unknown"
+        transport = CustodyTransport()
+        receipt["custody_transport"] = transport.state
+        env["ROVEZERO_CUSTODY_FD"] = str(transport.child_fd())
         def producer_spawned():
             receipt["producer_spawned"] = True
+            transport.child_started()
+        def producer_check():
+            transport.poll()
+            lease.check_budget()
         try:
             code, gone, failure = run_group([f"/proc/self/fd/{binary_fd}", f"/proc/self/fd/{config_image}"],
-                                            args.binary.parent, env, remaining, lease.check_budget,
-                                            pass_fds=(binary_fd, config_image), on_spawn=producer_spawned,
+                                            args.binary.parent, env, remaining, producer_check,
+                                            pass_fds=(binary_fd, config_image, transport.child_fd()), on_spawn=producer_spawned,
                                             verify_before_spawn=True)
         except ProcessNotSpawned as error:
             receipt["producer_tree_gone"] = True
             receipt["producer_not_spawned_cause"] = {
                 "type": type(error.__cause__).__name__, "message": str(error.__cause__)}
             raise
+        finally:
+            transport.poll()
+            transport.close()
         receipt.update(producer_result_observed=True, producer_exit_code=code,
                        producer_tree_gone=gone, producer_supervisor_error=failure,
                        status="capture_process_completed" if code == 0 and gone is True and failure is None

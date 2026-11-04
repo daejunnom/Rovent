@@ -725,6 +725,7 @@ impl VirtualSessionBank {
 pub struct VirtualReviewStartupCustody {
     // Established before native startup and shared only with this backend.
     synchronous_owner_identity: Arc<()>,
+    native_entry_started: Arc<std::sync::atomic::AtomicBool>,
     sources: Arc<dyn VirtualReviewOwnedSources>,
     runtime: Option<OrtRuntime>,
     profile_directory: Option<VirtualReviewProfileDirectory>,
@@ -748,8 +749,29 @@ impl VirtualReviewStartupCustody {
         sources: Arc<dyn VirtualReviewOwnedSources>,
         profile_directory: Option<VirtualReviewProfileDirectory>,
     ) -> Self {
+        Self::construct(sources, profile_directory, true)
+    }
+
+    /// Dedicated capture owner. The no-native evidence covers only native work
+    /// submitted through this owner, never unrelated native work or a device.
+    #[cfg(target_os = "linux")]
+    pub fn new_for_system_cuda_capture(
+        sources: VirtualReviewHeldFileSources,
+        profile_directory: Option<VirtualReviewProfileDirectory>,
+    ) -> Self {
+        Self::construct(Arc::new(sources), profile_directory, false)
+    }
+
+    fn construct(
+        sources: Arc<dyn VirtualReviewOwnedSources>,
+        profile_directory: Option<VirtualReviewProfileDirectory>,
+        native_entry_started: bool,
+    ) -> Self {
         Self {
             synchronous_owner_identity: Arc::new(()),
+            native_entry_started: Arc::new(std::sync::atomic::AtomicBool::new(
+                native_entry_started,
+            )),
             sources,
             runtime: None,
             profile_directory,
@@ -766,6 +788,9 @@ impl VirtualReviewStartupCustody {
         &mut self,
         runtime: OrtRuntime,
     ) -> Result<(), (BackendError, OrtRuntime)> {
+        // An externally created runtime necessarily crossed a native boundary,
+        // regardless of whether installation is accepted.
+        self.mark_native_entry();
         if self.runtime.is_some() || self.backend.is_some() || self.sessions.len() != 0 {
             return Err((
                 fail(
@@ -782,11 +807,31 @@ impl VirtualReviewStartupCustody {
     pub fn backend(&self) -> Option<&PalsVirtualReviewOnnxBackend> {
         self.backend.as_ref()
     }
+    /// Record entry immediately before any native loader call for this owner.
+    /// Once set, it can never be cleared or interpreted as completed work.
+    fn mark_native_entry(&mut self) {
+        self.native_entry_started
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The same owner marks entry before invoking the native loader, including
+    /// reuse and checked-callback failure. Callers cannot reset that mark.
+    #[cfg(target_os = "linux")]
+    pub fn load_system_cuda_for_capture(
+        &mut self,
+        runtime: &crate::onnx::SystemRuntime,
+        before_native: impl FnOnce() -> Result<(), BackendError>,
+    ) -> Result<OrtRuntime, BackendError> {
+        self.mark_native_entry();
+        OrtRuntime::load_system_cuda_with_checked_entry(runtime, before_native)
+    }
     pub fn session_load_failure(&self) -> Option<VirtualSessionLoadFailureObservation> {
         self.session_load_failure
     }
     /// The caller must guard transfer and return this same backend on failure.
     pub fn backend_slot_mut(&mut self) -> &mut Option<PalsVirtualReviewOnnxBackend> {
+        // Exposing mutable native state forfeits the unopened-owner proof.
+        self.mark_native_entry();
         &mut self.backend
     }
 
@@ -794,6 +839,20 @@ impl VirtualReviewStartupCustody {
     /// work. A failed or partial session remains unproven in this custody.
     /// This does not attest another worker, process, or the entire device.
     pub fn synchronous_shutdown_proof(&self) -> Option<crate::worker::SynchronousOwnerProof> {
+        if !self
+            .native_entry_started
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.runtime.is_none()
+            && self.backend.is_none()
+            && self.sessions.len() == 0
+            && self.serialized.is_none()
+            && self.session_load_failure.is_none()
+        {
+            return Some(crate::worker::SynchronousOwnerProof::no_native(
+                Arc::clone(&self.synchronous_owner_identity),
+                Arc::clone(&self.native_entry_started),
+            ));
+        }
         if self.session_load_failure.is_some()
             || self.serialized.is_some()
             || self.sessions.len() != 0
@@ -2907,16 +2966,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uninitialized_startup_custody_never_issues_a_shutdown_proof() {
+    #[cfg(target_os = "linux")]
+    fn startup_custody_no_native_proof_disappears_after_entry() {
         use crate::worker::SynchronousPhysicalOwner;
 
-        let source = Arc::new(owned_sources::PathSources::new(Path::new("/unused")));
-        let custody = VirtualReviewStartupCustody::new(source, None);
+        let source: Arc<dyn VirtualReviewOwnedSources> =
+            Arc::new(owned_sources::PathSources::new(Path::new("/unused")));
+        let legacy = VirtualReviewStartupCustody::new(Arc::clone(&source), None);
+        assert!(legacy.synchronous_shutdown_proof().is_none());
+        let source = VirtualReviewHeldFileSources::new(
+            std::fs::File::open(std::env::current_exe().unwrap()).unwrap(),
+            Vec::new(),
+        );
+        let mut custody = VirtualReviewStartupCustody::new_for_system_cuda_capture(source, None);
         let original = custody.synchronous_owner_identity();
         assert!(Arc::ptr_eq(
             &original,
             &custody.synchronous_owner_identity()
         ));
+        assert!(custody.synchronous_shutdown_proof().is_some());
+        custody.mark_native_entry();
         assert!(custody.synchronous_shutdown_proof().is_none());
     }
 

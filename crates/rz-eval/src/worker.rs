@@ -134,12 +134,24 @@ pub enum PhysicalRecoveryObservation {
 pub struct SynchronousOwnerProof {
     owner: Arc<()>,
     completed_synchronous_runs: u64,
+    // None is the existing same-session proof. Some(false) is the distinct
+    // original owner's no-native-entry proof; it is rechecked at shutdown.
+    no_native_entry: Option<Arc<AtomicBool>>,
 }
 impl SynchronousOwnerProof {
     pub(crate) fn new(owner: Arc<()>, completed_synchronous_runs: u64) -> Self {
         Self {
             owner,
             completed_synchronous_runs,
+            no_native_entry: None,
+        }
+    }
+
+    pub(crate) fn no_native(owner: Arc<()>, entered: Arc<AtomicBool>) -> Self {
+        Self {
+            owner,
+            completed_synchronous_runs: 0,
+            no_native_entry: Some(entered),
         }
     }
 }
@@ -614,6 +626,7 @@ pub struct SingleWorker<J, R> {
     shutdown_result: Option<Result<(), BackendError>>,
     retained_recovery: Option<PhysicalRecoveryKey>,
     released_session: Arc<Mutex<Option<SessionReleased>>>,
+    released_without_native_entry: Arc<AtomicBool>,
 }
 
 pub struct PhysicalLease<J, R> {
@@ -655,6 +668,12 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
             .released_session
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+    /// True only after the same owner proves no native entry and is joined.
+    /// This is neither a session release nor a device-wide fence.
+    pub fn no_native_entry_release(&self) -> bool {
+        matches!(self.shutdown_result.as_ref(), Some(Ok(())))
+            && self.released_without_native_entry.load(Ordering::Acquire)
     }
     /// Transfer the actual caller-owned state only after preserving a recovery
     /// slot for thread creation failure. The shared lock is used for this
@@ -753,6 +772,8 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
         let worker_identity = Arc::clone(&reservation.key.identity);
         let released_session = Arc::new(Mutex::new(None));
         let worker_released_session = Arc::clone(&released_session);
+        let released_without_native_entry = Arc::new(AtomicBool::new(false));
+        let worker_released_without_native_entry = Arc::clone(&released_without_native_entry);
         let handle_slot: PhysicalHandle = Arc::new(Mutex::new(None));
         reservation
             .publish(RecoveryControl {
@@ -825,12 +846,18 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
                 // Normal sender closure can also encounter an unproven CUDA
                 // startup. The callback must be a real same-owner fence.
                 let mut session_release = None;
+                let mut no_native_release = false;
                 let known = cause.is_none()
                     && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         match shutdown_fence(&mut retained, Instant::now()) {
                             ShutdownEvidence::Recovery(fence) => fence.confirmed(),
                             ShutdownEvidence::Session(proof) if synchronous_owner.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, &proof.owner)) => {
-                                session_release = Some(SessionReleased { completed_synchronous_runs: proof.completed_synchronous_runs });
+                                if let Some(entered) = &proof.no_native_entry {
+                                    if entered.load(Ordering::Acquire) { return false; }
+                                    no_native_release = true;
+                                } else {
+                                    session_release = Some(SessionReleased { completed_synchronous_runs: proof.completed_synchronous_runs });
+                                }
                                 true
                             }
                             ShutdownEvidence::Session(_) => false,
@@ -920,6 +947,7 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
                 drop(active);
                 drop(retained);
                 *worker_released_session.lock().unwrap_or_else(|e| e.into_inner()) = session_release;
+                worker_released_without_native_entry.store(no_native_release, Ordering::Release);
                 worker_state.store(CLOSED, Ordering::Release);
                 #[cfg(feature = "experimental-notify")]
                 worker_signal.notify();
@@ -951,6 +979,7 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
             shutdown_result: None,
             retained_recovery: Some(reservation.key.clone()),
             released_session,
+            released_without_native_entry,
         })
     }
     /// run must return only after physical completion, with owned outputs. There
@@ -1051,6 +1080,7 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
             shutdown_result: None,
             retained_recovery: None,
             released_session: Arc::new(Mutex::new(None)),
+            released_without_native_entry: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1634,6 +1664,59 @@ mod tests {
             )
         });
         wait_until(|| matches!(worker.try_shutdown(), Poll::Ready(Ok(()))));
+    }
+
+    #[test]
+    fn no_native_shutdown_is_distinct_from_session_release() {
+        let owner = Arc::new(());
+        let entered = Arc::new(AtomicBool::new(false));
+        let mut original = Some(SyncTrackedState {
+            _tracked: TrackedState(Arc::new(AtomicUsize::new(0))),
+            identity: Arc::clone(&owner),
+        });
+        let (mut reservation, _) = PhysicalRecoveryReservation::reserve().unwrap();
+        let mut worker = SingleWorker::<u8, u8>::spawn_with_retained_synchronous_owner(
+            &mut original,
+            &mut reservation,
+            |_, input| PhysicalRun::Complete(*input),
+            move |_, _| {
+                Some(SynchronousOwnerProof::no_native(
+                    Arc::clone(&owner),
+                    Arc::clone(&entered),
+                ))
+            },
+        )
+        .unwrap();
+        wait_until(|| matches!(worker.try_shutdown(), Poll::Ready(Ok(()))));
+        assert!(worker.no_native_entry_release());
+        assert!(worker.session_release().is_none());
+    }
+
+    #[test]
+    fn stale_no_native_proof_does_not_survive_same_owner_entry() {
+        let identity = Arc::new(());
+        let entered = Arc::new(AtomicBool::new(false));
+        let stale = SynchronousOwnerProof::no_native(Arc::clone(&identity), Arc::clone(&entered));
+        let mut original = Some(SyncTrackedState {
+            _tracked: TrackedState(Arc::new(AtomicUsize::new(0))),
+            identity,
+        });
+        let (mut reservation, _) = PhysicalRecoveryReservation::reserve().unwrap();
+        let mut worker = SingleWorker::<u8, u8>::spawn_with_retained_synchronous_owner(
+            &mut original,
+            &mut reservation,
+            move |_, input| {
+                entered.store(true, Ordering::Release);
+                PhysicalRun::Complete(*input)
+            },
+            move |_, _| Some(stale.clone()),
+        )
+        .unwrap();
+        let mut job = worker.submit(1).unwrap();
+        wait_until(|| matches!(job.poll(), PhysicalPoll::Ready(1)));
+        wait_until(|| matches!(worker.try_shutdown(), Poll::Ready(Err(_))));
+        assert!(!worker.no_native_entry_release());
+        assert!(worker.session_release().is_none());
     }
 
     #[test]
