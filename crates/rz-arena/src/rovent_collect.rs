@@ -1094,6 +1094,8 @@ mod native_capture;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod capture_router_v3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod game_authority_v3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod speculative_route_v3;
 #[cfg(feature = "pals-collection-onnx")]
 pub use native_capture::*;
