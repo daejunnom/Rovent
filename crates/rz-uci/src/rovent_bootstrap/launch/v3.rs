@@ -2890,7 +2890,7 @@ pub(super) fn run_native_admitted(
         ),
         ProductChoice::OwnBoard => launch_own!(
             super::super::product::RoventOwnBoardAssemblyV3::new(Arc::clone(&boundary)),
-            disabled
+            enabled
         ),
         ProductChoice::External(external, evidence) => {
             // Preserve the original external source, retirement authority and
