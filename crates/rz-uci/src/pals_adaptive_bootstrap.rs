@@ -350,6 +350,39 @@ impl Drop for StartupNativeGuard {
 }
 
 pub fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapError> {
+    run_cli_inner(arguments, None)
+}
+
+/// The executable passes its local main-entry observation for the explicitly
+/// selected proxy-entry functional smoke. This is not an OS spawn timestamp.
+/// Existing library callers retain `run_cli` and its established behavior.
+pub fn run_cli_from_main_entry(
+    arguments: Vec<String>,
+    main_entry: Instant,
+) -> Result<(), AdaptiveBootstrapError> {
+    run_cli_inner(arguments, Some(main_entry))
+}
+
+fn run_cli_inner(
+    arguments: Vec<String>,
+    main_entry: Option<Instant>,
+) -> Result<(), AdaptiveBootstrapError> {
+    if arguments
+        .iter()
+        .any(|arg| arg == "--pals-proxy-entry-functional-smoke=true")
+    {
+        #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+        {
+            let entry = main_entry.ok_or_else(|| boundary("ProxyEntrySmokeRequiresMainEntry"))?;
+            return crate::pals_system_proxy::run_entry_smoke_guarded(&arguments, entry)
+                .map_err(|error| failure("ProxyEntryFunctionalSmoke", &error));
+        }
+        #[cfg(not(all(target_os = "linux", feature = "onnx-cuda")))]
+        {
+            let _ = main_entry;
+            return Err(boundary("ProxyEntrySmokeRequiresLinuxCuda"));
+        }
+    }
     if arguments
         .iter()
         .any(|arg| arg.starts_with("--pals-system-proxy="))
