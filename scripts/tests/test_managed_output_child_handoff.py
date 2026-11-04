@@ -137,7 +137,8 @@ print(json.dumps({"owner_pid": reply["owner_pid"], "checks": 2}))
     def test_collection_child_receives_same_original_input_and_live_lease(self):
         # Actual child/socket/FDs; cgroup membership remains the test fixture.
         self.handoff.revoke()
-        data = os.urandom(71)
+        data = json.dumps({"schema": "rz-rovent-collection-lock-v3-launch/1",
+                           "output_directory": str(self.lease.output)}).encode()
         (self.source / "plan").write_bytes(data)
         source_fd = open_directory(self.source)
         try:
@@ -183,6 +184,20 @@ print("ok")
             original_input.close()
         self.assertEqual(result, (0, True, None))
         self.assertEqual(payload, b"ok\n")
+
+    def test_collection_rejects_plan_for_another_output_before_binding(self):
+        self.handoff.revoke()
+        data = json.dumps({"schema": "rz-rovent-collection-lock-v3-launch/1",
+                           "output_directory": str(self.root / "other-output")}).encode()
+        (self.source / "plan").write_bytes(data)
+        source_fd = open_directory(self.source)
+        try:
+            with OriginalControlInput(source_fd, Path("plan")) as original_input:
+                with self.assertRaisesRegex(StorageError, "invalid original collection plan"):
+                    ManagedCollectionOutputHandoffV2(self.key, self.group, self.scope, original_input)
+                self.assertFalse(self.scope.owns_output_group(self.group))
+        finally:
+            os.close(source_fd)
 
     def test_grandchild_cannot_claim_direct_child_lease(self):
         source = '''

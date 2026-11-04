@@ -12,6 +12,7 @@ import array
 import hashlib
 from contextlib import contextmanager
 import os
+from pathlib import Path
 import socket
 import stat
 import struct
@@ -377,9 +378,23 @@ class ManagedCollectionOutputHandoffV2(ManagedOutputChildHandoff):
     _schema = "rz-managed-output-lease/2"
 
     def __init__(self, lease_key, group, scope, original_input):
-        from rovent_v3_input_snapshot import OriginalControlInput
+        from rovent_v3_input_snapshot import OriginalControlInput, unique_json
         if type(original_input) is not OriginalControlInput:
             raise StorageError("original control input owner required")
+        try:
+            plan = unique_json(original_input.bytes)
+            output = plan["output_directory"]
+            if (not isinstance(plan, dict)
+                    or plan.get("schema") not in ("rz-rovent-collection-lock-v3-launch/1",
+                                                   "rz-rovent-own-collection-lock-v3-launch/1")
+                    or not isinstance(output, str) or not output):
+                raise ValueError("invalid collection plan")
+            declared_output = Path(output)
+            if (not declared_output.is_absolute() or ".." in declared_output.parts
+                    or declared_output != original_live_handoff(lease_key).output):
+                raise ValueError("collection output differs from original lease")
+        except (KeyError, TypeError, ValueError, UnicodeError, RecursionError, RuntimeError) as error:
+            raise StorageError("invalid original collection plan or output lease") from error
         self._input = original_input
         self._input_directory_fd = self._input_plan_fd = None
         self._session_id = None
