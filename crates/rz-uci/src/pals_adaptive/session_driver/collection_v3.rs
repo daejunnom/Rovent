@@ -328,6 +328,12 @@ pub struct RoventBoardCollectionWorkerV3 {
 /// process-local quarantine. It does not imply completion or authorization.
 #[derive(Clone)]
 pub struct RoventBoardCollectionWorkerKeyV3(Arc<()>);
+impl RoventBoardCollectionWorkerKeyV3 {
+    /// Same worker identity only; this is not a completion or join proof.
+    pub fn same_original(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 struct QuarantinedBoardWorkerV3 {
     key: RoventBoardCollectionWorkerKeyV3,
     admission: RoventCollectionRootAdmissionV3,
