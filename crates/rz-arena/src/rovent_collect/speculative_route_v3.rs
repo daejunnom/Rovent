@@ -44,6 +44,8 @@ pub(super) struct SpeculativeTicketV3 {
     state: AtomicU8,
     error: Mutex<Option<ArenaError>>,
     authority: SpeculativeTicketAuthorityV3,
+    target_gate: Arc<Mutex<()>>,
+    target_capability: Mutex<Option<TargetPublicationV3>>,
 }
 impl SpeculativeTicketV3 {
     pub(super) fn ticket(&self) -> &RoleTicketEnvelope {
@@ -55,11 +57,32 @@ impl SpeculativeTicketV3 {
     pub(super) fn capture_failed(&self) {
         self.state.store(5, Ordering::Release);
     }
-    pub(super) fn canceled(&self) {
+    pub(super) fn try_cancel(&self) -> Result<Option<()>, ArenaError> {
+        let _gate = match self.target_gate.try_lock() {
+            Ok(gate) => gate,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v3 target gate poisoned"));
+            }
+        };
         self.authority.cancel();
         let _ = self
             .state
             .compare_exchange(0, 6, Ordering::AcqRel, Ordering::Acquire);
+        Ok(Some(()))
+    }
+    pub(super) fn try_take_target_capability(&self) -> Result<TargetCapabilityTakeV3, ArenaError> {
+        let mut slot = match self.target_capability.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(TargetCapabilityTakeV3::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v3 target capability custody poisoned"));
+            }
+        };
+        Ok(match slot.take() {
+            Some(capability) => TargetCapabilityTakeV3::Ready(capability),
+            None => TargetCapabilityTakeV3::AlreadyTaken,
+        })
     }
     pub(super) fn not_required(&self) {
         self.state.store(8, Ordering::Release);
@@ -74,6 +97,99 @@ impl SpeculativeTicketV3 {
         };
         self.state
             .store(if recorded { 4 } else { 7 }, Ordering::Release);
+    }
+}
+
+pub(super) enum TargetCapabilityTakeV3 {
+    Ready(TargetPublicationV3),
+    Busy,
+    AlreadyTaken,
+}
+
+/// Read-only root revocation view. No caller can mutate the shared flag
+/// without going through the owning route's publication gate.
+#[derive(Clone)]
+pub(crate) struct TargetRevocationV3(Arc<AtomicBool>);
+impl TargetRevocationV3 {
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+    pub(crate) fn try_observe_open(&self) -> bool {
+        self.0
+            .compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+/// Non-clone publication authority for one original root and exact ticket.
+pub(crate) struct TargetPublicationV3 {
+    admission: RoventCollectionRootAdmissionV3,
+    ticket: RoleTicketEnvelope,
+    gate: Arc<Mutex<()>>,
+    revoked: TargetRevocationV3,
+    authority: SpeculativeTicketAuthorityV3,
+    state: AtomicU8,
+}
+impl TargetPublicationV3 {
+    pub(crate) fn matches_revocation(&self, revocation: &TargetRevocationV3) -> bool {
+        Arc::ptr_eq(&self.revoked.0, &revocation.0)
+    }
+    pub(crate) fn matches(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+        ticket: &RoleTicketEnvelope,
+    ) -> bool {
+        self.admission.same_original_admission(admission) && self.ticket == *ticket
+    }
+    /// None is transient contention. A cancellation, prior commit, or
+    /// uncertain previous append is an error and never grants a new attempt.
+    pub(crate) fn try_begin_append(&self) -> Result<Option<TargetAppendGuardV3<'_>>, ArenaError> {
+        let gate = match self.gate.try_lock() {
+            Ok(gate) => gate,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v3 target publication gate poisoned"));
+            }
+        };
+        if self.revoked.is_revoked() || self.authority.canceled() {
+            return Err(invalid("lock-v3 target revoked before append"));
+        }
+        if self.state.load(Ordering::Acquire) != 0 {
+            return Err(invalid(
+                "lock-v3 target append already committed or uncertain",
+            ));
+        }
+        self.state.store(1, Ordering::Release);
+        Ok(Some(TargetAppendGuardV3 {
+            capability: self,
+            _gate: gate,
+            resolved: false,
+        }))
+    }
+}
+
+/// The gate remains held across the real in-memory append. Dropping after a
+/// panic/unknown result makes subsequent attempts fail rather than guessing.
+pub(crate) struct TargetAppendGuardV3<'a> {
+    capability: &'a TargetPublicationV3,
+    _gate: std::sync::MutexGuard<'a, ()>,
+    resolved: bool,
+}
+impl TargetAppendGuardV3<'_> {
+    pub(crate) fn committed(mut self) {
+        self.capability.state.store(2, Ordering::Release);
+        self.resolved = true;
+    }
+    pub(crate) fn known_not_written(mut self) {
+        self.capability.state.store(0, Ordering::Release);
+        self.resolved = true;
+    }
+}
+impl Drop for TargetAppendGuardV3<'_> {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.capability.state.store(3, Ordering::Release);
+        }
     }
 }
 
@@ -94,7 +210,8 @@ pub(super) struct SpeculativeRouteV3 {
     unattributed: AtomicU64,
     cancel_all: Arc<AtomicBool>,
     root_revoked: Arc<AtomicBool>,
-    targets_revoked: Arc<AtomicBool>,
+    targets_revoked: TargetRevocationV3,
+    target_gate: Arc<Mutex<()>>,
 }
 
 /// The same Arc is retained by registration and the external teacher owner.
@@ -111,6 +228,7 @@ pub(crate) struct SpeculativeReceiverV3 {
     received: usize,
     overflowed: bool,
     identity_failed: bool,
+    pending_delivery: Option<Arc<SubmittedTeacherQueryV3>>,
 }
 
 /// A received capsule is returned intact on identity or counter failure.
@@ -119,6 +237,7 @@ pub(crate) enum SpeculativeReceiveErrorV3 {
     CounterOverflow(Arc<SubmittedTeacherQueryV3>),
     CounterExhausted,
     ForeignRoot(Arc<SubmittedTeacherQueryV3>),
+    PendingDelivery,
 }
 
 impl SpeculativeReceiverV3 {
@@ -129,6 +248,9 @@ impl SpeculativeReceiverV3 {
     pub(crate) fn try_recv(
         &mut self,
     ) -> Result<Option<Arc<SubmittedTeacherQueryV3>>, SpeculativeReceiveErrorV3> {
+        if self.pending_delivery.is_some() {
+            return Err(SpeculativeReceiveErrorV3::PendingDelivery);
+        }
         if self.overflowed {
             return Err(SpeculativeReceiveErrorV3::CounterExhausted);
         }
@@ -139,6 +261,9 @@ impl SpeculativeReceiverV3 {
                 return Err(SpeculativeReceiveErrorV3::Disconnected);
             }
         };
+        // Keep the original Arc before moving another reference to the pump.
+        // A panic before custody acknowledgement cannot lose this capsule.
+        self.pending_delivery = Some(Arc::clone(&query));
         let Some(next) = self.received.checked_add(1) else {
             self.overflowed = true;
             return Err(SpeculativeReceiveErrorV3::CounterOverflow(query));
@@ -155,6 +280,33 @@ impl SpeculativeReceiverV3 {
         Ok(Some(query))
     }
 
+    /// Inspect the original pending capsule after an interrupted handoff.
+    pub(crate) fn pending_delivery(&self) -> Option<Arc<SubmittedTeacherQueryV3>> {
+        self.pending_delivery.as_ref().map(Arc::clone)
+    }
+
+    /// The caller must first place this exact Arc in the original pump's
+    /// external custody. Acknowledgement never authorizes physical reuse.
+    pub(crate) fn acknowledge_delivery(
+        &mut self,
+        query: &Arc<SubmittedTeacherQueryV3>,
+    ) -> Result<(), ArenaError> {
+        if self.overflowed || self.identity_failed {
+            return Err(invalid(
+                "lock-v3 failed delivery must remain in original custody",
+            ));
+        }
+        match self.pending_delivery.as_ref() {
+            Some(original) if Arc::ptr_eq(original, query) => {
+                self.pending_delivery = None;
+                Ok(())
+            }
+            _ => Err(invalid(
+                "lock-v3 delivery acknowledgement differs from original capsule",
+            )),
+        }
+    }
+
     /// This only checks callback-to-receiver accounting for this route; it is
     /// not the external teacher worker's join or physical completion proof.
     pub(super) fn try_handoffs_accounted(
@@ -166,7 +318,7 @@ impl SpeculativeReceiverV3 {
                 "lock-v3 receiver belongs to another original route",
             ));
         }
-        if self.overflowed || self.identity_failed {
+        if self.overflowed || self.identity_failed || self.pending_delivery.is_some() {
             return Ok(Some(false));
         }
         root.try_handoffs_accounted_count(self.received)
@@ -197,7 +349,8 @@ impl SpeculativeRootV3 {
             unattributed: AtomicU64::new(0),
             cancel_all: Arc::new(AtomicBool::new(false)),
             root_revoked,
-            targets_revoked: Arc::new(AtomicBool::new(false)),
+            targets_revoked: TargetRevocationV3(Arc::new(AtomicBool::new(false))),
+            target_gate: Arc::new(Mutex::new(())),
         });
         Ok((
             Self {
@@ -209,6 +362,7 @@ impl SpeculativeRootV3 {
                 received: 0,
                 overflowed: false,
                 identity_failed: false,
+                pending_delivery: None,
             },
         ))
     }
@@ -233,8 +387,8 @@ impl SpeculativeRootV3 {
     pub(super) fn root_canceled(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.route.cancel_all)
     }
-    pub(crate) fn target_revoke_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.route.targets_revoked)
+    pub(super) fn target_revocation(&self) -> TargetRevocationV3 {
+        self.route.targets_revoked.clone()
     }
     pub(crate) fn unattributed_count(&self) -> u64 {
         self.route.unattributed.load(Ordering::Acquire)
@@ -279,12 +433,23 @@ impl SpeculativeRootV3 {
                 "lock-v3 speculative ticket capacity",
             ));
         }
+        let authority = SpeculativeTicketAuthorityV3::new();
+        let capability = TargetPublicationV3 {
+            admission: self.route.admission.clone(),
+            ticket: *ticket,
+            gate: Arc::clone(&self.route.target_gate),
+            revoked: self.route.targets_revoked.clone(),
+            authority: authority.clone(),
+            state: AtomicU8::new(0),
+        };
         let item = Arc::new(SpeculativeTicketV3 {
             ticket: *ticket,
             route_owner: Arc::clone(&self.route.route_owner),
             state: AtomicU8::new(0),
             error: Mutex::new(None),
-            authority: SpeculativeTicketAuthorityV3::new(),
+            authority,
+            target_gate: Arc::clone(&self.route.target_gate),
+            target_capability: Mutex::new(Some(capability)),
         });
         tickets.insert(ticket.id, Arc::clone(&item));
         SpeculativeTicketRegistrationV3::Ready(item)
@@ -342,15 +507,45 @@ impl SpeculativeRootV3 {
             .get(&ticket.id)
             .filter(|item| item.ticket == *ticket)
             .ok_or_else(|| invalid("lock-v3 original speculative ticket missing or changed"))?;
-        item.authority.cancel();
-        Ok(Some(()))
+        item.try_cancel()
+    }
+
+    /// Take the only publication capability from this exact root/ticket.
+    /// The caller must retain it if later preparation or append fails.
+    pub(super) fn try_take_target_capability(
+        &self,
+        ticket: &RoleTicketEnvelope,
+    ) -> Result<TargetCapabilityTakeV3, ArenaError> {
+        if !self.matches_ticket_authority(ticket) {
+            return Err(invalid("lock-v3 target ticket root mismatch"));
+        }
+        let tickets = match self.route.tickets.try_lock() {
+            Ok(tickets) => tickets,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(TargetCapabilityTakeV3::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v3 speculative ticket custody poisoned"));
+            }
+        };
+        let item = tickets
+            .get(&ticket.id)
+            .filter(|item| item.ticket == *ticket)
+            .ok_or_else(|| invalid("lock-v3 original target ticket missing or changed"))?;
+        item.try_take_target_capability()
     }
     pub(crate) fn cancel_all(&self) {
         self.route.cancel_all.store(true, Ordering::Release);
     }
-    pub(crate) fn revoke_all_targets(&self) {
-        self.route.targets_revoked.store(true, Ordering::Release);
+    pub(crate) fn try_revoke_all_targets(&self) -> Result<Option<()>, ArenaError> {
+        let _gate = match self.route.target_gate.try_lock() {
+            Ok(gate) => gate,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v3 target revocation gate poisoned"));
+            }
+        };
+        self.route.targets_revoked.0.store(true, Ordering::Release);
         self.route.cancel_all.store(true, Ordering::Release);
+        Ok(Some(()))
     }
     /// Used only with the original registration owner lock for rollback.
     pub(super) fn try_has_registered_tickets(&self) -> Result<Option<bool>, ArenaError> {
