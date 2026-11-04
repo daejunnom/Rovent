@@ -19,7 +19,10 @@ mod owned_sources;
 pub use legacy_manifest::{
     validate_pals_legacy_export_manifest, LegacyPalsExportManifestSummary, LegacyPalsGraphPin,
 };
-pub use owned_sources::{VirtualReviewOwnedSources, VirtualReviewProfileDirectory};
+pub use owned_sources::{
+    VirtualReviewHeldFileSources, VirtualReviewHeldGraph, VirtualReviewOwnedSources,
+    VirtualReviewProfileDirectory,
+};
 mod tickets;
 use rz_contracts::pals_adaptive::RoleTicketEnvelope;
 pub use tickets::VirtualReviewCompletion;
@@ -720,6 +723,8 @@ impl VirtualSessionBank {
 /// Its contents are not a physical completion witness or authority to reuse
 /// a device. A caller must preserve it on error or panic until a real fence.
 pub struct VirtualReviewStartupCustody {
+    // Established before native startup and shared only with this backend.
+    synchronous_owner_identity: Arc<()>,
     sources: Arc<dyn VirtualReviewOwnedSources>,
     runtime: Option<OrtRuntime>,
     profile_directory: Option<VirtualReviewProfileDirectory>,
@@ -744,6 +749,7 @@ impl VirtualReviewStartupCustody {
         profile_directory: Option<VirtualReviewProfileDirectory>,
     ) -> Self {
         Self {
+            synchronous_owner_identity: Arc::new(()),
             sources,
             runtime: None,
             profile_directory,
@@ -782,6 +788,33 @@ impl VirtualReviewStartupCustody {
     /// The caller must guard transfer and return this same backend on failure.
     pub fn backend_slot_mut(&mut self) -> &mut Option<PalsVirtualReviewOnnxBackend> {
         &mut self.backend
+    }
+
+    /// Proof for this owner only after successful startup and idle synchronous
+    /// work. A failed or partial session remains unproven in this custody.
+    /// This does not attest another worker, process, or the entire device.
+    pub fn synchronous_shutdown_proof(&self) -> Option<crate::worker::SynchronousOwnerProof> {
+        if self.session_load_failure.is_some()
+            || self.serialized.is_some()
+            || self.sessions.len() != 0
+        {
+            return None;
+        }
+        let backend = self.backend.as_ref()?;
+        if !Arc::ptr_eq(
+            &self.synchronous_owner_identity,
+            &backend.synchronous_owner_identity,
+        ) {
+            return None;
+        }
+        backend.synchronous_shutdown_proof()
+    }
+}
+
+impl crate::worker::synchronous_owner_sealed::Sealed for VirtualReviewStartupCustody {}
+impl crate::worker::SynchronousPhysicalOwner for VirtualReviewStartupCustody {
+    fn synchronous_owner_identity(&self) -> Arc<()> {
+        Arc::clone(&self.synchronous_owner_identity)
     }
 }
 
@@ -1488,7 +1521,7 @@ impl PalsVirtualReviewOnnxBackend {
             vram_peak_bytes: None,
         };
         custody.backend = Some(Self {
-            synchronous_owner_identity: Arc::new(()),
+            synchronous_owner_identity: Arc::clone(&custody.synchronous_owner_identity),
             synchronous_runs: SynchronousRunTracker::new(),
             applied_session_settings,
             runtime: Some(runtime),
@@ -2872,6 +2905,20 @@ fn extract_role_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uninitialized_startup_custody_never_issues_a_shutdown_proof() {
+        use crate::worker::SynchronousPhysicalOwner;
+
+        let source = Arc::new(owned_sources::PathSources::new(Path::new("/unused")));
+        let custody = VirtualReviewStartupCustody::new(source, None);
+        let original = custody.synchronous_owner_identity();
+        assert!(Arc::ptr_eq(
+            &original,
+            &custody.synchronous_owner_identity()
+        ));
+        assert!(custody.synchronous_shutdown_proof().is_none());
+    }
 
     #[test]
     fn placement_prerequisites_require_only_registered_roles_and_warm_seed() {

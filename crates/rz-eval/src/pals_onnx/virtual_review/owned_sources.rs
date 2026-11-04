@@ -218,6 +218,155 @@ pub trait VirtualReviewOwnedSources: Send + Sync + 'static {
     ) -> Result<Vec<u8>, BackendError>;
 }
 
+/// A caller-opened graph file and its registered manifest identity. The file
+/// handle is moved into the source owner; no path is reopened during loading.
+pub struct VirtualReviewHeldGraph {
+    pub role: String,
+    pub registered_file: String,
+    pub sha256: [u8; 32],
+    pub file: File,
+}
+
+/// Original manifest and graph descriptors held by a startup custody owner.
+/// Construction only transfers the descriptors: it does not authorize a
+/// model or establish a physical completion fence. Every read still goes
+/// through the ordinary manifest/graph byte and SHA checks at admission.
+pub struct VirtualReviewHeldFileSources {
+    manifest: File,
+    graphs: Vec<VirtualReviewHeldGraph>,
+}
+impl VirtualReviewHeldFileSources {
+    pub fn new(manifest: File, graphs: Vec<VirtualReviewHeldGraph>) -> Self {
+        Self { manifest, graphs }
+    }
+}
+
+#[cfg(unix)]
+fn held_read_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(bytes, offset)
+}
+/// Positional reads leave the original descriptor's file position unchanged.
+/// The subsequent checked boundary verifies the digest of these exact bytes.
+#[cfg(unix)]
+fn read_held(file: &File, max_bytes: usize) -> Result<Vec<u8>, BackendError> {
+    let before = file
+        .metadata()
+        .map_err(|_| fail(K::Io, S::Asset, "cannot inspect held V3 source"))?;
+    let len = usize::try_from(before.len()).map_err(|_| {
+        fail(
+            K::ResourceExhausted,
+            S::Asset,
+            "held V3 source exceeds address space",
+        )
+    })?;
+    if !before.is_file() || len == 0 || len > max_bytes {
+        return Err(fail(
+            K::ResourceExhausted,
+            S::Asset,
+            "held V3 source is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|_| {
+        fail(
+            K::ResourceExhausted,
+            S::Asset,
+            "held V3 source allocation failed",
+        )
+    })?;
+    bytes.resize(len, 0);
+    let mut offset = 0;
+    while offset < len {
+        match held_read_at(file, &mut bytes[offset..], offset as u64) {
+            Ok(0) => return Err(fail(K::Io, S::Asset, "held V3 source ended early")),
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(fail(K::Io, S::Asset, "held V3 source read failed")),
+        }
+    }
+    let mut extra = [0_u8; 1];
+    if held_read_at(file, &mut extra, len as u64)
+        .map_err(|_| fail(K::Io, S::Asset, "cannot check held V3 source length"))?
+        != 0
+    {
+        return Err(fail(K::IdentityMismatch, S::Asset, "held V3 source grew"));
+    }
+    let after = file
+        .metadata()
+        .map_err(|_| fail(K::Io, S::Asset, "cannot recheck held V3 source"))?;
+    if before.len() != after.len()
+        || before
+            .modified()
+            .ok()
+            .zip(after.modified().ok())
+            .is_some_and(|(a, b)| a != b)
+    {
+        return Err(fail(
+            K::IdentityMismatch,
+            S::Asset,
+            "held V3 source changed",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_held(_file: &File, _max_bytes: usize) -> Result<Vec<u8>, BackendError> {
+    Err(fail(
+        K::UnsupportedModel,
+        S::Asset,
+        "held V3 source positional reads require Unix",
+    ))
+}
+
+impl VirtualReviewOwnedSources for VirtualReviewHeldFileSources {
+    fn read_manifest(&self, max_bytes: usize) -> Result<Vec<u8>, BackendError> {
+        read_held(&self.manifest, max_bytes)
+    }
+
+    fn read_graph(
+        &self,
+        role: &str,
+        registered_file: &str,
+        expected_sha256: [u8; 32],
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, BackendError> {
+        if !matches!(
+            Path::new(registered_file)
+                .components()
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [Component::Normal(_)]
+        ) {
+            return Err(fail(
+                K::InvalidInput,
+                S::Asset,
+                "V3 graph must be a basename",
+            ));
+        }
+        let mut matches = self
+            .graphs
+            .iter()
+            .filter(|graph| graph.role == role && graph.registered_file == registered_file);
+        let graph = matches.next().ok_or_else(|| {
+            fail(
+                K::IdentityMismatch,
+                S::Asset,
+                "held V3 graph source is missing",
+            )
+        })?;
+        if matches.next().is_some() || graph.sha256 != expected_sha256 {
+            return Err(fail(
+                K::IdentityMismatch,
+                S::Asset,
+                "held V3 graph identity differs",
+            ));
+        }
+        read_held(&graph.file, max_bytes)
+    }
+}
+
 /// Compatibility source for the original manifest-relative path loader.
 /// Construction only records the path; config errors retain their precedence.
 pub(super) struct PathSources {
@@ -330,6 +479,64 @@ pub(super) fn read_graph_checked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn held_sources_read_original_descriptors_without_moving_their_offsets() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "rz-held-v3-source-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        struct RemoveFile(PathBuf);
+        impl Drop for RemoveFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = RemoveFile(path.clone());
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"original-graph").unwrap();
+        file.seek(SeekFrom::Start(3)).unwrap();
+        // try_clone shares the original offset on Unix. Positional reads of
+        // the held owner must preserve it for the caller and other users.
+        let mut observer = file.try_clone().unwrap();
+        let graph = file.try_clone().unwrap();
+        let digest = asset::sha256(b"original-graph");
+        let owner = VirtualReviewHeldFileSources::new(
+            file,
+            vec![VirtualReviewHeldGraph {
+                role: "public".into(),
+                registered_file: "public.onnx".into(),
+                sha256: digest,
+                file: graph,
+            }],
+        );
+        assert_eq!(owner.read_manifest(32).unwrap(), b"original-graph");
+        assert_eq!(
+            owner
+                .read_graph("public", "public.onnx", digest, 32)
+                .unwrap(),
+            b"original-graph"
+        );
+        assert_eq!(observer.stream_position().unwrap(), 3);
+        assert!(owner.read_manifest(2).is_err());
+        assert!(owner
+            .read_graph("public", "public.onnx", [0; 32], 32)
+            .is_err());
+        assert!(owner
+            .read_graph("public", "../public.onnx", digest, 32)
+            .is_err());
+        assert_eq!(observer.stream_position().unwrap(), 3);
+    }
     #[test]
     fn descriptor_profile_names_have_exact_role_and_leaf_scope() {
         for role in ["public", "shared_pc", "shared_warm", "validator"] {
