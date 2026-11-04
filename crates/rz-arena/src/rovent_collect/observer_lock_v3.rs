@@ -570,6 +570,29 @@ impl<Q, O> Observer<Q, O> {
     }
 }
 impl State {
+    fn admit_original(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<(), ArenaError> {
+        check(
+            self.admission.is_none()
+                && self.producer.is_some()
+                && self.position.is_some()
+                && self
+                    .prepared_admission
+                    .as_ref()
+                    .is_some_and(|original| original.same_original_admission(admission)),
+            "lock-v3 owner permits one original root only",
+        )?;
+        check(
+            self.route_admission
+                .as_ref()
+                .is_none_or(|original| original.same_original_admission(admission)),
+            "lock-v3 admitted root differs from sealed speculative route",
+        )?;
+        self.admission = Some(admission.clone());
+        Ok(())
+    }
     fn producer(&mut self) -> Result<&mut RoventCorpusProducerLockV3, ArenaError> {
         self.producer
             .as_mut()
@@ -728,25 +751,16 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
         admission: &RoventCollectionRootAdmissionV3,
     ) -> Result<(), AdaptiveCollectionError> {
         self.apply(AdaptiveCollectionStage::Dispatch, |state| {
-            check(
-                state.admission.is_none()
-                    && state.producer.is_some()
-                    && state.position.is_some()
-                    && state
-                        .prepared_admission
-                        .as_ref()
-                        .is_some_and(|original| original.same_original_admission(admission)),
-                "lock-v3 owner permits one original root only",
-            )?;
-            check(
-                state
-                    .route_admission
-                    .as_ref()
-                    .is_none_or(|original| original.same_original_admission(admission)),
-                "lock-v3 admitted root differs from sealed speculative route",
-            )?;
-            state.admission = Some(admission.clone());
-            Ok(())
+            state.admit_original(admission)
+        })
+    }
+    fn try_admitted(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.try_apply(AdaptiveCollectionStage::Dispatch, |state| {
+            state.admit_original(admission)?;
+            Ok(AdaptiveCollectionBoundaryV2::Ready)
         })
     }
     fn dispatch(
