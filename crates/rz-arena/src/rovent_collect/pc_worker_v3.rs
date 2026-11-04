@@ -58,10 +58,20 @@ struct PcScopeEffectSlotsV3 {
     claim: Option<super::game_authority_v3::GameEffectClaimV3<PcWorkerSupervisorV3>>,
     outcome: Option<Result<super::teacher::v3_session::TeacherScopeEffectOutcomeV3,
         super::teacher::v3_session::TeacherScopeEffectClaimFailureV3>>,
+    issue_error: Option<TeacherSessionClaimErrorV3>,
+    source_error: Option<&'static str>,
+    claim_error: Option<&'static str>,
+    completion_error: Option<&'static str>,
+    source_step: Option<super::game_authority_v3::GameStepV3>,
+    claim_step: Option<super::game_authority_v3::GameStepV3>,
+    completion_step: Option<super::game_authority_v3::GameStepV3>,
+    finished: bool,
 }
 impl PcScopeEffectSlotsV3 {
     fn new() -> Self {
-        Self { proof: None, teacher_source: None, game_source: None, claim: None, outcome: None }
+        Self { proof: None, teacher_source: None, game_source: None, claim: None, outcome: None,
+            issue_error: None, source_error: None, claim_error: None, completion_error: None,
+            source_step: None, claim_step: None, completion_step: None, finished: false }
     }
 }
 
@@ -1975,6 +1985,7 @@ impl PcWorkerSupervisorV3 {
         }
         for original in &self.roots {
             let outcome = prepare_root_step_v3(
+                self,
                 &self.bridge,
                 &self.router,
                 original,
@@ -2010,9 +2021,97 @@ impl PcWorkerSupervisorV3 {
     }
 }
 
+enum PcScopeDriveV3 { Pending, Finished, Failed, Aborted }
+
+/// All mutable effect slots were installed with this recovery before entry.
+/// The caller holds the original supervisor/recovery/stage guards already.
+fn drive_pc_scope_effect_v3(
+    supervisor: &PcWorkerSupervisorV3,
+    recovery: &mut PcRootRecoveryV3,
+    stage_owner: &Arc<Mutex<TeacherSessionStagingV3>>,
+    stage: &mut TeacherSessionStagingV3,
+) -> PcScopeDriveV3 {
+    use super::game_authority_v3::GameStepV3 as G;
+    use super::teacher::v3_session::TeacherScopeEffectClaimFailureV3 as F;
+    let owner = Arc::clone(&recovery.scope_effects);
+    let mut slots = match owner.try_lock() {
+        Ok(slots) => slots,
+        Err(std::sync::TryLockError::WouldBlock) => return PcScopeDriveV3::Pending,
+        Err(_) => { recovery.failure.get_or_insert_with(|| "P-C V3 scope slots poisoned".into()); return PcScopeDriveV3::Failed; }
+    };
+    let PcScopeEffectSlotsV3 { proof, teacher_source, game_source, claim, outcome,
+        issue_error, source_error, claim_error, completion_error, source_step, claim_step,
+        completion_step, finished } = &mut *slots;
+    if *finished { return PcScopeDriveV3::Finished; }
+    if issue_error.is_some() || source_error.is_some() || claim_error.is_some() || completion_error.is_some() {
+        return PcScopeDriveV3::Failed;
+    }
+    let game = supervisor.bridge.game_authority();
+    if game.abort_requested() && claim.is_none() { return PcScopeDriveV3::Aborted; }
+    if game_source.is_none() {
+        if proof.is_none() {
+            match PcReceivedStageProofV3::try_from_guards(supervisor, recovery, stage_owner, stage) {
+                Ok(Some(original)) => *proof = Some(original),
+                Ok(None) => return PcScopeDriveV3::Pending,
+                Err(error) => { *source_error = Some(error); return PcScopeDriveV3::Failed; }
+            }
+        }
+        if teacher_source.is_none() {
+            if let Err(error) = stage.issue_scope_effect_source(&recovery.admission, teacher_source) {
+                *issue_error = Some(error);
+                return PcScopeDriveV3::Failed;
+            }
+        }
+        let step = game.try_issue_pc_scope_source_in_slot(
+            proof, teacher_source, supervisor, recovery, &recovery.admission, game_source, source_error,
+        );
+        *source_step = Some(step);
+        match step {
+            G::Ready => {}, G::Busy => return PcScopeDriveV3::Pending,
+            G::Aborted | G::Closed => return PcScopeDriveV3::Aborted,
+            _ => return PcScopeDriveV3::Failed,
+        }
+    }
+    let Some(source) = game_source.as_ref() else { return PcScopeDriveV3::Failed; };
+    if claim.is_none() {
+        let step = game.try_claim_pc_scope(source, supervisor, recovery, claim, claim_error);
+        *claim_step = Some(step);
+        match step {
+            G::Ready => {}, G::Busy => return PcScopeDriveV3::Pending,
+            G::Aborted | G::Closed => return PcScopeDriveV3::Aborted,
+            _ => return PcScopeDriveV3::Failed,
+        }
+    }
+    let Some(original_claim) = claim.as_mut() else { return PcScopeDriveV3::Failed; };
+    if outcome.is_none() {
+        let Some(teacher) = source.pc_scope_source() else { return PcScopeDriveV3::Failed; };
+        let attempted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stage.claim_with_effect_source(teacher, original_claim, outcome)
+        }));
+        match attempted {
+            Ok(true) => {},
+            Ok(false) => { *completion_error = Some("P-C V3 scope claim was not entered"); return PcScopeDriveV3::Failed; }
+            Err(payload) => { recovery.panic = Some(payload); return PcScopeDriveV3::Failed; }
+        }
+    }
+    let (original_outcome, succeeded) = match outcome.as_ref() {
+        Some(Ok(value)) => (value, true),
+        Some(Err(F::Known { outcome, .. })) => (outcome, false),
+        Some(Err(F::RejectedBeforeEntry(_))) | Some(Err(F::Unknown(_))) | None => return PcScopeDriveV3::Failed,
+    };
+    let step = original_claim.try_complete_pc_scope(source, original_outcome, supervisor, recovery, completion_error);
+    *completion_step = Some(step);
+    match step {
+        G::Ready | G::Existing => { *finished = true; if succeeded { PcScopeDriveV3::Finished } else { PcScopeDriveV3::Failed } },
+        G::Busy => PcScopeDriveV3::Pending,
+        _ => PcScopeDriveV3::Failed,
+    }
+}
+
 /// Called outside the native manager callback. Busy leaves the same recovery
 /// owner in place; no new actor or claim is issued for another root.
 fn prepare_root_step_v3(
+    supervisor: &PcWorkerSupervisorV3,
     bridge: &Arc<RoventPcCollectionBridgeV3>,
     router: &Arc<CaptureRouterV3>,
     recovery: &Arc<Mutex<PcRootRecoveryV3>>,
@@ -2048,6 +2147,29 @@ fn prepare_root_step_v3(
     let mut state = recovery.lock().map_err(|_| "P-C V3 recovery poisoned")?;
     if !state.matches_received_root(bridge) {
         return Err("P-C V3 original receiver witness missing or changed".into());
+    }
+    // A claim acquired before abort must still be settled from its original
+    // outcome; abort closes new admission but cannot erase that claim.
+    if bridge.game_authority().abort_requested() {
+        let active = match state.scope_effects.try_lock() {
+            Ok(slots) => slots.claim.is_some() && !slots.finished,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(PcPrepareStepV3::Pending),
+            Err(_) => return Err("P-C V3 scope slots poisoned".into()),
+        };
+        if active {
+            let Some(stage_owner) = state.stage.as_ref().map(Arc::clone) else {
+                return Err("P-C V3 active scope claim lost stage owner".into());
+            };
+            let mut stage = match stage_owner.try_lock() {
+                Ok(stage) => stage,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(PcPrepareStepV3::Pending),
+                Err(_) => return Err("P-C V3 stage poisoned".into()),
+            };
+            if matches!(drive_pc_scope_effect_v3(supervisor, &mut state, &stage_owner, &mut stage), PcScopeDriveV3::Failed) {
+                state.failure.get_or_insert_with(|| "P-C V3 active scope outcome unresolved".into());
+            }
+            return Ok(PcPrepareStepV3::Pending);
+        }
     }
     if state.published {
         return Ok(PcPrepareStepV3::Published);
@@ -2239,17 +2361,23 @@ fn prepare_root_step_v3(
     {
         let mut staged = stage.lock().map_err(|_| "P-C V3 stage poisoned")?;
         use super::teacher::v3_session::TeacherSessionStageStateV3 as S;
-        match staged.state() {
-            S::Prepared => {
-                if bridge.game_authority().abort_requested() {
-                    return Ok(PcPrepareStepV3::Pending);
-                }
-                if let Err(error) = staged.claim() {
-                    state.stage_claim_failure = Some(error);
-                    state.failure = Some("teacher scope claim unresolved or rejected".into());
+        let scope_pending = match state.scope_effects.try_lock() {
+            Ok(slots) => slots.claim.is_some() && !slots.finished,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(PcPrepareStepV3::Pending),
+            Err(_) => return Err("P-C V3 scope slots poisoned".into()),
+        };
+        if staged.state() == S::Prepared || scope_pending {
+            match drive_pc_scope_effect_v3(supervisor, &mut state, &stage, &mut staged) {
+                PcScopeDriveV3::Finished => {},
+                PcScopeDriveV3::Pending | PcScopeDriveV3::Aborted => return Ok(PcPrepareStepV3::Pending),
+                PcScopeDriveV3::Failed => {
+                    state.failure.get_or_insert_with(|| "P-C V3 teacher scope effect failed or unresolved".into());
                     return Ok(PcPrepareStepV3::Failed);
                 }
             }
+        }
+        match staged.state() {
+            S::Prepared => return Ok(PcPrepareStepV3::Pending),
             S::Claimed => {}
             S::Ready => {}
             _ => {
@@ -2269,36 +2397,8 @@ fn prepare_root_step_v3(
         .ok_or("P-C V3 staged session absent")?;
     let roster = &inputs.plan().teacher_slots;
     if state.next_actor < roster.len() {
-        if bridge.game_authority().abort_requested() {
-            return Ok(PcPrepareStepV3::Pending);
-        }
-        let actor_id = roster[state.next_actor].actor_id.clone();
-        let mut owner = session.lock().map_err(|_| "P-C V3 session poisoned")?;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            owner.start_actor(
-                &actor_id,
-                startup_deadline,
-                cleanup_deadline,
-                &mut state.custodian,
-            )
-        }));
-        drop(owner);
-        match result {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                state.actor_start_failure = Some(error);
-                state.failure =
-                    Some("teacher actor start failed; original custody retained".into());
-                return Ok(PcPrepareStepV3::Failed);
-            }
-            Err(payload) => {
-                state.panic = Some(payload);
-                state.failure =
-                    Some("teacher actor start panicked; original outcome unknown".into());
-                return Ok(PcPrepareStepV3::Failed);
-            }
-        }
-        state.next_actor += 1;
+        // The scope gate does not authorize actor creation. Keep this exact
+        // session retained until the independent actor effect gate is wired.
         return Ok(PcPrepareStepV3::Pending);
     }
     if state.route.is_none() {
