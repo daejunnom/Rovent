@@ -14,7 +14,11 @@ use crate::rovent_external_launch::RoventTeacherScopeAggregateAckV3;
 use rz_search::pals::engine::pc_port::PcPortQuestion;
 use std::{
     any::Any,
-    sync::{Arc, Mutex, OnceLock, atomic::AtomicBool, mpsc},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
 };
 
 /// Internal custody remains with the original P/C session. A reported root
