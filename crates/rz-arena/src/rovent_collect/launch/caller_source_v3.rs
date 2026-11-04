@@ -173,6 +173,21 @@ impl CallerSourceReceiptV3 {
         original_lock_file: &std::fs::File,
     ) -> Result<Self, ArenaError> {
         inputs.validate_original_boundary(lock, directory, original_lock_file)?;
+        Self::from_inputs_and_lock(inputs, lock)
+    }
+
+    /// Build the diagnostic after the original callback has validated this
+    /// exact owner and lock. Hashing occurs only when this method is called.
+    pub(super) fn from_validated_boundary(
+        boundary: &super::pc_lock_v3::ValidatedCallerBoundaryV3,
+    ) -> Result<Self, ArenaError> {
+        Self::from_inputs_and_lock(boundary.inputs(), boundary.lock())
+    }
+
+    fn from_inputs_and_lock(
+        inputs: &PreparedPcCollectionInputsV3,
+        lock: &RoventInputLockV3,
+    ) -> Result<Self, ArenaError> {
         Ok(Self {
             schema: CALLER_RECEIPT_V3_DOMAIN,
             evidence_scope: "embedded caller source and declared input pins; execution unknown",
