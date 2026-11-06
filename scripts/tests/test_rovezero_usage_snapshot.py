@@ -191,13 +191,14 @@ class SnapshotTests(unittest.TestCase):
         root_cache = root / 'root-cache'
         home = root / 'home'
         var_tmp = root / 'var-tmp'
-        for parent in (root_cache, home / 'user' / '.cache', var_tmp):
+        tmp = root / 'tmp'
+        for parent in (root_cache, home / 'user' / '.cache', var_tmp, tmp):
             parent.mkdir(parents=True)
         (root_cache / 'rovezero').mkdir()
         (home / 'user' / '.cache' / 'rovezero').mkdir()
-        roots, parents = usage.default_roots_and_discovery(home, root_cache, var_tmp)
+        roots, parents = usage.default_roots_and_discovery(home, root_cache, var_tmp, tmp)
         self.assertEqual(set(roots), {root_cache / 'rovezero', home / 'user' / '.cache' / 'rovezero'})
-        self.assertEqual(set(parents), {root_cache, home / 'user' / '.cache', var_tmp})
+        self.assertEqual(set(parents), {root_cache, home / 'user' / '.cache', var_tmp, tmp})
 
     def test_origin_proof_is_bound_to_pair_and_does_not_expose_host_ids(self):
         machine = '0123456789abcdef0123456789abcdef'
@@ -220,6 +221,18 @@ class SnapshotTests(unittest.TestCase):
              mock.patch.object(Path, 'lstat', return_value=other_device), \
              mock.patch.object(Path, 'read_text', side_effect=[machine, boot]):
             self.assertIsNone(usage.origin_proof(roots, pair))
+
+    def test_origin_proof_accepts_verified_regular_file_roots(self):
+        path = Path(self.tmp.name) / 'rovezero-source.tar'
+        path.write_bytes(b'artifact')
+        info = path.lstat()
+        result = {'roots': [{'root': str(path), 'scan_device': info.st_dev,
+                             'scan_inode': info.st_ino, 'identity_unchanged': True}]}
+        with mock.patch.object(usage.os, 'stat', return_value=types.SimpleNamespace(st_dev=info.st_dev)), \
+             mock.patch.object(Path, 'lstat', return_value=info), \
+             mock.patch.object(Path, 'read_text', side_effect=[
+                 '0123456789abcdef0123456789abcdef', '6ba7b810-9dad-11d1-80b4-00c04fd430c8']):
+            self.assertIsNotNone(usage.origin_proof(result, '3c1f640d-f646-4f6f-b7f7-233d076d7f21'))
 
     @unittest.skipUnless(hasattr(__import__('os'), 'O_NOFOLLOW'), 'Linux nofollow')
     def test_paired_observations_cross_threshold_and_reject_other_boot(self):
@@ -366,7 +379,7 @@ class SnapshotTests(unittest.TestCase):
             usage.create_snapshot(self.path, pair_id='configured')
         second = usage.read_snapshot(self.path, require_root_owner=False)
         self.assertNotIn('_mirror_revision', second)
-        self.assertEqual(second['scope'], 'default_rovezero_caches_siblings_and_var_tmp_xdg_exceptions_unknown')
+        self.assertEqual(second['scope'], 'default_rovezero_caches_and_rovezero_rovent_tmp_siblings_xdg_exceptions_unknown')
         self.assertTrue((Path(self.tmp.name) / usage.MIRROR_CONFIG).exists())
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux advisory flock')

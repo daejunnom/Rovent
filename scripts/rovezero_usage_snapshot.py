@@ -320,10 +320,10 @@ def warn_cached_total_usage():
 
 
 def default_roots_and_discovery(home_parent=Path('/home'), root_cache_parent=Path('/root/.cache'),
-                                var_tmp_parent=Path('/var/tmp')):
+                                var_tmp_parent=Path('/var/tmp'), tmp_parent=Path('/tmp')):
     """Discover default cache roots and their direct legacy sibling parents."""
     roots = []
-    parents = [var_tmp_parent]
+    parents = [var_tmp_parent, tmp_parent]
     root_cache = root_cache_parent / 'rovezero'
     if root_cache_parent.is_dir() and not root_cache_parent.is_symlink():
         parents.append(root_cache_parent)
@@ -430,7 +430,7 @@ def origin_proof(result, pair_id):
         for item in roots:
             path = Path(item['root'])
             info = path.lstat()
-            if (not path.is_absolute() or not stat.S_ISDIR(info.st_mode)
+            if (not path.is_absolute() or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode))
                     or stat.S_ISLNK(info.st_mode) or info.st_dev != device
                     or item.get('identity_unchanged') is not True
                     or item.get('scan_device') != info.st_dev
@@ -606,7 +606,7 @@ def create_snapshot(path=SNAPSHOT, *, extra_roots=(), max_entries=2_000_000,
              'threshold_bytes', 'allocated_bytes_lower_bound', 'logical_bytes_lower_bound',
              'allocated_measure')}
     value.update(schema=SCHEMA, coverage='partial',
-                 scope='default_rovezero_caches_siblings_and_var_tmp_xdg_exceptions_unknown',
+                 scope='default_rovezero_caches_and_rovezero_rovent_tmp_siblings_xdg_exceptions_unknown',
                  consistency='best_effort_non_atomic', host_physical_bytes='unknown',
                  scan_summary=module.public_scan_summary(result))
     value['scan_summary']['partial_causes'].append('custom_scope_unknown')

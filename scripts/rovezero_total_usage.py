@@ -3,7 +3,7 @@
 
 Run outside catalog locks, preferably in a separately supervised worker.
 Roots are explicit.  A discovery parent contributes only its immediate
-``rovezero-*`` directories.  This is a best-effort snapshot of regular-file
+``rovezero-*`` and ``rovent-*`` directories and regular files.  This is a best-effort snapshot of regular-file
 allocation, not filesystem, VHDX, cloud, or host-disk accounting.  A soft
 deadline cannot interrupt an OS call that is already blocked.
 """
@@ -291,7 +291,7 @@ def scan_total_usage(roots, *, discover_parents=(), threshold_bytes=DEFAULT_THRE
                     if not bounded():
                         break
                     stats["entries"] += 1
-                    if not item.name.startswith("rovezero-"):
+                    if not item.name.startswith(("rovezero-", "rovent-")):
                         continue
                     if _private_name(item.name):
                         errors["private_entries_excluded"] += 1
@@ -301,7 +301,7 @@ def scan_total_usage(roots, *, discover_parents=(), threshold_bytes=DEFAULT_THRE
                         stats["symlinks_excluded"] += 1
                         # The matching child could identify an unobserved root.
                         errors["discovery_symlink_unresolved"] += 1
-                    elif stat.S_ISDIR(child.st_mode):
+                    elif stat.S_ISDIR(child.st_mode) or stat.S_ISREG(child.st_mode):
                         add_root(parent / item.name)
         except OSError:
             errors["discovery_unavailable"] += 1
@@ -353,6 +353,35 @@ def scan_total_usage(roots, *, discover_parents=(), threshold_bytes=DEFAULT_THRE
         try:
             _safe_root(root)
             info = root.lstat()
+            if stat.S_ISREG(info.st_mode):
+                root_identity = _identity(info)
+                if root_identity is None:
+                    raise OSError("root identity is unavailable")
+                root_record["scan_device"], root_record["scan_inode"] = root_identity
+                current = root.lstat()
+                root_record["identity_unchanged"] = (
+                    stat.S_ISREG(current.st_mode) and not _is_reparse(current)
+                    and _identity(current) == root_identity and current.st_size == info.st_size
+                )
+                if not root_record["identity_unchanged"]:
+                    errors["root_identity_changed"] += 1
+                elif root_identity in seen_files:
+                    stats["hardlinks_deduplicated"] += 1
+                else:
+                    seen_files.add(root_identity)
+                    logical += info.st_size
+                    file_allocation = _allocated_bytes(root, info)
+                    if file_allocation is None:
+                        errors["allocated_bytes_unavailable"] += 1
+                    else:
+                        allocated += file_allocation
+                    stats["unique_regular_files"] += 1
+                    if stop_when_exceeded and allocated > threshold_bytes:
+                        errors["threshold_short_circuit"] = 1
+                root_record.update({"allocated_bytes": allocated - before_allocated,
+                                    "logical_bytes": logical - before_logical,
+                                    "partial": sum(errors.values()) != before_errors})
+                continue
             if not stat.S_ISDIR(info.st_mode):
                 raise OSError("root is not a directory")
             root_identity = _identity(info)
@@ -526,7 +555,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", action="append", default=[], help="explicit storage root; repeatable")
     parser.add_argument("--discover-parent", action="append", default=[],
-                        help="discover only direct rovezero-* directories under this parent")
+                        help="discover direct rovezero-* and rovent-* directories and files under this parent")
     parser.add_argument("--threshold-bytes", type=int, default=DEFAULT_THRESHOLD)
     parser.add_argument("--max-entries", type=int, default=1_000_000)
     parser.add_argument("--max-seconds", type=float, default=60.0)

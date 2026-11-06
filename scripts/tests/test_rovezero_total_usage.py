@@ -66,6 +66,26 @@ class TotalUsageTests(unittest.TestCase):
         self.assertEqual(result["logical_bytes_lower_bound"], 3)
         self.assertEqual([x["root"] for x in result["roots"]], [str(selected)])
 
+    def test_discovery_counts_unregistered_files_and_rovent_directories_once(self):
+        parent = self.root("discovery")
+        directory = parent / "rovent-research"
+        directory.mkdir()
+        original = directory / "artifact.bin"
+        original.write_bytes(b"shared-data")
+        copy = parent / "rovezero-copy.tar"
+        try:
+            os.link(original, copy)
+        except OSError as exc:
+            self.skipTest("hardlinks unavailable: " + str(exc))
+        (parent / "rovezero-api-key.json").write_bytes(b"do-not-read")
+        (parent / "unrelated").write_bytes(b"not-in-scope")
+        result = usage.scan_total_usage([], discover_parents=[parent], threshold_bytes=10**12)
+        self.assertEqual(result["logical_bytes_lower_bound"], len(b"shared-data"))
+        self.assertEqual(result["counts"]["unique_regular_files"], 1)
+        self.assertEqual(result["counts"]["hardlinks_deduplicated"], 1)
+        self.assertEqual(result["partial_reasons"]["private_entries_excluded"], 1)
+        self.assertTrue(all(item["identity_unchanged"] for item in result["roots"]))
+
     def test_different_device_nested_root_is_scanned_independently(self):
         parent = self.root("parent")
         child = parent / "mounted"
