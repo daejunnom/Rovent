@@ -698,17 +698,7 @@ def _scope_observation(owner, stage):
 
 def _registered_read(consumer, reader):
     """Read a protected descriptor and publish discovered paths atomically."""
-    if consumer.registry is None:
-        return reader()[0]
-    with ExitStack() as stack:
-        guard = consumer._locked(stack)
-        value, inputs, future = reader()
-        inputs = list(dict.fromkeys(Path(path) for path in inputs))
-        future = [path for path in dict.fromkeys(Path(path) for path in future)
-                  if path not in inputs]
-        if inputs or future:
-            consumer.leases.append(guard.register(inputs, future_inputs=future))
-        return value
+    return consumer.read_and_register_with_future(reader)
 
 
 def _registered_system_libraries(runtime, *, path_fields=("path",)):

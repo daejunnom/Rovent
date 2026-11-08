@@ -117,6 +117,20 @@ class NumericInputRegistration:
                 self.leases.append(guard.register(paths))
             return value
 
+    def read_and_register_with_future(self, reader):
+        """Read a protected descriptor and atomically register both input kinds."""
+        if self.registry is None:
+            return reader()[0]
+        with ExitStack() as stack:
+            guard = self._locked(stack)
+            value, inputs, future = reader()
+            inputs = list(dict.fromkeys(Path(path) for path in inputs))
+            future = [path for path in dict.fromkeys(Path(path) for path in future)
+                      if path not in inputs]
+            if inputs or future:
+                self.leases.append(guard.register(inputs, future_inputs=future))
+            return value
+
     def close_if_not_dispatched(self):
         if not self.dispatched:
             for lease in reversed(self.leases):
