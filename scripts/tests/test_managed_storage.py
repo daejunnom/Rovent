@@ -1012,7 +1012,10 @@ class ProcessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="rovezero-owned-process-") as directory:
             marker = Path(directory) / "late-write"
             child = f"import time,pathlib; time.sleep(2); pathlib.Path({str(marker)!r}).write_text('escaped')"
-            program = f"import subprocess,sys; subprocess.Popen([sys.executable,'-c',{child!r}])"
+            # Keep the Popen object alive until the parent exits.  The test
+            # intentionally leaves an orphan for the original group to drain;
+            # discarding it earlier triggers Python's still-running warning.
+            program = f"import os,subprocess,sys; p=subprocess.Popen([sys.executable,'-c',{child!r}]); os._exit(0)"
             code, gone, failure = run_group(
                 [sys.executable, "-c", program], directory, os.environ.copy(), 5, lambda: None)
             self.assertEqual(code, 0)
