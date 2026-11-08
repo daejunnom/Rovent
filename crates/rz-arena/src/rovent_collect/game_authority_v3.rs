@@ -71,6 +71,14 @@ enum GameEffectOriginalV3 {
         proof: super::pc_worker_v3::PcReceivedActorProofV3,
         source: super::teacher::v3_session::TeacherActorEffectSourceV3,
     },
+    OwnScope {
+        proof: super::own_worker_v3::OwnReceivedStageProofV3,
+        source: super::teacher::v3_session::TeacherScopeEffectSourceV3,
+    },
+    OwnActor {
+        proof: super::own_worker_v3::OwnReceivedActorProofV3,
+        source: super::teacher::v3_session::TeacherActorEffectSourceV3,
+    },
 }
 
 impl<S> GameEffectSourceV3<S> {
@@ -88,6 +96,24 @@ impl<S> GameEffectSourceV3<S> {
     ) -> Option<&super::teacher::v3_session::TeacherActorEffectSourceV3> {
         match &self.original {
             GameEffectOriginalV3::PcActor { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+
+    pub(super) fn own_scope_source(
+        &self,
+    ) -> Option<&super::teacher::v3_session::TeacherScopeEffectSourceV3> {
+        match &self.original {
+            GameEffectOriginalV3::OwnScope { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+
+    pub(super) fn own_actor_source(
+        &self,
+    ) -> Option<&super::teacher::v3_session::TeacherActorEffectSourceV3> {
+        match &self.original {
+            GameEffectOriginalV3::OwnActor { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -1143,6 +1169,223 @@ impl GameAuthorityV3<super::pc_worker_v3::PcWorkerSupervisorV3> {
     }
 }
 
+impl GameAuthorityV3<super::own_worker_v3::OwnWorkerSupervisorV3> {
+    /// Move the original received-stage proof and nonclone scope source into
+    /// an already retained destination only after same-owner revalidation.
+    /// Neither Busy nor a rejection consumes either original input slot.
+    pub(super) fn try_issue_own_scope_source_in_slot(
+        self: &Arc<Self>,
+        proof_slot: &mut Option<super::own_worker_v3::OwnReceivedStageProofV3>,
+        source_slot: &mut Option<super::teacher::v3_session::TeacherScopeEffectSourceV3>,
+        supervisor: &super::own_worker_v3::OwnWorkerSupervisorV3,
+        recovery: &super::own_worker_v3::OwnRootRecoveryV3,
+        root: &RoventCollectionRootAdmissionV3,
+        destination: &mut Option<GameEffectSourceV3<super::own_worker_v3::OwnWorkerSupervisorV3>>,
+        error_destination: &mut Option<&'static str>,
+    ) -> GameStepV3 {
+        if error_destination.is_some() {
+            return GameStepV3::Failed;
+        }
+        if destination.is_some() {
+            return GameStepV3::Busy;
+        }
+        let (Some(proof), Some(source)) = (proof_slot.as_ref(), source_slot.as_ref()) else {
+            return GameStepV3::Busy;
+        };
+        match proof.matches_game(self) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        if !proof.matches_admission(root) || !proof.matches_scope_source(source) {
+            return GameStepV3::Foreign;
+        }
+        match proof.try_revalidate_with_guards(supervisor, recovery) {
+            Ok(Some(true)) => {}
+            Ok(None) => return GameStepV3::Busy,
+            Ok(Some(false)) => return GameStepV3::Foreign,
+            Err(error) => {
+                *error_destination = Some(error);
+                return GameStepV3::Failed;
+            }
+        }
+        let owner = Arc::clone(self);
+        let root = root.clone();
+        let stage = Arc::clone(source.identity());
+        // Both source slots were checked above. No fallible operation or
+        // external callback occurs between their take and destination write.
+        let proof = proof_slot
+            .take()
+            .expect("validated original received proof");
+        let source = source_slot.take().expect("validated original scope source");
+        *destination = Some(GameEffectSourceV3 {
+            owner,
+            root,
+            kind: GameEffectKindV3::TeacherScope,
+            stage,
+            actor: None,
+            original: GameEffectOriginalV3::OwnScope { proof, source },
+        });
+        GameStepV3::Ready
+    }
+
+    /// A source is not a dispatch/start permit. Revalidate its original
+    /// received stage under the caller's existing guards before game claim.
+    pub(super) fn try_claim_own_scope(
+        self: &Arc<Self>,
+        source: &GameEffectSourceV3<super::own_worker_v3::OwnWorkerSupervisorV3>,
+        supervisor: &super::own_worker_v3::OwnWorkerSupervisorV3,
+        recovery: &super::own_worker_v3::OwnRootRecoveryV3,
+        destination: &mut Option<GameEffectClaimV3<super::own_worker_v3::OwnWorkerSupervisorV3>>,
+        error_destination: &mut Option<&'static str>,
+    ) -> GameStepV3 {
+        if error_destination.is_some() {
+            return GameStepV3::Failed;
+        }
+        let GameEffectOriginalV3::OwnScope {
+            proof,
+            source: original,
+        } = &source.original
+        else {
+            return GameStepV3::Foreign;
+        };
+        if !Arc::ptr_eq(self, &source.owner) {
+            return GameStepV3::Foreign;
+        }
+        match proof.matches_game(self) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        if !proof.matches_admission(&source.root)
+            || !proof.matches_scope_source(original)
+            || !original.matches_stage_identity(&source.stage)
+        {
+            return GameStepV3::Foreign;
+        }
+        match proof.try_revalidate_with_guards(supervisor, recovery) {
+            Ok(Some(true)) => {}
+            Ok(None) => return GameStepV3::Busy,
+            Ok(Some(false)) => return GameStepV3::Foreign,
+            Err(error) => {
+                *error_destination = Some(error);
+                return GameStepV3::Failed;
+            }
+        }
+        self.try_claim_effect(source, destination)
+    }
+
+    /// Bind one actual received root and its original Ready actor into the
+    /// caller-owned slot. Identity observation is not a start or join.
+    pub(super) fn try_issue_own_actor_source_in_slot(
+        self: &Arc<Self>,
+        proof_slot: &mut Option<super::own_worker_v3::OwnReceivedActorProofV3>,
+        source_slot: &mut Option<super::teacher::v3_session::TeacherActorEffectSourceV3>,
+        supervisor: &super::own_worker_v3::OwnWorkerSupervisorV3,
+        recovery: &super::own_worker_v3::OwnRootRecoveryV3,
+        stage: &super::teacher::v3_session::TeacherSessionStagingV3,
+        session: &super::teacher::v3_session::RoventCollectionTeacherSessionV3,
+        root: &RoventCollectionRootAdmissionV3,
+        destination: &mut Option<GameEffectSourceV3<super::own_worker_v3::OwnWorkerSupervisorV3>>,
+        error_destination: &mut Option<&'static str>,
+    ) -> GameStepV3 {
+        if error_destination.is_some() {
+            return GameStepV3::Failed;
+        }
+        if destination.is_some() {
+            return GameStepV3::Busy;
+        }
+        let (Some(proof), Some(source)) = (proof_slot.as_ref(), source_slot.as_ref()) else {
+            return GameStepV3::Busy;
+        };
+        match proof.matches_game(self) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        if !proof.matches_admission(root) || !proof.matches_actor_source(source) {
+            return GameStepV3::Foreign;
+        }
+        match proof.try_revalidate_with_guards(supervisor, recovery, stage, session, source) {
+            Ok(Some(true)) => {}
+            Ok(None) => return GameStepV3::Busy,
+            Ok(Some(false)) => return GameStepV3::Foreign,
+            Err(error) => {
+                *error_destination = Some(error);
+                return GameStepV3::Failed;
+            }
+        }
+        let owner = Arc::clone(self);
+        let root = root.clone();
+        let stage = Arc::clone(source.session_identity());
+        let actor = Some(Arc::clone(source.actor_identity()));
+        let proof = proof_slot
+            .take()
+            .expect("validated original received actor proof");
+        let source = source_slot.take().expect("validated original actor source");
+        *destination = Some(GameEffectSourceV3 {
+            owner,
+            root,
+            kind: GameEffectKindV3::TeacherActor,
+            stage,
+            actor,
+            original: GameEffectOriginalV3::OwnActor { proof, source },
+        });
+        GameStepV3::Ready
+    }
+
+    pub(super) fn try_claim_own_actor(
+        self: &Arc<Self>,
+        source: &GameEffectSourceV3<super::own_worker_v3::OwnWorkerSupervisorV3>,
+        supervisor: &super::own_worker_v3::OwnWorkerSupervisorV3,
+        recovery: &super::own_worker_v3::OwnRootRecoveryV3,
+        stage: &super::teacher::v3_session::TeacherSessionStagingV3,
+        session: &super::teacher::v3_session::RoventCollectionTeacherSessionV3,
+        destination: &mut Option<GameEffectClaimV3<super::own_worker_v3::OwnWorkerSupervisorV3>>,
+        error_destination: &mut Option<&'static str>,
+    ) -> GameStepV3 {
+        if error_destination.is_some() {
+            return GameStepV3::Failed;
+        }
+        let GameEffectOriginalV3::OwnActor {
+            proof,
+            source: original,
+        } = &source.original
+        else {
+            return GameStepV3::Foreign;
+        };
+        if !Arc::ptr_eq(self, &source.owner) {
+            return GameStepV3::Foreign;
+        }
+        match proof.matches_game(self) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        if !proof.matches_admission(&source.root)
+            || !proof.matches_actor_source(original)
+            || !original.matches_session_identity(&source.stage)
+            || !source
+                .actor
+                .as_ref()
+                .is_some_and(|actor| original.matches_actor_identity(actor))
+        {
+            return GameStepV3::Foreign;
+        }
+        match proof.try_revalidate_with_guards(supervisor, recovery, stage, session, original) {
+            Ok(Some(true)) => {}
+            Ok(None) => return GameStepV3::Busy,
+            Ok(Some(false)) => return GameStepV3::Foreign,
+            Err(error) => {
+                *error_destination = Some(error);
+                return GameStepV3::Failed;
+            }
+        }
+        self.try_claim_effect(source, destination)
+    }
+
+}
+
 pub(super) struct GameRootReservationV3<S> {
     owner: Arc<GameAuthorityV3<S>>,
     root: RoventCollectionRootAdmissionV3,
@@ -1693,6 +1936,119 @@ impl GameEffectClaimV3<super::pc_worker_v3::PcWorkerSupervisorV3> {
             return GameStepV3::Foreign;
         }
         let GameEffectOriginalV3::PcActor {
+            proof,
+            source: original,
+        } = &source.original
+        else {
+            return GameStepV3::Foreign;
+        };
+        match proof.matches_game(&self.owner) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        if !proof.matches_admission(&self.root)
+            || !proof.matches_actor_source(original)
+            || !original.matches_session_identity(&source.stage)
+            || !source
+                .actor
+                .as_ref()
+                .is_some_and(|actor| original.matches_actor_identity(actor))
+            || !original.matches_outcome(outcome)
+        {
+            return GameStepV3::Foreign;
+        }
+        match proof.try_revalidate_with_guards(supervisor, recovery, stage, session, original) {
+            Ok(Some(true)) => {}
+            Ok(None) => return GameStepV3::Busy,
+            Ok(Some(false)) => return GameStepV3::Foreign,
+            Err(error) => {
+                *error_destination = Some(error);
+                return GameStepV3::Failed;
+            }
+        }
+        self.try_complete_verified()
+    }
+}
+impl GameEffectClaimV3<super::own_worker_v3::OwnWorkerSupervisorV3> {
+    /// Settle only the original scope's actual returned result. The outcome
+    /// remains in caller custody; this is not a physical retirement proof.
+    pub(super) fn try_complete_own_scope(
+        &mut self,
+        source: &GameEffectSourceV3<super::own_worker_v3::OwnWorkerSupervisorV3>,
+        outcome: &super::teacher::v3_session::TeacherScopeEffectOutcomeV3,
+        supervisor: &super::own_worker_v3::OwnWorkerSupervisorV3,
+        recovery: &super::own_worker_v3::OwnRootRecoveryV3,
+        error_destination: &mut Option<&'static str>,
+    ) -> GameStepV3 {
+        if error_destination.is_some() {
+            return GameStepV3::Failed;
+        }
+        if !Arc::ptr_eq(&self.owner, &source.owner)
+            || !self.root.same_original_admission(&source.root)
+            || self.kind != GameEffectKindV3::TeacherScope
+            || source.kind != GameEffectKindV3::TeacherScope
+            || !Arc::ptr_eq(&self.stage, &source.stage)
+            || self.actor.is_some()
+            || source.actor.is_some()
+        {
+            return GameStepV3::Foreign;
+        }
+        let GameEffectOriginalV3::OwnScope {
+            proof,
+            source: original,
+        } = &source.original
+        else {
+            return GameStepV3::Foreign;
+        };
+        match proof.matches_game(&self.owner) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        if !proof.matches_admission(&self.root)
+            || !proof.matches_scope_source(original)
+            || !original.matches_outcome(outcome)
+        {
+            return GameStepV3::Foreign;
+        }
+        match proof.try_revalidate_with_guards(supervisor, recovery) {
+            Ok(Some(true)) => {}
+            Ok(None) => return GameStepV3::Busy,
+            Ok(Some(false)) => return GameStepV3::Foreign,
+            Err(error) => {
+                *error_destination = Some(error);
+                return GameStepV3::Failed;
+            }
+        }
+        self.try_complete_verified()
+    }
+    /// An actor result resolves only this attempted effect. It does not prove
+    /// the spawned worker has retired or its physical resources are free.
+    pub(super) fn try_complete_own_actor(
+        &mut self,
+        source: &GameEffectSourceV3<super::own_worker_v3::OwnWorkerSupervisorV3>,
+        outcome: &super::teacher::v3_session::TeacherActorEffectOutcomeV3,
+        supervisor: &super::own_worker_v3::OwnWorkerSupervisorV3,
+        recovery: &super::own_worker_v3::OwnRootRecoveryV3,
+        stage: &super::teacher::v3_session::TeacherSessionStagingV3,
+        session: &super::teacher::v3_session::RoventCollectionTeacherSessionV3,
+        error_destination: &mut Option<&'static str>,
+    ) -> GameStepV3 {
+        if error_destination.is_some() {
+            return GameStepV3::Failed;
+        }
+        if !Arc::ptr_eq(&self.owner, &source.owner)
+            || !self.root.same_original_admission(&source.root)
+            || self.kind != GameEffectKindV3::TeacherActor
+            || source.kind != GameEffectKindV3::TeacherActor
+            || !Arc::ptr_eq(&self.stage, &source.stage)
+            || !same_effect_actor(&self.actor, &source.actor)
+            || self.actor.is_none()
+        {
+            return GameStepV3::Foreign;
+        }
+        let GameEffectOriginalV3::OwnActor {
             proof,
             source: original,
         } = &source.original

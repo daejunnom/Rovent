@@ -31,6 +31,10 @@ use rz_uci::pals_adaptive::{
 };
 use rz_uci::pals_native::ticketed::VirtualReviewTicketOutput;
 use rz_uci::rovent_bootstrap::{RoventNativeBackend, RoventStartupControl};
+use rz_uci::rovent_bootstrap::launch::{
+    RoventOwnCollectionHooksV3, RoventOwnCollectionLaunchOwnerV3,
+    RoventOwnCollectionNativeFenceV3,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak, mpsc};
 
@@ -39,6 +43,14 @@ type Backend = RoventNativeBackend<AdaptivePortQuestion>;
 type Observer = AdaptiveCollectionObserverBoxV3<AdaptivePortQuestion, Output>;
 type Handoff = Arc<Mutex<RoventBoardCollectionHandoffV3<Output>>>;
 type Custody = RoventBoardCollectionRootCustodyV3<Output>;
+
+/// Retains the original launch and external supervisor after their verified
+/// root handoffs. The native fence alone is not a GPU or teacher fence.
+struct OwnV3LaunchCustody {
+    _bridge: Arc<RoventOwnCollectionBridgeV3>,
+    _native_owner: Arc<RoventOwnCollectionLaunchOwnerV3>,
+    _supervisor: Arc<Mutex<super::own_worker_v3::OwnWorkerSupervisorV3>>,
+}
 
 struct RootSlot {
     admission: RoventCollectionRootAdmissionV3,
@@ -70,6 +82,7 @@ struct RootSlot {
 struct State {
     slots: Vec<RootSlot>,
     deferred: Vec<Arc<Mutex<RoventBoardDeferredCleanupV3>>>,
+    deferred_transferred: bool,
     maximum_roots: usize,
     maximum_workers: usize,
     maximum_teacher_roots: usize,
@@ -210,6 +223,9 @@ impl RoventOwnTeacherRouteRetirementV3 {
 /// Both this hook and its external supervisor retain this same Arc. The
 /// supervisor is responsible for settling or retaining every root worker.
 pub(crate) struct RoventOwnCollectionBridgeV3 {
+    self_weak: Weak<RoventOwnCollectionBridgeV3>,
+    native_owner: OnceLock<Weak<RoventOwnCollectionLaunchOwnerV3>>,
+    supervisor: OnceLock<Weak<Mutex<super::own_worker_v3::OwnWorkerSupervisorV3>>>,
     inputs: Arc<PreparedPcCollectionInputsV3>,
     game: Arc<GameAuthorityV3<super::own_worker_v3::OwnWorkerSupervisorV3>>,
     registration: RoventNativeCaptureRegistration,
@@ -347,7 +363,10 @@ impl RoventOwnCollectionBridgeV3 {
             .try_reserve_exact(maximum_roots)
             .map_err(|_| invalid("Own /3 cleanup allocation"))?;
         let (request_sender, request_receiver) = mpsc::sync_channel(maximum_roots);
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|self_weak| Self {
+            self_weak: self_weak.clone(),
+            native_owner: OnceLock::new(),
+            supervisor: OnceLock::new(),
             inputs,
             game,
             registration,
@@ -356,6 +375,7 @@ impl RoventOwnCollectionBridgeV3 {
             state: Mutex::new(State {
                 slots,
                 deferred,
+                deferred_transferred: false,
                 maximum_roots,
                 maximum_workers,
                 maximum_teacher_roots,
@@ -363,6 +383,41 @@ impl RoventOwnCollectionBridgeV3 {
             request_sender: GameDispatchChannelV3::new(request_sender),
             request_receiver: Mutex::new(request_receiver),
         }))
+    }
+
+    /// Bind before root admission; the original fence checks hook identity.
+    pub(crate) fn bind_native_owner(
+        &self,
+        owner: &Arc<RoventOwnCollectionLaunchOwnerV3>,
+    ) -> Result<(), &'static str> {
+        if let Some(original) = self.native_owner.get() {
+            return if original.upgrade().is_some_and(|old| Arc::ptr_eq(&old, owner)) {
+                Ok(())
+            } else {
+                Err("Own /3 native launch owner changed")
+            };
+        }
+        self.native_owner.set(Arc::downgrade(owner))
+            .map_err(|_| "Own /3 native owner binding raced")
+    }
+
+    /// Bind the same supervisor already registered with this game authority.
+    pub(crate) fn bind_supervisor(
+        &self,
+        supervisor: &Arc<Mutex<super::own_worker_v3::OwnWorkerSupervisorV3>>,
+    ) -> Result<(), &'static str> {
+        if !matches!(self.game.try_bind_supervisor(supervisor), GameStepV3::Existing) {
+            return Err("Own /3 game supervisor identity unavailable or differs");
+        }
+        if let Some(original) = self.supervisor.get() {
+            return if original.upgrade().is_some_and(|old| Arc::ptr_eq(&old, supervisor)) {
+                Ok(())
+            } else {
+                Err("Own /3 supervisor changed")
+            };
+        }
+        self.supervisor.set(Arc::downgrade(supervisor))
+            .map_err(|_| "Own /3 supervisor binding raced")
     }
 
     /// Only the supervisor calls this; a request is the exact original root,
@@ -665,15 +720,150 @@ impl RoventOwnCollectionBridgeV3 {
         if !original.matches_admission(admission)
             || !Arc::ptr_eq(&original.inputs, &self.inputs)
             || !Arc::ptr_eq(&original.request.revoked, &slot.revoked)
-            || slot.revoked.load(Ordering::Acquire)
         {
             return Err("Own /3 request or revocation owner differs");
+        }
+        if slot.revoked.load(Ordering::Acquire) {
+            // If abort raced the caller's branch selection, retry through the
+            // recovery-only path; unrelated root revocation remains rejected.
+            return if self.game.abort_requested() {
+                Ok(false)
+            } else {
+                Err("Own /3 request or revocation owner differs")
+            };
         }
         if let Some(existing) = &slot.recovery {
             return Ok(Arc::ptr_eq(existing, recovery));
         }
         slot.recovery = Some(Arc::clone(recovery));
         Ok(true)
+    }
+
+    /// Attach only the already-received recovery to its revoked original
+    /// slot. This is custody preservation, not permission to reserve, start,
+    /// acknowledge, retire, or infer physical completion of any work.
+    pub(super) fn try_publish_aborted_recovery(
+        self: &Arc<Self>,
+        supervisor: &super::own_worker_v3::OwnWorkerSupervisorV3,
+        admission: &RoventCollectionRootAdmissionV3,
+        recovery: &Arc<Mutex<OwnRootRecoveryV3>>,
+    ) -> Result<bool, &'static str> {
+        if !self.game.abort_requested() {
+            return Err("Own /3 game abort not requested");
+        }
+        let Some(bound_supervisor) = self.supervisor.get() else {
+            return Ok(false);
+        };
+        if !supervisor.matches_bound_recovery(bound_supervisor, self, recovery) {
+            return Err("Own /3 aborted recovery supervisor differs");
+        }
+        let original = match recovery.try_lock() {
+            Ok(value) => value,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => return Err("Own /3 recovery poisoned"),
+        };
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => return Err("Own /3 root custody poisoned"),
+        };
+        let Some(slot) = state.slots.iter_mut().find(|slot| {
+            slot.admission.same_original_admission(admission)
+        }) else {
+            return Err("Own /3 original request absent");
+        };
+        if !original.matches_admission(admission)
+            || !Arc::ptr_eq(&original.inputs, &self.inputs)
+            || !Arc::ptr_eq(&original.request.revoked, &slot.revoked)
+        {
+            return Err("Own /3 aborted recovery owner differs");
+        }
+        // Abort propagation and the original dispatch settlement can lag the
+        // queue receive. Neither absence is proof of a different owner.
+        if !slot.revoked.load(Ordering::Acquire)
+            || slot.dispatch.is_some()
+            || slot.reservation.is_some()
+            || !slot.requested
+            || slot.dispatch_receipt.is_none()
+        {
+            return Ok(false);
+        }
+        let envelope = OwnRootRequestV3 {
+            admission: admission.clone(),
+            revoked: Arc::clone(&slot.revoked),
+        };
+        let receipt = slot.dispatch_receipt.as_ref().expect("checked retained receipt");
+        if slot.abort_receipt.is_some()
+            || !receipt.matches_game(&self.game)
+            || !receipt.matches_root(admission)
+            || !receipt.matches_envelope(&envelope)
+            || receipt.outcome() != GameDispatchOutcomeV3::Sent
+        {
+            return Err("Own /3 aborted recovery dispatch differs");
+        }
+        if let Some(existing) = &slot.recovery {
+            return if Arc::ptr_eq(existing, recovery) {
+                Ok(true)
+            } else {
+                Err("Own /3 aborted recovery already has another owner")
+            };
+        }
+        if slot.installed || slot.owner.is_some() || slot.observer.is_some()
+            || slot.route.is_some() || slot.worker.is_some() || slot.worker_key.is_some()
+            || slot.handoff.is_some() || slot.joined.is_some() || slot.returned.is_some()
+            || slot.join_failure.is_some() || slot.join_panic.is_some()
+            || slot.join_unknown || slot.join_complete
+        {
+            return Err("Own /3 aborted slot already acquired another owner");
+        }
+        slot.recovery = Some(Arc::clone(recovery));
+        Ok(true)
+    }
+
+    /// Observe the original registered recovery without reacquiring its
+    /// guard. Revocation does not erase an already acquired effect's owner.
+    pub(super) fn try_matches_registered_recovery(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+        recovery: &Arc<Mutex<OwnRootRecoveryV3>>,
+        revoked: &Arc<AtomicBool>,
+    ) -> Result<Option<bool>, &'static str> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err("Own /3 root custody poisoned"),
+        };
+        let envelope = OwnRootRequestV3 {
+            admission: admission.clone(),
+            revoked: Arc::clone(revoked),
+        };
+        let Some(slot) = state.slots.iter().find(|slot| {
+            slot.admission.same_original_admission(admission)
+        }) else {
+            return Ok(Some(false));
+        };
+        if !slot.worker_reserved || !slot.teacher_reserved
+            || !Arc::ptr_eq(&slot.revoked, revoked)
+            || !slot.recovery.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, recovery))
+        {
+            return Ok(Some(false));
+        }
+        // A receiver can observe the send before its receipt is settled into
+        // the slot. Preserve the original owners and retry that observation.
+        let Some(receipt) = &slot.dispatch_receipt else {
+            return Ok(None);
+        };
+        if !receipt.matches_game(&self.game)
+            || !receipt.matches_root(admission)
+            || !receipt.matches_envelope(&envelope)
+            || !matches!(receipt.outcome(), GameDispatchOutcomeV3::Sent)
+        {
+            return Ok(Some(false));
+        }
+        if !slot.requested {
+            return Ok(None);
+        }
+        Ok(Some(true))
     }
 
     /// The caller creates the actual worker and teacher owner outside the
@@ -1054,7 +1244,14 @@ impl RoventOwnCollectionBridgeV3 {
     /// Transfer the original deferred owner for continued cleanup. The
     /// consumer must retain it and use its same capability and fence.
     pub(crate) fn try_take_deferred(&self) -> Option<Arc<Mutex<RoventBoardDeferredCleanupV3>>> {
-        self.state.try_lock().ok()?.deferred.pop()
+        let mut state = self.state.try_lock().ok()?;
+        let deferred = state.deferred.pop();
+        if deferred.is_some() {
+            // Transfer is not completion. Without a return proof settlement
+            // must continue retaining the original launch.
+            state.deferred_transferred = true;
+        }
+        deferred
     }
 }
 
@@ -1071,6 +1268,96 @@ fn manager_lock<'a>(
 }
 
 impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
+    fn try_finish_launch(
+        &self,
+        fence: &RoventOwnCollectionNativeFenceV3,
+    ) -> Result<Option<Box<dyn std::any::Any + Send>>, AdaptiveManagerError> {
+        let bridge = self.self_weak.upgrade().ok_or(AdaptiveManagerError::Invalid(
+            "Own /3 original bridge absent",
+        ))?;
+        let owner = self.native_owner.get().and_then(Weak::upgrade).ok_or(
+            AdaptiveManagerError::Invalid("Own /3 native owner absent"),
+        )?;
+        let supervisor = self.supervisor.get().and_then(Weak::upgrade).ok_or(
+            AdaptiveManagerError::Invalid("Own /3 supervisor absent"),
+        )?;
+        let hooks: Arc<RoventOwnCollectionHooksV3> = bridge.clone();
+        if !fence.matches_original_owner(&owner) || !fence.matches_original_hooks(&hooks) {
+            return Err(AdaptiveManagerError::Invalid("Own /3 native fence belongs to another launch"));
+        }
+
+        // The supervisor acquires the bridge state while executing its step;
+        // keep that lock order and never wait inside the native manager.
+        let supervisor_guard = match supervisor.try_lock() {
+            Ok(value) => value,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(AdaptiveManagerError::Invalid("Own /3 supervisor poisoned"));
+            }
+        };
+        let state = match manager_lock(&self.state) {
+            Ok(value) => value,
+            Err(AdaptiveManagerError::AuxiliaryPending) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !state.deferred.is_empty() || state.deferred_transferred {
+            return Ok(None);
+        }
+        for slot in &state.slots {
+            // Unstarted/aborted roots have no sealed no-scope proof in this
+            // bridge yet. Preserve them instead of guessing completion.
+            let (Some(route), Some(recovery), Some(returned), Some(key), Some(handoff)) = (
+                &slot.route, &slot.recovery, &slot.returned, &slot.worker_key, &slot.handoff,
+            ) else {
+                return Ok(None);
+            };
+            if !slot.installed || !slot.join_complete || slot.join_unknown
+                || slot.join_failure.is_some() || slot.join_panic.is_some()
+            {
+                return Ok(None);
+            }
+            let recovery = match recovery.try_lock() {
+                Ok(value) => value,
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(AdaptiveManagerError::Invalid("Own /3 recovery poisoned"));
+                }
+            };
+            match recovery.try_effects_settled() {
+                Ok(Some(true)) => {}
+                Ok(Some(false) | None) => return Ok(None),
+                Err(error) => return Err(AdaptiveManagerError::Invalid(error)),
+            }
+            // Only with_original_route sets this flag, after it revalidates
+            // the original worker, handoff, teacher ACK and pump while
+            // unlinking that exact route under the original owner locks.
+            if !recovery.route_unlinked || !recovery.matches_admission(&slot.admission)
+                || !recovery.route.as_ref().is_some_and(|old| old.same_original_route(route))
+                || recovery.consumer_phase != 0 || recovery.consumer_failure.is_some()
+                || recovery.persistence_failure.is_some()
+            {
+                return Ok(None);
+            }
+            let custody = match returned.try_lock() {
+                Ok(value) => value,
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(AdaptiveManagerError::Invalid("Own /3 returned custody poisoned"));
+                }
+            };
+            if !custody.matches_worker(key) || !custody.matches_handoff(handoff) {
+                return Err(AdaptiveManagerError::Invalid("Own /3 returned custody differs"));
+            }
+        }
+        drop(state);
+        drop(supervisor_guard);
+        Ok(Some(Box::new(OwnV3LaunchCustody {
+            _bridge: bridge,
+            _native_owner: owner,
+            _supervisor: supervisor,
+        })))
+    }
+
     fn register_startup_control(
         &self,
         control: &RoventStartupControl,
