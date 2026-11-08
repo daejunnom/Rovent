@@ -201,6 +201,7 @@ def _cleanup_completed_builds(manager, *, seconds, requires_finished_manager, ca
     result = {"schema": "rovezero.output-warning-cache-maintenance.v1",
               "status": "protected_or_empty", "removed_slots": 0, "removed_bytes": 0,
               "protected_slots": 0, "warnings": [], "output_total_changed": False,
+              "consumer_input_coverage": "unavailable",
               "observation_limit": "current-visible-proc-namespace-only; census is not atomic with deletion"}
     try:
         if requires_finished_manager and manager.finished is not True:
@@ -223,7 +224,18 @@ def _cleanup_completed_builds(manager, *, seconds, requires_finished_manager, ca
         catalog = checked(canonical_catalog() if catalog_override is None else Path(catalog_override))
         if not catalog.is_dir():
             raise StorageError("output evidence catalog is unavailable")
-        with CatalogGuard(root / "catalog.lock") as guard, CatalogGuard(catalog / "catalog.lock") as output_guard:
+        registry = getattr(manager, "dependency_registry", None)
+        from storage_consumer_registry import ConsumerRegistry, require_catalog_binding
+        if type(registry) is not ConsumerRegistry:
+            raise StorageError("consumer input registry unavailable; cleanup deferred")
+        # The common input guard is ordered after existing catalog locks and
+        # held across observation and removal of each candidate tree.
+        with (CatalogGuard(root / "catalog.lock") as guard,
+              CatalogGuard(catalog / "catalog.lock") as output_guard,
+              registry.guard() as dependency_guard):
+            require_catalog_binding(root, registry, guard)
+            require_catalog_binding(catalog, registry, output_guard)
+            result["consumer_input_coverage"] = "registered_only"
             tick()
             if (root / "owner.json").exists():
                 raise StorageError("build catalog has an active or interrupted owner")
@@ -281,6 +293,13 @@ def _cleanup_completed_builds(manager, *, seconds, requires_finished_manager, ca
                     target = slot / "cargo-target"
                     if not target.exists():
                         continue
+                    dependencies = dependency_guard.conflicts([target])
+                    if (type(dependencies) is not dict or dependencies.get("coverage") != "registered_only"
+                            or type(dependencies.get("conflicts")) is not list
+                            or type(dependencies.get("unknown")) is not list
+                            or dependencies["conflicts"] or dependencies["unknown"]):
+                        result["protected_slots"] += 1
+                        continue
                     before, amount = _snapshot(target, tick)
                     identities = {entry[0] for entry in before.values()}
                     census = _process_census(identities, set(), tick)
@@ -294,6 +313,7 @@ def _cleanup_completed_builds(manager, *, seconds, requires_finished_manager, ca
                     after, _ = _snapshot(target, tick)
                     if before != after:
                         raise StorageError("cache identity changed during maintenance")
+                    dependency_guard.check()
                     # Keep the slot and durable records even if deletion is
                     # interrupted.  A future build can regenerate this cache.
                     removed = _remove_snapshot(target, after, tick)

@@ -22,6 +22,7 @@ from managed_outputs import OutputLease
 from managed_process import OwnedProcessGroup, ProcessNotSpawned, run_group
 from managed_storage import checked
 from pals_followup_run import outside_git, sha, unique_object, observe_resources
+from virtual_system_numeric_prepare import NumericInputRegistration, add_consumer_arguments
 from virtual_custody_transport import CustodyTransport
 from virtual_quarantine_owner import retain_original_owner
 
@@ -203,12 +204,29 @@ def main(argv=None):
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--timeout", required=True, type=int)
     parser.add_argument("--output-bytes-max", type=int, default=128 * 1024 * 1024)
+    add_consumer_arguments(parser)
     args = parser.parse_args(argv)
     if sys.platform != "linux" or not 1 <= args.timeout <= 7200 or not 1 <= args.binary_bytes <= 2**63 - 1:
         parser.error("Linux, finite timeout and declared binary size are required")
     if not 1 <= args.output_bytes_max <= 2**63 - 1:
         parser.error("finite output allowance required")
     start_ns = time.monotonic_ns()
+    source = Path(__file__).resolve().parent.parent
+    consumer = NumericInputRegistration(args, [source, args.binary, args.config])
+    try:
+        result = _main_after_parse(args, consumer, start_ns)
+    except BaseException as error:
+        try:
+            consumer.close_if_not_dispatched()
+        except BaseException as close_error:
+            if hasattr(error, "add_note"):
+                error.add_note("consumer input close also failed: " + str(close_error))
+        raise
+    consumer.close_if_not_dispatched()
+    return result
+
+
+def _main_after_parse(args, consumer, start_ns):
     start = start_ns / 1_000_000_000
     deadline_ns = start_ns + args.timeout * 1_000_000_000
     deadline = deadline_ns / 1_000_000_000
@@ -258,6 +276,42 @@ def main(argv=None):
                             parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
         if type(config) is not dict or config.get("provider") != "cuda-system" or not isinstance(config.get("output_root"), str):
             raise ValueError("explicit V3 system-CUDA config/output required")
+        if consumer.registry is not None:
+            # Rust opens the graph siblings and the absolute runtime paths
+            # named in the config. Register them before opening the plan or
+            # dispatching either metadata getter.
+            paths = []
+            for field in ("case_plan", "export_manifest", "runtime_library", "system_cuda_config"):
+                value = config.get(field)
+                if not isinstance(value, str) or not Path(value).is_absolute():
+                    raise ValueError("absolute numeric capture input paths required")
+                path = Path(value)
+                paths.append(path.parent if field == "export_manifest" else path)
+            inventory = config.get("system_cuda_inventory")
+            if inventory is not None:
+                if not isinstance(inventory, str) or not Path(inventory).is_absolute():
+                    raise ValueError("absolute numeric inventory path required")
+                paths.append(Path(inventory))
+            consumer.add(paths)
+
+            def read_system_libraries():
+                system_fd, _, system_bytes = snapshot_file(
+                    Path(config["system_cuda_config"]), config["system_cuda_config_sha256"],
+                    64 * 1024, deadline, content=True, seal=False)
+                descriptors.append(system_fd)
+                system = json.loads(system_bytes, object_pairs_hook=unique_object,
+                                    parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
+                libraries = system.get("libraries") if isinstance(system, dict) else None
+                if not isinstance(libraries, list) or not 1 <= len(libraries) <= 64:
+                    raise ValueError("bounded system library declarations required")
+                library_paths = []
+                for item in libraries:
+                    if (not isinstance(item, dict) or not isinstance(item.get("path"), str)
+                            or not Path(item["path"]).is_absolute()):
+                        raise ValueError("absolute system library path required")
+                    library_paths.append(Path(item["path"]))
+                return system, library_paths
+            consumer.read_and_register(read_system_libraries)
         receipt["capture_window_preparation"] = require_capture_window(config, deadline_ns)
         target = outside_git(Path(config["output_root"]))
         if receipt_path == target or receipt_path.is_relative_to(target):
@@ -267,6 +321,9 @@ def main(argv=None):
         descriptors.append(plan_fd)
         plan = json.loads(plan_bytes, object_pairs_hook=unique_object,
                           parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
+        # The supplied ELF is not independently proven CPU-only; process exit
+        # or metadata output must not be treated as a physical completion.
+        consumer.dispatched = True
         pins = metadata_getter(binary_fd, "--source-pins", args.binary.parent, env, deadline, receipt)
         registry = metadata_getter(binary_fd, "--model-registry", args.binary.parent, env, deadline, receipt)
         binding = plan["bindings"]
@@ -300,7 +357,8 @@ def main(argv=None):
             try:
                 if lease is not None:
                     raise RuntimeError("capture output lease was already acquired")
-                lease = OutputLease(target, source, reserve=args.output_bytes_max, deferred=True).acquire()
+                lease = OutputLease(target, source, reserve=args.output_bytes_max, deferred=True,
+                                    dependency_registry=consumer.registry).acquire()
                 receipt["output_lease"]["acquired"] = True
             except Exception as error:
                 admission_error = error

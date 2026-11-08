@@ -102,7 +102,7 @@ class OriginalCollectionSupervisor:
     """
 
     def __init__(self, *, input_root, plan_path, output, checkout_root, reserve_bytes,
-                 binary_fd, window, bootstrap_budget_ms):
+                 binary_fd, window, bootstrap_budget_ms, dependency_registry=None):
         if type(window) is not OriginalCollectionWindow:
             raise ValueError("original Collection clock window required")
         window.check()
@@ -124,6 +124,10 @@ class OriginalCollectionSupervisor:
                 or type(bootstrap_budget_ms) is not int
                 or not 0 < bootstrap_budget_ms < 1 << 64):
             raise ValueError("absolute original roots and explicit collection reservation required")
+        if dependency_registry is not None:
+            from storage_consumer_registry import ConsumerRegistry
+            if type(dependency_registry) is not ConsumerRegistry:
+                raise ValueError("explicit pinned consumer registry required")
         self.reserve_bytes = reserve_bytes
         # Retain the caller's actual open file description now; a raw number
         # could otherwise be closed and reassigned before prepare().
@@ -132,6 +136,8 @@ class OriginalCollectionSupervisor:
         self.window = window
         self.work_ns, self.cleanup_ns = window.work_ns, window.cleanup_ns
         self.bootstrap_budget_ms = bootstrap_budget_ms
+        self.dependency_registry = dependency_registry
+        self._consumer_input_lease = None
         self.input_dir_fd = None
         self._input_dir_close_state = None
         self.input = self.scope = self.lease = self.process = None
@@ -147,10 +153,16 @@ class OriginalCollectionSupervisor:
         self._prepare_attempted = True
         try:
             self.window.check()
+            # Register before the first open of this input root. The supplied
+            # binary_fd has already been opened by our caller and is outside
+            # this opt-in registration's coverage.
+            if self.dependency_registry is not None:
+                self._consumer_input_lease = self.dependency_registry.register([self.input_root])
             self.input_dir_fd = open_directory(self.input_root)
             self.input = OriginalControlInput(self.input_dir_fd, self.plan_path)
             self.scope = CgroupOwner.prepare()
-            self.lease = OutputLease(self.output, self.checkout_root, reserve=self.reserve_bytes)
+            self.lease = OutputLease(self.output, self.checkout_root, reserve=self.reserve_bytes,
+                                     dependency_registry=self.dependency_registry)
             self.lease.acquire()
             self._acquired = True
             key = self.lease.prepare_live_handoff()
@@ -205,6 +217,11 @@ class OriginalCollectionSupervisor:
             self._input_dir_close_state = "unknown"
             os.close(fd)
             self._input_dir_close_state = "closed"
+        if self._consumer_input_lease is not None:
+            # Only this never-dispatched path is proven here; a dispatched
+            # run's physical completion is not inferred from process exit.
+            self._consumer_input_lease.close(not_started=True)
+            self._consumer_input_lease = None
 
     def recover_failed_scope_setup(self):
         """Retry only this same never-dispatched cgroup setup owner."""

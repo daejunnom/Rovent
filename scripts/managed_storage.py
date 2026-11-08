@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 import tempfile
 import time
 import uuid
@@ -265,7 +266,19 @@ class ManagedBuild:
     after checking the original process tree, paths and source ownership.
     """
     def __init__(self, root: Path, source: Path, *, slot_limit=8 * GiB,
-                 total_limit=18 * GiB, slots_limit=4, purpose=None, output_preservation=None):
+                 total_limit=18 * GiB, slots_limit=4, purpose=None, output_preservation=None,
+                 dependency_registry=None, dependency_registry_required=False):
+        if type(dependency_registry_required) is not bool:
+            raise StorageError("dependency registry policy must be explicit")
+        if dependency_registry is not None:
+            from storage_consumer_registry import ConsumerRegistry
+            if type(dependency_registry) is not ConsumerRegistry:
+                raise StorageError("pinned consumer registry required")
+        # None preserves the legacy domain. A required domain refuses removal
+        # if its participating consumer registry was not supplied.
+        self.dependency_registry = dependency_registry
+        self.dependency_registry_required = dependency_registry_required
+        self._dependency_removal_deferred = False
         if output_preservation is not None:
             from managed_output_unattributed_preservation import UnattributedSelection
             if (type(output_preservation) is not UnattributedSelection
@@ -293,9 +306,13 @@ class ManagedBuild:
         self.source_id = hashlib.sha256(identity.encode()).hexdigest()[:24]
         self.slot = self.root / "slots" / self.source_id
         self.target = self.slot / "cargo-target"
-        self.scratch = self.slot / "tmp"
+        self.scratch_root = self.slot / "tmp"
+        self.scratch = self.scratch_root
         self.lock = self.root / "owner.json"
         self.token = uuid.uuid4().hex
+        self._scoped_lifecycle = False
+        self._isolated_target = False
+        self._binding_guard = None
         self.acquired = False
         self.finished = False
         # Only the original runner can transition this before calling its
@@ -314,7 +331,92 @@ class ManagedBuild:
                  "lifetime": self.lifetime, "root_identity": [info.st_dev, info.st_ino]}
         if self.purpose is not None:
             value["purpose"] = self.purpose
+        if self._scoped_lifecycle:
+            value["scratch_layout"] = "owner-token-v1"
+        if self._isolated_target:
+            value["target_layout"] = "scratch-token-v1"
         return value
+
+    def _set_scoped_paths(self, *, isolated_target=False, token=None):
+        self._scoped_lifecycle = True
+        self.scratch = self.scratch_root / (token or self.token)
+        self._isolated_target = isolated_target
+        if isolated_target:
+            self.target = self.scratch / "cargo-target"
+
+    def _empty_catalog_for_binding(self, guard):
+        """Automatic adoption is limited to a freshly empty build catalog."""
+        guard.assert_held()
+        for entry in self.root.iterdir():
+            if entry.name == "catalog.lock":
+                continue
+            if entry.name == "slots":
+                checked(entry)
+                if not entry.is_dir() or any(entry.iterdir()):
+                    return False
+                continue
+            # Prior owner, closure, maintenance or any unknown entry is not
+            # evidence that legacy consumers finished using the catalog.
+            return False
+        return True
+
+    def _resolve_dependency_binding(self, guard):
+        """Pin this catalog to one registry; an unknown binding defers cleanup."""
+        from storage_consumer_registry import (bind_catalog, load_catalog_binding,
+                                                mark_catalog_registry_unavailable)
+        self._binding_guard = guard
+        requested = self.dependency_registry
+        try:
+            bound = load_catalog_binding(self.root, guard)
+            if bound is None and requested is not None:
+                if self._empty_catalog_for_binding(guard):
+                    bound = bind_catalog(self.root, requested, guard)
+                else:
+                    # Existing rows can have unregistered legacy consumers.
+                    # Do not adopt them into a new registry automatically.
+                    mark_catalog_registry_unavailable(self.root, guard)
+                    self.dependency_registry = None
+                    self.dependency_registry_required = True
+                    self._dependency_removal_deferred = True
+            elif bound is None and self.dependency_registry_required:
+                mark_catalog_registry_unavailable(self.root, guard)
+            if bound is not None:
+                if requested is not None and (bound.root != requested.root
+                                              or bound.registry_id != requested.registry_id):
+                    raise StorageError("consumer registry differs from catalog binding")
+                self.dependency_registry = bound
+                self.dependency_registry_required = True
+        except (StorageError, OSError):
+            # A bound but inaccessible/mismatched registry cannot be replaced
+            # by an arbitrary registry. Keep unrelated execution available.
+            self.dependency_registry = None
+            self.dependency_registry_required = True
+            if not (os.path.lexists(self.root / "consumer-registry.binding")
+                    or os.path.lexists(self.root / "consumer-registry.required")):
+                # Without a durable marker a later legacy cleaner could erase
+                # this owner's still-registered inputs. Never launch in that gap.
+                mark_catalog_registry_unavailable(self.root, guard)
+
+    def _target_requires_isolation(self):
+        if not self.dependency_registry_required and self.dependency_registry is None:
+            return False
+        if os.path.lexists(self.scratch_root):
+            try:
+                checked(self.scratch_root)
+                if not self.scratch_root.is_dir() or any(self.scratch_root.iterdir()):
+                    # A prior retained scoped run may still own the shared
+                    # target even if no consumer registration was available.
+                    return True
+            except (StorageError, OSError):
+                return True
+        if self.dependency_registry is None:
+            return True
+        try:
+            with self.dependency_registry.guard() as guard:
+                observation = guard.conflicts([self.target])
+                return bool(observation.get("conflicts") or observation.get("unknown"))
+        except (StorageError, OSError):
+            return True
 
     def _assert_owner(self) -> None:
         self.guard.assert_held()
@@ -334,7 +436,7 @@ class ManagedBuild:
                 raise StorageError("unknown catalog entry; preserve it")
             record = read_record(item / "record.json")
             if record.get("source_id") != item.name or set(record) - {
-                "lifetime", "root_identity", "purpose",
+                "lifetime", "root_identity", "purpose", "scratch_layout", "target_layout",
             } != {
                 "schema", "source_id", "source", "token", "pid", "state", "finished_ns",
             }:
@@ -349,6 +451,9 @@ class ManagedBuild:
                     or not isinstance(record["finished_ns"], int) or record["finished_ns"] < 0
                     or not isinstance(record["pid"], int) or record["pid"] <= 0
                     or not isinstance(record["token"], str) or len(record["token"]) != 32
+                    or ("scratch_layout" in record and record["scratch_layout"] != "owner-token-v1")
+                    or ("target_layout" in record and (record["target_layout"] != "scratch-token-v1"
+                        or record.get("scratch_layout") != "owner-token-v1"))
                     or any(c not in "0123456789abcdef" for c in record["token"])):
                 raise StorageError("invalid slot provenance; preserve it")
             allowed = {"record.json", "last-run.json", "cargo-target", "tmp"}
@@ -356,6 +461,107 @@ class ManagedBuild:
                 raise StorageError("unknown slot content; preserve it")
             rows.append((item, record))
         return rows
+
+    def _remove_with_dependencies(self, path: Path, parent: Path) -> bool:
+        """Remove a known tree only while its participating registry is locked.
+
+        The scope covers registered consumers only; it does not attest that
+        unregistered or legacy readers are absent. False means preserved.
+        Callers already hold the build catalog guard, establishing the common
+        catalog -> registry order. The registry remains held through removal.
+        """
+        if not path.exists():
+            return True
+        registry = self.dependency_registry
+        if self.dependency_registry_required or registry is not None:
+            from storage_consumer_registry import require_catalog_binding
+            try:
+                if registry is None:
+                    raise StorageError("consumer registry unavailable")
+                require_catalog_binding(self.root, registry, self._binding_guard)
+            except (StorageError, OSError):
+                self._dependency_removal_deferred = True
+                return False
+        if registry is None:
+            if self.dependency_registry_required:
+                self._dependency_removal_deferred = True
+                return False
+            remove_tree(path, parent)
+            return True
+        scope = registry.guard()
+        try:
+            guard = scope.__enter__()
+        except (StorageError, OSError):
+            # An unavailable or replaced registry is not authority to delete.
+            self._dependency_removal_deferred = True
+            return False
+        try:
+            try:
+                result = guard.conflicts([path])
+                if result.get("conflicts") or result.get("unknown"):
+                    self._dependency_removal_deferred = True
+                    return False
+                guard.check()
+            except (StorageError, OSError):
+                self._dependency_removal_deferred = True
+                return False
+            # Removal failures themselves propagate: they may be partial and
+            # must not be misreported as an ordinary protected candidate.
+            remove_tree(path, parent)
+            return True
+        finally:
+            scope.__exit__(None, None, None)
+
+    def _retained_scratch_marker(self, token):
+        return self.scratch_root / (".rovezero-retained-scratch-" + token + ".json")
+
+    def _record_retained_scratch(self, *, not_dispatched):
+        marker = self._retained_scratch_marker(self.token)
+        if os.path.lexists(marker):
+            raise StorageError("scoped scratch receipt already exists; preserve it")
+        write_record(marker, {"schema": "rovezero.retained-scoped-scratch.v1",
+                              "token": self.token, "scratch": str(self.scratch),
+                              "tree_gone": True, "physical_completion": "not_inferred",
+                              "no_child_dispatched": not_dispatched})
+
+    def _prune_retained_scoped_scratch(self):
+        """Reclaim only completed owned scratch after consumer release."""
+        if not self.scratch_root.is_dir() or self.dependency_registry is None:
+            return
+        checked(self.scratch_root)
+        entries = list(self.scratch_root.iterdir())
+        if len(entries) > 4096:
+            return  # A bounded, independent cleanup can handle this later.
+        prefix = ".rovezero-retained-scratch-"
+        for marker in entries:
+            if not marker.name.startswith(prefix) or not marker.name.endswith(".json"):
+                continue
+            token = marker.name[len(prefix):-5]
+            if len(token) != 32 or any(c not in "0123456789abcdef" for c in token):
+                continue
+            scratch = self.scratch_root / token
+            try:
+                original = read_record_snapshot(marker, schema="rovezero.retained-scoped-scratch.v1")
+                expected = {"schema": "rovezero.retained-scoped-scratch.v1", "token": token,
+                            "scratch": str(scratch), "tree_gone": True,
+                            "physical_completion": "not_inferred", "no_child_dispatched": True}
+                if original[0] != expected or not self._remove_with_dependencies(scratch, self.scratch_root):
+                    continue
+                # The small receipt can itself be a declared input. Protect it
+                # with the same lock and recheck it before unlink.
+                with self.dependency_registry.guard() as guard:
+                    from storage_consumer_registry import require_catalog_binding
+                    require_catalog_binding(self.root, self.dependency_registry, self._binding_guard)
+                    result = guard.conflicts([marker])
+                    if (result.get("conflicts") or result.get("unknown")
+                            or read_record_snapshot(marker, schema="rovezero.retained-scoped-scratch.v1") != original):
+                        continue
+                    guard.check()
+                    marker.unlink()
+            except (StorageError, OSError):
+                # Malformed or inaccessible receipts are retained, not fatal
+                # to a new independent run.
+                self._dependency_removal_deferred = True
 
     def _prune(self) -> None:
         rows = self._records()
@@ -373,10 +579,20 @@ class ManagedBuild:
             slot, expected = completed.pop(0)
             if read_record(slot / "record.json") != expected:
                 raise StorageError("eviction ownership changed")
+            if self.dependency_registry_required or self.dependency_registry is not None:
+                scratch_root = slot / "tmp"
+                if scratch_root.exists():
+                    checked(scratch_root)
+                    if any(scratch_root.iterdir()):
+                        # Any retained scoped scratch can include a dispatched
+                        # run whose physical completion is unknown. A missing
+                        # or incomplete receipt is not authority to evict it.
+                        self._dependency_removal_deferred = True
+                        continue
             amount = tree_size(slot)
-            remove_tree(slot, slot.parent)
-            total -= amount
-            count -= 1
+            if self._remove_with_dependencies(slot, slot.parent):
+                total -= amount
+                count -= 1
         # A still-active or retained owned slot may itself exceed the aggregate
         # threshold.  Warn rather than terminate its unrelated work; this is
         # never authority to delete active/unknown data.  The slot-count
@@ -384,7 +600,15 @@ class ManagedBuild:
         warn_output_threshold(total, self.total_limit, scope="managed_build_catalog",
                               observed_bytes=total)
         if count > self.slots_limit:
-            raise StorageError("slot limit cannot be met without deleting active/unknown data")
+            if self.dependency_registry_required or self.dependency_registry is not None:
+                # The disk threshold is advisory. Keep protected slots and let
+                # this independent owner run; active owners were rejected above.
+                try:
+                    print("managed_storage_warning=protected_slot_count_exceeded", file=sys.stderr)
+                except (OSError, ValueError):
+                    pass
+            else:
+                raise StorageError("slot limit cannot be met without deleting active/unknown data")
 
     def acquire(self) -> "ManagedBuild":
         # Diagnostic only: a single bounded cached read before any catalog lock.
@@ -399,9 +623,17 @@ class ManagedBuild:
             assert_manager_preservation_scope(self.root, self.output_preservation)
         self.root.mkdir(parents=True, exist_ok=True)
         self.guard.acquire()
-        if any(p.name not in {"owner.json", "slots", "catalog.lock", "maintenance.json", "closure.json"} for p in self.root.iterdir()):
+        if any(p.name not in {"owner.json", "slots", "catalog.lock", "maintenance.json", "closure.json",
+                              "consumer-registry.binding", "consumer-registry.required"} for p in self.root.iterdir()):
             self.guard.release()
             raise StorageError("unknown build root content; preserve it")
+        try:
+            self._resolve_dependency_binding(self.guard)
+            if self.dependency_registry_required or self.dependency_registry is not None:
+                self._set_scoped_paths(isolated_target=self._target_requires_isolation())
+        except BaseException:
+            self.guard.release()
+            raise
         try:
             with self.lock.open("xb") as stream:
                 stream.write((json.dumps(self._identity(), sort_keys=True) + "\n").encode())
@@ -421,26 +653,48 @@ class ManagedBuild:
                 previous = read_record(self.slot / "record.json")
                 if previous["source"] != str(self.source) or previous["state"] != "complete":
                     raise StorageError("source mismatch or interrupted slot; preserve it")
-                if tree_size(self.slot) > self.slot_limit:
-                    remove_tree(self.slot / "cargo-target", self.slot)
-                remove_tree(self.scratch, self.slot)
+                if self._scoped_lifecycle:
+                    self._prune_retained_scoped_scratch()
+                if not self._isolated_target and tree_size(self.slot) > self.slot_limit:
+                    if not self._remove_with_dependencies(self.slot / "cargo-target", self.slot):
+                        raise StorageError("build target required by a registered consumer; preserve it")
+                if not self._remove_with_dependencies(self.scratch, self.scratch.parent):
+                    raise StorageError("build scratch required by a registered consumer; preserve it")
             else:
                 self._prune()
                 self.slot.mkdir()
             self.record = {**self._identity(), "state": "active", "finished_ns": 0}
             write_record(self.slot / "record.json", self.record)
-            self.target.mkdir(exist_ok=True)
+            checked(self.scratch.parent)
+            self.scratch.parent.mkdir(exist_ok=True)
+            checked(self.scratch.parent)
             self.scratch.mkdir()
+            checked(self.target)
+            self.target.mkdir(exist_ok=True)
             self._prune()
             self.before = tree_size(self.slot)
             return self
-        except BaseException:
+        except BaseException as original:
             # A failed admission may expose an interrupted existing slot; do not
-            # delete that slot. Release only this invocation's verified lock.
-            if read_record(self.lock) == self._identity():
-                self.lock.unlink()
-            self.acquired = False
-            self.guard.release()
+            # delete that slot. If this owner already published its own active
+            # row, no child has been dispatched; close exactly that row before
+            # removing the owner. A failed closure retains the original owner.
+            try:
+                if self.record:
+                    self._assert_owner()
+                    terminal = {**self.record, "state": "complete", "finished_ns": time.time_ns()}
+                    write_record(self.slot / "record.json", terminal)
+                    if read_record(self.slot / "record.json") != terminal:
+                        raise StorageError("pre-dispatch slot closure changed")
+                    self.record = terminal
+                if read_record(self.lock) == self._identity():
+                    self.lock.unlink()
+            except (StorageError, OSError, ValueError) as secondary:
+                original.add_note("pre-dispatch slot closure failed; original owner retained: "
+                                  + type(secondary).__name__)
+            finally:
+                self.acquired = False
+                self.guard.release()
             raise
 
     def environment(self) -> dict:
@@ -453,6 +707,14 @@ class ManagedBuild:
                    TMPDIR=str(self.scratch), TMP=str(self.scratch),
                    TEMP=str(self.scratch), PYTHONDONTWRITEBYTECODE="1",
                    RZ_MANAGED_BUILD_ROOT=str(self.root), RZ_MANAGED_BUILD_TOKEN=self.token)
+        if self.dependency_registry is not None:
+            env.update(RZ_CONSUMER_REGISTRY_ROOT=str(self.dependency_registry.root),
+                       RZ_CONSUMER_REGISTRY_ID=self.dependency_registry.registry_id,
+                       RZ_CONSUMER_REGISTRY_REQUIRED="1")
+        elif self.dependency_registry_required:
+            env.pop("RZ_CONSUMER_REGISTRY_ROOT", None)
+            env.pop("RZ_CONSUMER_REGISTRY_ID", None)
+            env["RZ_CONSUMER_REGISTRY_REQUIRED"] = "1"
         return env
 
     def sample_output_budget(self):
@@ -506,20 +768,41 @@ class ManagedBuild:
                 from managed_output_unattributed_preservation import finalize_original_manager
                 finalize_original_manager(self, self.output_preservation)
         observed = tree_size(self.slot)
-        remove_tree(self.scratch, self.slot)
-        reset = tree_size(self.slot) > self.slot_limit
-        if reset:
-            remove_tree(self.target, self.slot)
+        physical_unknown = self._scoped_lifecycle and not _not_dispatched
+        if physical_unknown:
+            temporary_removed = False
+            self._dependency_removal_deferred = True
+        else:
+            temporary_removed = self._remove_with_dependencies(self.scratch, self.scratch.parent)
+        scratch_receipt = None
+        if self._scoped_lifecycle and not temporary_removed:
+            try:
+                self._record_retained_scratch(not_dispatched=_not_dispatched)
+                scratch_receipt = "recorded"
+            except (StorageError, OSError, ValueError):
+                # Tree termination is already established. The data remains
+                # preserved, while a missing receipt merely prevents later
+                # automatic scratch reclamation; it is not a live owner.
+                scratch_receipt = "unavailable_preserved"
+        reset_requested = tree_size(self.slot) > self.slot_limit
+        reset = (self._remove_with_dependencies(self.target, self.target.parent)
+                 if reset_requested and not self._isolated_target and not physical_unknown else False)
         self.record = {**self.record, "state": "complete", "finished_ns": time.time_ns()}
         write_record(self.slot / "record.json", self.record)
         result = {"schema": SCHEMA, "source_id": self.source_id,
                   "command_exit_code": exit_code, "tree_cleanup_verified": tree_gone,
                   "supervisor_error": supervisor_error,
                   "pre_run_bytes": self.before, "observed_end_bytes": observed,
-                  "temporary_removed": True, "post_run_budget_reset": reset,
+                  "temporary_removed": temporary_removed, "post_run_budget_reset": reset,
                   "retained_slot_bytes": tree_size(self.slot),
                   "slot_limit_bytes": self.slot_limit,
                   "catalog_limit_bytes": self.total_limit, "maximum_slots": self.slots_limit}
+        if self.dependency_registry is not None or self.dependency_registry_required:
+            result["consumer_dependency_coverage"] = ("registered_only" if self.dependency_registry is not None
+                                                      else "required_registry_unavailable")
+            result["consumer_dependency_removal_deferred_before_prune"] = self._dependency_removal_deferred
+            if scratch_receipt is not None:
+                result["retained_scratch_receipt"] = scratch_receipt
         if _not_dispatched:
             result["output_finalization"] = "not_needed_no_child_dispatched"
         elif self._foreign_output_cache is not None:
@@ -536,7 +819,8 @@ class ManagedBuild:
         return result
 
 
-def recover_build(root: Path, owner_sha256: str, *, output_preservation=None) -> dict:
+def recover_build(root: Path, owner_sha256: str, *, output_preservation=None,
+                  dependency_registry=None, dependency_registry_required=False) -> dict:
     """Explicit exact-owner recovery after reboot or original terminal closure.
 
     PID absence/reuse cannot establish that no orphan detached from its group.
@@ -546,7 +830,8 @@ def recover_build(root: Path, owner_sha256: str, *, output_preservation=None) ->
     if not root.is_dir():
         raise StorageError("existing managed build root required")
     with CatalogGuard(root / "catalog.lock") as guard:
-        if any(p.name not in {"owner.json", "slots", "catalog.lock", "maintenance.json", "closure.json"}
+        if any(p.name not in {"owner.json", "slots", "catalog.lock", "maintenance.json", "closure.json",
+                              "consumer-registry.binding", "consumer-registry.required"}
                for p in root.iterdir()):
             raise StorageError("unknown build root content; preserve it")
         owner, digest, owner_stamp = read_record_snapshot(root / "owner.json")
@@ -560,7 +845,14 @@ def recover_build(root: Path, owner_sha256: str, *, output_preservation=None) ->
                     and owner_proven_dead(owner.get("pid"), owner.get("lifetime"), current))
         if owner.get("root_identity") != [info.st_dev, info.st_ino] or not (reboot or terminal):
             raise StorageError("original tree termination not proven; preserve lease and all inputs")
-        manager = ManagedBuild(root, Path(owner["source"]), purpose=owner.get("purpose"))
+        manager = ManagedBuild(root, Path(owner["source"]), purpose=owner.get("purpose"),
+                               dependency_registry=dependency_registry,
+                               dependency_registry_required=dependency_registry_required)
+        manager._resolve_dependency_binding(guard)
+        if owner.get("scratch_layout") == "owner-token-v1":
+            manager.token = owner["token"]
+            manager._set_scoped_paths(isolated_target=owner.get("target_layout") == "scratch-token-v1",
+                                      token=owner["token"])
         rows = manager._records()
         matches = [(slot, record) for slot, record in rows if slot == manager.slot]
         if len(matches) != 1 or {k: v for k, v in matches[0][1].items()
@@ -585,11 +877,48 @@ def recover_build(root: Path, owner_sha256: str, *, output_preservation=None) ->
             if preservation_check is not None:
                 preservation_check()
             verify_recovery()
-            remove_tree(manager.scratch, manager.slot)
+            if manager._scoped_lifecycle:
+                # OS tree end is not a device fence. Record a durable retained
+                # generation before closing this exact owner; later managers
+                # isolate their scratch/target and never auto-delete it.
+                checked(manager.scratch_root)
+                manager.scratch_root.mkdir(exist_ok=True)
+                checked(manager.scratch_root)
+                marker = manager._retained_scratch_marker(manager.token)
+                if os.path.lexists(marker):
+                    prior, _, _ = read_record_snapshot(marker, schema="rovezero.retained-scoped-scratch.v1")
+                    expected = {"schema": "rovezero.retained-scoped-scratch.v1", "token": manager.token,
+                                "scratch": str(manager.scratch), "tree_gone": True,
+                                "physical_completion": "not_inferred",
+                                "no_child_dispatched": prior.get("no_child_dispatched")}
+                    if type(expected["no_child_dispatched"]) is not bool:
+                        raise StorageError("retained scratch completion is invalid; preserve owner")
+                    if prior != expected:
+                        raise StorageError("retained scratch receipt differs; preserve owner")
+                else:
+                    manager._record_retained_scratch(not_dispatched=False)
+                if preservation_check is not None:
+                    preservation_check()
+                verify_recovery()
+                record = {**matches[0][1], "state": "complete", "finished_ns": time.time_ns()}
+                write_record(manager.slot / "record.json", record)
+                audit.update(recovered=True, regenerable_cache_removed=False, temporary_removed=False,
+                             physical_completion="unknown_preserved")
+                write_record(root / "maintenance.json", audit)
+                verify_recovery()
+                if read_record(root / "owner.json") != owner:
+                    raise StorageError("recovery owner changed; preserve lock")
+                if preservation_check is not None:
+                    preservation_check()
+                (root / "owner.json").unlink()
+                return audit
+            if not manager._remove_with_dependencies(manager.scratch, manager.scratch.parent):
+                raise StorageError("recovery scratch required by a registered consumer; preserve it")
             if preservation_check is not None:
                 preservation_check()
             verify_recovery()
-            remove_tree(manager.target, manager.slot)
+            if not manager._remove_with_dependencies(manager.target, manager.target.parent):
+                raise StorageError("recovery target required by a registered consumer; preserve it")
             if preservation_check is not None:
                 preservation_check()
             record = {**matches[0][1], "state": "complete", "finished_ns": time.time_ns()}

@@ -15,6 +15,67 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pals_model_validate as wrapper
 from pals_model_validate import ValidationStages, ValidationStagesFailed, cpu_stage_dependencies
 from managed_storage import StorageError
+from storage_guard import CatalogGuard, lifetime
+from storage_consumer_registry import ConsumerRegistry, bind_catalog
+
+
+class ParentConsumerRegistryTests(unittest.TestCase):
+    def test_complete_supervisor_inputs_are_verified_before_use(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source, runtime, dataset = base / "source", base / "runtime", base / "dataset"
+            for path in (source, runtime, dataset):
+                path.mkdir()
+            rules, verifier = base / "rules.json", base / "verifier"
+            rules.write_text("{}")
+            verifier.write_bytes(b"binary")
+            registry = ConsumerRegistry.initialize(base / "registry", scope="cpu-validation-test")
+            catalog = base / "output-catalog"
+            catalog.mkdir()
+            with CatalogGuard(catalog / "catalog.lock") as guard:
+                bind_catalog(catalog, registry, guard)
+            output = base / "future-output"
+            lease = registry.register([source, runtime, rules, dataset, verifier], future_inputs=[output])
+            env = {"RZ_CONSUMER_LEASE_OWNER_ID": lease.owner_id,
+                   "RZ_CONSUMER_REGISTRY_ROOT": str(registry.root),
+                   "RZ_CONSUMER_REGISTRY_ID": registry.registry_id,
+                   "RZ_CONSUMER_REGISTRY_REQUIRED": "1"}
+            try:
+                actual = wrapper.parent_consumer_registry(source, runtime, rules, dataset, verifier,
+                    {"pid": os.getpid(), "lifetime": lifetime()}, environment=env, output_catalog=catalog,
+                    output=output)
+                self.assertEqual(actual.registry_id, registry.registry_id)
+                with self.assertRaises(StorageError):
+                    wrapper.parent_consumer_registry(source, runtime, rules, dataset, verifier,
+                        {"pid": os.getpid() + 1, "lifetime": lifetime()}, environment=env, output_catalog=catalog,
+                        output=output)
+                uncovered = base / "unregistered"
+                uncovered.mkdir()
+                with self.assertRaises(StorageError):
+                    wrapper.parent_consumer_registry(source, runtime, rules, uncovered, verifier,
+                        {"pid": os.getpid(), "lifetime": lifetime()}, environment=env, output_catalog=catalog,
+                        output=output)
+                with self.assertRaises(StorageError):
+                    wrapper.parent_consumer_registry(source, runtime, rules, dataset, verifier,
+                        {"pid": os.getpid(), "lifetime": lifetime()}, environment=env, output_catalog=catalog,
+                        output=base / "unregistered-output")
+                other = base / "unbound-catalog"
+                other.mkdir()
+                with self.assertRaises(StorageError):
+                    wrapper.parent_consumer_registry(source, runtime, rules, dataset, verifier,
+                        {"pid": os.getpid(), "lifetime": lifetime()}, environment=env, output_catalog=other,
+                        output=output)
+            finally:
+                lease.close(not_started=True)
+
+    def test_legacy_absent_registry_and_missing_strict_lease_are_distinct(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            self.assertIsNone(wrapper.parent_consumer_registry(source, source, None, None, None,
+                                                              None, environment={}))
+            with self.assertRaises(StorageError):
+                wrapper.parent_consumer_registry(source, source, None, None, None, None,
+                    environment={"RZ_CONSUMER_REGISTRY_REQUIRED": "1"})
 
 
 class ValidationStageTests(unittest.TestCase):
@@ -517,6 +578,37 @@ class OwnerBoundaryTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "failed")
         self.assertEqual(receipt["stage_results"]["venv_seconds"]["status"], "failed")
         self.assertEqual(receipt["stage_results"]["numeric_seconds"]["status"], "blocked")
+
+    def test_supervisor_lease_is_checked_before_source_body_access(self):
+        with self.patched_boundaries(), \
+             mock.patch.object(wrapper, "parent_consumer_registry", side_effect=StorageError("lease unavailable")), \
+             mock.patch.object(wrapper, "cpu_source_cohorts", side_effect=AssertionError("source read early")), \
+             self.assertRaisesRegex(StorageError, "lease unavailable"):
+            wrapper.main()
+        self.assertEqual(self.lease.calls, [])
+
+    def test_registered_supervisor_lease_reaches_output_lease(self):
+        registry = ConsumerRegistry.initialize(self.root / "registry", scope="validator-integration-test")
+        catalog = self.root / "output-catalog"
+        catalog.mkdir()
+        with CatalogGuard(catalog / "catalog.lock") as guard:
+            bind_catalog(catalog, registry, guard)
+        source = Path(wrapper.__file__).resolve().parent.parent
+        consumer = registry.register([source], future_inputs=[self.args.runtime_store, self.output])
+        self.lease.outer = {"owner": {"pid": os.getpid(), "lifetime": lifetime()}}
+        env = {"RZ_CONSUMER_LEASE_OWNER_ID": consumer.owner_id,
+               "RZ_CONSUMER_REGISTRY_ROOT": str(registry.root),
+               "RZ_CONSUMER_REGISTRY_ID": registry.registry_id,
+               "RZ_CONSUMER_REGISTRY_REQUIRED": "1"}
+        try:
+            with self.patched_boundaries(), \
+                 mock.patch.object(wrapper, "canonical_catalog", return_value=catalog), \
+                 mock.patch.dict(os.environ, env), self.assertRaises(ValidationStagesFailed):
+                wrapper.main()
+            self.assertEqual(self.lease.dependency_registry.registry_id, registry.registry_id)
+            self.assertEqual(consumer.row["state"], "active")
+        finally:
+            consumer.close(not_started=True)
 
     def test_missing_private_verifier_preserves_independent_neural_stages(self):
         self.args.dataset_run = self.root / "collection"

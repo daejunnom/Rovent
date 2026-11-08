@@ -9,10 +9,12 @@ the source ELF inode. All output belongs to one fresh managed lease.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -23,6 +25,103 @@ from managed_process import ProcessNotSpawned, run_group
 from managed_storage import checked
 
 sys.dont_write_bytecode = True
+
+
+def add_consumer_arguments(parser):
+    """Opt in to one already-bound consumer domain; legacy stays unchanged."""
+    parser.add_argument("--consumer-registry-root", type=Path)
+    parser.add_argument("--consumer-registry-id")
+    parser.add_argument("--consumer-registry-required", action="store_true")
+    parser.add_argument("--consumer-input-catalog", type=Path, action="append", default=[])
+
+
+class NumericInputRegistration:
+    """Original owner of the named inputs, not a GPU completion witness.
+
+    Only explicitly named, already-bound catalogs participate. Catalog locks
+    precede the registry lock, which stays held while discovered inputs are
+    recorded. Unknown or unregistered consumers are outside this guarantee.
+    """
+
+    def __init__(self, args, inputs):
+        from managed_storage import StorageError
+        self.registry = None
+        self.leases = []
+        self.catalogs = []
+        self.dispatched = False
+        env_root = os.environ.get("RZ_CONSUMER_REGISTRY_ROOT")
+        env_id = os.environ.get("RZ_CONSUMER_REGISTRY_ID")
+        env_required = os.environ.get("RZ_CONSUMER_REGISTRY_REQUIRED", "0")
+        if env_required not in ("0", "1"):
+            raise StorageError("invalid consumer registry requirement")
+        if bool(env_root) != bool(env_id) or bool(args.consumer_registry_root) != bool(args.consumer_registry_id):
+            raise StorageError("consumer registry root and ID must be supplied together")
+        if args.consumer_registry_root is not None:
+            if env_root and (checked(args.consumer_registry_root) != checked(Path(env_root))
+                             or args.consumer_registry_id != env_id):
+                raise StorageError("consumer registry differs from managed parent")
+            root, registry_id = args.consumer_registry_root, args.consumer_registry_id
+        else:
+            root, registry_id = env_root, env_id
+        if root is None:
+            if args.consumer_registry_required or env_required == "1" or args.consumer_input_catalog:
+                raise StorageError("participating consumer registry is required")
+            return
+        catalogs = list(args.consumer_input_catalog)
+        inherited_catalogs = os.environ.get("RZ_CONSUMER_INPUT_CATALOGS")
+        if inherited_catalogs:
+            if len(inherited_catalogs) > 65536:
+                raise StorageError("bounded inherited consumer catalogs required")
+            try:
+                values = json.loads(inherited_catalogs)
+            except (TypeError, ValueError) as error:
+                raise StorageError("invalid inherited consumer catalogs") from error
+            if (type(values) is not list or len(values) > 32
+                    or any(type(value) is not str or not Path(value).is_absolute() for value in values)):
+                raise StorageError("absolute inherited consumer catalogs required")
+            catalogs.extend(Path(value) for value in values)
+        if not catalogs or len(catalogs) > 32 or any(not Path(p).is_absolute() for p in catalogs):
+            raise StorageError("at least one already-bound input catalog is required")
+        from storage_consumer_registry import ConsumerRegistry
+        self.registry = ConsumerRegistry(root, registry_id=registry_id)
+        self.catalogs = sorted({checked(p) for p in catalogs},
+                               key=lambda p: os.path.normcase(str(p)))
+        self.add(inputs)
+
+    def _locked(self, stack):
+        from storage_consumer_registry import require_catalog_binding
+        from storage_guard import CatalogGuard
+        for root in self.catalogs:
+            guard = stack.enter_context(CatalogGuard(root / "catalog.lock"))
+            require_catalog_binding(root, self.registry, guard)
+        return stack.enter_context(self.registry.guard())
+
+    def add(self, inputs):
+        if self.registry is None:
+            return
+        paths = list(dict.fromkeys(Path(p) for p in inputs))
+        if paths:
+            with ExitStack() as stack:
+                guard = self._locked(stack)
+                self.leases.append(guard.register(paths))
+
+    def read_and_register(self, reader):
+        """Read a registered small descriptor and register its paths atomically."""
+        if self.registry is None:
+            return reader()[0]
+        with ExitStack() as stack:
+            guard = self._locked(stack)
+            value, paths = reader()
+            paths = list(dict.fromkeys(Path(p) for p in paths))
+            if paths:
+                self.leases.append(guard.register(paths))
+            return value
+
+    def close_if_not_dispatched(self):
+        if not self.dispatched:
+            for lease in reversed(self.leases):
+                lease.close(not_started=True)
+            self.leases.clear()
 
 
 def _regular_fd(path, limit):
@@ -189,6 +288,7 @@ def main():
     p.add_argument("--output-root", type=Path, required=True)
     p.add_argument("--model-epoch", type=int, required=True)
     p.add_argument("--seconds", type=int, default=600)
+    add_consumer_arguments(p)
     args = p.parse_args()
     if (sys.platform != "linux" or not 1 <= args.seconds <= 3600
             or not 1 <= args.binary_bytes < 2 ** 63
@@ -198,12 +298,35 @@ def main():
                                                args.checkpoint, args.system_config, args.output_root)):
         raise ValueError("absolute preparation paths required")
     started = time.monotonic()
+    inputs = [args.source_root, args.binary, args.export_manifest.parent,
+              args.checkpoint, args.system_config]
+    git_executable = shutil.which(args.git_executable)
+    if git_executable:
+        inputs.append(Path(os.path.abspath(git_executable)))
+    consumer = NumericInputRegistration(args, inputs)
+    try:
+        result = _main_after_parse(args, consumer, started)
+    except BaseException as error:
+        try:
+            consumer.close_if_not_dispatched()
+        except BaseException as close_error:
+            if hasattr(error, "add_note"):
+                error.add_note("consumer input close also failed: " + str(close_error))
+        raise
+    consumer.close_if_not_dispatched()
+    return result
+
+
+def _main_after_parse(args, consumer, started):
     deadline = started + args.seconds
     source, output = checked(args.source_root), checked(args.output_root)
     if output.exists() or not output.parent.is_dir():
         raise ValueError("fresh output leaf and existing parent required")
     if len(args.source_head) != 40 or any(c not in "0123456789abcdef" for c in args.source_head):
         raise ValueError("full source commit required")
+    # The caller may provide an arbitrary Git executable, so after this point
+    # process exit alone does not establish absence of GPU or escaped work.
+    consumer.dispatched = True
     head = source_head(source, args.git_executable, args.git_path_format)
     if head != args.source_head:
         raise ValueError("source commit differs")
@@ -228,7 +351,22 @@ def main():
         image_fd = _sealed_binary(binary_fd, binary_stat, args.binary_sha256, deadline)
         # This 64KiB bound is the V6 native capture config wire limit, not an
         # independently imposed limit on the ELF or the system libraries.
-        config, config_sha = _read_json(args.system_config, 64 * 1024, deadline, nc._strict_json)
+        def read_config_and_libraries():
+            config, digest = _read_json(args.system_config, 64 * 1024, deadline, nc._strict_json)
+            if type(config) is not dict or type(config.get("libraries")) is not list:
+                raise ValueError("bounded system library declarations required")
+            if not 1 <= len(config["libraries"]) <= 64:
+                raise ValueError("bounded system library declarations required")
+            paths = []
+            for item in config["libraries"]:
+                if type(item) is not dict or type(item.get("path")) is not str or not Path(item["path"]).is_absolute():
+                    raise ValueError("absolute system library path required")
+                paths.append(Path(item["path"]))
+            return (config, digest), paths
+        if consumer.registry is None:
+            config, config_sha = _read_json(args.system_config, 64 * 1024, deadline, nc._strict_json)
+        else:
+            config, config_sha = consumer.read_and_register(read_config_and_libraries)
         if type(config) is not dict or set(config) != {"max_libraries", "max_file_bytes", "max_total_bytes", "max_capture_ms", "libraries"}:
             raise ValueError("exact system configuration required")
         if (type(config["max_libraries"]) is not int or not 1 <= config["max_libraries"] < 2 ** 64
@@ -282,7 +420,8 @@ def main():
                 raise ValueError("actual export graph or role differs")
             graph_pins[graph["role"]] = digest
         actual_sources = nc.source_pins()
-        lease = OutputLease(output, source, reserve=16 * 1024 ** 2, deferred=True).acquire()
+        lease = OutputLease(output, source, reserve=16 * 1024 ** 2, deferred=True,
+                            dependency_registry=consumer.registry).acquire()
         lease.create_deferred_directory()
         created_output = True
         values = []

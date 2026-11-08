@@ -16,6 +16,7 @@ import managed_outputs
 import storage_code_retirement
 import run_managed
 from managed_storage import ManagedBuild, write_record
+from storage_consumer_registry import ConsumerRegistry, bind_catalog
 
 
 @unittest.skipUnless(sys.platform == "linux", "requires Linux path/census semantics")
@@ -32,6 +33,11 @@ class OutputMaintenanceTests(unittest.TestCase):
         self.catalog.mkdir()
         self.current = self._slot("current")
         self.candidate = self._slot("old")
+        self.registry = ConsumerRegistry.initialize(base / "input-registry", scope="idle-build-test")
+        for catalog in (self.root, self.catalog):
+            with maintenance.CatalogGuard(catalog / "catalog.lock") as guard:
+                bind_catalog(catalog, self.registry, guard)
+        self.current.dependency_registry = self.registry
         self.current.finished = True
         self.patches = [
             patch.object(managed_outputs, "canonical_catalog", return_value=self.catalog),
@@ -69,6 +75,46 @@ class OutputMaintenanceTests(unittest.TestCase):
         self.assertTrue((self.candidate.slot / "last-run.json").exists())
         self.assertFalse((self.candidate.slot / "cargo-target").exists())
         self.assertTrue(self.current.slot.exists())
+
+    def test_registered_consumer_protects_cache_until_closed(self):
+        target = self.candidate.slot / "cargo-target"
+        consumer = self.registry.register([target / "cache.o"])
+        try:
+            result = maintenance.cleanup_completed_builds_idle(self.current)
+            self.assertEqual(result["removed_slots"], 0)
+            self.assertEqual(result["consumer_input_coverage"], "registered_only")
+            self.assertTrue(target.exists())
+        finally:
+            consumer.close(not_started=True)
+        self.assertEqual(maintenance.cleanup_completed_builds_idle(self.current)["removed_slots"], 1)
+
+    def test_missing_registry_defers_idle_cache_cleanup(self):
+        self.current.dependency_registry = None
+        result = maintenance.cleanup_completed_builds_idle(self.current)
+        self.assertEqual(result["removed_slots"], 0)
+        self.assertEqual(result["consumer_input_coverage"], "unavailable")
+        self.assertTrue((self.candidate.slot / "cargo-target").exists())
+
+    def test_mismatched_registry_defers_idle_cache_cleanup(self):
+        self.current.dependency_registry = ConsumerRegistry.initialize(
+            Path(self.temp.name) / "other-registry", scope="unrelated")
+        result = maintenance.cleanup_completed_builds_idle(self.current)
+        self.assertEqual(result["removed_slots"], 0)
+        self.assertTrue(result["warnings"])
+        self.assertTrue((self.candidate.slot / "cargo-target").exists())
+
+    def test_build_and_output_catalogs_bound_to_different_registries_defer(self):
+        other_catalog = Path(self.temp.name) / "other-output-catalog"
+        other_catalog.mkdir()
+        other_registry = ConsumerRegistry.initialize(
+            Path(self.temp.name) / "other-registry", scope="unrelated")
+        with maintenance.CatalogGuard(other_catalog / "catalog.lock") as guard:
+            bind_catalog(other_catalog, other_registry, guard)
+        with patch.object(managed_outputs, "canonical_catalog", return_value=other_catalog):
+            result = maintenance.cleanup_completed_builds_idle(self.current)
+        self.assertEqual(result["removed_slots"], 0)
+        self.assertTrue(result["warnings"])
+        self.assertTrue((self.candidate.slot / "cargo-target").exists())
 
     def test_automatic_warning_maintenance_defers_build_cache_to_idle(self):
         result = maintenance.cleanup_completed_builds(self.current)

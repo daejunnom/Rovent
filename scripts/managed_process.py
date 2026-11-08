@@ -1,16 +1,56 @@
 """Finite owned command trees used by the build-storage boundary."""
 from __future__ import annotations
 import ctypes
+from contextlib import contextmanager
+from contextvars import ContextVar
 import math
 import os
 import signal
 import stat
 import subprocess
+import threading
 import time
 
 
 class ProcessNotSpawned(RuntimeError):
     """Opt-in preflight failed before Popen was invoked; retains original cause."""
+
+
+_supervisor_interrupt = ContextVar("rovezero_supervisor_interrupt", default=None)
+
+
+@contextmanager
+def supervisor_signal_scope():
+    """Turn catchable POSIX stop signals into a bounded original-owner drain.
+
+    This does not cover SIGKILL, interpreter death, escaped descendants, GPU
+    physical completion, or a Popen call which raises after attempting spawn.
+    Handlers do not raise, including on repeated signals during the drain.
+    """
+    if os.name != "posix" or threading.current_thread() is not threading.main_thread():
+        yield None
+        return
+    if _supervisor_interrupt.get() is not None:
+        raise RuntimeError("nested supervisor signal scope is unsupported")
+    state = {"signal": None}
+    saved = {}
+    token = None
+
+    def record(signum, _frame):
+        if state["signal"] is None:
+            state["signal"] = signum
+
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            saved[signum] = signal.getsignal(signum)
+            signal.signal(signum, record)
+        token = _supervisor_interrupt.set(state)
+        yield state
+    finally:
+        if token is not None:
+            _supervisor_interrupt.reset(token)
+        for signum, previous in saved.items():
+            signal.signal(signum, previous)
 
 
 def _group_has_live_members(pgid):
@@ -387,6 +427,12 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
                         exit_observation_timing=("before_deadline" if observed < absolute_deadline
                                                  else "at_or_after_deadline"),
                     )
+                break
+            interruption = _supervisor_interrupt.get()
+            if interruption is not None and interruption["signal"] is not None:
+                # The original leader remains unreaped and owns this group ID.
+                # Use the same drain as a timeout; do not infer GPU completion.
+                requested_exit = 128 + int(interruption["signal"])
                 break
             now = time.monotonic()
             if absolute_deadline is not None and now >= absolute_deadline:

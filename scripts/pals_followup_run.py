@@ -19,7 +19,7 @@ import time
 sys.dont_write_bytecode = True
 from managed_process import run_group
 from managed_storage import checked, tree_size
-from managed_outputs import OutputLease
+from managed_outputs import OutputLease, prepare_consumer_output_catalog
 
 GIB = 1024 ** 3
 SCHEMA = "rz-pals-followup-local-wrapper/1"
@@ -450,6 +450,9 @@ def main():
     parser.add_argument("--output-bytes-max", type=int, default=2 * GIB)
     parser.add_argument("--external-gc-ledger", type=Path)
     parser.add_argument("--external-gc-ledger-sha256")
+    parser.add_argument("--consumer-registry-root", type=Path)
+    parser.add_argument("--consumer-registry-id")
+    parser.add_argument("--consumer-registry-required", action="store_true")
     parser.add_argument("--run", action="store_true")
     commands = parser.add_subparsers(dest="mode", required=True)
     arena = commands.add_parser("arena")
@@ -478,6 +481,121 @@ def main():
     model.add_argument("--control-inventory", type=Path)
     model.add_argument("--control-inventory-sha256")
     args = parser.parse_args()
+    return run_with_registered_inputs(args, parser)
+
+
+def run_with_registered_inputs(args, parser):
+    """Register this launcher's declared inputs before its first content read.
+
+    Coverage is limited to the named registry and these declared paths. A GPU
+    dispatch has no physical fence here and therefore retains its lease.
+    """
+    env_root = os.environ.get("RZ_CONSUMER_REGISTRY_ROOT")
+    env_id = os.environ.get("RZ_CONSUMER_REGISTRY_ID")
+    env_required = os.environ.get("RZ_CONSUMER_REGISTRY_REQUIRED", "0")
+    if env_required not in ("0", "1"):
+        parser.error("invalid consumer registry required setting")
+    if bool(env_root) != bool(env_id) or bool(args.consumer_registry_root) != bool(args.consumer_registry_id):
+        parser.error("consumer registry root and ID must be provided together")
+    if args.consumer_registry_root is not None:
+        if env_root and (Path(os.path.abspath(args.consumer_registry_root)) != Path(os.path.abspath(env_root))
+                         or args.consumer_registry_id != env_id):
+            parser.error("consumer registry differs from managed parent")
+        root, registry_id = args.consumer_registry_root, args.consumer_registry_id
+    else:
+        root, registry_id = env_root, env_id
+    if root is None:
+        if args.consumer_registry_required or env_required == "1":
+            parser.error("configured consumer registry is required")
+        return _main_after_parse(args, parser)
+    from storage_consumer_registry import ConsumerRegistry
+    registry = ConsumerRegistry(Path(os.path.abspath(root)), registry_id=registry_id)
+    if args.run:
+        # Coordinate cleanup before any execution input is opened. Existing
+        # legacy rows do not establish participation and are not adopted.
+        args._consumer_catalog_binding = prepare_consumer_output_catalog(registry)
+    names = ["binary", "external_gc_ledger"]
+    if args.mode == "arena":
+        names += ["lock", "asset_root"]
+    else:
+        # The manifest names sibling ONNX graph files, which Rust opens later.
+        # Protect its parent before reading the manifest, not only the JSON.
+        names += ["fixtures", "runtime"]
+        if getattr(args, "provider", "cpu") == "cuda-system":
+            names += ["system_cuda_config"]
+    inputs = list(dict.fromkeys(Path(os.path.abspath(value)) for name in names
+                              if (value := getattr(args, name, None)) is not None))
+    if args.mode == "model-check" and args.export is not None:
+        export_root = Path(os.path.abspath(args.export)).parent
+        if export_root not in inputs:
+            inputs.append(export_root)
+    future_inputs = []
+    if (args.mode == "model-check" and getattr(args, "provider", "cpu") == "cpu"
+            and args.runtime_cache is not None):
+        cache = Path(os.path.abspath(args.runtime_cache))
+        if cache not in inputs:
+            future_inputs.append(cache)
+    leases = [registry.register(inputs, future_inputs=future_inputs)]
+    args._consumer_registry = registry
+    args._consumer_dispatch_state = {"started": False}
+    try:
+        if (args.mode == "model-check" and getattr(args, "provider", "cpu") == "cuda-system"
+                and args.system_cuda_config is not None):
+            # The config is already registered. Keep the registry lock while
+            # reading it and publishing its library paths so cleanup cannot
+            # unlink one between discovery and the second registration.
+            with registry.guard() as guard:
+                config_path = regular(Path(os.path.abspath(args.system_cuda_config)), 64 * 1024)
+                with config_path.open("rb") as stream:
+                    raw = stream.read(64 * 1024 + 1)
+                if not 0 < len(raw) <= 64 * 1024 or hashlib.sha256(raw).hexdigest() != sha(args.system_cuda_config_sha256):
+                    raise ValueError("actual pinned CUDA config bytes differ from registration")
+                config = json.loads(raw, object_pairs_hook=unique_object,
+                                    parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
+                libraries = config.get("libraries") if isinstance(config, dict) else None
+                if not isinstance(libraries, list) or len(libraries) > 64:
+                    raise ValueError("bounded CUDA library list required")
+                library_paths = []
+                for item in libraries:
+                    if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                        raise ValueError("CUDA library path required")
+                    path = Path(item["path"])
+                    if not path.is_absolute():
+                        raise ValueError("absolute CUDA library path required")
+                    library_paths.append(path)
+                library_paths = list(dict.fromkeys(library_paths))
+                if library_paths:
+                    leases.append(guard.register(library_paths))
+        result = _main_after_parse(args, parser)
+    except BaseException as error:
+        if not args._consumer_dispatch_state["started"]:
+            for lease in reversed(leases):
+                try:
+                    lease.close(not_started=True)
+                except BaseException as close_error:
+                    if hasattr(error, "add_note"):
+                        error.add_note("consumer lease close also failed: " + str(close_error))
+        raise
+    if not args._consumer_dispatch_state["started"]:
+        for lease in reversed(leases):
+            lease.close(not_started=True)
+    elif getattr(args, "receipt", None) is not None:
+        try:
+            observed = bounded_json(args.receipt)
+            if observed.get("tree_gone") is True:
+                for lease in reversed(leases):
+                    lease.retain_unknown(tree_gone=True)
+        except (OSError, ValueError, RuntimeError) as error:
+            # A failed bookkeeping transition retains active protection and
+            # does not change the original engine result.
+            print("consumer_lease_transition_warning=" + type(error).__name__, file=sys.stderr)
+    # Provider options and process termination do not prove an arbitrary
+    # dispatched binary never touched a GPU. Retain the original leases until
+    # an independently evidenced physical-completion path can close them.
+    return result
+
+
+def _main_after_parse(args, parser):
     if not 1 <= args.seconds <= 3600 or any(cpu < 0 for cpu in args.cpu_affinity) or len(set(args.cpu_affinity)) != 2:
         parser.error("finite 1..3600s window and two distinct nonnegative CPU IDs required")
     if not 1 <= args.output_bytes_max <= 2 * GIB:
@@ -496,6 +614,8 @@ def main():
                    "memory_high_bytes": 6 * GIB, "memory_max_bytes": 12 * GIB, "swap_max_bytes": 0},
                "actual_resources": "unknown", "training_executed": False, "strength_eligible": False,
                "automatic_retry": False, "tree_gone": "unknown", "exit_code": None, **details}
+    if hasattr(args, "_consumer_catalog_binding"):
+        receipt["consumer_output_catalog"] = args._consumer_catalog_binding
     if args.resource_profile == "colab-observed":
         receipt.update(resource_profile="colab-observed", strict_local_resources_admitted=False,
                        resource_policy_interpretation="requested targets, actual capability is independently observed",
@@ -531,7 +651,8 @@ def main():
             output_lifecycle={"acquired": False, "finish_attempted": False, "finish_returned": False})
         stage = "before_child_dispatch"
         output_lease = OutputLease(target, Path(__file__).resolve().parent.parent,
-                                   reserve=args.output_bytes_max, deferred=True).acquire()
+                                   reserve=args.output_bytes_max, deferred=True,
+                                   dependency_registry=getattr(args, "_consumer_registry", None)).acquire()
         try:
             receipt["output_lifecycle"]["acquired"] = True
             if args.resource_profile == "strict-local":
@@ -548,6 +669,8 @@ def main():
                     # A raised supervisor can have started a probe. Only its
                     # returned original closure observation may make this known.
                     receipt["tree_gone"] = "unknown"
+                    if hasattr(args, "_consumer_dispatch_state"):
+                        args._consumer_dispatch_state["started"] = True
                     receipt["host_driver_lookup"] = check_colab_driver_lookup(
                         receipt_path, binary.parent, environment, remaining,
                         lambda: check_colab_output_budget(args))
@@ -575,6 +698,8 @@ def main():
                 check_colab_output_budget(args)
                 receipt.update(tree_gone="unknown", child_spawned="unknown", producer_dispatch_attempted=True)
                 stage = "producer_supervision"
+                if hasattr(args, "_consumer_dispatch_state"):
+                    args._consumer_dispatch_state["started"] = True
                 code, gone, failure = run_group(command, binary.parent, environment, remaining, budget)
                 # Preserve the original result before any post-run observer can
                 # fail. Neither a zero exit nor process closure proves NN work.

@@ -136,6 +136,39 @@ def canonical_catalog():
     return canonical_root().parent.parent / "storage" / "outputs-v1"
 
 
+def prepare_consumer_output_catalog(registry, catalog=None):
+    """Bind an empty output domain or defer only its automatic cleanup.
+
+    A populated legacy catalog is not evidence that all of its consumers have
+    registered inputs. Its required marker makes compliant cleanup defer;
+    normal producer admission remains independent of that maintenance state.
+    """
+    from storage_consumer_registry import (BINDING_NAME, REQUIRED_MARKER_NAME,
+        ConsumerRegistry, bind_catalog, load_catalog_binding, mark_catalog_registry_unavailable)
+    if type(registry) is not ConsumerRegistry:
+        raise StorageError("pinned consumer registry required")
+    catalog = checked(catalog or canonical_catalog())
+    catalog.mkdir(parents=True, exist_ok=True)
+    with CatalogGuard(catalog / "catalog.lock") as guard:
+        if os.path.lexists(catalog / REQUIRED_MARKER_NAME):
+            # Validate marker without treating it as proof of an empty domain.
+            from storage_consumer_registry import REQUIRED_MARKER_SCHEMA
+            read_record_snapshot(catalog / REQUIRED_MARKER_NAME, schema=REQUIRED_MARKER_SCHEMA)
+            return {"status": "cleanup_deferred_required_marker", "coverage": "registered_only"}
+        bound = load_catalog_binding(catalog, guard)
+        if bound is not None:
+            if bound.root != registry.root or bound.registry_id != registry.registry_id:
+                mark_catalog_registry_unavailable(catalog, guard, force_bound=True)
+                return {"status": "cleanup_deferred_registry_mismatch", "coverage": "registered_only"}
+            return {"status": "bound", "coverage": "registered_only"}
+        entries = [item for item in catalog.iterdir() if item.name not in ("catalog.lock", BINDING_NAME)]
+        if entries:
+            mark_catalog_registry_unavailable(catalog, guard)
+            return {"status": "cleanup_deferred_legacy_rows", "coverage": "registered_only"}
+        bind_catalog(catalog, registry, guard)
+        return {"status": "bound_new_empty_catalog", "coverage": "registered_only"}
+
+
 def _read(path):
     return read_record_snapshot(path, schema=SCHEMA)[0]
 
@@ -183,12 +216,13 @@ def _attach_sampled_identity_observation(error, record_key, target, expected, ob
 
 
 def _catalog_rows(catalog, *, independent_output=None):
+    from storage_consumer_registry import BINDING_NAME, REQUIRED_MARKER_NAME
     rows = []
     entries = list(catalog.iterdir())
-    if len(entries) > MAX_RUNS + 1:
+    if len(entries) > MAX_RUNS + 3:
         raise StorageError("output catalog entry bound exceeded; archive review required")
     for path in entries:
-        if path.name == "catalog.lock":
+        if path.name in ("catalog.lock", BINDING_NAME, REQUIRED_MARKER_NAME):
             continue
         row = _read(path)
         target = checked(Path(row["output"]))
@@ -257,7 +291,8 @@ class OutputLease:
     def __init__(self, output, source, *, catalog=None, reserve=8 * GiB,
                  total_limit=18 * GiB, retention_days=14, deferred=False, outer_supervised=False,
                  quarantine_receipts=None, quarantine_transition_receipts=None,
-                 preservation_session=None, unattributed_preservation=None):
+                 preservation_session=None, unattributed_preservation=None,
+                 dependency_registry=None):
         if unattributed_preservation is not None:
             from managed_output_unattributed_preservation import UnattributedSelection
             if (type(unattributed_preservation) is not UnattributedSelection
@@ -282,6 +317,11 @@ class OutputLease:
                 raise StorageError("bounded explicit custody receipt pins required")
             if outer_supervised:
                 raise StorageError("outer finalizer does not carry explicit custody receipt pins")
+        if dependency_registry is not None:
+            from storage_consumer_registry import ConsumerRegistry
+            if type(dependency_registry) is not ConsumerRegistry:
+                raise StorageError("explicit initialized consumer registry required")
+        self.dependency_registry = dependency_registry
         self.output, self.source = checked(output), checked(source)
         self.catalog = checked(catalog or canonical_catalog())
         if (preservation_session is not None or unattributed_preservation is not None) and self.catalog != checked(canonical_catalog()):
@@ -1388,6 +1428,7 @@ def recover_output(catalog, key, expected_sha256):
 
 def finalize_supervised_outputs(root, owner, catalog=None, *, foreign_cache=None):
     """Called only by the original supervisor after its owned tree is gone."""
+    from storage_consumer_registry import BINDING_NAME, REQUIRED_MARKER_NAME
     catalog = checked(catalog or canonical_catalog())
     if not catalog.exists():
         if foreign_cache is not None and foreign_cache.get("__owned_rows__"):
@@ -1398,10 +1439,10 @@ def finalize_supervised_outputs(root, owner, catalog=None, *, foreign_cache=None
                     "scope": "inherited_outer_process_group_or_job"}
         sample_output_budget(catalog, supervisor_scope=expected, foreign_cache=foreign_cache, strict_scope=True)
         entries = list(catalog.iterdir())
-        if len(entries) > MAX_RUNS + 1:
+        if len(entries) > MAX_RUNS + 3:
             raise StorageError("output catalog bound exceeded")
         for path in entries:
-            if path.name == "catalog.lock":
+            if path.name in ("catalog.lock", BINDING_NAME, REQUIRED_MARKER_NAME):
                 continue
             try:
                 row = _read(path)
@@ -1444,6 +1485,7 @@ def sample_output_budget(catalog=None, *, quarantine_receipts=None, quarantine_g
     totals are estimates and may omit unreadable rows; the caller's own output
     remains sampled on every call. Busy/own-custody errors propagate.
     """
+    from storage_consumer_registry import BINDING_NAME, REQUIRED_MARKER_NAME
     if supervisor_scope is not None and (type(supervisor_scope) is not dict or
             quarantine_receipts is not None or quarantine_transition_receipts is not None or quarantine_guard is not None):
         raise StorageError("supervisor scope cannot be combined with custody selectors")
@@ -1490,10 +1532,10 @@ def sample_output_budget(catalog=None, *, quarantine_receipts=None, quarantine_g
     observed_bytes = 0
     owned_seen = set()
     entries = list(catalog.iterdir())
-    if len(entries) > MAX_RUNS + 1:
+    if len(entries) > MAX_RUNS + 3:
         raise StorageError("output catalog entry bound exceeded")
     for path in entries:
-        if path.name == "catalog.lock":
+        if path.name in ("catalog.lock", BINDING_NAME, REQUIRED_MARKER_NAME):
             continue
         try:
             row = _read(path)

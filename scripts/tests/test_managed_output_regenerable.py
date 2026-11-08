@@ -18,6 +18,7 @@ import managed_output_regenerable as reclaim
 import managed_outputs
 import rovezero_usage_snapshot
 import storage_code_retirement
+from storage_consumer_registry import ConsumerRegistry, bind_catalog
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux no-follow/census path")
@@ -29,12 +30,17 @@ class CpuGraphReclamationTests(unittest.TestCase):
         self.source = base / "source"
         self.source.mkdir()
         self.catalog = base / "catalog"
+        self.catalog.mkdir()
         self.root = base / "build"
         self.root.mkdir()
         self.output = base / "output"
         self.owner = {"schema": "rovezero.managed-build.v1", "pid": 1234,
                       "source": str(self.source), "source_id": "a" * 24}
-        self.manager = SimpleNamespace(root=self.root, finished=True, _identity=lambda: self.owner)
+        self.registry = ConsumerRegistry.initialize(base / "input-registry", scope="cpu-graph-test")
+        with managed_outputs.CatalogGuard(self.catalog / "catalog.lock") as guard:
+            bind_catalog(self.catalog, self.registry, guard)
+        self.manager = SimpleNamespace(root=self.root, finished=True, _identity=lambda: self.owner,
+                                       dependency_registry=self.registry)
         self.lease = managed_outputs.OutputLease(self.output, self.source, catalog=self.catalog,
                                                 reserve=1024 * 1024)
         self.lease.outer = {"root": str(self.root), "owner": self.owner,
@@ -74,6 +80,47 @@ class CpuGraphReclamationTests(unittest.TestCase):
         self.assertTrue((self.output / "validation.json").exists())
         self.assertTrue((self.output / ".rovezero-output.json").exists())
         self.assertTrue((self.output / ".rovezero-cpu-static-packing-retirement.jsonl").exists())
+
+    def test_registered_consumer_preserves_graph_until_closed(self):
+        consumer = self.registry.register([self.graph])
+        try:
+            result = self.cleanup_graph()
+            self.assertEqual(result["removed_files"], 0)
+            self.assertEqual(result["consumer_input_coverage"], "registered_only")
+            self.assertTrue(self.graph.exists())
+        finally:
+            consumer.close(not_started=True)
+        self.assertEqual(self.cleanup_graph()["removed_files"], 1)
+
+    def test_missing_registry_defers_maintenance(self):
+        self.manager.dependency_registry = None
+        result = self.cleanup_graph()
+        self.assertEqual(result["removed_files"], 0)
+        self.assertEqual(result["consumer_input_coverage"], "unavailable")
+        self.assertTrue(self.graph.exists())
+
+    def test_mismatched_catalog_registry_defers_maintenance(self):
+        self.manager.dependency_registry = ConsumerRegistry.initialize(
+            self.output.parent / "other-registry", scope="unrelated")
+        result = self.cleanup_graph()
+        self.assertEqual(result["removed_files"], 0)
+        self.assertTrue(result["warnings"])
+        self.assertTrue(self.graph.exists())
+
+    def test_unknown_consumer_record_protects_graph(self):
+        (self.registry.root / ("consumer-" + "a" * 32 + ".json")).write_text("not json")
+        result = self.cleanup_graph()
+        self.assertEqual(result["removed_files"], 0)
+        self.assertTrue(self.graph.exists())
+
+    def test_new_consumer_cannot_register_during_unlink_window(self):
+        def census(*_args):
+            with self.assertRaises(reclaim.StorageError):
+                self.registry.register([self.graph])
+            return {"complete": True}
+        with patch.object(storage_code_retirement, "_process_census", side_effect=census):
+            result = self.cleanup_graph()
+        self.assertEqual(result["removed_files"], 1)
 
     def test_gpu_or_failed_validation_never_deleted(self):
         self.receipt["gpu_validation"] = "unknown"
@@ -444,8 +491,13 @@ class DirectLeaseCpuGraphTests(unittest.TestCase):
             base = Path(temporary)
             source, output, catalog = base / "source", base / "output", base / "catalog"
             source.mkdir()
+            catalog.mkdir()
+            registry = ConsumerRegistry.initialize(base / "input-registry", scope="direct-lease-test")
+            with managed_outputs.CatalogGuard(catalog / "catalog.lock") as guard:
+                bind_catalog(catalog, registry, guard)
             lease = managed_outputs.OutputLease(output, source, catalog=catalog,
-                                               reserve=1024 * 1024, total_limit=1)
+                                               reserve=1024 * 1024, total_limit=1,
+                                               dependency_registry=registry)
             lease.acquire()
             packing = output / "device-packing"
             packing.mkdir()

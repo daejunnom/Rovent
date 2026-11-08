@@ -98,6 +98,42 @@ def input_identity(path):
             value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
 
+def parent_consumer_registry(source, runtime_store, rules_profile, dataset_run,
+                             verifier_binary, expected_owner, *, environment=None,
+                             output_catalog=None, output=None):
+    """Verify an explicitly registered CPU validator's supervisor lease.
+
+    The outer supervisor registers before starting this Python process and
+    retains the lease until it has verified CPU process-tree termination.
+    This covers the source tree and explicit managed inputs; it is not a
+    statement about unrelated or unregistered consumers.
+    """
+    env = os.environ if environment is None else environment
+    owner_id = env.get("RZ_CONSUMER_LEASE_OWNER_ID")
+    if not owner_id:
+        if env.get("RZ_CONSUMER_REGISTRY_REQUIRED") == "1":
+            raise StorageError("participating CPU validator requires a supervisor input lease")
+        return None
+    root = env.get("RZ_CONSUMER_REGISTRY_ROOT")
+    registry_id = env.get("RZ_CONSUMER_REGISTRY_ID")
+    if not root or not registry_id or not isinstance(expected_owner, dict):
+        raise StorageError("registered CPU validator requires its original supervisor lease")
+    if output is None:
+        raise StorageError("registered CPU validator requires its future output input boundary")
+    from storage_consumer_registry import ConsumerRegistry, require_catalog_binding, verify_lease_coverage
+    from storage_guard import CatalogGuard
+    registry = ConsumerRegistry(root, registry_id=registry_id)
+    catalog = checked(canonical_catalog() if output_catalog is None else output_catalog)
+    # This is an explicitly prepared domain, never silent adoption of a
+    # pre-existing catalog. Cleanup checks the same binding under this lock.
+    with CatalogGuard(catalog / "catalog.lock") as catalog_guard:
+        require_catalog_binding(catalog, registry, catalog_guard)
+    paths = [checked(source), checked(runtime_store), checked(output)]
+    paths.extend(checked(path) for path in (rules_profile, dataset_run, verifier_binary) if path is not None)
+    verify_lease_coverage(registry, owner_id, paths, expected_owner=expected_owner)
+    return registry
+
+
 class StageInputFailure(ValueError):
     """A known unavailable input belongs only to its consuming stage."""
 
@@ -394,6 +430,12 @@ def main():
     if not scratch or os.environ.get("CARGO_TARGET_DIR") is None:
         parser.error("run through scripts/run_managed.py with managed scratch")
     output_lease = OutputLease(output, source, outer_supervised=True)
+    # Check the supervisor's already-published registration before hashing
+    # source bodies, invoking Git, or reading any selected model input.
+    outer = getattr(output_lease, "outer", None)
+    output_lease.dependency_registry = parent_consumer_registry(
+        source, runtime_store, rules_profile, dataset_run, verifier_binary,
+        outer.get("owner") if outer else None, output=output)
     receipt = {"schema": "rovezero.pals-cpu-model-validation.v1", "status": "running",
                "training_executed": False, "training_steps": 0,
                "provider": "cpu", "gpu_validation": "not_run", "stages": {}}

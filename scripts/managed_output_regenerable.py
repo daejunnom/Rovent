@@ -117,6 +117,7 @@ def cleanup_registered_cpu_graphs(manager, catalog, *, seconds=2, own_lease=None
     result = {"removed_files": 0, "removed_bytes": 0, "removed_bytes_scope": "logical_file_size", "protected": 0,
               "deferred_active_sources": False, "candidate_count": "not_counted",
               "directory_sync_unconfirmed": 0,
+              "consumer_input_coverage": "unavailable",
               "warnings": [], "output_total_changed": False,
               "observation_limit": "current-visible-proc-namespace-only; active worker mount namespaces and aliases may be unknown; lock hold deadline is cooperative and cannot preempt blocking filesystem I/O"}
     if (type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0):
@@ -130,11 +131,22 @@ def cleanup_registered_cpu_graphs(manager, catalog, *, seconds=2, own_lease=None
     # source between the census and deletion.
     guard = None
     try:
+        registry = getattr(own_lease, "dependency_registry", None) if own_lease is not None else None
+        if registry is None and manager is not None:
+            registry = getattr(manager, "dependency_registry", None)
+        from storage_consumer_registry import ConsumerRegistry, require_catalog_binding
+        if type(registry) is not ConsumerRegistry:
+            raise StorageError("consumer input registry unavailable; cleanup deferred")
         guard = CatalogGuard(checked(Path(catalog)) / "catalog.lock")
         guard.acquire()
-        _cleanup_registered_cpu_graphs_locked(
-            manager, catalog, until=until, own_lease=own_lease,
-            guard=guard, result=result)
+        require_catalog_binding(catalog, registry, guard)
+        # Producers publish their input leases while holding this same guard.
+        # Keep it through the final unlink, after the catalog guard.
+        with registry.guard() as dependency_guard:
+            result["consumer_input_coverage"] = "registered_only"
+            _cleanup_registered_cpu_graphs_locked(
+                manager, catalog, until=until, own_lease=own_lease,
+                guard=guard, dependency_guard=dependency_guard, result=result)
     except (OSError, StorageError, RuntimeError, ValueError, TypeError) as error:
         _record_warning(result, error)
     finally:
@@ -154,12 +166,13 @@ def _has_active_source(catalog, tick):
     from managed_outputs import _read
     entries = list(catalog.iterdir())
     from managed_outputs import MAX_RUNS
-    if len(entries) > MAX_RUNS + 1:
+    from storage_consumer_registry import BINDING_NAME, REQUIRED_MARKER_NAME
+    if len(entries) > MAX_RUNS + 3:
         raise StorageError("output catalog entry bound exceeded")
     inactive_rows = []
     for entry in entries:
         tick()
-        if entry.name == "catalog.lock":
+        if entry.name in ("catalog.lock", BINDING_NAME, REQUIRED_MARKER_NAME):
             continue
         row = _read(entry)
         if row.get("state") == "active":
@@ -183,7 +196,7 @@ def _has_active_source(catalog, tick):
     return False
 
 
-def _cleanup_registered_cpu_graphs_locked(manager, catalog, *, until, own_lease, guard, result):
+def _cleanup_registered_cpu_graphs_locked(manager, catalog, *, until, own_lease, guard, dependency_guard, result):
 
     def tick():
         if time.monotonic() >= until:
@@ -271,6 +284,13 @@ def _cleanup_registered_cpu_graphs_locked(manager, catalog, *, until, own_lease,
                         or asset != {"bytes": mark.get("bytes"), "sha256": mark.get("sha256")}):
                     raise StorageError("CPU static validation evidence missing")
                 target = checked(output / RELATIVE)
+                dependencies = dependency_guard.conflicts([target])
+                if (type(dependencies) is not dict or dependencies.get("coverage") != "registered_only"
+                        or type(dependencies.get("conflicts")) is not list
+                        or type(dependencies.get("unknown")) is not list
+                        or dependencies["conflicts"] or dependencies["unknown"]):
+                    result["protected"] += 1
+                    continue
                 pin = _file_pin(target)
                 if pin != {key: mark[key] for key in ("bytes", "sha256", "identity", "stamp")}:
                     raise StorageError("CPU static graph changed")
@@ -333,6 +353,7 @@ def _cleanup_registered_cpu_graphs_locked(manager, catalog, *, until, own_lease,
                             or identity(output) != row["identity"]):
                         raise StorageError("CPU graph path changed after journal")
                     guard.assert_held()
+                    dependency_guard.check()
                     os.unlink(target.name, dir_fd=parent_fd)
                     unlinked = True
                     # The namespace changed at unlink, independently of
