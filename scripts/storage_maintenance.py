@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import tarfile
 import zipfile
@@ -15,8 +16,71 @@ import zlib
 sys.dont_write_bytecode = True
 # Permit an isolated -I -S invocation without caller PYTHONPATH or user packages.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from managed_storage import StorageError, checked, recover_build, tree_size
+from managed_storage import (MAX_ENTRIES, StorageError, checked, recover_build,
+                             reject_credential_names, tree_size)
 from managed_outputs import recover_output
+
+
+def _inventory_root(root):
+    """Count a root and each direct child in one bounded tree traversal.
+
+    The root and every child have separate hardlink sets, as they did in the
+    independent tree_size calls. A symlink must be safe within its direct
+    child's tree as well as within the root; direct-child links are rejected.
+    """
+    children = sorted(root.iterdir())
+    # Preserve tree_size(root)'s original path revalidation even for an empty
+    # root that was replaced after inventory() admitted it.
+    checked(root)
+    if len(children) > 1024:
+        raise StorageError("inventory child bound exceeded")
+    child_totals = [0] * len(children)
+    child_seen = [set() for _ in children]
+    root_seen = set()
+    root_total = 0
+    # tree_size(root) counts the root itself against its global entry limit.
+    entries = 1
+    pending = []
+    for index, child in enumerate(children):
+        pending.append((checked(child), index))
+    while pending:
+        current, index = pending.pop()
+        reject_credential_names(current)
+        info = current.lstat()
+        entries += 1
+        if entries > MAX_ENTRIES:
+            raise StorageError("managed tree entry bound exceeded")
+        if stat.S_ISLNK(info.st_mode):
+            checked(current.parent)
+            target = Path(os.path.abspath(current.parent / os.readlink(current)))
+            child_root = children[index]
+            if (not target.is_relative_to(child_root)
+                    or not checked(target).is_relative_to(child_root)):
+                raise StorageError("managed symlink escapes its owned tree")
+            root_total += info.st_size
+            child_totals[index] += info.st_size
+            continue
+        checked(current)
+        if stat.S_ISDIR(info.st_mode):
+            with os.scandir(current) as contents:
+                for item in contents:
+                    if entries + len(pending) >= MAX_ENTRIES:
+                        raise StorageError("managed tree entry bound exceeded")
+                    pending.append((Path(item.path), index))
+        elif stat.S_ISREG(info.st_mode):
+            identity = (info.st_dev, info.st_ino)
+            if identity not in root_seen:
+                root_total += info.st_size
+                root_seen.add(identity)
+            if identity not in child_seen[index]:
+                child_totals[index] += info.st_size
+                child_seen[index].add(identity)
+        else:
+            raise StorageError("unsupported managed tree entry")
+    return {"root": str(root), "length_bytes": root_total,
+            "children": [{"name": child.name, "length_bytes": child_totals[index],
+                          "classification": "unclassified_preserved"}
+                         for index, child in enumerate(children)]}
 
 
 def inventory(roots):
@@ -28,12 +92,7 @@ def inventory(roots):
     for root in selected:
         if not root.is_dir():
             raise StorageError("inventory requires an existing explicit root")
-        children = list(root.iterdir())
-        if len(children) > 1024:
-            raise StorageError("inventory child bound exceeded")
-        rows.append({"root": str(root), "length_bytes": tree_size(root),
-            "children": [{"name": path.name, "length_bytes": tree_size(path),
-                          "classification": "unclassified_preserved"} for path in sorted(children)]})
+        rows.append(_inventory_root(root))
     return {"schema": "rovezero.storage-inventory.v1", "roots": rows,
             "sum_root_length_bytes": sum(row["length_bytes"] for row in rows),
             "cross_root_hardlink_deduplication": "not_performed",
@@ -120,6 +179,15 @@ def main():
     explicit_observe.add_argument("--output-catalog", type=Path, action="append", default=[])
     explicit_observe.add_argument("--build-catalog", type=Path, action="append", default=[])
     explicit_observe.add_argument("--seconds", type=int, default=300)
+    registered_elf = commands.add_parser(
+        "observe-explicit-cpu-elf-registered-dependencies",
+        help="inspect the bound registry under its OS lock; never authorizes deletion")
+    registered_elf.add_argument("--plan", type=Path, required=True)
+    registered_elf.add_argument("--plan-bytes", type=int, required=True)
+    registered_elf.add_argument("--plan-sha256", required=True)
+    registered_elf.add_argument("--consumer-registry-root", type=Path, required=True)
+    registered_elf.add_argument("--consumer-registry-id", required=True)
+    registered_elf.add_argument("--seconds", type=int, default=300)
     legacy = commands.add_parser("register-legacy-observation", help="record a bounded legacy build observation; no deletion authority")
     legacy.add_argument("--inputs-root", type=Path, required=True)
     legacy.add_argument("--directory", type=Path, required=True)
@@ -200,6 +268,13 @@ def main():
         result = observe_explicit_cpu_elf_dependencies(
             {"path": str(args.plan), "bytes": args.plan_bytes, "sha256": args.plan_sha256},
             output_catalogs=args.output_catalog, build_catalogs=args.build_catalog, seconds=args.seconds)
+    elif args.operation == "observe-explicit-cpu-elf-registered-dependencies":
+        from storage_consumer_registry import ConsumerRegistry
+        from storage_explicit_elf_retirement import observe_explicit_cpu_elf_registered_dependencies
+        registry = ConsumerRegistry(args.consumer_registry_root, registry_id=args.consumer_registry_id)
+        result = observe_explicit_cpu_elf_registered_dependencies(
+            {"path": str(args.plan), "bytes": args.plan_bytes, "sha256": args.plan_sha256},
+            dependency_registry=registry, seconds=args.seconds)
     else:
         from storage_code_retirement import retire_code_cache
         result = retire_code_cache({"path": str(args.plan), "bytes": args.plan_bytes,

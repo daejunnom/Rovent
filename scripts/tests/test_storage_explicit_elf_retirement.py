@@ -3,6 +3,7 @@ from pathlib import Path
 from contextlib import nullcontext
 import json
 import os
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -179,6 +180,101 @@ class ExplicitRetirementTests(unittest.TestCase):
         self.assertTrue(self.leaf.exists())
         with self.assertRaisesRegex(StorageError, "active/unknown dependency protection"):
             explicit.retire_explicit_cpu_elf(plan_pin, seconds=30)
+        self.assertTrue(self.leaf.exists())
+
+    def test_registered_observation_uses_real_binding_and_keeps_legacy_unknown(self):
+        registry = self.bound_registry()
+        plan_pin = fixture.dump(self.plan_path, self.plan)
+        lease = registry.register([self.leaf])
+        observe = explicit.observe_explicit_cpu_elf_registered_dependencies
+        active = observe(plan_pin, dependency_registry=registry, seconds=30)
+        self.assertEqual(len(active["registered_dependencies"]["conflicts"]), 1)
+        self.assertEqual(active["registered_dependencies"]["coverage"], "registered_only")
+        self.assertEqual(active["legacy_and_unregistered_coverage"], "unknown")
+        self.assertFalse(active["deletion_authorized"])
+        lease.retain_unknown(tree_gone=True)
+        unknown = observe(plan_pin, dependency_registry=registry, seconds=30)
+        self.assertEqual(unknown["registered_dependencies"]["conflicts"][0]["state"],
+                         "physical_unknown_retained")
+        self.assertTrue(self.leaf.exists())
+        self.assertFalse(list(self.output.glob(".rovezero-explicit-cpu-elf-retirement-*")))
+
+    def test_registered_observation_unknown_and_unbound_preserve_file(self):
+        from storage_consumer_registry import ConsumerRegistry
+        registry = ConsumerRegistry.initialize(self.base / "registry", scope="isolated_test")
+        plan_pin = fixture.dump(self.plan_path, self.plan)
+        observe = explicit.observe_explicit_cpu_elf_registered_dependencies
+        with self.assertRaises(StorageError):
+            observe(plan_pin, dependency_registry=registry, seconds=30)
+        self.assertTrue(self.leaf.exists())
+        from storage_consumer_registry import bind_catalog
+        from storage_guard import CatalogGuard
+        with CatalogGuard(self.catalog / "catalog.lock") as guard:
+            bind_catalog(self.catalog, registry, guard)
+        (registry.root / "unexpected-entry").write_text("unknown")
+        observed = observe(plan_pin, dependency_registry=registry, seconds=30)
+        self.assertTrue(observed["registered_dependencies"]["unknown"])
+        self.assertEqual(observed["legacy_and_unregistered_coverage"], "unknown")
+        self.assertFalse(observed["deletion_authorized"])
+        self.assertTrue(self.leaf.exists())
+
+    def test_registered_observation_holds_both_real_os_locks(self):
+        from storage_guard import CatalogGuard
+        registry = self.bound_registry()
+        plan_pin = fixture.dump(self.plan_path, self.plan)
+        with registry.guard() as probe:
+            guard_type = type(probe)
+        real_conflicts = guard_type.conflicts
+        invoked = []
+
+        def check_locks(guard, *args, **kwargs):
+            # Competing opens must fail while observation is in progress;
+            # these are actual flock-backed locks, not an in-memory double.
+            with self.assertRaises(StorageError):
+                registry.register([self.leaf])
+            with self.assertRaises(StorageError):
+                with CatalogGuard(self.catalog / "catalog.lock", create=False):
+                    pass
+            invoked.append(True)
+            return real_conflicts(guard, *args, **kwargs)
+
+        with patch.object(guard_type, "conflicts", new=check_locks):
+            result = explicit.observe_explicit_cpu_elf_registered_dependencies(
+                plan_pin, dependency_registry=registry, seconds=30)
+        self.assertEqual(invoked, [True])
+        self.assertTrue(result["catalog_and_registry_locked_together"])
+        self.assertFalse(result["deletion_authorized"])
+        self.assertTrue(self.leaf.exists())
+
+    def test_registered_observation_does_not_create_missing_catalog_lock(self):
+        registry = self.bound_registry()
+        pin = fixture.dump(self.plan_path, self.plan)
+        lock_path = self.catalog / "catalog.lock"
+        lock_path.unlink()
+        with self.assertRaises(OSError):
+            explicit.observe_explicit_cpu_elf_registered_dependencies(
+                pin, dependency_registry=registry, seconds=30)
+        self.assertFalse(lock_path.exists())
+        self.assertTrue(self.leaf.exists())
+
+    def test_registered_observation_cli_does_not_open_retirement_gate(self):
+        registry = self.bound_registry()
+        pin = fixture.dump(self.plan_path, self.plan)
+        completed = subprocess.run(
+            [sys.executable, "-I", "-S", str(SCRIPTS / "storage_maintenance.py"),
+             "observe-explicit-cpu-elf-registered-dependencies",
+             "--plan", pin["path"], "--plan-bytes", str(pin["bytes"]),
+             "--plan-sha256", pin["sha256"],
+             "--consumer-registry-root", str(registry.root),
+             "--consumer-registry-id", registry.registry_id],
+            capture_output=True, text=True, timeout=30, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        observed = json.loads(completed.stdout)
+        self.assertEqual(observed["legacy_and_unregistered_coverage"], "unknown")
+        self.assertEqual(observed["registered_dependencies"]["conflicts"], [])
+        self.assertFalse(observed["deletion_authorized"])
+        with self.assertRaisesRegex(StorageError, "active/unknown dependency protection"):
+            explicit.retire_explicit_cpu_elf(pin, dependency_registry=registry, seconds=30)
         self.assertTrue(self.leaf.exists())
 
     def test_duplicate_names_and_unapproved_names_rejected(self):

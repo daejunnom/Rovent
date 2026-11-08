@@ -110,6 +110,101 @@ def observe_explicit_cpu_elf_dependencies(plan_pin, *, output_catalogs=(), build
     return result
 
 
+def observe_explicit_cpu_elf_registered_dependencies(plan_pin, *, dependency_registry, seconds=300):
+    """Inspect a pinned output's registered consumers without unlink authority.
+
+    The actual catalog and its pinned registry OS locks remain held until the
+    plan, row, candidate identities and registry observation have been checked.
+    This only covers cooperating registrations in the bound registry: an empty
+    result must never be interpreted as complete cross-catalog or legacy input
+    coverage. In particular, it cannot open the retirement gate.
+    """
+    if sys.platform != "linux":
+        raise base.CodeCacheRetirementUnsupported("explicit CPU ELF observation requires Linux")
+    if dependency_registry is None:
+        raise StorageError("a shared consumer dependency registry is required")
+    inputs = base._Inputs(seconds)
+    guard = dependency_manager = dependency_guard = None
+    entered = False
+    first = result = None
+    try:
+        plan = _plan(review.decode(inputs.open(plan_pin, 1 << 20).read((1 << 20) + 1)))
+        catalog = base._path(plan["catalog"])
+        inputs.directory(catalog, controlled=True)
+        guard = CatalogGuard(catalog / "catalog.lock", create=False)
+        guard.acquire()
+        require_catalog_binding(catalog, dependency_registry, guard)
+        dependency_manager = dependency_registry.guard()
+        dependency_guard = dependency_manager.__enter__()
+        entered = True
+        _refuse_custody_registry(catalog)
+        rows = _catalog_rows(catalog)
+        matches = [entry for entry in rows if entry[1]["key"] == plan["key"]]
+        base._need(len(matches) == 1, "exact original output row required")
+        record_path, row, output = matches[0]
+        output = base._path(output)
+        inputs.directory(output, controlled=True)
+        original = read_record_snapshot(record_path, schema="rovezero.managed-output.v1")
+        base._need(original[0] == row and original[1] == plan["record_sha256"],
+                   "original output record pin differs")
+        base._need(base._path(plan["receipt"]["path"]) == output / "build-receipt.json",
+                   "receipt must be original output build-receipt.json")
+        receipt = review.decode(inputs.open(plan["receipt"], 1 << 20).read((1 << 20) + 1))
+        _receipt(receipt, plan)
+        candidates = []
+        for item in plan["files"]:
+            path = base._path(output / item["relative"])
+            stream = inputs.open({"path": str(path), "bytes": item["bytes"],
+                                  "sha256": item["sha256"]}, review.ELF_CAP)
+            base._need(stream.read(4) == b"\x7fELF", "actual ELF bytes required")
+            candidates.append(path)
+        observation = dependency_guard.conflicts(candidates)
+        base._need(isinstance(observation, dict)
+                   and isinstance(observation.get("conflicts"), list)
+                   and isinstance(observation.get("unknown"), list)
+                   and observation.get("coverage") == "registered_only",
+                   "consumer dependency observation malformed")
+        inputs.check()
+        guard.assert_held()
+        dependency_guard.check()
+        require_catalog_binding(catalog, dependency_registry, guard)
+        base._need(_catalog_rows(catalog) == rows
+                   and read_record_snapshot(record_path, schema="rovezero.managed-output.v1") == original,
+                   "catalog or marker changed during dependency observation")
+        result = {"schema": "rovezero.explicit-cpu-elf-registered-dependency-observation.v1",
+                  "candidate_count": len(candidates),
+                  "registered_dependencies": observation,
+                  "catalog_and_registry_locked_together": True,
+                  "registered_coverage": "bound_registry_only",
+                  "legacy_and_unregistered_coverage": "unknown",
+                  "future_nonparticipating_consumers": "unknown",
+                  "owner_and_physical_completion_checked": False,
+                  "retirement_preflight": False, "deletion_authorized": False}
+    except BaseException as error:
+        first = error
+    finally:
+        first = inputs.close(first)
+        if entered:
+            try:
+                dependency_manager.__exit__(None, None, None)
+            except BaseException as error:
+                if first is None:
+                    first = error
+                else:
+                    base._note(first, "consumer dependency guard release failed: " + base._describe(error))
+        if guard is not None:
+            try:
+                guard.release()
+            except BaseException as error:
+                if first is None:
+                    first = error
+                else:
+                    base._note(first, "catalog guard release failed: " + base._describe(error))
+    if first is not None:
+        raise first
+    return result
+
+
 def retire_explicit_cpu_elf(plan_pin, *, seconds=300, dependency_registry=None):
     """Retire only pinned leaves of one completed original CPU output."""
     if sys.platform != "linux":
