@@ -423,4 +423,4 @@ fn integrity(message: &str) -> ManifestError {
 
 #[cfg(test)]
 #[path = "rovent_root_allocation/tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -13,6 +13,8 @@ pub use crate::rovent_corpus_lock_v2::publication::{
 };
 
 pub const ROVENT_LOCK_V3_PUBLICATION_DOMAIN: &str = "rz-rovent-corpus-publication-lock-v3/1";
+pub const ROVENT_LOCK_V3_CPU_PUBLICATION_DOMAIN: &str =
+    "rz-rovent-corpus-publication-cpu-lock-v3/1";
 
 fn require(condition: bool, detail: &'static str) -> Result<(), ManifestError> {
     if condition {
@@ -20,6 +22,13 @@ fn require(condition: bool, detail: &'static str) -> Result<(), ManifestError> {
     } else {
         Err(ManifestError::Integrity(detail.into()))
     }
+}
+
+// An absent family-specific field is allowed, but an explicitly present
+// value must remain a string. In particular, accepting null would silently
+// erase a wire field during reserialization and widen the historical parser.
+fn present_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(d).map(Some)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -31,7 +40,19 @@ pub struct RoventLockV3PublicationAdmission {
     pub canonical_input_lock_sha256: String,
     /// Captured system identity declared by this admission. It still requires
     /// independent verification against the original /3 lock and child.
-    pub system_runtime_identity_sha256: String,
+    #[serde(
+        default,
+        deserialize_with = "present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub system_runtime_identity_sha256: Option<String>,
+    /// The single actual CPU ORT library SHA, not a CUDA system identity.
+    #[serde(
+        default,
+        deserialize_with = "present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cpu_runtime_library_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -63,12 +84,22 @@ impl RoventLockV3Publication {
     /// child observations, corpus rows and bytes are verified independently.
     pub fn validate(&self) -> Result<(), ManifestError> {
         require(
-            self.schema == ROVENT_LOCK_V3_PUBLICATION_DOMAIN
-                && self
-                    .admissions
-                    .iter()
-                    .all(|a| generation_sha(&a.system_runtime_identity_sha256)),
-            "lock-v3 publication domain or system runtime identity",
+            match self.schema.as_str() {
+                ROVENT_LOCK_V3_PUBLICATION_DOMAIN => self.admissions.iter().all(|a| {
+                    a.system_runtime_identity_sha256
+                        .as_ref()
+                        .is_some_and(|s| generation_sha(s))
+                        && a.cpu_runtime_library_sha256.is_none()
+                }),
+                ROVENT_LOCK_V3_CPU_PUBLICATION_DOMAIN => self.admissions.iter().all(|a| {
+                    a.system_runtime_identity_sha256.is_none()
+                        && a.cpu_runtime_library_sha256
+                            .as_ref()
+                            .is_some_and(|s| generation_sha(s) && s == &self.runtime_sha256)
+                }),
+                _ => false,
+            },
+            "lock-v3 publication domain or runtime identity",
         )?;
         // Bound the actual /3 envelope before allocating the shared projection.
         struct Count(usize);
@@ -151,20 +182,97 @@ mod tests {
                 input_lock: file("input-locks/lock.json", 'd', 40),
                 input_lock_bytes_origin: RoventLockV3InputLockBytesOrigin::OriginalFile,
                 canonical_input_lock_sha256: "e".repeat(64),
-                system_runtime_identity_sha256: "f".repeat(64),
+                system_runtime_identity_sha256: Some("f".repeat(64)),
+                cpu_runtime_library_sha256: None,
             }],
         };
         let encoded = serde_json::to_string(&publication).unwrap();
+        // The legacy CUDA wire had exactly one required string identity field.
+        // Compare byte-for-byte against that independently declared shape.
+        #[derive(Serialize)]
+        struct LegacyAdmission<'a> {
+            native_admission_sha256: &'a str,
+            input_lock: &'a RoventLockV3PublicationFile,
+            input_lock_bytes_origin: RoventLockV3InputLockBytesOrigin,
+            canonical_input_lock_sha256: &'a str,
+            system_runtime_identity_sha256: &'a str,
+        }
+        #[derive(Serialize)]
+        struct LegacyPublication<'a> {
+            schema: &'a str,
+            manifest: &'a RoventLockV3PublicationFile,
+            index: &'a RoventLockV3PublicationFile,
+            chunks: &'a [RoventLockV3PublicationFile],
+            canonical_manifest_sha256: &'a str,
+            canonical_index_sha256: &'a str,
+            source_commit: &'a str,
+            source_sha256: &'a str,
+            runtime_sha256: &'a str,
+            record_count: u64,
+            total_payload_bytes: u64,
+            native_admission_sha256: &'a [String],
+            admissions: Vec<LegacyAdmission<'a>>,
+        }
+        let a = &publication.admissions[0];
+        let legacy = LegacyPublication {
+            schema: &publication.schema,
+            manifest: &publication.manifest,
+            index: &publication.index,
+            chunks: &publication.chunks,
+            canonical_manifest_sha256: &publication.canonical_manifest_sha256,
+            canonical_index_sha256: &publication.canonical_index_sha256,
+            source_commit: &publication.source_commit,
+            source_sha256: &publication.source_sha256,
+            runtime_sha256: &publication.runtime_sha256,
+            record_count: publication.record_count,
+            total_payload_bytes: publication.total_payload_bytes,
+            native_admission_sha256: &publication.native_admission_sha256,
+            admissions: vec![LegacyAdmission {
+                native_admission_sha256: &a.native_admission_sha256,
+                input_lock: &a.input_lock,
+                input_lock_bytes_origin: a.input_lock_bytes_origin,
+                canonical_input_lock_sha256: &a.canonical_input_lock_sha256,
+                system_runtime_identity_sha256: a
+                    .system_runtime_identity_sha256
+                    .as_deref()
+                    .unwrap(),
+            }],
+        };
+        assert_eq!(encoded, serde_json::to_string(&legacy).unwrap());
+        assert!(!encoded.contains("cpu_runtime_library_sha256"));
         assert_eq!(
             RoventLockV3Publication::from_json(&encoded).unwrap(),
             publication
         );
         assert!(RoventLockV2Publication::from_json(&encoded).is_err());
-        publication.admissions[0]
-            .system_runtime_identity_sha256
-            .clear();
+        let mut cuda_null: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        cuda_null["admissions"][0]["cpu_runtime_library_sha256"] = serde_json::Value::Null;
+        assert!(RoventLockV3Publication::from_json(&cuda_null.to_string()).is_err());
+        cuda_null["admissions"][0]["system_runtime_identity_sha256"] = serde_json::Value::Null;
+        assert!(RoventLockV3Publication::from_json(&cuda_null.to_string()).is_err());
+        publication.admissions[0].system_runtime_identity_sha256 = Some(String::new());
         assert!(publication.validate().is_err());
-        publication.admissions[0].system_runtime_identity_sha256 = "f".repeat(64);
+        publication.admissions[0].system_runtime_identity_sha256 = Some("f".repeat(64));
+        publication.schema = ROVENT_LOCK_V3_CPU_PUBLICATION_DOMAIN.into();
+        assert!(publication.validate().is_err());
+        publication.admissions[0].system_runtime_identity_sha256 = None;
+        publication.admissions[0].cpu_runtime_library_sha256 =
+            Some(publication.runtime_sha256.clone());
+        assert!(publication.validate().is_ok());
+        let cpu = serde_json::to_string(&publication).unwrap();
+        assert!(!cpu.contains("system_runtime_identity_sha256"));
+        let mut cpu_null: serde_json::Value = serde_json::from_str(&cpu).unwrap();
+        cpu_null["admissions"][0]["system_runtime_identity_sha256"] = serde_json::Value::Null;
+        assert!(RoventLockV3Publication::from_json(&cpu_null.to_string()).is_err());
+        let mut cpu_required_null: serde_json::Value = serde_json::from_str(&cpu).unwrap();
+        cpu_required_null["admissions"][0]["cpu_runtime_library_sha256"] = serde_json::Value::Null;
+        assert!(RoventLockV3Publication::from_json(&cpu_required_null.to_string()).is_err());
+        assert_eq!(
+            RoventLockV3Publication::from_json(&cpu).unwrap(),
+            publication
+        );
+        publication.admissions[0].cpu_runtime_library_sha256 = Some("0".repeat(64));
+        assert!(publication.validate().is_err());
         publication.schema = ROVENT_LOCK_V2_PUBLICATION_DOMAIN.into();
         assert!(publication.validate().is_err());
     }

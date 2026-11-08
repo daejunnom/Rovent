@@ -350,6 +350,13 @@ pub struct RoventSystemReadyObservationV3 {
     pub session_settings: Arc<[PalsAppliedSessionSettings]>,
 }
 
+/// Settings retained from the original successful CPU session constructors.
+/// They attest neither inference nor the physical completion of later work.
+#[derive(Clone, Debug)]
+pub struct RoventCpuReadyObservationV3 {
+    pub session_settings: Arc<[PalsAppliedSessionSettings]>,
+}
+
 /// Observations from the original successful constructor, not first Run.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -368,6 +375,9 @@ pub struct RoventNativeStartupSnapshot {
     /// Populated only by the original V3 system-CUDA factory after sessions
     /// and mapping checks complete. Physical completion remains separate.
     pub system_runtime: Option<RoventSystemReadyObservationV3>,
+    /// Present only when the original native loader selected CPU and created
+    /// its model sessions. This is not a CUDA observation or a device fence.
+    pub cpu_runtime: Option<RoventCpuReadyObservationV3>,
     pub startup_configuration: Digest,
     pub search_configuration: Digest,
     pub validator_loaded: bool,
@@ -1841,6 +1851,7 @@ fn load_native_system_v3(
             provider_ready: true,
             session_settings,
         }),
+        cpu_runtime: None,
         startup_configuration: Digest(sources.configuration().configuration_digest()?),
         search_configuration: Digest(sources.configuration().search_configuration_digest()?),
         validator_loaded: backend.validator_present(),
@@ -1933,6 +1944,11 @@ fn load_native<L: NativeInputLock>(
             "loaded role set or model namespace differs from admitted export",
         ));
     }
+    let cpu_runtime = matches!(resources.configuration.provider, Provider::Cpu).then(|| {
+        RoventCpuReadyObservationV3 {
+            session_settings: backend.applied_session_settings(),
+        }
+    });
     let snapshot = RoventNativeStartupSnapshot {
         domain: ROVENT_NATIVE_STARTUP_DOMAIN,
         input_lock: sources.lock_digest(),
@@ -1946,6 +1962,7 @@ fn load_native<L: NativeInputLock>(
         runtime_bundle: backend.runtime_bundle_digest().map(Digest),
         native_configuration: Digest(config_digest),
         system_runtime: None,
+        cpu_runtime,
         startup_configuration: Digest(sources.configuration().configuration_digest()?),
         search_configuration: Digest(sources.configuration().search_configuration_digest()?),
         validator_loaded: backend.validator_present(),

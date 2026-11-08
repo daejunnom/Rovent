@@ -6,8 +6,9 @@
 use super::*;
 use rz_experiments::RoventInputLockV3;
 use rz_experiments::rovent_corpus_lock_v3::publication::{
-    ROVENT_LOCK_V3_PUBLICATION_DOMAIN, RoventLockV3InputLockBytesOrigin, RoventLockV3Publication,
-    RoventLockV3PublicationAdmission, RoventLockV3PublicationFile,
+    ROVENT_LOCK_V3_CPU_PUBLICATION_DOMAIN, ROVENT_LOCK_V3_PUBLICATION_DOMAIN,
+    RoventLockV3InputLockBytesOrigin, RoventLockV3Publication, RoventLockV3PublicationAdmission,
+    RoventLockV3PublicationFile,
 };
 use rz_experiments::rovent_corpus_lock_v3::record::{
     RoventCorpusIndexLockV3, RoventCorpusManifestLockV3,
@@ -18,13 +19,21 @@ use std::sync::Arc;
 pub(super) struct LockV3PublicationSource {
     pub(super) admission_sha256: String,
     pub(super) lock: RoventInputLockV3,
-    pub(super) system_runtime_identity_sha256: String,
+    runtime_identity: OriginalRuntimeIdentityV3,
     lock_bytes: Vec<u8>,
+}
+
+/// CPU reports the original loaded runtime library, not a system-CUDA
+/// identity. The variants remain separate in the published wire format.
+enum OriginalRuntimeIdentityV3 {
+    CpuLibrarySha256(String),
+    SystemCudaIdentitySha256(String),
 }
 
 impl LockV3PublicationSource {
     /// Capture declaration bytes from the real in-process /3 admission.
-    /// The lock contains the declared system runtime, not a CUDA file bundle.
+    /// The lock records the declared CPU or system-CUDA runtime; no runtime
+    /// library bundle is copied into the publication.
     pub(super) fn capture(admission: &RoventCollectionRootAdmissionV3) -> Result<Self, ArenaError> {
         let origin = admission.native_origin();
         let lock = origin.original_input_lock();
@@ -35,15 +44,39 @@ impl LockV3PublicationSource {
         )?;
         let lock_bytes = serde_json::to_vec(lock).map_err(|error| invalid(error.to_string()))?;
         check(lock_bytes.len() <= 16 * 1024 * 1024, "/3 lock metadata cap")?;
-        let runtime_identity =
-            origin.raw_receipt()["startup_observation"]["system_runtime_identity_sha256"]
-                .as_str()
-                .ok_or_else(|| invalid("original /3 system runtime identity is unknown"))?
-                .to_owned();
+        let observed = &origin.raw_receipt()["startup_observation"];
+        let runtime_identity = match &lock.manifest.system_runtime_lock.runtime {
+            rz_experiments::NativeRuntimeSourceV6::Cpu => {
+                let runtime_sha256 =
+                    observed["runtime_library_sha256"].as_str().ok_or_else(|| {
+                        invalid("original /3 CPU runtime library identity is unknown")
+                    })?;
+                check(
+                    observed["provider"] == "cpu"
+                        && observed["provider_ready"] == true
+                        && lock.manifest.engine.pc.runtime_artifacts.len() == 1
+                        && lock
+                            .manifest
+                            .engine
+                            .pc
+                            .runtime_artifacts
+                            .first()
+                            .is_some_and(|artifact| artifact.sha256 == runtime_sha256),
+                    "original /3 CPU provider or runtime identity differs",
+                )?;
+                OriginalRuntimeIdentityV3::CpuLibrarySha256(runtime_sha256.to_owned())
+            }
+            rz_experiments::NativeRuntimeSourceV6::SystemCuda(_) => {
+                let identity = observed["system_runtime_identity_sha256"]
+                    .as_str()
+                    .ok_or_else(|| invalid("original /3 system runtime identity is unknown"))?;
+                OriginalRuntimeIdentityV3::SystemCudaIdentitySha256(identity.to_owned())
+            }
+        };
         Ok(Self {
             admission_sha256: admission.raw_sha256().to_owned(),
             lock: lock.clone(),
-            system_runtime_identity_sha256: runtime_identity,
+            runtime_identity,
             lock_bytes,
         })
     }
@@ -59,7 +92,7 @@ impl publication::PublicationSourceBytes for LockV3PublicationSource {
     }
 
     fn runtime_bundle(&self) -> Option<(&rz_experiments::ArtifactRef, &[u8])> {
-        // The /3 system runtime is recorded in the original lock and native
+        // The /3 runtime is recorded in the original lock and native
         // observation. There is intentionally no copied library bundle.
         None
     }
@@ -252,17 +285,40 @@ fn publish_lock_v3_payloads_authorized_with_hook(
             let original = admissions
                 .get(&entry.native_admission_sha256)
                 .ok_or_else(|| invalid("/3 publication original admission missing"))?;
+            let (system_runtime_identity_sha256, cpu_runtime_library_sha256) = match &original
+                .runtime_identity
+            {
+                OriginalRuntimeIdentityV3::SystemCudaIdentitySha256(value) => {
+                    (Some(value.clone()), None)
+                }
+                OriginalRuntimeIdentityV3::CpuLibrarySha256(value) => (None, Some(value.clone())),
+            };
             published_admissions.push(RoventLockV3PublicationAdmission {
                 native_admission_sha256: entry.native_admission_sha256,
                 input_lock: file(entry.input_lock),
                 input_lock_bytes_origin:
                     RoventLockV3InputLockBytesOrigin::ValidatedSemanticSnapshot,
                 canonical_input_lock_sha256: entry.canonical_input_lock_sha256,
-                system_runtime_identity_sha256: original.system_runtime_identity_sha256.clone(),
+                system_runtime_identity_sha256,
+                cpu_runtime_library_sha256,
             });
         }
         let result = RoventLockV3Publication {
-            schema: ROVENT_LOCK_V3_PUBLICATION_DOMAIN.into(),
+            schema: match &admissions
+                .values()
+                .next()
+                .expect("nonempty checked")
+                .lock
+                .manifest
+                .system_runtime_lock
+                .runtime
+            {
+                rz_experiments::NativeRuntimeSourceV6::Cpu => ROVENT_LOCK_V3_CPU_PUBLICATION_DOMAIN,
+                rz_experiments::NativeRuntimeSourceV6::SystemCuda(_) => {
+                    ROVENT_LOCK_V3_PUBLICATION_DOMAIN
+                }
+            }
+            .into(),
             manifest: file(manifest_file),
             index: file(index_file),
             chunks: chunks.into_iter().map(file).collect(),

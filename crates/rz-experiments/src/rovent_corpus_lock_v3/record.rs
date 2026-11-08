@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 pub const ROVENT_CORPUS_MANIFEST_LOCK_V3_DOMAIN: &str = "rz-rovent-corpus-manifest-lock-v3/1";
 pub const ROVENT_TRAINING_RECORD_LOCK_V3_DOMAIN: &str = "rz-rovent-training-record-lock-v3/1";
 pub const ROVENT_CORPUS_INDEX_LOCK_V3_DOMAIN: &str = "rz-rovent-corpus-index-lock-v3/1";
+pub const ROVENT_CORPUS_MANIFEST_CPU_LOCK_V3_DOMAIN: &str =
+    "rz-rovent-corpus-manifest-cpu-lock-v3/1";
+pub const ROVENT_TRAINING_RECORD_CPU_LOCK_V3_DOMAIN: &str =
+    "rz-rovent-training-record-cpu-lock-v3/1";
+pub const ROVENT_CORPUS_INDEX_CPU_LOCK_V3_DOMAIN: &str = "rz-rovent-corpus-index-cpu-lock-v3/1";
 pub const MAX_LOCK_V3_METADATA_BYTES: usize =
     crate::rovent_corpus_lock_v2::record::MAX_LOCK_V2_METADATA_BYTES;
 
@@ -38,7 +43,8 @@ impl RoventCorpusManifestLockV3 {
     pub fn from_json(input: &str) -> Result<Self, ManifestError> {
         let value: Self = crate::parse_bounded(input, MAX_LOCK_V3_METADATA_BYTES)?;
         require(
-            value.schema == ROVENT_CORPUS_MANIFEST_LOCK_V3_DOMAIN,
+            value.schema == ROVENT_CORPUS_MANIFEST_LOCK_V3_DOMAIN
+                || value.schema == ROVENT_CORPUS_MANIFEST_CPU_LOCK_V3_DOMAIN,
             "explicit /3 lock corpus domain required",
         )?;
         value.registration.validate()?;
@@ -58,28 +64,38 @@ impl RoventCorpusManifestLockV3 {
             ManifestError::Integrity("corpus source identity is unavailable".into())
         })?;
         let source = rovent_source_aggregate_sha256(source_commit, &engine.source_components)?;
-        let runtime = match &lock.manifest.system_runtime_lock.runtime {
-            NativeRuntimeSourceV6::SystemCuda(runtime) => runtime,
+        let (expected_schema, runtime_sha) = match &lock.manifest.system_runtime_lock.runtime {
+            NativeRuntimeSourceV6::SystemCuda(runtime) => {
+                let core = runtime
+                    .libraries
+                    .iter()
+                    .find(|library| library.role == "ort-core")
+                    .ok_or_else(|| {
+                        ManifestError::Integrity("system ORT core registration missing".into())
+                    })?;
+                (ROVENT_CORPUS_MANIFEST_LOCK_V3_DOMAIN, core.sha256.as_str())
+            }
             NativeRuntimeSourceV6::Cpu => {
-                return Err(ManifestError::Integrity(
-                    "system CUDA /3 collection requires an explicit system CUDA runtime".into(),
-                ));
+                let pc = &lock.manifest.engine.pc;
+                require(
+                    pc.backend == crate::RoventBackend::OrtCpu
+                        && pc.device == crate::RoventDevice::Cpu
+                        && pc.runtime_artifacts.len() == 1,
+                    "CPU collection requires the single pinned CPU ORT runtime",
+                )?;
+                (
+                    ROVENT_CORPUS_MANIFEST_CPU_LOCK_V3_DOMAIN,
+                    pc.runtime_artifacts[0].sha256.as_str(),
+                )
             }
         };
-        let core = runtime
-            .libraries
-            .iter()
-            .find(|library| library.role == "ort-core")
-            .ok_or_else(|| {
-                ManifestError::Integrity("system ORT core registration missing".into())
-            })?;
         require(
-            self.schema == ROVENT_CORPUS_MANIFEST_LOCK_V3_DOMAIN
+            self.schema == expected_schema
                 && lock.manifest.purpose == RoventPurpose::Collection
                 && self.startup_lock_sha256 == lock.canonical_sha256
                 && self.registration.source_commit == source_commit
                 && self.registration.source_sha256 == source
-                && self.registration.runtime_sha256 == core.sha256,
+                && self.registration.runtime_sha256 == runtime_sha,
             "corpus /3 lock, declared source or runtime registration differs",
         )?;
         require(
@@ -100,7 +116,7 @@ impl RoventCorpusManifestLockV3 {
 
     pub fn sha256(&self, lock: &RoventInputLockV3) -> Result<String, ManifestError> {
         self.validate(lock)?;
-        generation_digest(ROVENT_CORPUS_MANIFEST_LOCK_V3_DOMAIN, self)
+        generation_digest(&self.schema, self)
     }
 }
 
@@ -118,14 +134,19 @@ impl RoventTrainingRecordLockV3 {
         )?;
         let value: Self = crate::decode_json(input)?;
         require(
-            value.0.schema == ROVENT_TRAINING_RECORD_LOCK_V3_DOMAIN,
+            value.0.schema == ROVENT_TRAINING_RECORD_LOCK_V3_DOMAIN
+                || value.0.schema == ROVENT_TRAINING_RECORD_CPU_LOCK_V3_DOMAIN,
             "explicit /3 lock record domain required",
         )?;
         Ok(value)
     }
     pub fn sha256(&self) -> Result<String, ManifestError> {
-        self.0
-            .sha256_for_domain(ROVENT_TRAINING_RECORD_LOCK_V3_DOMAIN)
+        require(
+            self.0.schema == ROVENT_TRAINING_RECORD_LOCK_V3_DOMAIN
+                || self.0.schema == ROVENT_TRAINING_RECORD_CPU_LOCK_V3_DOMAIN,
+            "explicit /3 lock record domain required",
+        )?;
+        self.0.sha256_for_domain(&self.0.schema)
     }
     pub fn validate(
         &self,
@@ -138,12 +159,19 @@ impl RoventTrainingRecordLockV3 {
             ));
         }
         manifest.validate(lock)?;
+        let expected = if matches!(
+            lock.manifest.system_runtime_lock.runtime,
+            NativeRuntimeSourceV6::Cpu
+        ) {
+            ROVENT_TRAINING_RECORD_CPU_LOCK_V3_DOMAIN
+        } else {
+            ROVENT_TRAINING_RECORD_LOCK_V3_DOMAIN
+        };
+        require(self.0.schema == expected, "record runtime family differs")?;
         self.0.input.validate()?;
         super::validate_native_lifecycle_lock_v3(&self.0.native, &manifest.registration, lock)?;
-        self.0.validate_record_body(
-            &manifest.registration,
-            ROVENT_TRAINING_RECORD_LOCK_V3_DOMAIN,
-        )
+        self.0
+            .validate_record_body(&manifest.registration, expected)
     }
     pub fn seal(
         &mut self,
@@ -156,7 +184,15 @@ impl RoventTrainingRecordLockV3 {
             ));
         }
         require(
-            self.0.schema == ROVENT_TRAINING_RECORD_LOCK_V3_DOMAIN,
+            self.0.schema
+                == if matches!(
+                    lock.manifest.system_runtime_lock.runtime,
+                    NativeRuntimeSourceV6::Cpu
+                ) {
+                    ROVENT_TRAINING_RECORD_CPU_LOCK_V3_DOMAIN
+                } else {
+                    ROVENT_TRAINING_RECORD_LOCK_V3_DOMAIN
+                },
             "explicit /3 lock record domain required",
         )?;
         self.0.input_sha256 = self.0.input.sha256()?;
@@ -179,7 +215,8 @@ impl RoventCorpusIndexLockV3 {
     pub fn from_json(input: &str) -> Result<Self, ManifestError> {
         let value: Self = crate::parse_bounded(input, MAX_LOCK_V3_METADATA_BYTES)?;
         require(
-            value.schema == ROVENT_CORPUS_INDEX_LOCK_V3_DOMAIN,
+            value.schema == ROVENT_CORPUS_INDEX_LOCK_V3_DOMAIN
+                || value.schema == ROVENT_CORPUS_INDEX_CPU_LOCK_V3_DOMAIN,
             "explicit /3 lock index domain required",
         )?;
         Ok(value)
@@ -190,7 +227,15 @@ impl RoventCorpusIndexLockV3 {
         lock: &RoventInputLockV3,
     ) -> Result<(), ManifestError> {
         require(
-            self.schema == ROVENT_CORPUS_INDEX_LOCK_V3_DOMAIN
+            self.schema
+                == if matches!(
+                    lock.manifest.system_runtime_lock.runtime,
+                    NativeRuntimeSourceV6::Cpu
+                ) {
+                    ROVENT_CORPUS_INDEX_CPU_LOCK_V3_DOMAIN
+                } else {
+                    ROVENT_CORPUS_INDEX_LOCK_V3_DOMAIN
+                }
                 && self.manifest_sha256 == manifest.sha256(lock)?
                 && self.record_count <= MAX_CORPUS_ROWS as u64
                 && self.origins.len() as u64 == self.record_count
@@ -219,6 +264,33 @@ impl RoventCorpusIndexLockV3 {
         .validate()
     }
     pub fn sha256(&self) -> Result<String, ManifestError> {
-        generation_digest(ROVENT_CORPUS_INDEX_LOCK_V3_DOMAIN, self)
+        require(
+            self.schema == ROVENT_CORPUS_INDEX_LOCK_V3_DOMAIN
+                || self.schema == ROVENT_CORPUS_INDEX_CPU_LOCK_V3_DOMAIN,
+            "explicit /3 lock index domain required",
+        )?;
+        generation_digest(&self.schema, self)
+    }
+}
+
+#[cfg(test)]
+mod cpu_family_tests {
+    use super::*;
+
+    #[test]
+    fn index_digest_rejects_unregistered_family_and_separates_cpu_cuda() {
+        let mut index = RoventCorpusIndexLockV3 {
+            schema: ROVENT_CORPUS_INDEX_LOCK_V3_DOMAIN.into(),
+            manifest_sha256: "a".repeat(64),
+            record_count: 0,
+            chunks: vec![],
+            origins: vec![],
+        };
+        let cuda = index.sha256().unwrap();
+        index.schema = ROVENT_CORPUS_INDEX_CPU_LOCK_V3_DOMAIN.into();
+        let cpu = index.sha256().unwrap();
+        assert_ne!(cuda, cpu);
+        index.schema = "unregistered-domain".into();
+        assert!(index.sha256().is_err());
     }
 }

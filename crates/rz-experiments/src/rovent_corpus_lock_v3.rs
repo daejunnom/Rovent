@@ -1,5 +1,6 @@
 //! Separate corpus family joined to the original Rovent input-lock /3.
 //! Records are evidence metadata and never recreate live native authority.
+pub mod cpu_native;
 pub mod native;
 pub mod publication;
 pub mod record;

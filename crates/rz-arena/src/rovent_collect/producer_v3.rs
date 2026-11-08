@@ -202,16 +202,33 @@ impl RoventCorpusProducerLockV3 {
     ) -> Result<Self, ArenaError> {
         let lock = admission.native_origin().original_input_lock();
         manifest.validate(lock)?;
-        rz_experiments::rovent_corpus_lock_v3::native::validate_lock_v3_root_metadata(
-            admission.raw_receipt(),
-            &json!(admission.raw_sha256()),
-            lock,
-        )?;
+        match &lock.manifest.system_runtime_lock.runtime {
+            rz_experiments::NativeRuntimeSourceV6::Cpu => {
+                rz_experiments::rovent_corpus_lock_v3::cpu_native::validate_lock_v3_cpu_root_metadata(
+                    admission.raw_receipt(),
+                    &json!(admission.raw_sha256()),
+                    lock,
+                )?
+            }
+            rz_experiments::NativeRuntimeSourceV6::SystemCuda(_) => {
+                rz_experiments::rovent_corpus_lock_v3::native::validate_lock_v3_root_metadata(
+                    admission.raw_receipt(),
+                    &json!(admission.raw_sha256()),
+                    lock,
+                )?
+            }
+        }
         let manifest_sha256 = manifest.sha256(lock)?;
         let mut original = RoventCorpusProducerV2::new(manifest.registration.clone())?;
         original.original.manifest_sha256 = manifest_sha256;
-        original.original.native_domain =
-            rz_experiments::rovent_corpus_lock_v3::native::ROVENT_LOCK_V3_NATIVE_RAW_DOMAIN;
+        original.original.native_domain = match &lock.manifest.system_runtime_lock.runtime {
+            rz_experiments::NativeRuntimeSourceV6::Cpu => {
+                rz_experiments::rovent_corpus_lock_v3::cpu_native::ROVENT_LOCK_V3_CPU_NATIVE_RAW_DOMAIN
+            }
+            rz_experiments::NativeRuntimeSourceV6::SystemCuda(_) => {
+                rz_experiments::rovent_corpus_lock_v3::native::ROVENT_LOCK_V3_NATIVE_RAW_DOMAIN
+            }
+        };
         Ok(Self {
             manifest,
             admission,
@@ -488,7 +505,10 @@ impl RoventCorpusProducerLockV3 {
             admission: self.admission.clone(),
             record: rz_experiments::rovent_corpus_lock_v3::record::RoventTrainingRecordLockV3(
                 RoventTrainingRecordV2 {
-                    schema: rz_experiments::rovent_corpus_lock_v3::record::ROVENT_TRAINING_RECORD_LOCK_V3_DOMAIN.into(),
+                    schema: match &self.admission.native_origin().original_input_lock().manifest.system_runtime_lock.runtime {
+                        rz_experiments::NativeRuntimeSourceV6::Cpu => rz_experiments::rovent_corpus_lock_v3::record::ROVENT_TRAINING_RECORD_CPU_LOCK_V3_DOMAIN,
+                        rz_experiments::NativeRuntimeSourceV6::SystemCuda(_) => rz_experiments::rovent_corpus_lock_v3::record::ROVENT_TRAINING_RECORD_LOCK_V3_DOMAIN,
+                    }.into(),
                     role: pending.input.role,
                     split,
                     input,

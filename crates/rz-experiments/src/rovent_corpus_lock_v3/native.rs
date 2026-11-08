@@ -162,6 +162,12 @@ pub fn validate_lock_v3_root_metadata(
     expected_sha256: &Value,
     lock: &RoventInputLockV3,
 ) -> Result<(), ManifestError> {
+    if matches!(
+        lock.manifest.system_runtime_lock.runtime,
+        NativeRuntimeSourceV6::Cpu
+    ) {
+        return super::cpu_native::validate_lock_v3_cpu_root_metadata(raw, expected_sha256, lock);
+    }
     lock.validate()?;
     let serialized =
         serde_json::to_string(raw).map_err(|e| ManifestError::Integrity(e.to_string()))?;
@@ -280,6 +286,12 @@ pub fn validate_native_lifecycle_lock_v3(
     manifest: &RoventCorpusManifestV2,
     lock: &RoventInputLockV3,
 ) -> Result<(), ManifestError> {
+    if matches!(
+        lock.manifest.system_runtime_lock.runtime,
+        NativeRuntimeSourceV6::Cpu
+    ) {
+        return super::cpu_native::validate_native_lifecycle_lock_v3_cpu(native, manifest, lock);
+    }
     manifest.validate()?;
     native.validate_submitted_input_for_domain(
         &manifest.common_registration_projection(),

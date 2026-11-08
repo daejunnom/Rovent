@@ -8,7 +8,8 @@ use publication::PublicationSourceBytes;
 use publication_lock_v3::{LockV3PublicationSource, publish_lock_v3_payloads};
 use rz_experiments::rovent_corpus_lock_v3::publication::RoventLockV3Publication;
 use rz_experiments::rovent_corpus_lock_v3::record::{
-    ROVENT_CORPUS_INDEX_LOCK_V3_DOMAIN, RoventCorpusIndexLockV3, RoventCorpusManifestLockV3,
+    ROVENT_CORPUS_INDEX_CPU_LOCK_V3_DOMAIN, ROVENT_CORPUS_INDEX_LOCK_V3_DOMAIN,
+    RoventCorpusIndexLockV3, RoventCorpusManifestLockV3,
 };
 use std::sync::Arc;
 
@@ -134,7 +135,15 @@ impl RoventCorpusWriterLockV3 {
             manifest: manifest.clone(),
             original_manifest: None,
             index: RoventCorpusIndexLockV3 {
-                schema: ROVENT_CORPUS_INDEX_LOCK_V3_DOMAIN.into(),
+                schema: match &lock.manifest.system_runtime_lock.runtime {
+                    rz_experiments::NativeRuntimeSourceV6::Cpu => {
+                        ROVENT_CORPUS_INDEX_CPU_LOCK_V3_DOMAIN
+                    }
+                    rz_experiments::NativeRuntimeSourceV6::SystemCuda(_) => {
+                        ROVENT_CORPUS_INDEX_LOCK_V3_DOMAIN
+                    }
+                }
+                .into(),
                 manifest_sha256,
                 record_count: 0,
                 chunks: Vec::new(),

@@ -28,6 +28,11 @@ pub const ROVENT_COLLECTION_NATIVE_ORIGIN_LOCK_V3: &str =
     "rz-rovent-collection-native-origin-lock-v3/1";
 pub const ROVENT_COLLECTION_ROOT_ADMISSION_LOCK_V3: &str =
     "rz-rovent-collection-root-admission-lock-v3/1";
+/// CPU observations use distinct domains, without fabricating CUDA evidence.
+pub const ROVENT_COLLECTION_NATIVE_ORIGIN_CPU_LOCK_V3: &str =
+    "rz-rovent-collection-native-origin-cpu-lock-v3/1";
+pub const ROVENT_COLLECTION_ROOT_ADMISSION_CPU_LOCK_V3: &str =
+    "rz-rovent-collection-root-admission-cpu-lock-v3/1";
 
 fn reject(message: impl Into<String>) -> AdaptiveCollectionError {
     AdaptiveCollectionError::new(
@@ -476,32 +481,102 @@ impl RoventNativeCollectionOriginV3 {
             pc.validator.is_some(),
             "/3",
         )?;
-        let system = snapshot
-            .system_runtime
-            .as_ref()
-            .filter(|observation| observation.provider_ready)
-            .ok_or_else(|| reject("original /3 system CUDA provider is not Ready"))?;
-        let (representation_model, representation_encoding, representation_precision, frozen_epoch) =
-            namespace.representation_identity();
-        let representation_precision = match representation_precision {
-            rz_contracts::PrecisionProfile::Fp32 => "fp32",
-            _ => return Err(reject("unsupported /3 collection representation precision")),
+        use rz_experiments::{NativeRuntimeSourceV6, RoventBackend, RoventDevice};
+        let (origin_schema, cpu_roles, system) = match &lock.manifest.system_runtime_lock.runtime {
+            NativeRuntimeSourceV6::SystemCuda(_) => (
+                ROVENT_COLLECTION_NATIVE_ORIGIN_LOCK_V3,
+                None,
+                Some(
+                    snapshot
+                        .system_runtime
+                        .as_ref()
+                        .filter(|s| s.provider_ready)
+                        .ok_or_else(|| reject("original /3 system CUDA provider is not Ready"))?,
+                ),
+            ),
+            NativeRuntimeSourceV6::Cpu => {
+                if !matches!(pc.device, RoventDevice::Cpu)
+                    || !matches!(pc.backend, RoventBackend::OrtCpu)
+                    || pc.runtime_artifacts.len() != 1
+                    || snapshot.system_runtime.is_some()
+                    || snapshot.runtime_bundle.is_some()
+                    || snapshot.domain != crate::rovent_bootstrap::ROVENT_NATIVE_STARTUP_DOMAIN
+                {
+                    return Err(reject(
+                        "original /3 CPU runtime declaration differs from Ready",
+                    ));
+                }
+                let expected = rz_eval::asset::parse_sha256(&pc.runtime_artifacts[0].sha256)
+                    .map_err(|error| reject(error.to_string()))?;
+                if snapshot.runtime_library != Digest(expected) {
+                    return Err(reject("original /3 CPU runtime identity differs from pin"));
+                }
+                let cpu = snapshot
+                    .cpu_runtime
+                    .as_ref()
+                    .ok_or_else(|| reject("original /3 CPU session settings missing"))?;
+                let sessions = &cpu.session_settings;
+                let residency = &snapshot.session_residency;
+                if sessions.is_empty()
+                    || sessions.len() != residency.native_sessions
+                    || sessions.len() != residency.graphs.len()
+                    || sessions.iter().any(|session| {
+                        !matches!(session.provider(), rz_eval::onnx::Provider::Cpu)
+                            || session.cuda_provider_available().is_some()
+                            || residency
+                                .graphs
+                                .iter()
+                                .filter(|g| g.role == session.role())
+                                .count()
+                                != 1
+                            || sessions
+                                .iter()
+                                .filter(|s| s.role() == session.role())
+                                .count()
+                                != 1
+                    })
+                {
+                    return Err(reject("original /3 CPU model sessions do not match Ready"));
+                }
+                let mut roles: Vec<_> = sessions.iter().map(|s| s.role().to_owned()).collect();
+                roles.sort();
+                if !roles
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["public", "shared_pc", "validator"])
+                {
+                    return Err(reject("original /3 CPU collection role set differs"));
+                }
+                (
+                    ROVENT_COLLECTION_NATIVE_ORIGIN_CPU_LOCK_V3,
+                    Some(roles),
+                    None,
+                )
+            }
         };
-        let raw = json!({
-            "schema": ROVENT_COLLECTION_NATIVE_ORIGIN_LOCK_V3,
-            "input_lock_domain": rz_experiments::ROVENT_LOCK_V3_DOMAIN,
-            "input_lock_sha256": text_sha(snapshot.input_lock),
-            "declaration": {
-                "purpose": "collection",
-                "mode": mode_wire_v2(lock.manifest.engine.mode),
-                "source_commit": lock.manifest.engine.source_commit,
-                "source_components": lock.manifest.engine.source_components,
-                "model_semantics": pc.proposer.semantics,
-                "encoding": pc.proposer.encoding,
-                "validator_model": pc.validator,
-                "teacher_profiles": lock.manifest.engine.teachers,
-            },
-            "startup_observation": {
+        let startup_observation = if let Some(roles) = cpu_roles {
+            json!({
+                "domain": snapshot.domain,
+                "process_epoch": snapshot.process_epoch,
+                "mode": mode_wire_v2(snapshot.mode),
+                "topology": topology_wire_v2(snapshot.topology),
+                "weights_sha256": text_sha(snapshot.weights),
+                "export_manifest_sha256": text_sha(snapshot.export_manifest),
+                "backend_sha256": text_sha(snapshot.backend),
+                "runtime_library_sha256": text_sha(snapshot.runtime_library),
+                "provider": "cpu",
+                "provider_ready": true,
+                "cpu_session_roles": roles,
+                "native_configuration_sha256": text_sha(snapshot.native_configuration),
+                "startup_configuration_sha256": text_sha(snapshot.startup_configuration),
+                "search_configuration_sha256": text_sha(snapshot.search_configuration),
+                "validator_loaded": snapshot.validator_loaded,
+                "physical_workers_created": snapshot.physical_workers_created,
+                "neural_service_executed": snapshot.neural_service_executed,
+            })
+        } else {
+            let system = system.ok_or_else(|| reject("original /3 CUDA observation missing"))?;
+            json!({
                 "domain": snapshot.domain,
                 "process_epoch": snapshot.process_epoch,
                 "mode": mode_wire_v2(snapshot.mode),
@@ -520,7 +595,29 @@ impl RoventNativeCollectionOriginV3 {
                 "validator_loaded": snapshot.validator_loaded,
                 "physical_workers_created": snapshot.physical_workers_created,
                 "neural_service_executed": snapshot.neural_service_executed,
+            })
+        };
+        let (representation_model, representation_encoding, representation_precision, frozen_epoch) =
+            namespace.representation_identity();
+        let representation_precision = match representation_precision {
+            rz_contracts::PrecisionProfile::Fp32 => "fp32",
+            _ => return Err(reject("unsupported /3 collection representation precision")),
+        };
+        let raw = json!({
+            "schema": origin_schema,
+            "input_lock_domain": rz_experiments::ROVENT_LOCK_V3_DOMAIN,
+            "input_lock_sha256": text_sha(snapshot.input_lock),
+            "declaration": {
+                "purpose": "collection",
+                "mode": mode_wire_v2(lock.manifest.engine.mode),
+                "source_commit": lock.manifest.engine.source_commit,
+                "source_components": lock.manifest.engine.source_components,
+                "model_semantics": pc.proposer.semantics,
+                "encoding": pc.proposer.encoding,
+                "validator_model": pc.validator,
+                "teacher_profiles": lock.manifest.engine.teachers,
             },
+            "startup_observation": startup_observation,
             "registered_namespace": {
                 "value_semantics": namespace.value_identity().semantics,
                 "value_model": namespace.value_identity().model,
@@ -536,11 +633,8 @@ impl RoventNativeCollectionOriginV3 {
             "neural_completion": "unknown",
             "physical_completion": "unknown",
         });
-        let raw_sha256 = rz_experiments::pals_data_v3::generation_digest(
-            ROVENT_COLLECTION_NATIVE_ORIGIN_LOCK_V3,
-            &raw,
-        )
-        .map_err(|error| reject(error.to_string()))?;
+        let raw_sha256 = rz_experiments::pals_data_v3::generation_digest(origin_schema, &raw)
+            .map_err(|error| reject(error.to_string()))?;
         Ok(Self {
             original: Arc::new(LoadedOriginV3 {
                 sources,
@@ -1339,8 +1433,16 @@ impl RoventCollectionRootAdmissionV3 {
             .allocation_clock()
             .digest()
             .map_err(|error| reject(error.to_string()))?;
+        let root_schema = match &loaded.sources.lock().manifest.system_runtime_lock.runtime {
+            rz_experiments::NativeRuntimeSourceV6::Cpu => {
+                ROVENT_COLLECTION_ROOT_ADMISSION_CPU_LOCK_V3
+            }
+            rz_experiments::NativeRuntimeSourceV6::SystemCuda(_) => {
+                ROVENT_COLLECTION_ROOT_ADMISSION_LOCK_V3
+            }
+        };
         let raw = collection_root_observation!(
-            ROVENT_COLLECTION_ROOT_ADMISSION_LOCK_V3,
+            root_schema,
             original,
             registration,
             root_admission,
@@ -1350,11 +1452,8 @@ impl RoventCollectionRootAdmissionV3 {
             descriptor_digest,
             allocation_digest
         );
-        let raw_sha256 = rz_experiments::pals_data_v3::generation_digest(
-            ROVENT_COLLECTION_ROOT_ADMISSION_LOCK_V3,
-            &raw,
-        )
-        .map_err(|error| reject(error.to_string()))?;
+        let raw_sha256 = rz_experiments::pals_data_v3::generation_digest(root_schema, &raw)
+            .map_err(|error| reject(error.to_string()))?;
         if !accepts()? {
             return Err(reject("original /3 root revoked during attach").into());
         }

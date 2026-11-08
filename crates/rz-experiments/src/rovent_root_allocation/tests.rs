@@ -10,20 +10,20 @@ use rz_contracts::rovent::ROVENT_SEARCH_REVISION;
 use serde_json::{Value, json};
 use std::num::NonZeroU16;
 
-fn sha_value(byte: char) -> String {
+pub(crate) fn sha_value(byte: char) -> String {
     std::iter::repeat_n(byte, 64).collect()
 }
 
-fn digest_hex(digest: rz_contracts::Digest) -> String {
+pub(crate) fn digest_hex(digest: rz_contracts::Digest) -> String {
     digest.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn artifact(name: &str) -> Value {
+pub(crate) fn artifact(name: &str) -> Value {
     json!({"path":format!("fixture/{name}"),"sha256":sha_value('a'),"bytes":32,
         "source":"https://example.org/metadata-only-allocation-fixture","license":"fixture-only"})
 }
 
-fn fixture() -> (
+pub(crate) fn fixture() -> (
     RoventInputLock,
     RoventRootDescriptor,
     RoventRootAllocationInput,
