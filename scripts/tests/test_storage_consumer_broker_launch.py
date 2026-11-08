@@ -121,6 +121,17 @@ class ManagedBrokerLaunchTests(unittest.TestCase):
         self.assertTrue(self.launch.finish(tree_gone=True))
         self.assertTrue(self.launch.domain.closed)
 
+    def test_restricted_unknown_releases_domain_but_keeps_lease_active(self):
+        import time
+        self.launch.reader_scope_proven = True
+        self.exchange({"kind": "begin", "request_id": 1, "deadline": time.monotonic() + 10, "descriptor": None})
+        self.exchange({"kind": "commit", "request_id": 1, "inputs": ["/asset"], "future_inputs": []})
+        self.exchange({"kind": "begin", "request_id": 2, "deadline": time.monotonic() + 10, "descriptor": None})
+        self.assertTrue(self.launch.finish(tree_gone=False))
+        self.assertFalse(self.fake_group._completed)
+        self.assertTrue(self.launch.domain.closed)
+        self.assertEqual(self.launch.domain.leases[0].state, "active")
+
 
 if __name__ == "__main__":
     unittest.main()

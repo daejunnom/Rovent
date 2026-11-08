@@ -20,10 +20,13 @@ from storage_consumer_broker_transport import open_pair
 class ManagedBrokerLaunch:
     """Keep the original manager, process-group owner and pinned domain alive."""
 
-    def __init__(self, manager, catalogs):
+    def __init__(self, manager, catalogs, *, reader_scope_proven=False):
         if sys.platform != "linux" or not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
             raise StorageError("Linux original process supervision required")
         self.manager = manager
+        if type(reader_scope_proven) is not bool:
+            raise StorageError("explicit reader scope required")
+        self.reader_scope_proven = reader_scope_proven
         self._owner_pid, self._uid, self._gid = os.getpid(), os.getuid(), os.getgid()
         self.roots = _ordered_roots(manager, catalogs)
         self.domain = PinnedBrokerDomain(manager, self.roots)
@@ -134,12 +137,16 @@ class ManagedBrokerLaunch:
         if self._attempted and not self._not_dispatched and not tree_gone:
             if self.broker is not None:
                 self.broker.revoke()
-            return False
+                if self.reader_scope_proven:
+                    self.broker.abandon_unknown(reader_scope_proven=True)
+                else:
+                    return False
+            else:
+                return False
         if self.broker is not None:
             self.broker.revoke()
-            if self.broker.transaction_active and not tree_gone:
-                return False
-            self.broker.finish(child_never_dispatched=self._not_dispatched, tree_gone=tree_gone)
+            if tree_gone or self._not_dispatched:
+                self.broker.finish(child_never_dispatched=self._not_dispatched, tree_gone=tree_gone)
         if self._child_endpoint is not None:
             self._child_endpoint.close()
             self._child_endpoint = None

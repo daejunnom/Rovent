@@ -84,6 +84,15 @@ class ConsumerBrokerSupervisorTests(unittest.TestCase):
         self.broker.finish(child_never_dispatched=False, tree_gone=True)
         self.assertFalse(self.locked)
 
+    def test_restricted_unknown_abandon_preserves_lease_without_tree_claim(self):
+        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0, "descriptor": None})
+        self.request({"kind": "commit", "request_id": 1,
+                      "inputs": ["/asset"], "future_inputs": []})
+        self.request({"kind": "begin", "request_id": 2, "deadline": 20.0, "descriptor": None})
+        self.broker.abandon_unknown(reader_scope_proven=True)
+        self.assertFalse(self.locked)
+        self.assertEqual(self.leases[0].state, "active")
+
     def test_lost_commit_ack_keeps_published_lease(self):
         self.request({"kind": "begin", "request_id": 1, "deadline": 20.0, "descriptor": None})
         send_packet(self.child, {"kind": "commit", "request_id": 1,

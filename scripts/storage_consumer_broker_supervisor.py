@@ -114,3 +114,9 @@ class ConsumerBrokerSupervisor:
             self._state.release_after_drain(tree_gone=tree_gone)
         else:
             self._state.finish(child_never_dispatched=child_never_dispatched, tree_gone=tree_gone)
+
+    def abandon_unknown(self, *, reader_scope_proven):
+        """Revoke and preserve rows; original group completion is unknown."""
+        self.revoke()
+        self._state.abandon_unknown(admission_revoked=self._revoked,
+                                    reader_scope_proven=reader_scope_proven)

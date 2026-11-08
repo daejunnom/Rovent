@@ -276,6 +276,25 @@ class ConsumerBrokerState:
         self._assert_supervisor()
         self._release_transaction()
 
+    def abandon_unknown(self, *, admission_revoked, reader_scope_proven):
+        """Release guards but preserve every lease when group end is unknown.
+
+        This is restricted to a separately verified reader profile: no derived
+        file content may be used before its COMMIT ACK, and a descriptor-free
+        request performs registration only. It covers bound, cooperating
+        cleaners only. It is not evidence of tree or physical completion.
+        """
+        if (os.getpid() != self._pid or threading.get_ident() != self._thread
+                or self._finalized or self._lock_release_unknown or not self._hold_on_failure
+                or admission_revoked is not True or reader_scope_proven is not True):
+            raise BrokerStateError("original revoked restricted reader owner required")
+        self._assert_supervisor()
+        if self._descriptor_pin is not None:
+            self._descriptor_pin.verify()
+        # No active or potentially published row is closed or transitioned.
+        self._release_transaction()
+        self._finalized = True
+
     def finish(self, *, child_never_dispatched, tree_gone):
         """Release guards; close only proven unstarted leases, else preserve.
 
