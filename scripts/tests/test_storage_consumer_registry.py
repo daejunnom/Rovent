@@ -163,12 +163,117 @@ class ConsumerRegistryTests(unittest.TestCase):
             self.assertTrue(guard.conflicts([self.b])["conflicts"])
             self.assertTrue(guard.conflicts([self.b], seconds=1e-12)["unknown"])
 
+    def test_moved_and_replaced_directory_protects_its_actual_child(self):
+        nested = self.a / "nested"
+        nested.mkdir()
+        (nested / "data").write_bytes(b"input")
+        unrelated = self.root / "unrelated"
+        unrelated.write_bytes(b"other")
+        self.registry.register([self.a])
+        with self.registry.guard() as guard:
+            self.assertEqual(guard.conflicts([unrelated])["unknown"], [])
+        moved = self.b / "moved"
+        self.a.rename(moved)
+        self.a.mkdir()  # Same path, a different directory identity.
+        with self.registry.guard() as guard:
+            child = guard.conflicts([moved / "nested" / "data"], seconds=10)
+            self.assertTrue(child["conflicts"])
+            self.assertEqual(child["unknown"], [])
+            unresolved = guard.conflicts([unrelated], seconds=10)
+            self.assertFalse(unresolved["conflicts"])
+            self.assertTrue(any(item.get("target") == str(unrelated) for item in unresolved["unknown"]))
+
+    def test_moved_child_is_unknown_when_registered_directory_was_replaced(self):
+        original = self.a / "input"
+        original.write_bytes(b"input")
+        elsewhere = self.b / "detached-input"
+        self.registry.register([self.a])
+        original.rename(elsewhere)
+        self.a.rename(self.b / "old-directory")
+        self.a.mkdir()
+        with self.registry.guard() as guard:
+            result = guard.conflicts([elsewhere], seconds=10)
+        self.assertFalse(result["conflicts"])
+        self.assertTrue(any(item.get("target") == str(elsewhere) for item in result["unknown"]))
+
+    def test_failed_ancestor_observation_preserves_only_examined_target(self):
+        self.registry.register([self.a])
+        target = self.b / "target"
+        target.write_bytes(b"target")
+        with self.registry.guard() as guard, \
+             patch("storage_consumer_registry._ancestor_directories", side_effect=StorageError("unavailable")):
+            result = guard.conflicts([target], seconds=10)
+        self.assertFalse(result["conflicts"])
+        self.assertTrue(any(item.get("target") == str(target) for item in result["unknown"]))
+
     def test_unknown_record_and_identity_mismatch_fail_closed(self):
         (self.registry.root / "bad.json").write_text("{}")
         with self.registry.guard() as guard:
             self.assertTrue(guard.conflicts([self.a])["unknown"])
         with self.assertRaises(StorageError):
             ConsumerRegistry(self.registry.root, registry_id="0" * 32)
+
+    def test_registry_scan_pages_past_old_entry_limit_and_protects_only_overlap(self):
+        # Lower the former threshold rather than creating thousands of files.
+        # Each actual row and registry lock still uses the normal code path.
+        self.registry.register([self.a])
+        for _ in range(4):
+            self.registry.register([self.b])
+        unrelated = self.root / "unrelated"
+        unrelated.mkdir()
+        with patch("storage_consumer_registry._LIMIT", 2), \
+             patch("storage_consumer_registry._REGISTRY_PAGE_SIZE", 2), \
+             self.registry.guard() as guard:
+            clear = guard.conflicts([unrelated], seconds=10)
+            self.assertEqual(clear["conflicts"], [])
+            self.assertEqual(clear["unknown"], [])
+            blocked = guard.conflicts([self.a], seconds=10)
+            self.assertEqual(len(blocked["conflicts"]), 1)
+            self.assertEqual(blocked["unknown"], [])
+
+    def test_registry_scan_detects_directory_change_during_page_read(self):
+        import storage_consumer_registry as module
+        self.registry.register([self.a])
+        original_read = module.read_record_snapshot
+        changed = []
+
+        def change_directory(path, **kwargs):
+            result = original_read(path, **kwargs)
+            if path.name.startswith("consumer-") and not changed:
+                (self.registry.root / "unexpected").write_text("x")
+                changed.append(True)
+            return result
+
+        # Simulate a filesystem whose directory timestamp does not change;
+        # the names-only verification must still detect the new entry.
+        stable_directory_stamp = object()
+        with self.registry.guard() as guard, \
+             patch.object(module, "read_record_snapshot", change_directory), \
+             patch.object(module, "_registry_directory_stamp", return_value=stable_directory_stamp):
+            observed = guard.conflicts([self.b], seconds=10)
+        self.assertTrue(changed)
+        self.assertEqual(observed["conflicts"], [])
+        self.assertEqual([item["reason"] for item in observed["unknown"]],
+                         ["registry_directory_changed_during_scan"])
+
+    def test_registry_scan_deadline_keeps_incomplete_result_unknown(self):
+        import storage_consumer_registry as module
+        self.registry.register([self.a])
+        with self.registry.guard() as guard, \
+             patch.object(module, "_REGISTRY_PAGE_SIZE", 1), \
+             patch.object(module.time, "monotonic", side_effect=[0.0, 0.0, 2.0]):
+            result = guard.conflicts([self.b], seconds=1)
+        self.assertTrue(any(item["reason"] == "registry_scan_time_budget_exceeded"
+                            for item in result["unknown"]))
+
+    def test_registry_scan_caps_diagnostics_without_hiding_conflicts(self):
+        for _ in range(3):
+            self.registry.register([self.a])
+        with patch("storage_consumer_registry._LIMIT", 2), self.registry.guard() as guard:
+            result = guard.conflicts([self.a], seconds=10)
+        self.assertEqual(len(result["conflicts"]), 2)
+        self.assertTrue(any(item["reason"] == "registry_scan_result_limit"
+                            for item in result["unknown"]))
 
     def test_supervisor_lease_coverage_checks_owner_and_input(self):
         lease = self.registry.register([self.a])

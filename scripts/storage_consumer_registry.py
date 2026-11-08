@@ -3,9 +3,20 @@
 An empty registry only speaks for participants in this registry. It is never
 evidence that legacy or unregistered consumers do not exist. Registration
 and retirement must use the same pinned registry identity and OS lock.
+
+A directory input identifies the registered directory and its subtree at
+inspection time; it does not track former descendants moved outside that
+subtree. Register individual files before use when their identity must remain
+protected after a move. If the registered directory identity changes, a
+same-device cleanup candidate whose alias status cannot be established is
+retained as unknown. Recovery requires restoring the original identity or
+the original consumer's supported lease completion or recovery procedure;
+age, a pathname, or process exit alone does not establish physical completion.
 """
 from __future__ import annotations
 
+import hashlib
+from itertools import islice
 import os
 from pathlib import Path
 import re
@@ -20,10 +31,32 @@ REGISTRY_SCHEMA = "rovezero.consumer-registry.v1"
 LEASE_SCHEMA = "rovezero.consumer-input-lease.v1"
 _ID = re.compile(r"[0-9a-f]{32}\Z")
 _LIMIT = 4096
+_REGISTRY_PAGE_SIZE = 128
 BINDING_NAME = "consumer-registry.binding"
 BINDING_SCHEMA = "rovezero.catalog-consumer-binding.v1"
 REQUIRED_MARKER_NAME = "consumer-registry.required"
 REQUIRED_MARKER_SCHEMA = "rovezero.catalog-consumer-required.v1"
+
+
+class _BoundedScanResults(list):
+    """Bound diagnostic storage without treating omitted conflicts as safe."""
+
+    def __init__(self):
+        super().__init__()
+        self.overflow = False
+
+    def append(self, value):
+        if len(self) < _LIMIT:
+            super().append(value)
+        else:
+            self.overflow = True
+
+
+def _registry_directory_stamp(root):
+    info = root.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode):
+        raise StorageError("registry directory unavailable")
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_mtime_ns, info.st_ctime_ns)
 
 
 def _absolute(value):
@@ -65,6 +98,19 @@ def _hardlinked_inodes(root, deadline):
                 elif stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
                     result.add((info.st_dev, info.st_ino))
     return result, directories
+
+
+def _ancestor_directories(target, deadline):
+    """Observe target ancestors for a moved registered directory identity."""
+    identities = set()
+    for parent in target.parents:
+        if time.monotonic() >= deadline:
+            raise StorageError("cleanup ancestor scan time budget exceeded")
+        info = parent.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            raise StorageError("cleanup ancestor is not a directory")
+        identities.add((info.st_dev, info.st_ino))
+    return identities
 
 
 def _catalog_guard(root, guard):
@@ -380,6 +426,58 @@ class _RegistryGuard:
     def register(self, inputs, *, owner_id=None, future_inputs=()):
         return self.registry.register(inputs, owner_id=owner_id, future_inputs=future_inputs, _guard=self)
 
+    def _registry_pages(self, deadline, unknown):
+        """Scan bounded pages under the original registry lock and identity.
+
+        Cooperating writers cannot alter rows while the guard is held. A
+        directory change during the scan makes the result incomplete. A
+        second names-only pass detects membership changes even on filesystems
+        with coarse directory timestamps; row contents are read only once.
+        This is not isolation from nonparticipating writers or a filesystem
+        snapshot.
+        """
+        root = self.registry.root
+        try:
+            before = _registry_directory_stamp(root)
+            def add_name(fingerprint, name):
+                count, xor, total = fingerprint
+                digest = int.from_bytes(hashlib.sha256(os.fsencode(name)).digest(), "big")
+                return count + 1, xor ^ digest, (total + digest) % (1 << 256)
+            first = (0, 0, 0)
+            with os.scandir(root) as entries:
+                while True:
+                    if time.monotonic() >= deadline:
+                        unknown.append({"reason": "registry_scan_time_budget_exceeded"})
+                        return
+                    page = list(islice(entries, _REGISTRY_PAGE_SIZE))
+                    if not page:
+                        break
+                    self.check()
+                    for entry in page:
+                        first = add_name(first, entry.name)
+                        yield root / entry.name
+            self.check()
+            if before != _registry_directory_stamp(root):
+                unknown.append({"reason": "registry_directory_changed_during_scan"})
+                return
+            second = (0, 0, 0)
+            with os.scandir(root) as entries:
+                while True:
+                    if time.monotonic() >= deadline:
+                        unknown.append({"reason": "registry_scan_time_budget_exceeded"})
+                        return
+                    page = list(islice(entries, _REGISTRY_PAGE_SIZE))
+                    if not page:
+                        break
+                    self.check()
+                    for entry in page:
+                        second = add_name(second, entry.name)
+            self.check()
+            if first != second or before != _registry_directory_stamp(root):
+                unknown.append({"reason": "registry_directory_changed_during_scan"})
+        except (OSError, StorageError):
+            unknown.append({"reason": "registry_scan_incomplete"})
+
     def conflicts(self, targets, *, seconds=1.0):
         self.check()
         if not isinstance(targets, (list, tuple)) or not 1 <= len(targets) <= _LIMIT:
@@ -388,12 +486,10 @@ class _RegistryGuard:
             raise StorageError("bounded alias scan time required")
         deadline = time.monotonic() + seconds
         candidates = [_absolute(item) for item in targets]
-        entries = list(self.registry.root.iterdir())
-        if len(entries) > _LIMIT + 3:
-            return {"conflicts": [], "unknown": [{"reason": "registry_entry_limit"}],
-                    "coverage": "registered_only"}
-        matches, unknown, directory_aliases = [], [], {}
-        for path in entries:
+        matches, unknown, directory_aliases = _BoundedScanResults(), _BoundedScanResults(), {}
+        target_ancestors = {}
+        comparisons = 0
+        for path in self._registry_pages(deadline, unknown):
             if path.name in ("registry.json", "registry.lock", "registry-history.json"):
                 continue
             if not path.name.startswith("consumer-") or not path.name.endswith(".json"):
@@ -431,7 +527,24 @@ class _RegistryGuard:
                             value = {"path": value["path"],
                                      "kind": "file" if stat.S_ISREG(created.st_mode) else "directory",
                                      "device": created.st_dev, "inode": created.st_ino}
+                    directory_identity_changed = False
+                    if value["kind"] == "directory":
+                        try:
+                            source_info = source.stat(follow_symlinks=False)
+                            directory_identity_changed = (
+                                not stat.S_ISDIR(source_info.st_mode)
+                                or (source_info.st_dev, source_info.st_ino)
+                                != (value["device"], value["inode"])
+                            )
+                        except OSError:
+                            directory_identity_changed = True
                     for target in candidates:
+                        comparisons += 1
+                        if comparisons % _REGISTRY_PAGE_SIZE == 0 and time.monotonic() >= deadline:
+                            self.check()
+                            return {"conflicts": list(matches),
+                                    "unknown": [*unknown, {"reason": "registry_scan_time_budget_exceeded"}],
+                                    "coverage": "registered_only"}
                         path_overlap = source == target or source.is_relative_to(target) or target.is_relative_to(source)
                         if path_overlap:
                             matches.append({"record": str(path), "input": str(source),
@@ -448,9 +561,48 @@ class _RegistryGuard:
                         same_identity = ((value["kind"] == "file" and stat.S_ISREG(info.st_mode)
                                           or value["kind"] == "directory" and stat.S_ISDIR(info.st_mode))
                                          and (value["device"], value["inode"]) == (info.st_dev, info.st_ino))
+                        if value["kind"] == "directory" and not same_identity:
+                            try:
+                                if target not in target_ancestors:
+                                    target_ancestors[target] = _ancestor_directories(target, deadline)
+                                if (value["device"], value["inode"]) in target_ancestors[target]:
+                                    matches.append({"record": str(path), "input": str(source),
+                                                    "target": str(target), "state": row["state"]})
+                                    continue
+                            except (OSError, StorageError):
+                                unknown.append({"reason": "directory_ancestor_scan_incomplete", "target": str(target)})
+                                continue
                         if same_identity:
                             matches.append({"record": str(path), "input": str(source),
                                             "target": str(target), "state": row["state"]})
+                        elif value["kind"] == "directory" and info.st_dev == value["device"]:
+                            if directory_identity_changed and not stat.S_ISDIR(info.st_mode):
+                                # An unrecorded child may have moved separately.
+                                # Limit uncertainty to this same-device target.
+                                unknown.append({"reason": "registered_directory_identity_changed_alias_unknown",
+                                                "target": str(target)})
+                                continue
+                            if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+                                unknown.append({"reason": "directory_hardlink_alias_unknown", "target": str(target)})
+                                continue
+                            if stat.S_ISDIR(info.st_mode):
+                                try:
+                                    if target not in directory_aliases:
+                                        if time.monotonic() >= deadline:
+                                            raise StorageError("cleanup alias scan time budget exceeded")
+                                        directory_aliases[target] = _hardlinked_inodes(target, deadline)
+                                    aliases, directories = directory_aliases[target]
+                                except (OSError, StorageError):
+                                    unknown.append({"reason": "directory_alias_scan_incomplete", "target": str(target)})
+                                    continue
+                                if (value["device"], value["inode"]) in directories:
+                                    matches.append({"record": str(path), "input": str(source),
+                                                    "target": str(target), "state": row["state"]})
+                                elif directory_identity_changed:
+                                    unknown.append({"reason": "registered_directory_identity_changed_alias_unknown",
+                                                    "target": str(target)})
+                                elif aliases:
+                                    unknown.append({"reason": "directory_contents_alias_unknown", "target": str(target)})
                         elif value["kind"] == "directory" and stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
                             # A registered directory may contain another name
                             # for this inode; discovering that would require an
@@ -477,7 +629,11 @@ class _RegistryGuard:
             except (OSError, StorageError, ValueError):
                 unknown.append({"reason": "invalid_or_unreadable_consumer", "record": str(path)})
         self.check()
-        return {"conflicts": matches, "unknown": unknown, "coverage": "registered_only"}
+        if matches.overflow or unknown.overflow:
+            return {"conflicts": list(matches),
+                    "unknown": [*unknown, {"reason": "registry_scan_result_limit"}],
+                    "coverage": "registered_only"}
+        return {"conflicts": list(matches), "unknown": list(unknown), "coverage": "registered_only"}
 
 
 class ConsumerLease:
