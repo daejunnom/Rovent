@@ -8,6 +8,7 @@ after the finite run/cleanup window; the quarantine is reported separately.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import errno
 import json
 import os
@@ -122,7 +123,7 @@ def _pre_native_evidence(value, pid, epoch, lock_sha256):
     return None
 
 
-def run(args, *, containment=None, started=None, outcome=None):
+def run(args, *, containment=None, started=None, outcome=None, input_registration=None, interruption=None):
     started = time.monotonic() if started is None else started
     run_until = started + args.seconds
     cleanup_until = run_until + args.cleanup_seconds
@@ -178,6 +179,11 @@ def run(args, *, containment=None, started=None, outcome=None):
     def request_cancel(_signum, _frame):
         nonlocal cancelled
         cancelled = True
+        if interruption is not None and interruption.get("signal") is None:
+            interruption["signal"] = _signum
+
+    def stop_requested():
+        return cancelled or (interruption is not None and interruption.get("signal") is not None)
 
     def add_input(value):
         input_buffer.extend(value)
@@ -271,12 +277,20 @@ def run(args, *, containment=None, started=None, outcome=None):
             env["RZ_V3_SYSTEM_NUMERIC_CAPTURE"] = "1"
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[sig] = signal.signal(sig, request_cancel)
-        if cancelled or time.monotonic() >= run_until:
+        if stop_requested() or time.monotonic() >= run_until:
             raise InterruptedError("cancelled or deadline elapsed before child spawn")
         native_argv = [str(args.binary), *raw_arguments]
         barrier_read = barrier_write = None
         try:
+            # Popen may fail after creating a child. Preserve the original
+            # input leases unless a separate physical completion is proven.
             if containment is None:
+                if stop_requested():
+                    raise InterruptedError("cancelled before child spawn")
+                if input_registration is not None:
+                    input_registration.dispatched = True
+                if outcome is not None:
+                    outcome["spawned"] = None
                 process = subprocess.Popen(
                     native_argv, executable=f"/proc/self/fd/{binary_fd}",
                     pass_fds=(binary_fd,), cwd=args.cwd, env=env, start_new_session=True,
@@ -286,6 +300,12 @@ def run(args, *, containment=None, started=None, outcome=None):
             else:
                 from rovent_cgroup_owner import entry_command
                 barrier_read, barrier_write = os.pipe2(os.O_CLOEXEC)
+                if stop_requested():
+                    raise InterruptedError("cancelled before child spawn")
+                if input_registration is not None:
+                    input_registration.dispatched = True
+                if outcome is not None:
+                    outcome["spawned"] = None
                 process = subprocess.Popen(
                     entry_command(binary_fd, barrier_read, native_argv),
                     pass_fds=(binary_fd, barrier_read), cwd=args.cwd, env=env, start_new_session=True,
@@ -294,7 +314,7 @@ def run(args, *, containment=None, started=None, outcome=None):
                     outcome["spawned"] = True
                 os.close(barrier_read)
                 barrier_read = None
-                if cancelled or time.monotonic() >= run_until:
+                if stop_requested() or time.monotonic() >= run_until:
                     os.close(barrier_write)
                     barrier_write = None
                     barrier_not_released = True
@@ -320,7 +340,7 @@ def run(args, *, containment=None, started=None, outcome=None):
                 except OSError:
                     pass
             if (pending_route is not None and image_verified and channel is None
-                    and not cancelled and error is None and now < run_until):
+                    and not stop_requested() and error is None and now < run_until):
                 channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 channel.setblocking(False)
                 status = channel.connect_ex(pending_route)
@@ -332,12 +352,12 @@ def run(args, *, containment=None, started=None, outcome=None):
             if authenticated and image_verified and state == "waiting_for_notice" and now < run_until:
                 state = "uci"
                 add_input(b"uci\n")
-            if (cancelled or error is not None or now >= run_until) and not quit_queued:
-                error = error or ("cancelled" if cancelled else "run_deadline_elapsed")
+            if (stop_requested() or error is not None or now >= run_until) and not quit_queued:
+                error = error or ("cancelled" if stop_requested() else "run_deadline_elapsed")
                 queue_quit()
             if now >= cleanup_until:
                 error = error or "cleanup_deadline_elapsed"
-            if (cancelled or error is not None or now >= run_until) and auth_phase in ("connecting", "write", "read"):
+            if (stop_requested() or error is not None or now >= run_until) and auth_phase in ("connecting", "write", "read"):
                 # Already-written admission bytes can have authorized native
                 # entry. Keep that same stream and owner, but never send more.
                 try:
@@ -411,7 +431,7 @@ def run(args, *, containment=None, started=None, outcome=None):
                          "reason": error or ("child_quarantine" if quarantine_notice else "cleanup_deadline_elapsed")})
             for key, _ in selector.select(0.05):
                 if key.data == "auth":
-                    if cancelled or error is not None or time.monotonic() >= run_until:
+                    if stop_requested() or error is not None or time.monotonic() >= run_until:
                         continue
                     try:
                         if auth_phase == "connecting":
@@ -427,7 +447,7 @@ def run(args, *, containment=None, started=None, outcome=None):
                                 "lock_sha256": args.lock_sha256, "cuda_ordinal": args.cuda_ordinal},
                                 separators=(",", ":")).encode("utf-8") + b"\n")
                             auth_phase = "write"
-                        if auth_phase == "write" and not cancelled and time.monotonic() < run_until:
+                        if auth_phase == "write" and not stop_requested() and time.monotonic() < run_until:
                             count = channel.send(auth_out)
                             if count == 0:
                                 raise PreflightError("parent_write_zero")
@@ -676,7 +696,132 @@ def _scope_observation(owner, stage):
     return value
 
 
-def run_managed(plan_path):
+def _registered_read(consumer, reader):
+    """Read a protected descriptor and publish discovered paths atomically."""
+    if consumer.registry is None:
+        return reader()[0]
+    with ExitStack() as stack:
+        guard = consumer._locked(stack)
+        value, inputs, future = reader()
+        inputs = list(dict.fromkeys(Path(path) for path in inputs))
+        future = [path for path in dict.fromkeys(Path(path) for path in future)
+                  if path not in inputs]
+        if inputs or future:
+            consumer.leases.append(guard.register(inputs, future_inputs=future))
+        return value
+
+
+def _registered_system_libraries(runtime, *, path_fields=("path",)):
+    """Describe actual system-library targets, without opening their contents."""
+    if not isinstance(runtime, dict) or not isinstance(runtime.get("libraries"), list):
+        raise ValueError("explicit system-runtime library declarations required")
+    entries = runtime["libraries"]
+    if not 1 <= len(entries) <= 64:
+        raise ValueError("bounded system-runtime library declarations required")
+    existing, future = [], []
+    for item in entries:
+        if not isinstance(item, dict):
+            raise ValueError("absolute system-library path required")
+        for field in path_fields:
+            if not isinstance(item.get(field), str):
+                raise ValueError("absolute system-library path required")
+            original = Path(item[field])
+            if not original.is_absolute() or ".." in original.parts or any(_secret_name(part) for part in original.parts):
+                raise ValueError("non-secret absolute system-library path required")
+            # SystemRuntime resolves normal SONAME symlinks before opening.
+            # Protect both the currently resolved request and the registered
+            # canonical target when a lock supplies both identities.
+            target = Path(os.path.realpath(original))
+            (existing if target.exists() else future).append(target)
+    return existing, future
+
+
+def _consumer_plan(plan_path, consumer):
+    from rovent_v3_input_snapshot import unique_json
+
+    def read_plan():
+        plan = unique_json(_managed_control(plan_path))
+        if not isinstance(plan, dict) or plan.get("schema") != "rz-rovent-v3-managed-parent-plan/1":
+            raise ValueError("explicit managed V3 plan required")
+        paths = [plan["checkout_root"], plan["asset_root"], plan["request"]["path"],
+                 plan["native_binary"]["path"], plan["registration_binary"]["path"]]
+        return plan, paths, [plan["output"]]
+
+    plan = _registered_read(consumer, read_plan)
+
+    def read_request():
+        import hashlib
+        pin = plan["request"]
+        raw = _managed_control(Path(pin["path"]))
+        if len(raw) != pin["bytes"] or hashlib.sha256(raw).hexdigest() != pin["sha256"]:
+            raise ValueError("request source bytes differ")
+        document = unique_json(raw)
+        if not isinstance(document, dict):
+            raise ValueError("request document must be an object")
+        request = document.get("request") if document.get("status") == "draft_incomplete_do_not_execute" else document
+        if not isinstance(request, dict):
+            raise ValueError("request declaration is unavailable")
+        inputs, future = _registered_system_libraries(request.get("system_runtime"))
+        return raw, inputs, future
+
+    return plan, _registered_read(consumer, read_request)
+
+
+def _finish_consumer_observation(consumer, *, original_scope_closed):
+    if not consumer.dispatched:
+        consumer.close_if_not_dispatched()
+    elif original_scope_closed:
+        # This only changes owner state; it deliberately keeps every input
+        # protected because process/cgroup exit is not a GPU fence.
+        for lease in reversed(consumer.leases):
+            lease.retain_unknown(tree_gone=True)
+
+
+def run_managed(plan_path, *, consumer_args=None):
+    """Run one V3 owner, optionally registering its actual input scope."""
+    from managed_process import supervisor_signal_scope
+
+    with supervisor_signal_scope() as interruption:
+        return _run_managed_registered(plan_path, consumer_args=consumer_args, interruption=interruption)
+
+
+def _check_pre_dispatch_interruption(interruption):
+    if interruption is not None and interruption.get("signal") is not None:
+        raise InterruptedError("cancelled before child dispatch")
+
+
+def _run_managed_registered(plan_path, *, consumer_args, interruption):
+    from virtual_system_numeric_prepare import NumericInputRegistration
+
+    started = time.monotonic()
+    if consumer_args is None:
+        consumer_args = argparse.Namespace(consumer_registry_root=None, consumer_registry_id=None,
+                                           consumer_registry_required=False, consumer_input_catalog=[])
+    consumer = NumericInputRegistration(consumer_args, [Path(plan_path)])
+    try:
+        _check_pre_dispatch_interruption(interruption)
+        prepared = _consumer_plan(plan_path, consumer) if consumer.registry is not None else None
+        _check_pre_dispatch_interruption(interruption)
+        result = _run_managed(plan_path, consumer=consumer, prepared=prepared, started=started,
+                              interruption=interruption)
+    except BaseException as error:
+        if not consumer.dispatched:
+            try:
+                consumer.close_if_not_dispatched()
+            except BaseException as close_error:
+                error.add_note("consumer input close also failed: " + str(close_error))
+        raise
+    try:
+        _finish_consumer_observation(consumer, original_scope_closed=True)
+    except Exception as error:
+        # The original execution result remains authoritative; the prior
+        # active registration still protects inputs if this observation fails.
+        _report({"schema": REPORT_SCHEMA, "status": "consumer_observation_unavailable",
+                 "error_type": type(error).__name__, "physical_completion": "unknown"})
+    return result
+
+
+def _run_managed(plan_path, *, consumer, prepared, started, interruption=None):
     """Own the fresh output, snapshots, registration and V3 child together.
 
     This entry is opt-in. It never accepts a draft request as executable and
@@ -688,8 +833,7 @@ def run_managed(plan_path):
     from rovent_v3_input_snapshot import copy_pin, open_directory, protect_output, relative, unique_json
     from rovent_cgroup_owner import CgroupOwner, CgroupSetupError, entry_command
 
-    started = time.monotonic()
-    plan = unique_json(_managed_control(plan_path))
+    plan = prepared[0] if prepared is not None else unique_json(_managed_control(plan_path))
     if not isinstance(plan, dict) or plan.get("schema") != "rz-rovent-v3-managed-parent-plan/1":
         raise ValueError("explicit managed V3 plan required")
     seconds, cleanup_seconds = plan["seconds"], plan["cleanup_seconds"]
@@ -711,7 +855,7 @@ def run_managed(plan_path):
         raise ValueError("absolute managed roots required")
     request_pin, native_pin, registration_pin = (plan[key] for key in ("request", "native_binary", "registration_binary"))
     request_source = Path(request_pin["path"])
-    request_bytes = _managed_control(request_source)
+    request_bytes = prepared[1] if prepared is not None else _managed_control(request_source)
     if (len(request_bytes) != request_pin["bytes"]
             or hashlib.sha256(request_bytes).hexdigest() != request_pin["sha256"]):
         raise ValueError("request source bytes differ")
@@ -781,11 +925,16 @@ def run_managed(plan_path):
 
     def request_cancel(_signum, _frame):
         cancel_requested[0] = True
+        if interruption is not None and interruption.get("signal") is None:
+            interruption["signal"] = _signum
+
+    def stop_requested():
+        return cancel_requested[0] or (interruption is not None and interruption.get("signal") is not None)
 
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[sig] = signal.signal(sig, request_cancel)
-        if cancel_requested[0] or time.monotonic() >= run_until:
+        if stop_requested() or time.monotonic() >= run_until:
             raise InterruptedError("managed run cancelled before owner setup")
         # Scope and output remain held by this exact manager process.
         try:
@@ -816,7 +965,8 @@ def run_managed(plan_path):
         _report(_scope_observation(owner, "before_snapshots"))
         parent_fd = open_directory(output.parent)
         try:
-            lease = OutputLease(output, checkout, reserve=reserve, retention_days=14)
+            lease = OutputLease(output, checkout, reserve=reserve, retention_days=14,
+                                dependency_registry=consumer.registry)
             try:
                 lease.acquire()
                 acquired = True
@@ -849,19 +999,20 @@ def run_managed(plan_path):
         asset_fd = open_directory(asset_root)
         try:
             for path, (size, sha256) in unique.items():
-                if cancel_requested[0]:
+                if stop_requested():
                     raise InterruptedError("managed snapshot cancelled")
-                copy_pin(asset_fd, output, {"path": path, "bytes": size, "sha256": sha256}, run_until, progress)
+                copy_pin(asset_fd, output, {"path": path, "bytes": size, "sha256": sha256},
+                         run_until, progress, stop_requested=stop_requested)
         finally:
             os.close(asset_fd)
         for pin, source in ((native_pin, binary_path), (registration_pin, registration_path)):
-            if cancel_requested[0]:
+            if stop_requested():
                 raise InterruptedError("managed snapshot cancelled")
             source_fd = open_directory(source.parent)
             try:
                 copy_pin(source_fd, output / "inputs" / "bin",
                          {"path": source.name, "bytes": pin["bytes"], "sha256": pin["sha256"]},
-                         run_until, progress)
+                         run_until, progress, stop_requested=stop_requested)
             finally:
                 os.close(source_fd)
             executable_fd = os.open(output / "inputs" / "bin" / source.name, os.O_RDONLY | os.O_NOFOLLOW)
@@ -893,7 +1044,7 @@ def run_managed(plan_path):
         lease.check_budget()
         lease.suspend_live()
         suspended = True
-        if cancel_requested[0] or time.monotonic() >= run_until:
+        if stop_requested() or time.monotonic() >= run_until:
             raise TimeoutError("managed window expired before registration")
 
         registration_image = output / "inputs" / "bin" / registration_path.name
@@ -909,18 +1060,19 @@ def run_managed(plan_path):
                 original_child_unsettled = True
                 os.close(barrier_read)
                 barrier_read = None
-                if cancel_requested[0] or time.monotonic() >= run_until:
+                if stop_requested() or time.monotonic() >= run_until:
                     os.close(barrier_write)
                     barrier_write = None
                     raise InterruptedError("registration cancelled before barrier release")
                 release_fd, barrier_write = barrier_write, None
                 owner.admit_waiting_child(group._child.pid, release_fd)
             def registration_tick():
-                if cancel_requested[0]:
+                if stop_requested():
                     raise InterruptedError("registration cancelled")
                 if os.fstat(registration_stdout).st_size > 1024 * 1024:
                     raise RuntimeError("registration stdout exceeds bound")
             original_child_unsettled = True
+            consumer.dispatched = True
             try:
                 code, gone, failure = run_group(
                     argv, output, {"PATH": "/usr/bin:/bin", "LANG": "C"},
@@ -931,6 +1083,7 @@ def run_managed(plan_path):
                     on_tick=registration_tick)
             except ProcessNotSpawned:
                 original_child_unsettled = False
+                consumer.dispatched = False
                 raise
             if not gone or not owner.workload_empty():
                 raise RuntimeError("original registration process scope remains unknown")
@@ -971,10 +1124,13 @@ def run_managed(plan_path):
                                    seconds=seconds, cleanup_seconds=cleanup_seconds,
                                    numeric_observation=plan.get("numeric_observation") is True,
                                    go_nodes=plan["go_nodes"], native_args=arguments)
+        if stop_requested():
+            raise InterruptedError("managed run cancelled before native dispatch")
         original_child_unsettled = True
         native_attempted = True
         native_outcome["spawned"] = False
-        result = run(smoke, containment=owner, started=started, outcome=native_outcome)
+        result = run(smoke, containment=owner, started=started, outcome=native_outcome,
+                     input_registration=consumer, interruption=interruption)
         original_child_unsettled = not ((native_outcome.get("session_reported") is True
                                          or native_outcome.get("before_native") is True)
                                         and native_outcome.get("group_gone") is True
@@ -1114,10 +1270,76 @@ def run_managed(plan_path):
             signal.signal(sig, handler)
 
 
+def _run_direct_registered(args):
+    """Protect direct launch inputs before opening the lock or executable."""
+    from managed_process import supervisor_signal_scope
+
+    with supervisor_signal_scope() as interruption:
+        return _run_direct_registered_scoped(args, interruption)
+
+
+def _run_direct_registered_scoped(args, interruption):
+    from rovent_v3_input_snapshot import relative, unique_json
+    from virtual_system_numeric_prepare import NumericInputRegistration
+
+    started = time.monotonic()
+    inputs = list(dict.fromkeys((args.binary, args.cwd, args.output_dir)))
+    consumer = NumericInputRegistration(args, inputs)
+    if consumer.registry is None:
+        # Preserve the original non-participating direct path and its clock.
+        _check_pre_dispatch_interruption(interruption)
+        return run(args, interruption=interruption)
+    outcome = {}
+    try:
+        _check_pre_dispatch_interruption(interruption)
+        if consumer.registry is not None:
+            arguments = args.native_args[1:] if args.native_args[:1] == ["--"] else args.native_args
+            lock_path = args.cwd / relative(_once(arguments, "--input-lock="))
+
+            def read_lock():
+                lock = unique_json(_managed_control(lock_path))
+                if not isinstance(lock, dict) or not isinstance(lock.get("manifest"), dict):
+                    raise ValueError("explicit system V3 lock required")
+                runtime = lock["manifest"].get("system_runtime_lock")
+                runtime = runtime.get("runtime") if isinstance(runtime, dict) else None
+                if not isinstance(runtime, dict) or runtime.get("kind") != "system_cuda":
+                    raise ValueError("system CUDA runtime lock required")
+                existing, future = _registered_system_libraries(
+                    runtime.get("configuration"), path_fields=("requested_path", "canonical_path"))
+                return None, existing, future
+
+            _registered_read(consumer, read_lock)
+        _check_pre_dispatch_interruption(interruption)
+        result = run(args, started=started, outcome=outcome, input_registration=consumer,
+                     interruption=interruption)
+    except BaseException as error:
+        if not consumer.dispatched:
+            try:
+                consumer.close_if_not_dispatched()
+            except BaseException as close_error:
+                error.add_note("consumer input close also failed: " + str(close_error))
+        raise
+    try:
+        # Direct mode observes a process group, not a contained original tree;
+        # an escaped descendant therefore cannot be excluded. Keep a
+        # dispatched lease active instead of asserting tree termination.
+        _finish_consumer_observation(consumer, original_scope_closed=False)
+    except Exception as error:
+        _report({"schema": REPORT_SCHEMA, "status": "consumer_observation_unavailable",
+                 "error_type": type(error).__name__, "physical_completion": "unknown"})
+    return result
+
+
 def main():
-    if len(sys.argv) == 3 and sys.argv[1] == "--managed-plan":
+    from virtual_system_numeric_prepare import add_consumer_arguments
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--managed-plan":
+        managed = argparse.ArgumentParser(description=__doc__)
+        managed.add_argument("--managed-plan", required=True, type=Path)
+        add_consumer_arguments(managed)
+        managed_args = managed.parse_args()
         try:
-            return run_managed(Path(sys.argv[2]))
+            return run_managed(managed_args.managed_plan, consumer_args=managed_args)
         except Exception as exc:
             _report({"schema": REPORT_SCHEMA, "status": "managed_failed_before_owner",
                      "error_type": type(exc).__name__, "physical_completion": "unknown"})
@@ -1135,6 +1357,7 @@ def main():
     parser.add_argument("--cleanup-seconds", type=int, default=30)
     parser.add_argument("--numeric-observation", action="store_true")
     parser.add_argument("--go-nodes", type=int, default=64)
+    add_consumer_arguments(parser)
     parser.add_argument("native_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if (sys.platform != "linux" or not all(path.is_absolute() for path in (args.binary, args.cwd, args.output_dir))
@@ -1146,7 +1369,7 @@ def main():
             or not (1 <= args.go_nodes <= 1_000_000)):
         parser.error("invalid bounded Linux V3 smoke configuration")
     try:
-        return run(args)
+        return _run_direct_registered(args)
     except Exception as exc:
         _report({"schema": REPORT_SCHEMA, "status": "failed_before_owner_or_unexpected",
                  "error_type": type(exc).__name__, "physical_completion": "unknown"})

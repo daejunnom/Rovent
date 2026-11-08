@@ -92,9 +92,15 @@ for command in sys.stdin:
         print("readyok", flush=True)
     elif command == "go nodes 64":
         assert commands[-2] == "position startpos"
-        print("bestmove e2e4", flush=True)
+        if variant == "stop_drain":
+            Path("fixture-go-observed").touch()
+        else:
+            print("bestmove e2e4", flush=True)
     elif command == "quit":
         assert commands[:4] == ["uci", "isready", "position startpos", "go nodes 64"]
+        if variant == "stop_drain":
+            Path("fixture-quit-observed").touch()
+            time.sleep(0.75)
         if variant == "unknown":
             break
         finish = {"schema":"rz-rovent-product-finish-observation/1", "process_id":pid,
@@ -330,6 +336,64 @@ class ParentCpuFixtureTests(unittest.TestCase):
                     if process.poll() is None:
                         process.kill()
                     process.communicate(timeout=5)
+
+    def test_repeated_signals_during_real_child_drain_preserve_owner(self):
+        # Wait for the CPU fixture's quit acknowledgment, then send repeated
+        # stops while it delays its own finish report. This is not GPU proof.
+        import time
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, _ = self.command(root, "stop_drain")
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                def wait_marker(name):
+                    until = time.monotonic() + 10
+                    while not (root / name).exists() and time.monotonic() < until:
+                        self.assertIsNone(process.poll(), "fixture owner exited before marker")
+                        time.sleep(0.01)
+                    self.assertTrue((root / name).exists(), name)
+
+                wait_marker("fixture-go-observed")
+                os.kill(process.pid, signal.SIGTERM)
+                wait_marker("fixture-quit-observed")
+                for _ in range(3):
+                    os.kill(process.pid, signal.SIGTERM)
+                    time.sleep(0.05)
+                    self.assertIsNone(process.poll(), "owner stopped during live drain")
+                stdout, stderr = process.communicate(timeout=10)
+                records = [json.loads(line) for line in stdout.splitlines()]
+                self.assertTrue(records, stderr.decode(errors="replace"))
+                self.assertEqual(records[-1]["physical_completion"], "session_reported_by_original_product")
+                self.assertEqual(records[-1]["gpu_device_fence"], "not_observed")
+                self.assertNotEqual(process.returncode, 0)
+            finally:
+                if process.poll() is None:
+                    process.kill()  # CPU-only fixture; never a GPU operation.
+                    process.communicate(timeout=5)
+
+    def test_repeated_stop_signals_do_not_discard_unknown_child_owner(self):
+        # A real CPU-only fixture child exits without the native-finish
+        # observation. Repeated catchable stops must not discard its owner.
+        with tempfile.TemporaryDirectory() as temporary:
+            command, _ = self.command(Path(temporary), "unknown")
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                import selectors
+                import time
+                selector = selectors.DefaultSelector()
+                selector.register(process.stdout, selectors.EVENT_READ)
+                self.assertTrue(selector.select(15), "fixture did not report retained owner")
+                record = json.loads(process.stdout.readline())
+                self.assertEqual(record["status"], "quarantined_original_owner_retained")
+                for _ in range(3):
+                    os.kill(process.pid, signal.SIGTERM)
+                    time.sleep(0.1)
+                    self.assertIsNone(process.poll(), "unverified owner discarded after stop")
+                selector.close()
+            finally:
+                if process.poll() is None:
+                    process.kill()  # CPU-only fixture, never a GPU operation.
+                process.communicate(timeout=5)
 
     def test_cancelled_before_spawn_never_creates_child(self):
         with tempfile.TemporaryDirectory() as temporary:

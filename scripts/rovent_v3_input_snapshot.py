@@ -191,16 +191,29 @@ class OriginalControlInput:
         self.close()
 
 
-def copy_pin(base, root, item, deadline, progress):
-    """Copy one pinned regular file without replacing an existing output."""
+def copy_pin(base, root, item, deadline, progress, *, stop_requested=None):
+    """Copy a pin, preserving partial output if cooperative cancellation occurs.
+
+    The optional callback is checked between I/O operations. It cannot
+    interrupt an individual blocking system call such as read, write or fsync.
+    """
+    def check_stop():
+        if stop_requested is not None:
+            if stop_requested():
+                raise InterruptedError("snapshot copy cancelled")
+            require(time.monotonic() < deadline, "original deadline expired while copying")
+
+    check_stop()
     rel = relative(item["path"])
     expected_size, expected_sha = item["bytes"], item["sha256"]
     require(type(expected_size) is int and 0 < expected_size <= MAX_ASSET,
             "invalid declared artifact size")
     require(isinstance(expected_sha, str) and len(expected_sha) == 64 and
             all(c in "0123456789abcdef" for c in expected_sha), "invalid declared digest")
+    check_stop()
     fd, before = open_source(base, rel)
     try:
+        check_stop()
         require(before.st_size == expected_size, "source artifact size differs")
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -208,6 +221,7 @@ def copy_pin(base, root, item, deadline, progress):
         digest, total = hashlib.sha256(), 0
         try:
             while True:
+                check_stop()
                 require(time.monotonic() < deadline, "original deadline expired while copying")
                 data = os.read(fd, 1024 * 1024)
                 if not data:
@@ -219,17 +233,32 @@ def copy_pin(base, root, item, deadline, progress):
                 require(progress[0] <= progress[1], "aggregate copy reservation exceeded")
                 view = memoryview(data)
                 while view:
+                    check_stop()
                     written = os.write(out_fd, view)
                     require(written > 0, "copy made no progress")
                     view = view[written:]
+            check_stop()
             os.fsync(out_fd)
+            check_stop()
         finally:
             os.close(out_fd)
         require(total == expected_size and digest.hexdigest() == expected_sha and
                 metadata(before) == metadata(os.fstat(fd)), "artifact bytes or source identity changed")
         with open(target, "rb") as output:
-            require(hashlib.file_digest(output, "sha256").hexdigest() == expected_sha,
-                    "copied artifact digest differs")
+            if stop_requested is None:
+                copied_sha = hashlib.file_digest(output, "sha256").hexdigest()
+            else:
+                copied_digest = hashlib.sha256()
+                while True:
+                    check_stop()
+                    require(time.monotonic() < deadline, "original deadline expired while verifying")
+                    chunk = output.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    copied_digest.update(chunk)
+                copied_sha = copied_digest.hexdigest()
+            check_stop()
+            require(copied_sha == expected_sha, "copied artifact digest differs")
         return {"path": str(rel), "bytes": total, "sha256": expected_sha}
     finally:
         os.close(fd)

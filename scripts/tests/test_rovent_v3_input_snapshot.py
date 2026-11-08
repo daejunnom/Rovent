@@ -5,6 +5,7 @@ import builtins
 import hashlib
 import importlib.util
 import os
+import signal
 from pathlib import Path
 import stat
 import sys
@@ -17,6 +18,7 @@ from unittest import mock
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 import rovent_v3_input_snapshot as snapshot
+from managed_process import supervisor_signal_scope
 
 
 class SnapshotImportTests(unittest.TestCase):
@@ -131,6 +133,58 @@ class SnapshotOwnershipTests(unittest.TestCase):
             snapshot.copy_pin(self.source_fd, self.output,
                               {"path": "expired", "bytes": len(data), "sha256": sha},
                               time.monotonic() - 1, [0, len(data)])
+
+    def test_signal_during_copy_interrupts_and_preserves_partial_output(self):
+        data = b"x" * (1024 * 1024 + 17)
+        (self.source / "asset").write_bytes(data)
+        item = {"path": "asset", "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        progress = [0, len(data)]
+        original_read = os.read
+        sent = False
+
+        def signal_after_first_chunk(fd, size):
+            nonlocal sent
+            result = original_read(fd, size)
+            if result and not sent:
+                sent = True
+                os.kill(os.getpid(), signal.SIGTERM)
+            return result
+
+        with supervisor_signal_scope() as interruption:
+            self.assertIsNotNone(interruption)
+            with mock.patch.object(snapshot.os, "read", side_effect=signal_after_first_chunk):
+                with self.assertRaisesRegex(InterruptedError, "snapshot copy cancelled"):
+                    snapshot.copy_pin(self.source_fd, self.output, item, time.monotonic() + 5,
+                                      progress, stop_requested=lambda: interruption["signal"] is not None)
+            self.assertEqual(interruption["signal"], signal.SIGTERM)
+        self.assertTrue(sent)
+        # The output belongs to the existing owner; no automatic unlink or
+        # successful snapshot receipt is manufactured on cancellation.
+        self.assertTrue((self.output / "asset").is_file())
+        self.assertLess((self.output / "asset").stat().st_size, len(data))
+        self.assertLess(progress[0], len(data))
+
+    def test_deadline_is_checked_between_short_writes(self):
+        data = b"0123456789"
+        (self.source / "asset").write_bytes(data)
+        item = {"path": "asset", "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        original_write = os.write
+        now = [0.0]
+        writes = []
+
+        def short_write(fd, value):
+            count = original_write(fd, value[:2])
+            writes.append(count)
+            now[0] = 2.0
+            return count
+
+        with mock.patch.object(snapshot.time, "monotonic", side_effect=lambda: now[0]):
+            with mock.patch.object(snapshot.os, "write", side_effect=short_write):
+                with self.assertRaisesRegex(RuntimeError, "deadline expired"):
+                    snapshot.copy_pin(self.source_fd, self.output, item, 1.0, [0, len(data)],
+                                      stop_requested=lambda: False)
+        self.assertEqual(writes, [2])
+        self.assertEqual((self.output / "asset").read_bytes(), data[:2])
 
     def test_source_and_ancestor_symlinks_are_not_followed(self):
         data = os.urandom(16)
