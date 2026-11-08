@@ -1674,7 +1674,7 @@ struct ResourceAdmissionV3<'a> {
         dyn FnOnce(
                 &Arc<RoventInputLockV3>,
                 &Dir,
-                &std::fs::File,
+                &Arc<std::fs::File>,
                 std::time::Instant,
                 std::time::Instant,
                 Option<&Dir>,

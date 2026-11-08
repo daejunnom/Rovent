@@ -1707,7 +1707,7 @@ pub(super) fn admit_original<'a>(
     lock_file: File,
     resource: Option<ResourceAdmissionV3<'a>>,
 ) -> Result<OriginalV3Inputs<'a>, RoventLaunchError> {
-    admit_original_inner(arguments, lock, root, cwd, lock_file, resource, None)
+    admit_original_inner(arguments, lock, root, cwd, Arc::new(lock_file), resource, None)
 }
 
 /// Admit the explicit /3 P/C Collection using the same original process,
@@ -1727,7 +1727,7 @@ pub(super) fn admit_original_collection<'a>(
         lock,
         root,
         cwd,
-        lock_file,
+        Arc::new(lock_file),
         resource,
         Some(collection),
     )
@@ -1739,7 +1739,7 @@ fn admit_original_inner<'a>(
     lock: Arc<RoventInputLockV3>,
     root: Dir,
     cwd: PathBuf,
-    lock_file: File,
+    lock_file: Arc<File>,
     resource: Option<ResourceAdmissionV3<'a>>,
     collection: Option<OriginalCollectionOwnerV3>,
 ) -> Result<OriginalV3Inputs<'a>, RoventLaunchError> {
@@ -2172,7 +2172,7 @@ fn admit_original_inner<'a>(
         collection,
         storage,
         selection_file: selection_file.map(Arc::new),
-        lock_file: Arc::new(lock_file),
+        lock_file,
         receipt_writer: receipt_writer.map(Arc::new),
         control_scope_pin,
         connected_parent,
