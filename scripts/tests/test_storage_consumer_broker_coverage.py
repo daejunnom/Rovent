@@ -139,6 +139,68 @@ class DescriptorCoverageTests(unittest.TestCase):
         with self.registry.guard() as guard:
             self.assertTrue(guard.conflicts([self.descriptor])["conflicts"])
 
+    def test_traversal_intermediate_close_unknown_preserves_broker_lease(self):
+        import storage_consumer_broker_coverage as coverage
+        state = ConsumerBrokerState(self.registry.guard, lambda: None, lambda: None)
+        state.begin(1, deadline=time.monotonic() + 10)
+        state.commit(1, [self.inputs])
+        original_close = os.close
+        identity = (self.root.parent.stat().st_dev, self.root.parent.stat().st_ino)
+        calls = []
+        failed = []
+
+        def uncertain_close(fd):
+            info = os.fstat(fd)
+            calls.append(fd)
+            original_close(fd)
+            if (info.st_dev, info.st_ino) == identity and not failed:
+                failed.append(len(calls) - 1)
+                raise OSError("injected intermediate close unknown")
+
+        with patch.object(coverage.os, "close", side_effect=uncertain_close):
+            with self.assertRaises(DescriptorCloseUnknown):
+                state.begin(2, deadline=time.monotonic() + 10, descriptor=self.descriptor)
+        self.assertTrue(state.descriptor_close_unknown)
+        self.assertTrue(failed)
+        self.assertTrue(any(fd != calls[failed[0]] for fd in calls[failed[0] + 1:]))
+        with self.assertRaises(BrokerStateError):
+            state.finish(child_never_dispatched=False, tree_gone=True)
+        with self.registry.guard() as guard:
+            self.assertTrue(guard.conflicts([self.descriptor])["conflicts"])
+
+    def test_open_error_survives_traversal_cleanup_close_unknown(self):
+        import storage_consumer_broker_coverage as coverage
+        lease = self.registry.register([self.inputs])
+        original_open, original_close = os.open, os.close
+        source_identity = (self.inputs.stat().st_dev, self.inputs.stat().st_ino)
+        primary = OSError("injected descriptor open failure")
+        failed_closes = []
+        with self.registry.guard() as guard:
+            pin = pin_descriptor_coverage(guard, [lease], self.descriptor)
+
+            def failed_open(path, *args, **kwargs):
+                if path == self.descriptor.name:
+                    raise primary
+                return original_open(path, *args, **kwargs)
+
+            def uncertain_close(fd):
+                info = os.fstat(fd)
+                original_close(fd)
+                if (info.st_dev, info.st_ino) == source_identity and not failed_closes:
+                    failed_closes.append(fd)
+                    raise OSError("injected cleanup close unknown")
+
+            with patch.object(coverage.os, "open", side_effect=failed_open), \
+                 patch.object(coverage.os, "close", side_effect=uncertain_close):
+                with self.assertRaises(StorageError) as raised:
+                    pin.verify()
+            self.assertIs(raised.exception.__cause__, primary)
+            self.assertTrue(getattr(raised.exception, "descriptor_close_unknown", False))
+            self.assertTrue(pin.close_unknown)
+            self.assertEqual(len(failed_closes), 1)
+            with self.assertRaises(DescriptorCloseUnknown):
+                pin.close()
+
     def test_future_path_cannot_prove_existing_descriptor(self):
         self.descriptor.unlink()
         lease = self.registry.register([], future_inputs=[self.descriptor])

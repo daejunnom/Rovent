@@ -32,6 +32,17 @@ def _mark_close_unknown(error):
         error.add_note("descriptor close outcome unknown; preserve the original consumer lease")
 
 
+def _close_once(fd):
+    """Never retry a descriptor number after its close outcome is unknown."""
+    try:
+        os.close(fd)
+    except OSError as error:
+        raise DescriptorCloseUnknown("descriptor traversal close outcome unknown") from error
+    except BaseException as error:
+        _mark_close_unknown(error)
+        raise
+
+
 def _nonsecret_path(value):
     path = Path(value)
     if len(path.parts) > _MAX_PARTS:
@@ -61,20 +72,26 @@ def _open_nofollow(path, *, directory):
         for component in components[:-1]:
             nxt = os.open(component, flags, dir_fd=current)
             old, current = current, nxt
-            os.close(old)
+            _close_once(old)
         final_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
         final_flags |= os.O_DIRECTORY if directory else getattr(os, "O_NONBLOCK", 0)
         result = os.open(components[-1], final_flags, dir_fd=current)
         old, current = current, None
         try:
-            os.close(old)
-        except BaseException:
-            os.close(result)
+            _close_once(old)
+        except BaseException as original:
+            try:
+                _close_once(result)
+            except BaseException:
+                _mark_close_unknown(original)
             raise
         return result
-    except BaseException:
+    except BaseException as original:
         if current is not None:
-            os.close(current)
+            try:
+                _close_once(current)
+            except BaseException:
+                _mark_close_unknown(original)
         raise
 
 
@@ -120,6 +137,8 @@ class DescriptorCoveragePin:
             self._target_identity = _identity(self._target_fd, directory=False)
             self.verify()
         except BaseException as error:
+            if getattr(error, "descriptor_close_unknown", False):
+                self._close_unknown = True
             try:
                 self.close()
             except BaseException as close_error:
@@ -153,9 +172,14 @@ class DescriptorCoveragePin:
                 raise StorageError("named descriptor or source was replaced")
         except OSError as error:
             primary = StorageError("descriptor or registered source unavailable")
+            if getattr(error, "descriptor_close_unknown", False):
+                self._close_unknown = True
+                _mark_close_unknown(primary)
             raise primary from error
         except BaseException as error:
             primary = error
+            if getattr(error, "descriptor_close_unknown", False):
+                self._close_unknown = True
             raise
         finally:
             close_error = None
