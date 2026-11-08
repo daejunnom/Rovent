@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -482,6 +483,33 @@ class WindowsRetirementUnsupportedTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).iterdir()), [])
 
 
+class Source7RegistryIdentityTests(unittest.TestCase):
+    def test_standard_source7_import_shares_registry_guard_and_original_gate(self):
+        # This checks the tracked modules under ordinary Python import, not an
+        # external source7 loader or an actual source-pinned execution owner.
+        import managed_output_unattributed_preservation as preservation
+        import storage_consumer_registry as consumers
+        import storage_guard
+
+        self.assertIs(preservation.CatalogGuard, storage_guard.CatalogGuard)
+        self.assertIs(consumers.CatalogGuard, storage_guard.CatalogGuard)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            catalog = root / "catalog"
+            catalog.mkdir()
+            registry = consumers.ConsumerRegistry.initialize(root / "registry", scope="fixture")
+            with preservation.CatalogGuard(catalog / "catalog.lock") as guard:
+                fd = guard.stream.fileno()
+                before = os.fstat(fd)
+                consumers.bind_catalog(catalog, registry, guard)
+                pinned = consumers.load_catalog_binding(catalog, guard)
+                self.assertEqual(pinned.registry_id, registry.registry_id)
+                consumers.require_catalog_binding(catalog, registry, guard)
+                after = os.fstat(fd)
+                self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
+                self.assertIsNotNone(guard.stream)
+
+
 class RetirementFailureReportingTests(unittest.TestCase):
     def test_selected_code_facades_reject_foreign_proof_before_fd_or_effect_checks(self):
         # Opposite-kind instances deliberately have no live state. Rejection
@@ -506,6 +534,58 @@ class RetirementFailureReportingTests(unittest.TestCase):
                 with self.assertRaises(StorageError):
                     retire(foreign, borrowed_live_view=None, source_pack=None,
                            actual_originals=None, same_guard=None)
+
+    @unittest.skipUnless(sys.platform == "linux", "native Linux original-gate boundary")
+    def test_selected_code_profiles_preserve_conflicting_consumer_before_effects(self):
+        # Exercise real registry + catalog locks with a mocked earlier
+        # borrowed-view attestation; this is not an actual source7 owner test.
+        class Inputs:
+            def __init__(self):
+                self.until = time.monotonic() + 20
+                self.closed = False
+            def check(self):
+                pass
+            def close(self, primary=None):
+                self.closed = True
+                return primary
+
+        for proof_type, retire, profile in (
+            (retirement.PreparedNormalDeferredSelectedNumericCode,
+             retirement.retire_prepared_normal_deferred_selected_numeric_code,
+             retirement.review.NUMERIC_CODE_PROFILE),
+            (retirement.PreparedNormalDeferredSelectedNativeCode,
+             retirement.retire_prepared_normal_deferred_selected_native_code,
+             retirement.review.NATIVE_CODE_PROFILE),
+            (retirement.PreparedNormalDeferredSelectedUtilityCode,
+             retirement.retire_prepared_normal_deferred_selected_utility_code,
+             retirement.review.UTILITY_CODE_PROFILE)):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temp:
+                base = Path(temp).resolve()
+                catalog = base / "catalog"
+                catalog.mkdir()
+                candidate = base / "candidate"
+                candidate.write_bytes(b"ELF fixture")
+                registry = ConsumerRegistry.initialize(base / "input-registry", scope="fixture")
+                lease = registry.register([candidate])
+                inputs = Inputs()
+                raw = json.dumps({"profile": profile, "catalog": str(catalog)}).encode("utf-8")
+                prepared = proof_type(retirement._NUMERIC_PREPARED_TOKEN,
+                    _inputs=inputs, _plan=raw, _pin={"path": str(base / "plan"), "bytes": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest()}, _path=candidate,
+                    _keeper={}, _research={}, _pid=os.getpid(), _hard_until=inputs.until,
+                    _closed=False, _consumed=False)
+                class View:
+                    until = inputs.until
+                with CatalogGuard(catalog / "catalog.lock") as guard:
+                    bind_catalog(catalog, registry, guard)
+                    with patch.object(retirement, "_numeric_borrowed_view", return_value=object()):
+                        with self.assertRaisesRegex(StorageError, "consumer dependency conflicts or unknown"):
+                            retire(prepared, borrowed_live_view=View(), source_pack=None,
+                                   actual_originals=None, same_guard=guard)
+                    self.assertIsNotNone(guard.stream)
+                self.assertTrue(inputs.closed)
+                self.assertEqual(candidate.read_bytes(), b"ELF fixture")
+                lease.close(not_started=True)
 
     def test_selected_code_decode_and_profile_failures_close_accepted_inputs_once(self):
         class HeldInputs:

@@ -1110,6 +1110,8 @@ def _retire_prepared_normal_deferred_selected_code(prepared, *, profile, borrowe
           "one actual live preparation, never an audit JSON or automatic retry")
     object.__setattr__(prepared, "_consumed", True)
     inputs, journal, first, result = prepared._inputs, None, None, None
+    dependency_manager = dependency_guard = None
+    dependency_guard_entered = False
     plan = None
     path = prepared._path
     attempt = {"unlink_attempted": False, "unlink_returned": False, "directory_fsynced": False}
@@ -1127,6 +1129,30 @@ def _retire_prepared_normal_deferred_selected_code(prepared, *, profile, borrowe
         current_guard = _numeric_borrowed_view(borrowed_live_view, source_pack, actual_originals, same_guard, catalog)
         inputs.until = min(inputs.until, borrowed_live_view.until)
         prepared.check()
+        # The caller retains the original catalog gate. The registry must be
+        # the one bound to that exact catalog and stays locked through unlink.
+        from storage_consumer_registry import load_catalog_binding, require_catalog_binding
+        dependency_registry = load_catalog_binding(catalog, same_guard)
+        _need(dependency_registry is not None,
+              "unbound consumer registry; preserve retirement candidate")
+        require_catalog_binding(catalog, dependency_registry, same_guard)
+        dependency_manager = dependency_registry.guard()
+        dependency_guard = dependency_manager.__enter__()
+        dependency_guard_entered = True
+
+        def dependencies_clear():
+            same_guard.assert_held()
+            require_catalog_binding(catalog, dependency_registry, same_guard)
+            dependency_guard.check()
+            dependency = dependency_guard.conflicts([path])
+            _need(isinstance(dependency, dict)
+                  and dependency.get("coverage") == "registered_only"
+                  and isinstance(dependency.get("conflicts"), list)
+                  and isinstance(dependency.get("unknown"), list)
+                  and not dependency["conflicts"] and not dependency["unknown"],
+                  "consumer dependency conflicts or unknown; preserve retirement candidate")
+
+        dependencies_clear()
         rows, usage = borrowed_live_view.checked_usage()
         producer_state = _numeric_producer_state(rows, borrowed_live_view.keys)
         evidence.update(producer_state)
@@ -1175,6 +1201,7 @@ def _retire_prepared_normal_deferred_selected_code(prepared, *, profile, borrowe
         inputs.hash_file(path)
         _process_census(targets, inputs.fds() | {same_guard.stream.fileno(), journal.fd}, inputs.tick)
         inputs.check(); same_guard.assert_held(); journal.check()
+        dependencies_clear()
         _need(borrowed_live_view.rows() == rows
               and _numeric_source_function(current_guard, "lifetime")() == now
               and _numeric_original_owner_dead(current_guard, row, now),
@@ -1220,6 +1247,12 @@ def _retire_prepared_normal_deferred_selected_code(prepared, *, profile, borrowe
         if attempt["unlink_returned"]:
             evidence["logical_removed_bytes"] = plan["code"][0]["bytes"]
         evidence["partial"] = bool(attempt["unlink_attempted"])
+        if dependency_guard_entered:
+            try:
+                dependency_manager.__exit__(None, None, None)
+            except BaseException as error:
+                if first is None: first = error
+                else: _note(first, "consumer registry guard release also failed: " + _describe(error))
         first = prepared.close(first)
     if first is not None:
         try: first.code_cache_retirement = evidence
