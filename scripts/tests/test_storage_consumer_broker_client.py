@@ -56,23 +56,35 @@ class ConsumerBrokerClientTests(unittest.TestCase):
             self.assertEqual([item["kind"] for item in observed], ["begin"])
             return "sealed-value", ["/asset", "/asset"]
 
-        self.assertEqual(self.client.read_and_register(reader), "sealed-value")
+        self.assertEqual(self.client.read_and_register(reader, descriptor="/descriptor"), "sealed-value")
         thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
         self.assertFalse(self.errors)
         self.assertEqual(observed[1]["inputs"], ["/asset"])
         self.assertEqual(observed[1]["future_inputs"], [])
+        self.assertEqual(observed[0]["descriptor"], "/descriptor")
 
     def test_existing_and_future_paths_share_one_commit(self):
         observed = []
         thread = self.launch(("begin", "commit"), observed)
         result = self.client.read_and_register_with_future(
-            lambda: ("value", ["/asset"], ["/asset", "/future"]))
+            lambda: ("value", ["/asset"], ["/asset", "/future"]), descriptor="/descriptor")
         thread.join(timeout=2)
         self.assertEqual(result, "value")
         self.assertFalse(thread.is_alive())
         self.assertFalse(self.errors)
         self.assertEqual(observed[1]["inputs"], ["/asset"])
+        self.assertEqual(observed[1]["future_inputs"], ["/future"])
+
+    def test_future_registration_is_not_a_descriptor_read(self):
+        observed = []
+        thread = self.launch(("begin", "commit"), observed)
+        self.client.add_future(["/future"])
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(self.errors)
+        self.assertIsNone(observed[0]["descriptor"])
+        self.assertEqual(observed[1]["inputs"], [])
         self.assertEqual(observed[1]["future_inputs"], ["/future"])
 
     def test_done_closes_admission_without_claiming_completion(self):
@@ -93,7 +105,7 @@ class ConsumerBrokerClientTests(unittest.TestCase):
             raise ValueError("bad descriptor")
 
         with self.assertRaisesRegex(ValueError, "bad descriptor"):
-            self.client.read_and_register(reader)
+            self.client.read_and_register(reader, descriptor="/descriptor")
         thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
         self.assertFalse(self.errors)

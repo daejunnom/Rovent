@@ -696,9 +696,9 @@ def _scope_observation(owner, stage):
     return value
 
 
-def _registered_read(consumer, reader):
+def _registered_read(consumer, reader, *, descriptor=None):
     """Read a protected descriptor and publish discovered paths atomically."""
-    return consumer.read_and_register_with_future(reader)
+    return consumer.read_and_register_with_future(reader, descriptor=descriptor)
 
 
 def _registered_system_libraries(runtime, *, path_fields=("path",)):
@@ -737,7 +737,7 @@ def _consumer_plan(plan_path, consumer):
                  plan["native_binary"]["path"], plan["registration_binary"]["path"]]
         return plan, paths, [plan["output"]]
 
-    plan = _registered_read(consumer, read_plan)
+    plan = _registered_read(consumer, read_plan, descriptor=plan_path)
 
     def read_request():
         import hashlib
@@ -754,7 +754,7 @@ def _consumer_plan(plan_path, consumer):
         inputs, future = _registered_system_libraries(request.get("system_runtime"))
         return raw, inputs, future
 
-    return plan, _registered_read(consumer, read_request)
+    return plan, _registered_read(consumer, read_request, descriptor=plan["request"]["path"])
 
 
 def _finish_consumer_observation(consumer, *, original_scope_closed):
@@ -1304,7 +1304,7 @@ def _run_direct_registered_scoped(args, interruption):
                     runtime.get("configuration"), path_fields=("requested_path", "canonical_path"))
                 return None, existing, future
 
-            _registered_read(consumer, read_lock)
+            _registered_read(consumer, read_lock, descriptor=lock_path)
         _check_pre_dispatch_interruption(interruption)
         result = run(args, started=started, outcome=outcome, input_registration=consumer,
                      interruption=interruption)

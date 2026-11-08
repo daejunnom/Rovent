@@ -134,12 +134,24 @@ class NumericInputRegistration:
                 guard = self._locked(stack)
                 self.leases.append(guard.register(paths))
 
-    def read_and_register(self, reader):
+    def add_future(self, inputs):
+        if self.registry is None:
+            return
+        paths = list(dict.fromkeys(Path(p) for p in inputs))
+        if paths:
+            if getattr(self, "_broker", None) is not None:
+                self._broker.add_future(paths)
+                return
+            with ExitStack() as stack:
+                guard = self._locked(stack)
+                self.leases.append(guard.register([], future_inputs=paths))
+
+    def read_and_register(self, reader, *, descriptor=None):
         """Read a registered small descriptor and register its paths atomically."""
         if self.registry is None:
             return reader()[0]
         if getattr(self, "_broker", None) is not None:
-            return self._broker.read_and_register(reader)
+            return self._broker.read_and_register(reader, descriptor=descriptor)
         with ExitStack() as stack:
             guard = self._locked(stack)
             value, paths = reader()
@@ -148,12 +160,12 @@ class NumericInputRegistration:
                 self.leases.append(guard.register(paths))
             return value
 
-    def read_and_register_with_future(self, reader):
+    def read_and_register_with_future(self, reader, *, descriptor=None):
         """Read a protected descriptor and atomically register both input kinds."""
         if self.registry is None:
             return reader()[0]
         if getattr(self, "_broker", None) is not None:
-            return self._broker.read_and_register_with_future(reader)
+            return self._broker.read_and_register_with_future(reader, descriptor=descriptor)
         with ExitStack() as stack:
             guard = self._locked(stack)
             value, inputs, future = reader()
@@ -430,7 +442,8 @@ def _main_after_parse(args, consumer, started):
         if consumer.registry is None:
             config, config_sha = _read_json(args.system_config, 64 * 1024, deadline, nc._strict_json)
         else:
-            config, config_sha = consumer.read_and_register(read_config_and_libraries)
+            config, config_sha = consumer.read_and_register(read_config_and_libraries,
+                                                             descriptor=args.system_config)
         if type(config) is not dict or set(config) != {"max_libraries", "max_file_bytes", "max_total_bytes", "max_capture_ms", "libraries"}:
             raise ValueError("exact system configuration required")
         if (type(config["max_libraries"]) is not int or not 1 <= config["max_libraries"] < 2 ** 64

@@ -78,7 +78,7 @@ class NumericConsumerFutureTests(unittest.TestCase):
             def add(self, inputs):
                 calls.append(("add", list(inputs)))
 
-            def read_and_register_with_future(self, reader):
+            def read_and_register_with_future(self, reader, *, descriptor):
                 calls.append(("future", None))
                 return reader()[0]
 
@@ -87,7 +87,8 @@ class NumericConsumerFutureTests(unittest.TestCase):
 
         consumer._broker = Broker()
         consumer.add(["/source"])
-        self.assertEqual(_registered_read(consumer, lambda: ("value", [], ["/future"])), "value")
+        self.assertEqual(_registered_read(consumer, lambda: ("value", [], ["/future"]),
+                                          descriptor="/descriptor"), "value")
         consumer.finish_broker()
         self.assertEqual(calls, [("add", [Path("/source")]), ("future", None), ("done", None)])
         with self.assertRaises(RuntimeError):

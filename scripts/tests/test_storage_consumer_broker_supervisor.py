@@ -61,7 +61,7 @@ class ConsumerBrokerSupervisorTests(unittest.TestCase):
         return receive_packet(self.child, self.peer)
 
     def test_transaction_and_unknown_physical_completion(self):
-        begin = self.request({"kind": "begin", "request_id": 1, "deadline": 20.0})
+        begin = self.request({"kind": "begin", "request_id": 1, "deadline": 20.0, "descriptor": None})
         self.assertEqual(begin["phase"], "begin")
         self.assertTrue(self.locked)
         commit = self.request({"kind": "commit", "request_id": 1, "inputs": ["/asset"],
@@ -73,7 +73,7 @@ class ConsumerBrokerSupervisorTests(unittest.TestCase):
         self.assertEqual(self.leases[0].state, "physical_unknown")
 
     def test_timeout_revokes_but_does_not_unlock_before_drain(self):
-        self.request({"kind": "begin", "request_id": 1, "deadline": 11.0})
+        self.request({"kind": "begin", "request_id": 1, "deadline": 11.0, "descriptor": None})
         self.now = 11.0
         with self.assertRaises(BrokerTransportError):
             self.broker.service()
@@ -85,7 +85,7 @@ class ConsumerBrokerSupervisorTests(unittest.TestCase):
         self.assertFalse(self.locked)
 
     def test_lost_commit_ack_keeps_published_lease(self):
-        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0})
+        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0, "descriptor": None})
         send_packet(self.child, {"kind": "commit", "request_id": 1,
                                  "inputs": ["/asset"], "future_inputs": []})
         self.child.close()
@@ -96,13 +96,13 @@ class ConsumerBrokerSupervisorTests(unittest.TestCase):
         self.assertEqual(self.leases[0].state, "physical_unknown")
 
     def test_boolean_request_id_is_rejected(self):
-        send_packet(self.child, {"kind": "begin", "request_id": True, "deadline": 20.0})
+        send_packet(self.child, {"kind": "begin", "request_id": True, "deadline": 20.0, "descriptor": None})
         with self.assertRaises(BrokerTransportError):
             self.broker.service()
         self.assertFalse(self.locked)
 
     def test_done_does_not_release_lease_or_imply_physical_completion(self):
-        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0})
+        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0, "descriptor": None})
         self.request({"kind": "commit", "request_id": 1,
                       "inputs": ["/asset"], "future_inputs": []})
         done = self.request({"kind": "done", "request_id": 2})
@@ -112,7 +112,7 @@ class ConsumerBrokerSupervisorTests(unittest.TestCase):
         self.assertEqual(self.leases[0].state, "physical_unknown")
 
     def test_done_during_read_revokes_without_releasing_guard(self):
-        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0})
+        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0, "descriptor": None})
         send_packet(self.child, {"kind": "done", "request_id": 2})
         with self.assertRaises(RuntimeError):
             self.broker.service()
@@ -121,7 +121,7 @@ class ConsumerBrokerSupervisorTests(unittest.TestCase):
         self.assertFalse(self.locked)
 
     def test_child_identity_loss_during_commit_retains_guard_until_drain(self):
-        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0})
+        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0, "descriptor": None})
         self.child_alive = False
         send_packet(self.child, {"kind": "commit", "request_id": 1,
                                  "inputs": ["/asset"], "future_inputs": []})
@@ -134,7 +134,7 @@ class ConsumerBrokerSupervisorTests(unittest.TestCase):
         self.assertFalse(self.locked)
 
     def test_deadline_race_during_commit_retains_guard_until_drain(self):
-        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0})
+        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0, "descriptor": None})
         self.advance_on_peer = True
         send_packet(self.child, {"kind": "commit", "request_id": 1,
                                  "inputs": ["/asset"], "future_inputs": []})
@@ -145,7 +145,7 @@ class ConsumerBrokerSupervisorTests(unittest.TestCase):
         self.assertFalse(self.locked)
 
     def test_unknown_publication_keeps_guard_until_original_drain(self):
-        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0})
+        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0, "descriptor": None})
         self.fail_register = True
         send_packet(self.child, {"kind": "commit", "request_id": 1,
                                  "inputs": ["/asset"], "future_inputs": []})

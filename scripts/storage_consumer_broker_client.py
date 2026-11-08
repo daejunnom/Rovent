@@ -106,13 +106,18 @@ class ConsumerBrokerClient:
             self.close()
             raise
 
-    def read_and_register(self, reader):
+    def read_and_register(self, reader, *, descriptor):
         def with_future():
             value, inputs = reader()
             return value, inputs, ()
-        return self.read_and_register_with_future(with_future)
+        return self.read_and_register_with_future(with_future, descriptor=descriptor)
 
-    def read_and_register_with_future(self, reader):
+    def read_and_register_with_future(self, reader, *, descriptor):
+        if descriptor is None or not Path(descriptor).is_absolute():
+            raise BrokerTransportError("protected absolute descriptor path required")
+        return self._transaction(reader, descriptor=os.fspath(Path(descriptor)))
+
+    def _transaction(self, reader, *, descriptor):
         if not callable(reader):
             raise ValueError("descriptor reader required")
         self._sequence += 1
@@ -122,7 +127,8 @@ class ConsumerBrokerClient:
             raise BrokerTransportError("consumer broker request limit reached")
         sequence = self._sequence
         deadline = self._clock() + self._maximum_seconds
-        self._exchange({"kind": "begin", "request_id": sequence, "deadline": deadline},
+        self._exchange({"kind": "begin", "request_id": sequence, "deadline": deadline,
+                        "descriptor": descriptor},
                        "begin", sequence, deadline)
         try:
             value, paths, future_paths = reader()
@@ -149,7 +155,10 @@ class ConsumerBrokerClient:
         return value
 
     def add(self, paths):
-        self.read_and_register(lambda: (None, paths))
+        self._transaction(lambda: (None, paths, ()), descriptor=None)
+
+    def add_future(self, paths):
+        self._transaction(lambda: (None, (), paths), descriptor=None)
 
     def finish(self):
         """Close request admission; no lease or physical completion is claimed."""

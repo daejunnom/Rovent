@@ -76,11 +76,14 @@ class ConsumerBrokerSupervisor:
                 sequence = message.get("request_id")
                 if type(kind) is not str or type(sequence) is not int:
                     raise BrokerTransportError("exact broker message types required")
-                if kind == "begin" and set(message) == {"kind", "request_id", "deadline"}:
+                if kind == "begin" and set(message) == {"kind", "request_id", "deadline", "descriptor"}:
                     deadline = message["deadline"]
                     if type(deadline) not in (int, float) or not math.isfinite(deadline):
                         raise BrokerTransportError("finite deadline required")
-                    self._state.begin(sequence, deadline=deadline)
+                    descriptor = message["descriptor"]
+                    if descriptor is not None and (type(descriptor) is not str or not Path(descriptor).is_absolute()):
+                        raise BrokerTransportError("absolute descriptor path required")
+                    self._state.begin(sequence, deadline=deadline, descriptor=descriptor)
                     self._deadline = deadline
                 elif kind == "commit" and set(message) == {"kind", "request_id", "inputs", "future_inputs"}:
                     inputs = self._paths(message["inputs"])

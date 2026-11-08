@@ -86,6 +86,7 @@ class ConsumerBrokerState:
         self._guard = None
         self._request = None
         self._deadline = None
+        self._descriptor_pin = None
         self._last_request = -1
         self._leases = []
         self._broken = False
@@ -144,9 +145,9 @@ class ConsumerBrokerState:
                 self._broken = True
                 self._lock_release_unknown = True
                 raise
-        self._stack = self._guard = self._request = self._deadline = None
+        self._stack = self._guard = self._request = self._deadline = self._descriptor_pin = None
 
-    def begin(self, request_id, *, deadline):
+    def begin(self, request_id, *, deadline, descriptor=None):
         self._check(child=True, preserve_on_failure=self._hold_on_failure)
         if self._admission_closed:
             raise BrokerStateError("consumer admission already closed")
@@ -166,10 +167,15 @@ class ConsumerBrokerState:
             guard = stack.enter_context(self._factory())
             self._assert_supervisor()
             self._assert_child()
+            descriptor_pin = None
+            if descriptor is not None:
+                from storage_consumer_broker_coverage import pin_descriptor_coverage
+                descriptor_pin = stack.enter_context(pin_descriptor_coverage(guard, self._leases, descriptor))
             if self._clock() >= deadline:
                 raise BrokerStateError("transaction expired while acquiring guards")
             self._stack, self._guard = stack, guard
             self._request, self._deadline = request_id, deadline
+            self._descriptor_pin = descriptor_pin
         except BaseException:
             try:
                 stack.close()
@@ -195,6 +201,8 @@ class ConsumerBrokerState:
             raise BrokerStateError("transaction expired")
         succeeded = False
         try:
+            if self._descriptor_pin is not None:
+                self._descriptor_pin.verify()
             # Empty input lists are valid when the descriptor names no assets.
             if inputs or future_inputs:
                 owner_id = uuid.uuid4().hex
@@ -223,6 +231,8 @@ class ConsumerBrokerState:
                         "consumer row publication or rollback unknown; preserve registry") from error
             self._assert_supervisor()
             self._assert_child()
+            if self._descriptor_pin is not None:
+                self._descriptor_pin.verify()
             if self._clock() >= self._deadline:
                 raise BrokerStateError("transaction expired during registration; lease preserved")
             succeeded = True
