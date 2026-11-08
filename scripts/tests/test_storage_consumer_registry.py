@@ -43,6 +43,419 @@ class ConsumerRegistryTests(unittest.TestCase):
         self.assertFalse((self.registry.root / ("consumer-" + lease.owner_id + ".json")).exists())
         self.assertTrue((self.registry.root / "registry-history.json").exists())
 
+    def test_symlink_input_and_target_protect_only_their_cleanup_scopes(self):
+        library = self.b / "libexample.so.1"
+        library.write_bytes(b"fixture-library")
+        requested = self.a / "libexample.so"
+        try:
+            requested.symlink_to(library)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        unrelated = self.root / "unrelated"
+        unrelated.mkdir()
+        (unrelated / "disposable").write_bytes(b"fixture")
+        with self.registry.guard() as guard:
+            lease = guard.register([library], symlink_inputs=[requested])
+            link_result = guard.conflicts([self.a])
+            target_result = guard.conflicts([library])
+            unrelated_result = guard.conflicts([unrelated])
+        self.assertTrue(link_result["conflicts"])
+        self.assertTrue(target_result["conflicts"])
+        self.assertFalse(unrelated_result["conflicts"])
+        self.assertFalse(unrelated_result["unknown"])
+        lease.close(not_started=True)
+        with self.registry.guard() as guard:
+            self.assertFalse(guard.conflicts([self.a])["conflicts"])
+            self.assertFalse(guard.conflicts([library])["conflicts"])
+
+    def test_symlink_chain_protects_each_link_and_the_canonical_target(self):
+        link_parent = self.a / "requested"
+        middle = self.b / "middle"
+        target_dir = self.root / "target"
+        target_dir.mkdir()
+        target = target_dir / "libexample.so.1"
+        target.write_bytes(b"fixture-library")
+        try:
+            link_parent.symlink_to(self.b, target_is_directory=True)
+            middle.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        with self.registry.guard() as guard:
+            lease = guard.register([target], symlink_inputs=[link_parent, middle])
+            for cleanup in (self.a, self.b, target):
+                self.assertTrue(guard.conflicts([cleanup])["conflicts"], str(cleanup))
+        lease.close(not_started=True)
+
+    def test_replaced_or_missing_symlink_does_not_unprotect_original_path(self):
+        target = self.b / "target"
+        target.write_bytes(b"fixture-library")
+        requested = self.a / "requested"
+        try:
+            requested.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        with self.registry.guard() as guard:
+            lease = guard.register([target], symlink_inputs=[requested])
+        requested.unlink()
+        with self.registry.guard() as guard:
+            removed = guard.conflicts([self.a])
+            self.assertTrue(removed["conflicts"] or removed["unknown"])
+        try:
+            requested.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("replacement symlink creation unavailable")
+        with self.registry.guard() as guard:
+            replaced = guard.conflicts([self.a])
+            self.assertTrue(replaced["conflicts"] or replaced["unknown"])
+        lease.close(not_started=True)
+
+    def test_symlink_registration_rejects_regular_file_without_publishing_lease(self):
+        target = self.b / "target"
+        target.write_bytes(b"fixture-library")
+        not_link = self.a / "ordinary"
+        not_link.write_bytes(b"fixture")
+        with self.registry.guard() as guard:
+            with self.assertRaises(StorageError):
+                guard.register([target], symlink_inputs=[not_link])
+            result = guard.conflicts([self.a, target])
+            self.assertFalse(result["conflicts"])
+            self.assertFalse(result["unknown"])
+
+    def test_symlink_input_secret_names_are_rejected_before_filesystem_access(self):
+        # These are lexical-only paths. No secret directory or file is created.
+        blocked_paths = [
+            (self.root / ".ssh", self.root / ".ssh" / "id_ed25519"),
+            (self.root / "id_ecdsa", self.root / "id_ecdsa"),
+            (self.root / "id_dsa", self.root / "id_dsa"),
+            (self.root / ".env", self.root / ".env"),
+            (self.root / ".env.production", self.root / ".env.production"),
+            (self.root / "api_key.json", self.root / "api_key.json"),
+            (self.root / "api-key.txt", self.root / "api-key.txt"),
+            (self.root / "service-account.json", self.root / "service-account.json"),
+            (self.root / "service_account.json", self.root / "service_account.json"),
+            (self.root / "credentials.json", self.root / "credentials.json"),
+            (self.root / "client_secret.json", self.root / "client_secret.json"),
+            (self.root / "token.json", self.root / "token.json"),
+            (self.root / "private_key.pem", self.root / "private_key.pem"),
+            (self.root / "private-key.data", self.root / "private-key.data"),
+            (self.root / "example.key", self.root / "example.key"),
+            (self.root / "example.p12", self.root / "example.p12"),
+            (self.root / "example.pfx", self.root / "example.pfx"),
+            (self.root / "example.kdbx", self.root / "example.kdbx"),
+        ]
+        original_stat = os.stat
+        original_lstat = os.lstat
+        for forbidden_root, candidate in blocked_paths:
+            with self.subTest(name=forbidden_root.name):
+                observations = []
+
+                def reject_sensitive_access(original):
+                    def invoke(value, *args, **kwargs):
+                        if isinstance(value, (str, bytes, os.PathLike)):
+                            observed = Path(os.fsdecode(value))
+                            if observed == forbidden_root or observed.is_relative_to(forbidden_root):
+                                observations.append(observed)
+                                raise AssertionError("secret-like path accessed before rejection")
+                        return original(value, *args, **kwargs)
+                    return invoke
+
+                with self.registry.guard() as guard:
+                    with patch("storage_consumer_registry.os.stat", side_effect=reject_sensitive_access(original_stat)), \
+                            patch("storage_consumer_registry.os.lstat", side_effect=reject_sensitive_access(original_lstat)):
+                        with self.assertRaises(StorageError):
+                            guard.register([self.b], symlink_inputs=[candidate])
+                    self.assertEqual(observations, [])
+                    result = guard.conflicts([self.b])
+                    self.assertFalse(result["conflicts"])
+                    self.assertFalse(result["unknown"])
+
+    def test_symlink_registration_rejects_unobservable_inode_without_publishing(self):
+        link = self.a / "unobservable-link"
+        try:
+            link.symlink_to(self.b, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        original_lstat = Path.lstat
+
+        class StatView:
+            st_ino = 0
+            st_file_attributes = 0
+            def __init__(self, info):
+                self._info = info
+            def __getattr__(self, name):
+                return getattr(self._info, name)
+
+        def hide_link_inode(value, *args, **kwargs):
+            info = original_lstat(value, *args, **kwargs)
+            return StatView(info) if value == link else info
+
+        with self.registry.guard() as guard:
+            with patch.object(Path, "lstat", new=hide_link_inode):
+                with self.assertRaises(StorageError):
+                    guard.register([self.b], symlink_inputs=[link])
+            result = guard.conflicts([self.a, self.b])
+            self.assertFalse(result["conflicts"])
+            self.assertFalse(result["unknown"])
+
+    def test_unobservable_alias_link_marks_only_same_device_candidate_unknown(self):
+        registered = self.a / "registered-link"
+        candidate = self.root / "candidate"
+        candidate.mkdir()
+        observed = candidate / "unobservable-alias"
+        other_device = self.root / "other-device"
+        other_device.mkdir()
+        try:
+            registered.symlink_to(self.b, target_is_directory=True)
+            observed.symlink_to(self.b, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        actual_stat = os.stat
+        actual_scandir = os.scandir
+
+        def with_stat_field(info, index, value):
+            # os.stat_result(tuple(...)) loses the Windows file attributes.
+            # Preserve all other native fields and explicitly give the alias
+            # fixture a known, non-reparse attribute value.
+            class StatView:
+                st_file_attributes = 0
+
+                def __getattr__(self, name):
+                    if index == 1 and name == "st_ino":
+                        return value
+                    if index == 2 and name == "st_dev":
+                        return value
+                    return getattr(info, name)
+            return StatView()
+
+        def fake_stat(value, *args, **kwargs):
+            info = actual_stat(value, *args, **kwargs)
+            if isinstance(value, (str, bytes, os.PathLike)):
+                name = Path(os.fsdecode(value))
+                if name == observed and kwargs.get("follow_symlinks") is False:
+                    return with_stat_field(info, 1, 0)  # st_ino
+                if name == other_device:
+                    return with_stat_field(info, 2, info.st_dev + 1)  # st_dev
+            return info
+
+        class EntryProxy:
+            def __init__(self, entry):
+                self._entry = entry
+                self.name = entry.name
+                self.path = entry.path
+
+            def stat(self, *args, **kwargs):
+                info = self._entry.stat(*args, **kwargs)
+                if Path(self.path) == observed:
+                    return with_stat_field(info, 1, 0)
+                return info
+
+        class ScandirProxy:
+            def __init__(self, scan):
+                self._scan = scan
+
+            def __enter__(self):
+                entries = self._scan.__enter__()
+                return (EntryProxy(entry) for entry in entries)
+
+            def __exit__(self, *args):
+                return self._scan.__exit__(*args)
+
+        def fake_scandir(value):
+            scan = actual_scandir(value)
+            if Path(os.fsdecode(value)) == candidate:
+                return ScandirProxy(scan)
+            return scan
+
+        with self.registry.guard() as guard:
+            lease = guard.register([], symlink_inputs=[registered])
+            with patch("storage_consumer_registry.os.stat", side_effect=fake_stat), \
+                    patch("storage_consumer_registry.os.scandir", side_effect=fake_scandir):
+                result = guard.conflicts([candidate, other_device])
+            self.assertFalse(result["conflicts"])
+            self.assertTrue(any(item.get("target") == str(candidate)
+                                and item.get("reason") == "symlink_alias_identity_unavailable"
+                                for item in result["unknown"]))
+            self.assertFalse(any(item.get("target") == str(other_device) or "target" not in item
+                                 for item in result["unknown"]))
+        lease.close(not_started=True)
+
+    def test_nested_other_device_candidate_marks_only_that_candidate_unknown(self):
+        registered = self.a / "registered-link"
+        candidate = self.root / "different-device-root"
+        nested = candidate / "nested-original-device"
+        candidate.mkdir()
+        nested.mkdir()
+        unrelated = self.root / "unrelated-candidate"
+        unrelated.mkdir()
+        try:
+            registered.symlink_to(self.b, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        source_device = registered.lstat().st_dev
+        if not source_device or nested.stat().st_dev != source_device:
+            self.skipTest("fixture requires an observable shared source device")
+        actual_stat = os.stat
+        actual_scandir = os.scandir
+        visited = []
+
+        class StatView:
+            st_file_attributes = 0
+            def __init__(self, info):
+                self._info = info
+                self.st_dev = source_device + 1
+            def __getattr__(self, name):
+                return getattr(self._info, name)
+
+        def fake_stat(value, *args, **kwargs):
+            info = actual_stat(value, *args, **kwargs)
+            if isinstance(value, (str, bytes, os.PathLike)) and Path(os.fsdecode(value)) == candidate:
+                return StatView(info)
+            return info
+
+        def observe_scandir(value):
+            if isinstance(value, (str, bytes, os.PathLike)):
+                visited.append(Path(os.fsdecode(value)))
+            return actual_scandir(value)
+
+        with self.registry.guard() as guard:
+            lease = guard.register([], symlink_inputs=[registered])
+            with patch("storage_consumer_registry.os.stat", side_effect=fake_stat), \
+                    patch("storage_consumer_registry.os.scandir", side_effect=observe_scandir):
+                result = guard.conflicts([candidate, unrelated])
+            self.assertFalse(result["conflicts"])
+            self.assertTrue(any(item.get("target") == str(candidate)
+                                and item.get("reason") == "symlink_alias_scan_incomplete"
+                                for item in result["unknown"]))
+            self.assertFalse(any(item.get("target") == str(unrelated) or "target" not in item
+                                 for item in result["unknown"]))
+            self.assertIn(candidate, visited)
+            self.assertIn(unrelated, visited)
+        lease.close(not_started=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows reparse attributes only")
+    def test_unknown_windows_alias_attributes_affect_only_candidate(self):
+        registered = self.a / "registered-link"
+        candidate = self.root / "candidate-attributes"
+        candidate.mkdir()
+        observed = candidate / "observed-link"
+        other_device = self.root / "other-device-attributes"
+        other_device.mkdir()
+        try:
+            registered.symlink_to(self.b, target_is_directory=True)
+            observed.symlink_to(self.b, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        original_stat = os.stat
+        source_device = registered.lstat().st_dev
+        if not source_device:
+            self.skipTest("source device identity unavailable")
+
+        class StatView:
+            def __init__(self, info, **fields):
+                self._info = info
+                self._fields = fields
+            def __getattr__(self, name):
+                if name in self._fields:
+                    return self._fields[name]
+                return getattr(self._info, name)
+
+        def fake_stat(value, *args, **kwargs):
+            info = original_stat(value, *args, **kwargs)
+            if isinstance(value, (str, bytes, os.PathLike)):
+                name = Path(os.fsdecode(value))
+                if name == observed and kwargs.get("follow_symlinks") is False:
+                    return StatView(info, st_file_attributes=None)
+                if name == other_device:
+                    return StatView(info, st_dev=source_device + 1, st_file_attributes=0)
+            return info
+
+        with self.registry.guard() as guard:
+            lease = guard.register([], symlink_inputs=[registered])
+            with patch("storage_consumer_registry.os.stat", side_effect=fake_stat):
+                result = guard.conflicts([candidate, other_device])
+            self.assertFalse(result["conflicts"])
+            self.assertTrue(any(item.get("target") == str(candidate) for item in result["unknown"]))
+            self.assertFalse(any(item.get("target") == str(other_device) or "target" not in item
+                                 for item in result["unknown"]))
+        lease.close(not_started=True)
+
+    def test_unobservable_source_device_marks_each_directory_candidate_unknown(self):
+        registered = self.a / "registered-link"
+        first = self.root / "first-candidate"
+        second = self.root / "second-candidate"
+        first.mkdir()
+        second.mkdir()
+        ordinary = self.root / "ordinary-file"
+        ordinary.write_bytes(b"fixture")
+        try:
+            registered.symlink_to(self.b, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        original_lstat = Path.lstat
+
+        class StatView:
+            st_dev = 0
+            st_file_attributes = 0
+            def __init__(self, info):
+                self._info = info
+            def __getattr__(self, name):
+                return getattr(self._info, name)
+
+        def fake_lstat(value, *args, **kwargs):
+            info = original_lstat(value, *args, **kwargs)
+            return StatView(info) if value == registered else info
+
+        with self.registry.guard() as guard:
+            with patch.object(Path, "lstat", new=fake_lstat):
+                lease = guard.register([], symlink_inputs=[registered])
+            result = guard.conflicts([first, second, ordinary])
+            self.assertFalse(result["conflicts"])
+            unknown_targets = {item.get("target") for item in result["unknown"]}
+            self.assertEqual(unknown_targets, {str(first), str(second)})
+        lease.close(not_started=True)
+
+    def test_unobservable_candidate_device_does_not_block_known_other_device(self):
+        registered = self.a / "registered-link"
+        candidate = self.root / "unknown-device-candidate"
+        other_device = self.root / "known-other-device-candidate"
+        candidate.mkdir()
+        other_device.mkdir()
+        try:
+            registered.symlink_to(self.b, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        source_device = registered.lstat().st_dev
+        if not source_device:
+            self.skipTest("source device identity unavailable")
+        original_stat = os.stat
+
+        class StatView:
+            st_file_attributes = 0
+            def __init__(self, info, device):
+                self._info = info
+                self.st_dev = device
+            def __getattr__(self, name):
+                return getattr(self._info, name)
+
+        def fake_stat(value, *args, **kwargs):
+            info = original_stat(value, *args, **kwargs)
+            if isinstance(value, (str, bytes, os.PathLike)):
+                name = Path(os.fsdecode(value))
+                if name == candidate:
+                    return StatView(info, 0)
+                if name == other_device:
+                    return StatView(info, source_device + 1)
+            return info
+
+        with self.registry.guard() as guard:
+            lease = guard.register([], symlink_inputs=[registered])
+            with patch("storage_consumer_registry.os.stat", side_effect=fake_stat):
+                result = guard.conflicts([candidate, other_device])
+            self.assertFalse(result["conflicts"])
+            unknown_targets = {item.get("target") for item in result["unknown"]}
+            self.assertEqual(unknown_targets, {str(candidate)})
+        lease.close(not_started=True)
+
     def test_original_registry_object_rejects_replaced_lock_before_next_guard(self):
         lease = self.registry.register([self.a])
         lock = self.registry.root / "registry.lock"

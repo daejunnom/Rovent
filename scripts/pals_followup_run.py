@@ -13,12 +13,13 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import time
 
 sys.dont_write_bytecode = True
 from managed_process import run_group
-from managed_storage import checked, tree_size
+from managed_storage import checked, reject_credential_names, tree_size
 from managed_outputs import OutputLease, prepare_consumer_output_catalog
 
 GIB = 1024 ** 3
@@ -83,6 +84,90 @@ def pinned(path, digest, cap):
     if hasher.hexdigest() != sha(digest):
         raise ValueError("actual pinned file bytes differ from registration")
     return path
+
+
+def _reject_secret_library_path(path):
+    reject_credential_names(path)
+    for part in path.parts:
+        name = part.lower()
+        if (name == ".ssh" or name.startswith(".env") or "credential" in name
+                or "service-account" in name or "service_account" in name
+                or "api_key" in name or "api-key" in name
+                or "secret" in name or "token" in name or "private_key" in name
+                or "private-key" in name or name.endswith((".pem", ".key", ".p12", ".pfx", ".kdbx"))
+                or name in {"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"}):
+            raise ValueError("secret-like system-library path is not permitted")
+
+
+def _checked_library_spelling(path):
+    """Reject secrets before observing any path component or link target."""
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("absolute system-library path without parent traversal required")
+    _reject_secret_library_path(path)
+
+
+def _check_library_deadline(deadline):
+    if time.monotonic() >= deadline:
+        raise TimeoutError("system-library registration deadline exceeded")
+
+
+def _observed_windows_reparse(info, *, is_windows):
+    """Do not interpret unavailable Windows file attributes as no reparse."""
+    if not is_windows:
+        return False
+    attributes = getattr(info, "st_file_attributes", None)
+    if type(attributes) is not int:
+        raise ValueError("system-library Windows file attributes unavailable")
+    return bool(attributes & 0x400)
+
+
+def _observe_system_library(path, *, deadline):
+    """Capture every link spelling and final file; never open library contents.
+
+    Call with the common registry guard held and publish links and target in
+    one lease, then observe again before releasing that guard. Deadline checks
+    are cooperative and cannot preempt an individual blocking filesystem call.
+    Protection covers participating cleanup, not arbitrary external writers.
+    """
+    path = Path(path)
+    _checked_library_spelling(path)
+    remaining = list(path.parts[1:])
+    if not remaining or len(remaining) > 256 or len(str(path)) > 4096:
+        raise ValueError("bounded system-library file path required")
+    current = Path(path.anchor)
+    links = []
+    traversals = 0
+    while remaining:
+        _check_library_deadline(deadline)
+        current = current / remaining.pop(0)
+        _checked_library_spelling(current)
+        info = current.lstat()
+        _check_library_deadline(deadline)
+        is_reparse = _observed_windows_reparse(info, is_windows=os.name == "nt")
+        if stat.S_ISLNK(info.st_mode):
+            traversals += 1
+            if traversals > 40:
+                raise ValueError("system-library symlink traversal limit exceeded")
+            links.append((current, info.st_dev, info.st_ino))
+            _check_library_deadline(deadline)
+            destination = Path(os.readlink(current))
+            _check_library_deadline(deadline)
+            expanded = destination if destination.is_absolute() else current.parent / destination
+            # Check the unresolved spelling before normalization as well; do
+            # not inspect any credential-like component even when followed by ..
+            _reject_secret_library_path(expanded)
+            expanded = Path(os.path.normpath(expanded))
+            _checked_library_spelling(expanded)
+            remaining = list(expanded.parts[1:]) + remaining
+            current = Path(expanded.anchor)
+        elif is_reparse:
+            raise ValueError("unverified system-library reparse point")
+        elif remaining and not stat.S_ISDIR(info.st_mode):
+            raise ValueError("system-library parent is not a directory")
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("system library must resolve to a regular file")
+    _check_library_deadline(deadline)
+    return current, (info.st_dev, info.st_ino), links
 
 
 def unique_object(pairs):
@@ -529,6 +614,9 @@ def run_with_registered_inputs(args, parser):
         export_root = Path(os.path.abspath(args.export)).parent
         if export_root not in inputs:
             inputs.append(export_root)
+    if (args.mode == "model-check" and getattr(args, "provider", "cpu") == "cuda-system"
+            and args.system_cuda_config is not None):
+        _checked_library_spelling(Path(os.path.abspath(args.system_cuda_config)))
     future_inputs = []
     if (args.mode == "model-check" and getattr(args, "provider", "cpu") == "cpu"
             and args.runtime_cache is not None):
@@ -545,9 +633,16 @@ def run_with_registered_inputs(args, parser):
             # reading it and publishing its library paths so cleanup cannot
             # unlink one between discovery and the second registration.
             with registry.guard() as guard:
+                # Match the existing broker's finite registration window. A
+                # single blocking filesystem operation cannot be preempted.
+                deadline = time.monotonic() + 25.0
+                _check_library_deadline(deadline)
                 config_path = regular(Path(os.path.abspath(args.system_cuda_config)), 64 * 1024)
+                _check_library_deadline(deadline)
                 with config_path.open("rb") as stream:
+                    _check_library_deadline(deadline)
                     raw = stream.read(64 * 1024 + 1)
+                    _check_library_deadline(deadline)
                 if not 0 < len(raw) <= 64 * 1024 or hashlib.sha256(raw).hexdigest() != sha(args.system_cuda_config_sha256):
                     raise ValueError("actual pinned CUDA config bytes differ from registration")
                 config = json.loads(raw, object_pairs_hook=unique_object,
@@ -555,17 +650,23 @@ def run_with_registered_inputs(args, parser):
                 libraries = config.get("libraries") if isinstance(config, dict) else None
                 if not isinstance(libraries, list) or len(libraries) > 64:
                     raise ValueError("bounded CUDA library list required")
-                library_paths = []
+                observations = []
                 for item in libraries:
                     if not isinstance(item, dict) or not isinstance(item.get("path"), str):
                         raise ValueError("CUDA library path required")
                     path = Path(item["path"])
                     if not path.is_absolute():
                         raise ValueError("absolute CUDA library path required")
-                    library_paths.append(path)
-                library_paths = list(dict.fromkeys(library_paths))
-                if library_paths:
-                    leases.append(guard.register(library_paths))
+                    observations.append((path, _observe_system_library(path, deadline=deadline)))
+                library_paths = list(dict.fromkeys(result[0] for _, result in observations))
+                link_paths = list(dict.fromkeys(link[0] for _, result in observations for link in result[2]))
+                if library_paths or link_paths:
+                    _check_library_deadline(deadline)
+                    leases.append(guard.register(library_paths, symlink_inputs=link_paths))
+                    _check_library_deadline(deadline)
+                    for original, before in observations:
+                        if _observe_system_library(original, deadline=deadline) != before:
+                            raise ValueError("system-library path changed during registration")
         result = _main_after_parse(args, parser)
     except BaseException as error:
         if not args._consumer_dispatch_state["started"]:

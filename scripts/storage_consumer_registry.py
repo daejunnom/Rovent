@@ -85,10 +85,41 @@ def _absolute(value):
     return checked(path)
 
 
+def _link_name(value):
+    """Lexical link name; never follow or read the link's destination."""
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts:
+        raise StorageError("absolute symlink input path required")
+    reject_credential_names(path)
+    for part in path.parts:
+        name = part.lower()
+        if (name == ".ssh" or name.startswith(".env") or "credential" in name
+                or "service-account" in name or "service_account" in name
+                or "api_key" in name or "api-key" in name
+                or "secret" in name or "token" in name or "private_key" in name
+                or "private-key" in name or name.endswith((".pem", ".key", ".p12", ".pfx", ".kdbx"))
+                or name in {"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"}):
+            raise StorageError("secret-like symlink input is not permitted")
+    return path
+
+
+def _pinned_link(value):
+    """A symlink whose parent is a currently checked, canonical directory."""
+    path = _link_name(value)
+    parent = checked(path.parent)
+    if parent != path.parent:
+        raise StorageError("canonical symlink parent required")
+    info = path.lstat()
+    if not stat.S_ISLNK(info.st_mode) or not info.st_ino:
+        raise StorageError("symbolic link input with observable identity required")
+    return path, info
+
+
 def _hardlinked_inodes(root, deadline):
     """Bounded metadata-only scan of a proposed directory cleanup target."""
     root_info = root.stat()
-    pending, result, directories, count = [root], set(), {(root_info.st_dev, root_info.st_ino)}, 0
+    pending, result, directories, links, count = [root], set(), {(root_info.st_dev, root_info.st_ino)}, set(), 0
+    unknown_link_identity = False
     device = root_info.st_dev
     while pending:
         directory = pending.pop()
@@ -101,22 +132,37 @@ def _hardlinked_inodes(root, deadline):
                     raise StorageError("cleanup alias scan limit exceeded")
                 path = Path(entry.path)
                 name = entry.name.lower()
-                if (name == ".ssh" or name == "id_ecdsa" or "credential" in name
+                if (name == ".ssh" or name in {"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"} or "credential" in name
                         or "service-account" in name or "service_account" in name
-                        or "api-key" in name or "api_key" in name):
+                        or "api-key" in name or "api_key" in name
+                        or "secret" in name or "token" in name or "private_key" in name
+                        or "private-key" in name or name.endswith((".pem", ".key", ".p12", ".pfx", ".kdbx"))):
                     raise StorageError("private-named entry is outside alias observation")
                 reject_credential_names(path)
                 # Windows DirEntry.stat may report device/inode as zero even
                 # when os.stat supplies stable identifiers.
                 info = os.stat(entry.path, follow_symlinks=False) if os.name == "nt" else entry.stat(follow_symlinks=False)
+                if type(info.st_dev) is not int or info.st_dev <= 0:
+                    raise StorageError("cleanup alias entry device identity unavailable")
                 if info.st_dev != device:
                     raise StorageError("cleanup alias scan crosses a device")
+                attributes = getattr(info, "st_file_attributes", None)
+                if os.name == "nt" and type(attributes) is not int:
+                    raise StorageError("cleanup alias entry attributes unavailable")
+                if (attributes is not None and attributes & 0x400
+                        and not stat.S_ISLNK(info.st_mode)):
+                    raise StorageError("unverified reparse point in cleanup alias scan")
                 if stat.S_ISDIR(info.st_mode):
                     directories.add((info.st_dev, info.st_ino))
                     pending.append(path)
+                elif stat.S_ISLNK(info.st_mode):
+                    if info.st_ino:
+                        links.add((info.st_dev, info.st_ino))
+                    else:
+                        unknown_link_identity = True
                 elif stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
                     result.add((info.st_dev, info.st_ino))
-    return result, directories
+    return result, directories, links, unknown_link_identity
 
 
 def _ancestor_directories(target, deadline):
@@ -277,9 +323,15 @@ def verify_lease_coverage(registry, owner_id, paths, *, expected_owner=None):
             covered = False
             for item in row["inputs"]:
                 if (type(item) is not dict or set(item) != {"path", "kind", "device", "inode"}
-                        or item.get("kind") not in ("file", "directory", "future")
+                        or item.get("kind") not in ("file", "directory", "future", "symlink")
                         or not isinstance(item.get("path"), str)):
                     raise StorageError("invalid parent consumer input")
+                if item["kind"] == "symlink":
+                    # The existing child coverage API asks for ordinary
+                    # canonical paths; separate symlink entries are neither
+                    # proof of nor an obstacle to that coverage.
+                    _link_name(item["path"])
+                    continue
                 source = _absolute(item["path"])
                 if not (source == target or (item["kind"] in ("directory", "future") and target.is_relative_to(source))):
                     continue
@@ -354,20 +406,23 @@ class ConsumerRegistry:
     def guard(self):
         return _RegistryGuard(self)
 
-    def register(self, inputs, *, owner_id=None, future_inputs=(), _guard=None):
+    def register(self, inputs, *, owner_id=None, future_inputs=(), symlink_inputs=(), _guard=None):
         if (not isinstance(inputs, (list, tuple)) or not isinstance(future_inputs, (list, tuple))
-                or not 1 <= len(inputs) + len(future_inputs) <= _LIMIT):
+                or not isinstance(symlink_inputs, (list, tuple))
+                or not 1 <= len(inputs) + len(future_inputs) + len(symlink_inputs) <= _LIMIT):
             raise StorageError("bounded explicit consumer inputs required")
         paths = [_absolute(path) for path in inputs] + [_absolute(path) for path in future_inputs]
         future = set(_absolute(path) for path in future_inputs)
-        if len(set(paths)) != len(paths):
+        links = [_link_name(path) for path in symlink_inputs]
+        if len(set(paths + links)) != len(paths) + len(links):
             raise StorageError("duplicate consumer input")
         owner_id = uuid.uuid4().hex if owner_id is None else owner_id
         if not isinstance(owner_id, str) or not _ID.fullmatch(owner_id):
             raise StorageError("valid consumer owner identity required")
         if _guard is None:
             with self.guard() as guard:
-                return self.register(inputs, owner_id=owner_id, future_inputs=future_inputs, _guard=guard)
+                return self.register(inputs, owner_id=owner_id, future_inputs=future_inputs,
+                                     symlink_inputs=symlink_inputs, _guard=guard)
         guard = _guard
         if type(guard) is not _RegistryGuard or guard.registry is not self:
             raise StorageError("original consumer registry guard required")
@@ -385,6 +440,9 @@ class ConsumerRegistry:
                 raise StorageError("regular file or directory consumer input required")
             entries.append({"path": str(path), "kind": "file" if stat.S_ISREG(info.st_mode) else "directory",
                             "device": info.st_dev, "inode": info.st_ino})
+        for path in links:
+            path, info = _pinned_link(path)
+            entries.append({"path": str(path), "kind": "symlink", "device": info.st_dev, "inode": info.st_ino})
         row = {"schema": LEASE_SCHEMA, "registry_id": self.registry_id,
                "owner_id": owner_id, "pid": os.getpid(), "lifetime": lifetime(),
                "state": "active", "inputs": entries}
@@ -470,8 +528,9 @@ class _RegistryGuard:
         self.lock.assert_held()
         self.registry._check_identity()
 
-    def register(self, inputs, *, owner_id=None, future_inputs=()):
-        return self.registry.register(inputs, owner_id=owner_id, future_inputs=future_inputs, _guard=self)
+    def register(self, inputs, *, owner_id=None, future_inputs=(), symlink_inputs=()):
+        return self.registry.register(inputs, owner_id=owner_id, future_inputs=future_inputs,
+                                      symlink_inputs=symlink_inputs, _guard=self)
 
     def _registry_pages(self, deadline, unknown):
         """Scan bounded pages under the original registry lock and identity.
@@ -557,11 +616,57 @@ class _RegistryGuard:
                 for value in values:
                     if (type(value) is not dict or set(value) != {"path", "kind", "device", "inode"}
                             or not isinstance(value["path"], str)
-                            or value["kind"] not in ("file", "directory", "future")
+                            or value["kind"] not in ("file", "directory", "future", "symlink")
                             or (value["kind"] == "future" and (value["device"] is not None or value["inode"] is not None))
                             or (value["kind"] != "future" and
                                 (type(value["device"]) is not int or type(value["inode"]) is not int))):
                         raise StorageError("invalid consumer input")
+                    if value["kind"] == "symlink":
+                        # Compare the lexical name without following its
+                        # destination. A link parent may have moved since
+                        # registration; direct path conflicts remain valid.
+                        source = _link_name(value["path"])
+                        for target in candidates:
+                            comparisons += 1
+                            if comparisons % _REGISTRY_PAGE_SIZE == 0 and time.monotonic() >= deadline:
+                                self.check()
+                                return {"conflicts": list(matches),
+                                        "unknown": [*unknown, {"reason": "registry_scan_time_budget_exceeded"}],
+                                        "coverage": "registered_only"}
+                            if source == target or source.is_relative_to(target):
+                                matches.append({"record": str(path), "input": str(source),
+                                                "target": str(target), "state": row["state"]})
+                                continue
+                            try:
+                                info = target.stat()
+                            except FileNotFoundError:
+                                continue
+                            # A bind mount can expose the same symlink inode in
+                            # another directory even when st_nlink is one, and
+                            # a different-device root may contain a nested
+                            # mount. Scan this candidate under the deadline;
+                            # any crossed mount becomes candidate-only unknown.
+                            if not stat.S_ISDIR(info.st_mode):
+                                continue
+                            if (type(info.st_dev) is not int or info.st_dev <= 0 or value["device"] <= 0):
+                                unknown.append({"reason": "symlink_device_identity_unavailable", "target": str(target)})
+                                continue
+                            if value["inode"] <= 0:
+                                unknown.append({"reason": "symlink_identity_unavailable", "target": str(target)})
+                                continue
+                            try:
+                                if target not in directory_aliases:
+                                    directory_aliases[target] = _hardlinked_inodes(target, deadline)
+                                _, _, link_identities, link_identity_unknown = directory_aliases[target]
+                            except (OSError, StorageError):
+                                unknown.append({"reason": "symlink_alias_scan_incomplete", "target": str(target)})
+                                continue
+                            if (value["device"], value["inode"]) in link_identities:
+                                matches.append({"record": str(path), "input": str(source),
+                                                "target": str(target), "state": row["state"]})
+                            elif link_identity_unknown:
+                                unknown.append({"reason": "symlink_alias_identity_unavailable", "target": str(target)})
+                        continue
                     source = _absolute(value["path"])
                     if value["kind"] == "future":
                         try:
@@ -638,7 +743,7 @@ class _RegistryGuard:
                                         if time.monotonic() >= deadline:
                                             raise StorageError("cleanup alias scan time budget exceeded")
                                         directory_aliases[target] = _hardlinked_inodes(target, deadline)
-                                    aliases, directories = directory_aliases[target]
+                                    aliases, directories, _, _ = directory_aliases[target]
                                 except (OSError, StorageError):
                                     unknown.append({"reason": "directory_alias_scan_incomplete", "target": str(target)})
                                     continue
@@ -661,7 +766,7 @@ class _RegistryGuard:
                                     if time.monotonic() >= deadline:
                                         raise StorageError("cleanup alias scan time budget exceeded")
                                     directory_aliases[target] = _hardlinked_inodes(target, deadline)
-                                aliases, directories = directory_aliases[target]
+                                aliases, directories, _, _ = directory_aliases[target]
                             except (OSError, StorageError):
                                 unknown.append({"reason": "directory_alias_scan_incomplete", "target": str(target)})
                                 continue
