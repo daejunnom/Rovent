@@ -79,7 +79,8 @@ class ManagedBrokerLaunch:
         self._assert_supervisor()
         if (self.reader_contract is None or self._command is None
                 or command is not self._command or self.reader_contract.profile.command is not self._command
-                or os.path.realpath(os.fspath(cwd)) != os.path.realpath(os.fspath(self.manager.source))):
+                or os.path.realpath(os.fspath(cwd)) != os.path.realpath(os.fspath(self.manager.source))
+                or not self.reader_contract.profile.unchanged()):
             raise StorageError("original profiled command and source cwd required")
         if self._attempted:
             raise StorageError("broker spawn already attempted")

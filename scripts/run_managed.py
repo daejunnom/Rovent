@@ -183,9 +183,42 @@ def _main(*, output_preservation=None, interruption=None) -> int:
     consumer_dispatched = False
     consumer_closed = False
     broker_launch = None
+    budget_gate = None
+    quarantine = quarantine_key = None
+    quarantine_retained = False
+
+    def retain_broker_unknown(reason, *, finalization_unknown=False):
+        nonlocal quarantine_retained
+        if quarantine is None or quarantine_key is None or broker_launch is None or budget_gate is None:
+            raise StorageError("original broker quarantine reservation unavailable")
+        quarantine.retain(quarantine_key, broker_launch, budget_gate, reason=reason,
+                          finalization_unknown=finalization_unknown)
+        quarantine_retained = True
+        try:
+            print("managed_consumer_broker_quarantine=" + json.dumps(
+                quarantine.observation(quarantine_key), sort_keys=True), file=sys.stderr)
+        except Exception:
+            pass
+
+    def retain_manager_unknown(reason, manager):
+        nonlocal quarantine_retained
+        if quarantine is None or quarantine_key is None:
+            return
+        quarantine.retain_manager(quarantine_key, manager, reason=reason, launch=broker_launch)
+        quarantine_retained = True
+        try:
+            print("managed_consumer_broker_quarantine=" + json.dumps(
+                quarantine.observation(quarantine_key), sort_keys=True), file=sys.stderr)
+        except Exception:
+            pass
+
     try:
         if interruption is not None and interruption["signal"] is not None:
             return 128 + int(interruption["signal"])
+        if args.consumer_broker_reviewed_sha256 is not None:
+            from storage_consumer_broker_quarantine import IN_PROCESS_BROKER_QUARANTINE
+            quarantine = IN_PROCESS_BROKER_QUARANTINE
+            quarantine_key = quarantine.reserve()
         dependency_options = _consumer_registry_options(args.consumer_registry_root,
                                                         args.consumer_registry_id,
                                                         args.consumer_registry_required)
@@ -204,7 +237,18 @@ def _main(*, output_preservation=None, interruption=None) -> int:
             raise StorageError("participating catalog environment exceeds bounded size")
         manager = ManagedBuild(canonical_root(), args.source_root, purpose=args.purpose,
                                output_preservation=output_preservation, **dependency_options)
-        manager.acquire()
+        try:
+            manager.acquire()
+        except BaseException as error:
+            # This manager still references its original guard stream, but
+            # that alone does not prove OS lock ownership or successful close.
+            # Foreign owners/ordinary lock contention are never adopted.
+            if quarantine is not None and manager.guard.stream is not None:
+                try:
+                    retain_manager_unknown("manager acquisition guard close state unknown", manager)
+                except BaseException as retain_error:
+                    error.add_note("original manager quarantine unavailable: " + type(retain_error).__name__)
+            raise
         try:
             environment = manager.environment()
             if verified_catalogs:
@@ -247,10 +291,12 @@ def _main(*, output_preservation=None, interruption=None) -> int:
         except BaseException as error:
             # This try ends before run_group: no payload child was dispatched.
             # Keep the first failure if original-owner cleanup also fails.
+            cleanup_unknown = False
             if broker_launch is not None:
                 try:
                     broker_launch.finish(tree_gone=False)
                 except BaseException as cleanup_error:
+                    cleanup_unknown = True
                     error.add_note("pre-dispatch broker cleanup unknown: " + type(cleanup_error).__name__)
             try:
                 if output_preservation is None:
@@ -258,9 +304,15 @@ def _main(*, output_preservation=None, interruption=None) -> int:
                 else:
                     manager.finish(exit_code=125, tree_gone=True)
             except BaseException as cleanup_error:
+                cleanup_unknown = True
                 error.add_note("pre-dispatch original manager cleanup failed: "
                                + type(cleanup_error).__name__ + ": " + str(cleanup_error)[:2048])
                 _emit_storage_cleanup_failure(cleanup_error)
+            if cleanup_unknown:
+                try:
+                    retain_manager_unknown("pre-dispatch preparation cleanup unknown", manager)
+                except BaseException as retain_error:
+                    error.add_note("original manager quarantine unavailable: " + type(retain_error).__name__)
             raise
 
         def sample_budget():
@@ -285,7 +337,6 @@ def _main(*, output_preservation=None, interruption=None) -> int:
                 # after that same cleanup; do not alter its type or message.
                 budget_failure = exc
                 raise
-        budget_gate = None
         if broker_launch is not None:
             from storage_consumer_broker_budget import BrokerBudgetGate
             budget_gate = BrokerBudgetGate(
@@ -305,12 +356,19 @@ def _main(*, output_preservation=None, interruption=None) -> int:
             # This branch precedes any spawn attempt, so the original manager
             # can finalize its own lease without inventing child evidence.
             exit_code = 128 + int(interruption["signal"])
-            if broker_launch is not None:
-                broker_launch.finish(tree_gone=False)
-            if output_preservation is None:
-                receipt = manager.finish(exit_code=exit_code, tree_gone=True, _not_dispatched=True)
-            else:
-                receipt = manager.finish(exit_code=exit_code, tree_gone=True)
+            try:
+                if broker_launch is not None:
+                    broker_launch.finish(tree_gone=False)
+                if output_preservation is None:
+                    receipt = manager.finish(exit_code=exit_code, tree_gone=True, _not_dispatched=True)
+                else:
+                    receipt = manager.finish(exit_code=exit_code, tree_gone=True)
+            except BaseException as error:
+                try:
+                    retain_manager_unknown("pre-dispatch interruption cleanup unknown", manager)
+                except BaseException as retain_error:
+                    error.add_note("original manager quarantine unavailable: " + type(retain_error).__name__)
+                raise
             try:
                 print("managed_storage=" + json.dumps(receipt, sort_keys=True), file=sys.stderr)
             except BaseException:
@@ -323,9 +381,11 @@ def _main(*, output_preservation=None, interruption=None) -> int:
                 child_fds = broker_launch.child_fds
                 broker_launch.mark_dispatch_attempted()
             except BaseException as error:
+                cleanup_unknown = False
                 try:
                     broker_launch.finish(tree_gone=False)
                 except BaseException as cleanup_error:
+                    cleanup_unknown = True
                     error.add_note("pre-dispatch broker cleanup unknown: " + type(cleanup_error).__name__)
                 try:
                     if output_preservation is None:
@@ -333,7 +393,13 @@ def _main(*, output_preservation=None, interruption=None) -> int:
                     else:
                         manager.finish(exit_code=125, tree_gone=True)
                 except BaseException as cleanup_error:
+                    cleanup_unknown = True
                     error.add_note("pre-dispatch manager cleanup unknown: " + type(cleanup_error).__name__)
+                if cleanup_unknown:
+                    try:
+                        retain_manager_unknown("pre-dispatch arm cleanup unknown", manager)
+                    except BaseException as retain_error:
+                        error.add_note("original manager quarantine unavailable: " + type(retain_error).__name__)
                 raise
         # Set before even attempting dispatch: a launcher failure with uncertain
         # child creation must never use the no-child cleanup shortcut.
@@ -350,10 +416,12 @@ def _main(*, output_preservation=None, interruption=None) -> int:
                     owned_group=broker_launch.group, on_stop=broker_launch.on_stop,
                     verify_before_spawn=True)
             except ProcessNotSpawned as error:
+                cleanup_unknown = False
                 try:
                     broker_launch.mark_pre_dispatch_failure(error)
                     broker_launch.finish(tree_gone=False)
                 except BaseException as cleanup_error:
+                    cleanup_unknown = True
                     error.add_note("pre-dispatch broker cleanup unknown: " + type(cleanup_error).__name__)
                 manager._dispatch_started = False
                 consumer_dispatched = False
@@ -363,7 +431,13 @@ def _main(*, output_preservation=None, interruption=None) -> int:
                     else:
                         manager.finish(exit_code=125, tree_gone=True)
                 except BaseException as cleanup_error:
+                    cleanup_unknown = True
                     error.add_note("pre-dispatch manager cleanup unknown: " + type(cleanup_error).__name__)
+                if cleanup_unknown:
+                    try:
+                        retain_manager_unknown("proven no-spawn cleanup unknown", manager)
+                    except BaseException as retain_error:
+                        error.add_note("original manager quarantine unavailable: " + type(retain_error).__name__)
                 raise
             except BaseException as error:
                 # No broker exists until the original group's Popen object is
@@ -386,9 +460,24 @@ def _main(*, output_preservation=None, interruption=None) -> int:
                                   file=sys.stderr)
                         except Exception:
                             pass
+                try:
+                    retain_broker_unknown("broker spawn or original group unknown")
+                except BaseException as retain_error:
+                    error.add_note("original broker quarantine unavailable: " + type(retain_error).__name__)
                 raise
-            if not broker_launch.finish(tree_gone=gone):
+            try:
+                broker_released = broker_launch.finish(tree_gone=gone)
+            except BaseException as error:
+                try:
+                    retain_broker_unknown("broker finalization unknown", finalization_unknown=True)
+                except BaseException as retain_error:
+                    error.add_note("original broker quarantine unavailable: " + type(retain_error).__name__)
+                raise
+            if not broker_released:
+                retain_broker_unknown("original group or reader scope unknown")
                 raise StorageError("broker original group or reader scope remains unknown; preserve owner")
+            if not gone:
+                retain_broker_unknown("original group unknown after restricted guard release")
             try:
                 print("managed_consumer_broker_observation=" + json.dumps({
                     "registered_scope": "participating_bound_catalogs_only",
@@ -436,7 +525,15 @@ def _main(*, output_preservation=None, interruption=None) -> int:
                     print("managed_consumer_lease_warning=" + type(error).__name__, file=sys.stderr)
                 except Exception:
                     pass
-        receipt = manager.finish(exit_code=code, tree_gone=gone, supervisor_error=failure)
+        try:
+            receipt = manager.finish(exit_code=code, tree_gone=gone, supervisor_error=failure)
+        except BaseException as error:
+            if broker_launch is not None and not quarantine_retained:
+                try:
+                    retain_broker_unknown("manager finalization unknown", finalization_unknown=True)
+                except BaseException as retain_error:
+                    error.add_note("original manager quarantine unavailable: " + type(retain_error).__name__)
+            raise
         print("managed_storage=" + json.dumps(receipt, sort_keys=True), file=sys.stderr)
         # The catalog total includes foreign reservations, so it cannot
         # establish actual disk pressure. Read a fresh advisory snapshot only
@@ -487,6 +584,14 @@ def _main(*, output_preservation=None, interruption=None) -> int:
             except (StorageError, OSError) as error:
                 try:
                     print("managed_consumer_lease_warning=" + type(error).__name__, file=sys.stderr)
+                except Exception:
+                    pass
+        if quarantine is not None and quarantine_key is not None and not quarantine_retained:
+            try:
+                quarantine.release_reservation(quarantine_key)
+            except Exception as error:
+                try:
+                    print("managed_consumer_broker_quarantine_warning=" + type(error).__name__, file=sys.stderr)
                 except Exception:
                     pass
 

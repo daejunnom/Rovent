@@ -19,10 +19,10 @@ class BrokerBudgetGate:
         self._deferred = False
         self.deferred_count = 0
         self._owner_pid = os.getpid()
-        self._owner_thread = threading.get_ident()
+        self._owner_thread = threading.current_thread()
 
     def _check_owner(self):
-        if os.getpid() != self._owner_pid or threading.get_ident() != self._owner_thread:
+        if os.getpid() != self._owner_pid or threading.current_thread() is not self._owner_thread:
             raise RuntimeError("original budget event-loop owner required")
 
     @property

@@ -81,7 +81,7 @@ class ConsumerBrokerState:
         self._hold_on_failure = hold_on_failure
         self._requests_started = 0
         self._pid = os.getpid()
-        self._thread = threading.get_ident()
+        self._thread = threading.current_thread()
         self._stack = None
         self._guard = None
         self._request = None
@@ -97,7 +97,7 @@ class ConsumerBrokerState:
         self._admission_closed = False
 
     def _check(self, *, child=False, preserve_on_failure=False):
-        if (os.getpid() != self._pid or threading.get_ident() != self._thread
+        if (os.getpid() != self._pid or threading.current_thread() is not self._thread
                 or self._broken or self._finalized):
             raise BrokerStateError("original broker owner unavailable")
         try:
@@ -270,7 +270,7 @@ class ConsumerBrokerState:
 
         This does not repair a broken registry or close/transition any lease.
         """
-        if (os.getpid() != self._pid or threading.get_ident() != self._thread
+        if (os.getpid() != self._pid or threading.current_thread() is not self._thread
                 or self._finalized or self._lock_release_unknown or tree_gone is not True):
             raise BrokerStateError("original supervisor and observed drain required")
         self._assert_supervisor()
@@ -284,7 +284,7 @@ class ConsumerBrokerState:
         request performs registration only. It covers bound, cooperating
         cleaners only. It is not evidence of tree or physical completion.
         """
-        if (os.getpid() != self._pid or threading.get_ident() != self._thread
+        if (os.getpid() != self._pid or threading.current_thread() is not self._thread
                 or self._finalized or self._lock_release_unknown or not self._hold_on_failure
                 or admission_revoked is not True or reader_scope_proven is not True):
             raise BrokerStateError("original revoked restricted reader owner required")

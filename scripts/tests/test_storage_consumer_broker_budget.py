@@ -3,6 +3,7 @@ import sys
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from storage_consumer_broker_budget import BrokerBudgetGate
@@ -78,6 +79,12 @@ class BrokerBudgetGateTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], RuntimeError)
         self.assertEqual(samples, [])
+
+    def test_reused_numeric_thread_id_does_not_imply_same_thread_object(self):
+        gate = BrokerBudgetGate(lambda: None, lambda: False)
+        with patch("storage_consumer_broker_budget.threading.current_thread", return_value=object()):
+            with self.assertRaises(RuntimeError):
+                gate.sample()
 
 
 if __name__ == "__main__":

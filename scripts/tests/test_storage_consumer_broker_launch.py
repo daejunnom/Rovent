@@ -200,6 +200,19 @@ class ManagedBrokerLaunchTests(unittest.TestCase):
             finally:
                 self.assertTrue(other.finish(tree_gone=False))
 
+    def test_source_drift_before_spawn_rejects_only_opt_in(self):
+        group = SimpleNamespace(_owner_pid=os.getpid(), _child=None, _completed=False)
+        with patch("storage_consumer_broker_launch.OwnedProcessGroup", return_value=group):
+            contract = FakeContract(self.manager)
+            other = ManagedBrokerLaunch(self.manager, [], reader_contract=contract)
+            try:
+                contract.profile.stable = False
+                with self.assertRaises(RuntimeError):
+                    other.assert_spawn_command(other.command, self.manager.source)
+                self.assertFalse(other._attempted)
+            finally:
+                self.assertTrue(other.finish(tree_gone=False))
+
     def test_unconfirmed_spawn_revokes_only_unserved_broker_resources(self):
         group = SimpleNamespace(_owner_pid=os.getpid(), _child=None, _completed=False)
         with patch("storage_consumer_broker_launch.OwnedProcessGroup", return_value=group):

@@ -3,6 +3,7 @@ import sys
 import threading
 import tempfile
 import unittest
+from unittest.mock import patch
 import os
 import uuid
 from contextlib import contextmanager
@@ -83,6 +84,14 @@ class Fixture:
 
 
 class ConsumerBrokerStateTests(unittest.TestCase):
+    def test_same_numeric_thread_id_is_not_same_thread_object(self):
+        fixture = Fixture()
+        state = fixture.state()
+        with patch("storage_consumer_broker_state.threading.current_thread", return_value=object()):
+            with self.assertRaises(BrokerStateError):
+                state.begin(1, deadline=20)
+        self.assertFalse(fixture.locked)
+
     def test_hold_policy_keeps_guard_on_expiry_and_owner_failure(self):
         fixture = Fixture()
         state = ConsumerBrokerState(fixture.transaction, fixture.assert_owner, fixture.assert_child,
