@@ -328,6 +328,17 @@ fn go_parses_each_supported_budget_mode_without_losing_units() {
     );
     assert!(parse_default("go movetime 0").is_ok());
     assert!(parse_default("go wtime 0 btime 0").is_ok());
+    assert_eq!(
+        parse_default("go movetime 150 wtime 900 btime 800 winc 5 binc 7"),
+        Ok(Command::Go(GoLimits {
+            movetime_ms: Some(150),
+            white_time_ms: Some(900),
+            black_time_ms: Some(800),
+            white_increment_ms: Some(5),
+            black_increment_ms: Some(7),
+            ..GoLimits::default()
+        }))
+    );
 }
 
 #[test]
@@ -341,7 +352,6 @@ fn go_rejects_conflicts_missing_fields_duplicates_and_overflow() {
         "go winc 1",
         "go binc 1",
         "go movestogo 1",
-        "go movetime 1 wtime 1 btime 1",
         "go infinite movetime 1",
         "go infinite wtime 1 btime 1",
         "go infinite infinite",

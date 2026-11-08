@@ -485,11 +485,6 @@ fn parse_go(
     {
         return Err(ParseError::Malformed("increments/movestogo require clocks"));
     }
-    if limits.movetime_ms.is_some() && has_clock {
-        return Err(ParseError::Malformed(
-            "movetime and clock modes are distinct",
-        ));
-    }
     // Infinite owns bestmove output until stop even if a finite work objective
     // has completed. Its time/ponder conflicts retain the existing policy.
     if limits.infinite && (limits.ponder || limits.movetime_ms.is_some() || has_clock) {

@@ -406,33 +406,49 @@ impl PreparedSearchBinding {
             NodeBudgetSemantics::RoventPositionVisits => settings.max_simulations,
         };
 
-        let (time_control, kind) = if let Some(movetime) = limits.movetime_ms {
-            (
-                TimeControl::MoveTime(Duration::from_millis(movetime)),
-                BudgetKind::UciTime,
-            )
-        } else if let (Some(white), Some(black)) = (limits.white_time_ms, limits.black_time_ms) {
+        let clock_control = if let (Some(white), Some(black)) =
+            (limits.white_time_ms, limits.black_time_ms)
+        {
             // validate_limits established that both side clocks exist.
             let (remaining, increment) = match side {
                 SideToMove::White => (white, limits.white_increment_ms.unwrap_or(0)),
                 SideToMove::Black => (black, limits.black_increment_ms.unwrap_or(0)),
             };
-            (
-                TimeControl::Clock {
-                    remaining: Duration::from_millis(remaining),
-                    increment: Duration::from_millis(increment),
-                    moves_to_go: limits.moves_to_go,
-                },
-                BudgetKind::UciTime,
-            )
+            Some(TimeControl::Clock {
+                remaining: Duration::from_millis(remaining),
+                increment: Duration::from_millis(increment),
+                moves_to_go: limits.moves_to_go,
+            })
         } else {
-            (
-                TimeControl::MoveTime(settings.untimed_limit),
-                BudgetKind::ResourceWall,
-            )
+            None
         };
-        let budget = TimeBudget::new(start, time_control, settings.time_config)
-            .map_err(BuildSearchError::TimeBudget)?;
+        let movetime_control = limits
+            .movetime_ms
+            .map(|value| TimeControl::MoveTime(Duration::from_millis(value)));
+        let kind = if movetime_control.is_some() || clock_control.is_some() {
+            BudgetKind::UciTime
+        } else {
+            BudgetKind::ResourceWall
+        };
+        let mut budget = TimeBudget::new(
+            start,
+            movetime_control
+                .or(clock_control)
+                .unwrap_or(TimeControl::MoveTime(settings.untimed_limit)),
+            settings.time_config,
+        )
+        .map_err(BuildSearchError::TimeBudget)?;
+        if let (Some(_), Some(clock_control)) = (movetime_control, clock_control) {
+            // Both independently declared limits apply. Preserve every
+            // reserve and use the earliest corresponding boundary.
+            let clock = TimeBudget::new(start, clock_control, settings.time_config)
+                .map_err(BuildSearchError::TimeBudget)?;
+            budget.soft_deadline = budget.soft_deadline.min(clock.soft_deadline);
+            budget.admission_deadline = budget.admission_deadline.min(clock.admission_deadline);
+            budget.hard_deadline = budget.hard_deadline.min(clock.hard_deadline);
+            budget.output_deadline = budget.output_deadline.min(clock.output_deadline);
+            budget.allocation = budget.allocation.min(clock.allocation);
+        }
         // A Rovent process registers the complete per-go wall allocation,
         // including output reserve. Legacy simulation bindings keep their
         // existing clock policy; only the explicit node-domain opts in.
@@ -570,11 +586,6 @@ fn validate_limits(
             "increments/movestogo require clocks",
         ));
     }
-    if limits.movetime_ms.is_some() && has_clock {
-        return Err(BuildSearchError::InvalidGo(
-            "movetime and clocks are distinct modes",
-        ));
-    }
     if limits.infinite && (limits.ponder || limits.movetime_ms.is_some() || has_clock) {
         return Err(BuildSearchError::InvalidGo(
             "infinite cannot combine with ponder or time limits",
@@ -691,6 +702,97 @@ mod tests {
         assert_eq!(binding.budget().allocation, Duration::from_secs(1));
         assert_eq!(binding.control().max_simulations, 7);
         assert_eq!(binding.control().deadline, now + Duration::from_millis(990));
+    }
+
+    #[test]
+    fn mixed_movetime_and_clock_keep_each_earliest_boundary_for_both_sides() {
+        let now = Instant::now();
+        for semantics in [
+            NodeBudgetSemantics::LegacySimulations,
+            NodeBudgetSemantics::RoventPositionVisits,
+        ] {
+            for (line, expected_allocations) in [
+                (
+                    "go movetime 4000 wtime 30000 btime 60000 winc 1000 binc 2000",
+                    [4000, 4000],
+                ),
+                (
+                    "go movetime 20000 wtime 30000 btime 60000 winc 1000 binc 2000",
+                    [5400, 10800],
+                ),
+            ] {
+                let (_, limits) = start(&mut session(), line);
+                for (side, expected_ms) in [SideToMove::White, SideToMove::Black]
+                    .into_iter()
+                    .zip(expected_allocations)
+                {
+                    let combined = PreparedSearchBinding::prepare(
+                        &limits, side, now, settings(), None, semantics,
+                    )
+                    .unwrap();
+                    let mut move_only = limits.clone();
+                    move_only.white_time_ms = None;
+                    move_only.black_time_ms = None;
+                    move_only.white_increment_ms = None;
+                    move_only.black_increment_ms = None;
+                    let move_budget = *PreparedSearchBinding::prepare(
+                        &move_only, side, now, settings(), None, semantics,
+                    )
+                    .unwrap()
+                    .budget();
+                    let mut clock_only = limits.clone();
+                    clock_only.movetime_ms = None;
+                    let clock_budget = *PreparedSearchBinding::prepare(
+                        &clock_only, side, now, settings(), None, semantics,
+                    )
+                    .unwrap()
+                    .budget();
+                    let actual = combined.budget();
+                    assert_eq!(actual.allocation, Duration::from_millis(expected_ms));
+                    assert_eq!(
+                        actual.soft_deadline,
+                        move_budget.soft_deadline.min(clock_budget.soft_deadline)
+                    );
+                    assert_eq!(
+                        actual.admission_deadline,
+                        move_budget.admission_deadline.min(clock_budget.admission_deadline)
+                    );
+                    assert_eq!(
+                        actual.hard_deadline,
+                        move_budget.hard_deadline.min(clock_budget.hard_deadline)
+                    );
+                    assert_eq!(
+                        actual.output_deadline,
+                        move_budget.output_deadline.min(clock_budget.output_deadline)
+                    );
+                    assert_eq!(actual.allocation, move_budget.allocation.min(clock_budget.allocation));
+                    assert_eq!(combined.budget_kind(), BudgetKind::UciTime);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_limits_cannot_borrow_the_next_increment() {
+        let limits = GoLimits {
+            movetime_ms: Some(1_000),
+            white_time_ms: Some(0),
+            black_time_ms: Some(60_000),
+            white_increment_ms: Some(10_000),
+            ..GoLimits::default()
+        };
+        let now = Instant::now();
+        let prepared = PreparedSearchBinding::prepare(
+            &limits,
+            SideToMove::White,
+            now,
+            settings(),
+            None,
+            NodeBudgetSemantics::LegacySimulations,
+        )
+        .unwrap();
+        assert_eq!(prepared.budget().allocation, Duration::ZERO);
+        assert_eq!(prepared.budget().output_deadline, now);
     }
 
     #[test]
@@ -1261,12 +1363,6 @@ mod tests {
             GoLimits {
                 movetime_ms: Some(10),
                 infinite: true,
-                ..GoLimits::default()
-            },
-            GoLimits {
-                movetime_ms: Some(10),
-                white_time_ms: Some(20),
-                black_time_ms: Some(20),
                 ..GoLimits::default()
             },
             GoLimits {

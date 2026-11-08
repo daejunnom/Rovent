@@ -230,10 +230,6 @@ impl SearchSessionDriver for SourceAdmissionProbe {
             .inner
             .run(position, context, progress)
             .map_err(|failure| self.gate.retain_failure(failure))?;
-        let clock = context
-            .effective_clock
-            .as_ref()
-            .expect("actual ponder clock");
         {
             let mut state = self.gate.state.lock().unwrap();
             state.runs += 1;
@@ -245,6 +241,11 @@ impl SearchSessionDriver for SourceAdmissionProbe {
             });
             self.gate.changed.notify_all();
         }
+        let Some(clock) = context.effective_clock.as_ref() else {
+            // Normal go requests use the original budget directly. Keep the
+            // same custody probe without manufacturing a ponder clock.
+            return Ok(report);
+        };
         let until = Instant::now() + Duration::from_secs(5);
         loop {
             // Version is read before the snapshot/release/cancellation checks.
@@ -411,6 +412,130 @@ fn original_custody_unchanged(original: &Delivered, observed: &Delivered, owner:
         .unwrap()
         .verify(&original.position, a, &owner.clock)
         .unwrap();
+}
+
+fn mixed_expected_budgets(
+    start: Instant,
+    config: rz_search::time::TimeBudgetConfig,
+    movetime_ms: u64,
+    remaining_ms: u64,
+    increment_ms: u64,
+) -> (rz_search::time::TimeBudget, rz_search::time::TimeBudget) {
+    use rz_search::time::{TimeBudget, TimeControl};
+    let move_budget = TimeBudget::new(
+        start,
+        TimeControl::MoveTime(Duration::from_millis(movetime_ms)),
+        config,
+    )
+    .unwrap();
+    let clock_budget = TimeBudget::new(
+        start,
+        TimeControl::Clock {
+            remaining: Duration::from_millis(remaining_ms),
+            increment: Duration::from_millis(increment_ms),
+            moves_to_go: None,
+        },
+        config,
+    )
+    .unwrap();
+    (move_budget, clock_budget)
+}
+
+fn assert_mixed_boundaries(
+    actual: &rz_search::time::TimeBudget,
+    move_budget: &rz_search::time::TimeBudget,
+    clock_budget: &rz_search::time::TimeBudget,
+) {
+    assert_eq!(actual.soft_deadline, move_budget.soft_deadline.min(clock_budget.soft_deadline));
+    assert_eq!(actual.admission_deadline, move_budget.admission_deadline.min(clock_budget.admission_deadline));
+    assert_eq!(actual.hard_deadline, move_budget.hard_deadline.min(clock_budget.hard_deadline));
+    assert_eq!(actual.output_deadline, move_budget.output_deadline.min(clock_budget.output_deadline));
+    assert_eq!(actual.allocation, move_budget.allocation.min(clock_budget.allocation));
+}
+
+#[test]
+fn actual_owner_driver_mixed_time_for_both_sides_publishes_legal_bestmove() {
+    for (position, remaining, increment) in [
+        ("position startpos", 30_000, 1_000),
+        ("position startpos moves e2e4", 60_000, 2_000),
+    ] {
+        for movetime in [4_000, 20_000] {
+            let (mut owner, mut session, acknowledgments) = search_driver_output_fixture(false);
+            let gate = install_probe(&mut owner, &mut session);
+            let (sender, events) = event_channel();
+            let mut positioned = owner.handle(&mut session, Event::Line(position.into()));
+            assert!(positioned.accepted, "{:?}", positioned.diagnostics);
+            dispatch_all(&mut owner, &sender, &mut positioned);
+            let command = format!("go movetime {movetime} wtime 30000 btime 60000 winc 1000 binc 2000 nodes 7");
+            let mut start = owner.handle(&mut session, Event::Line(command));
+            assert!(start.accepted, "{:?}", start.diagnostics);
+            dispatch_all(&mut owner, &sender, &mut start);
+            let delivered = gate.delivered();
+            let actual = delivered.context.original_time_budget.unwrap();
+            let (move_budget, clock_budget) = mixed_expected_budgets(
+                actual.start, owner.settings.search.time_config, movetime, remaining, increment,
+            );
+            assert_mixed_boundaries(&actual, &move_budget, &clock_budget);
+            assert_eq!(delivered.context.control.soft_deadline, actual.soft_deadline);
+            assert_eq!(delivered.context.control.admission_deadline, actual.admission_deadline);
+            assert_eq!(delivered.context.control.deadline, actual.hard_deadline);
+            let completed = finish_worker(&mut owner, &mut session, &events);
+            let moves = bestmoves(&completed);
+            assert_eq!(moves.len(), 1);
+            let movement = BoardMove::from_uci(moves[0]).unwrap();
+            assert!(delivered.position.ordered_legal_moves().moves().contains(&movement));
+            assert_eq!(acknowledgments.lock().unwrap().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn actual_owner_ponderhit_mixed_time_is_capped_and_keeps_same_worker() {
+    for (position, remaining, increment) in [
+        ("position startpos", 30_000, 1_000),
+        ("position startpos moves e2e4", 60_000, 2_000),
+    ] {
+        for movetime in [4_000, 20_000] {
+            let (mut owner, mut session, acknowledgments) = search_driver_output_fixture(false);
+            let gate = install_probe(&mut owner, &mut session);
+            let (sender, events) = event_channel();
+            let mut positioned = owner.handle(&mut session, Event::Line(position.into()));
+            assert!(positioned.accepted, "{:?}", positioned.diagnostics);
+            dispatch_all(&mut owner, &sender, &mut positioned);
+            let command = format!("go ponder movetime {movetime} wtime 30000 btime 60000 winc 1000 binc 2000 nodes 7");
+            let mut start = owner.handle(&mut session, Event::Line(command));
+            assert!(start.accepted, "{:?}", start.diagnostics);
+            let ticket = session.active_ticket().unwrap();
+            dispatch_all(&mut owner, &sender, &mut start);
+            let delivered = gate.delivered();
+            let original = delivered.context.original_time_budget.unwrap();
+            let hit_result = owner.handle(&mut session, Event::Line("ponderhit".into()));
+            assert!(hit_result.accepted, "{:?}", hit_result.diagnostics);
+            no_restart_or_cancel(&hit_result);
+            assert_eq!(session.active_ticket(), Some(ticket));
+            gate.wait_for(|state| state.observed_hit);
+            let snapshot = delivered.context.effective_clock.as_ref().unwrap().snapshot(Instant::now());
+            let hit = snapshot.hit().unwrap();
+            let (move_budget, clock_budget) = mixed_expected_budgets(
+                hit.hit_at(), owner.settings.search.time_config, movetime, remaining, increment,
+            );
+            let effective = hit.budget();
+            assert_eq!(effective.soft_deadline, original.soft_deadline.min(move_budget.soft_deadline).min(clock_budget.soft_deadline));
+            assert_eq!(effective.admission_deadline, original.admission_deadline.min(move_budget.admission_deadline).min(clock_budget.admission_deadline));
+            assert_eq!(effective.hard_deadline, original.hard_deadline.min(move_budget.hard_deadline).min(clock_budget.hard_deadline));
+            assert_eq!(effective.output_deadline, original.output_deadline.min(move_budget.output_deadline).min(clock_budget.output_deadline));
+            assert_eq!(effective.start, original.start);
+            assert_eq!(effective.start + effective.allocation, effective.output_deadline);
+            assert_eq!(gate.state.lock().unwrap().runs, 1);
+            gate.release();
+            let completed = finish_worker(&mut owner, &mut session, &events);
+            let moves = bestmoves(&completed);
+            assert_eq!(moves.len(), 1);
+            let movement = BoardMove::from_uci(moves[0]).unwrap();
+            assert!(delivered.position.ordered_legal_moves().moves().contains(&movement));
+            assert_eq!(acknowledgments.lock().unwrap().len(), 1);
+        }
+    }
 }
 
 #[test]
