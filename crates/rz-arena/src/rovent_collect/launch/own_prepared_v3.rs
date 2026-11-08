@@ -111,6 +111,12 @@ mod tests {
 }
 
 impl OwnCollectionPreparedV3 {
+    /// The same native owner created by this prepared launch. This reference
+    /// alone is neither a start authority nor a completion witness.
+    pub(crate) fn native_owner(&self) -> &Arc<RoventOwnCollectionLaunchOwnerV3> {
+        &self.native
+    }
+
     /// Validate and retain the supplied input/lock and output owners.
     /// Failure leaves their original Arcs with the caller. The caller must
     /// retain the result before attempting any later admission; this function
@@ -124,16 +130,23 @@ impl OwnCollectionPreparedV3 {
         lock: &Arc<RoventInputLockV3>,
         directory: &cap_std::fs::Dir,
         lock_file: &Arc<std::fs::File>,
+        preparation_ceiling: Instant,
         execution_ceiling: Instant,
         cleanup_ceiling: Instant,
     ) -> Result<Self, ArenaError> {
-        if execution_ceiling > cleanup_ceiling || Instant::now() >= execution_ceiling {
+        if preparation_ceiling > execution_ceiling
+            || execution_ceiling > cleanup_ceiling
+            || Instant::now() >= preparation_ceiling
+        {
             return Err(invalid("Own /3 original preparation deadline unavailable"));
         }
-        verify_supplied_lock(lock, lock_file, execution_ceiling)?;
+        verify_supplied_lock(lock, lock_file, preparation_ceiling)?;
         // Do not reopen supplied descriptors by pathname. Native FD identity
         // is not yet observed or established here.
         inputs.validate_original_own_boundary(lock, directory, lock_file)?;
+        if Instant::now() >= preparation_ceiling {
+            return Err(invalid("Own /3 original preparation deadline expired"));
+        }
         if !output.matches_inputs(inputs) {
             return Err(invalid("Own /3 output original input owner differs"));
         }
@@ -172,6 +185,9 @@ impl OwnCollectionPreparedV3 {
             Box::new(observer),
         ));
         bridge.bind_native_owner(&native).map_err(invalid)?;
+        if Instant::now() >= preparation_ceiling {
+            return Err(invalid("Own /3 original preparation deadline expired"));
+        }
         Ok(Self {
             inputs: Arc::clone(inputs),
             output: Arc::clone(output),

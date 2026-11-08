@@ -1679,6 +1679,14 @@ pub(super) struct OriginalV3Inputs<'a> {
     control: RoventStartupControl,
     clock: ProcessClock,
     collection: Option<OriginalCollectionOwnerV3>,
+    // The arena's scope-free input leaf is owned from reservation onward.
+    // It is not the external recovery entry or a completion proof.
+    own_scope_leaf: Option<Box<dyn std::any::Any + Send>>,
+    // The one-shot sink belongs to the arena's original external entry.
+    own_guard_receipt: Option<(
+        Arc<()>,
+        Box<dyn FnOnce(super::RoventOwnUciNoDispatchV3) -> Result<(), RoventLaunchError> + Send>,
+    )>,
     // Original open descriptors only; no archive worker is started here.
     storage: Option<storage::RoventStorageByteCustody<RoventInputLockV3>>,
     // A legacy selection index is retained through physical completion;
@@ -1707,7 +1715,7 @@ pub(super) fn admit_original<'a>(
     lock_file: File,
     resource: Option<ResourceAdmissionV3<'a>>,
 ) -> Result<OriginalV3Inputs<'a>, RoventLaunchError> {
-    admit_original_inner(arguments, lock, root, cwd, Arc::new(lock_file), resource, None)
+    admit_original_inner(arguments, lock, root, cwd, Arc::new(lock_file), resource, None, None)
 }
 
 /// Admit the explicit /3 P/C Collection using the same original process,
@@ -1730,6 +1738,25 @@ pub(super) fn admit_original_collection<'a>(
         Arc::new(lock_file),
         resource,
         Some(collection),
+        None,
+    )
+}
+
+/// Admit a controlled Own factory with the original lock FD. The factory is
+/// called only after the original process boundary and resource control have
+/// been checked; its external recovery owner must already be registered.
+#[cfg(target_os = "linux")]
+pub(super) fn admit_original_own_factory<'a>(
+    arguments: &Arguments,
+    lock: Arc<RoventInputLockV3>,
+    root: Dir,
+    cwd: PathBuf,
+    lock_file: File,
+    resource: Option<ResourceAdmissionV3<'a>>,
+    factory: super::OwnFactoryV3<'a>,
+) -> Result<OriginalV3Inputs<'a>, RoventLaunchError> {
+    admit_original_inner(
+        arguments, lock, root, cwd, Arc::new(lock_file), resource, None, Some(factory),
     )
 }
 
@@ -1741,7 +1768,8 @@ fn admit_original_inner<'a>(
     cwd: PathBuf,
     lock_file: Arc<File>,
     resource: Option<ResourceAdmissionV3<'a>>,
-    collection: Option<OriginalCollectionOwnerV3>,
+    mut collection: Option<OriginalCollectionOwnerV3>,
+    own_factory: Option<super::OwnFactoryV3<'a>>,
 ) -> Result<OriginalV3Inputs<'a>, RoventLaunchError> {
     if arguments.storage.is_some()
         || arguments.startup_diagnostics
@@ -1755,7 +1783,7 @@ fn admit_original_inner<'a>(
         ));
     }
     if !matches!(
-        (lock.manifest.purpose, collection.is_some()),
+        (lock.manifest.purpose, collection.is_some() || own_factory.is_some()),
         (
             rz_experiments::RoventPurpose::Validation | rz_experiments::RoventPurpose::Deployment,
             false
@@ -1770,6 +1798,20 @@ fn admit_original_inner<'a>(
         return Err(error(
             "InputLockUnsupportedV3",
             "Own V3 Collection launch remains guarded until its product and physical lifetime are connected",
+        ));
+    }
+    if own_factory.is_some()
+        && (collection.is_some()
+            || resource.is_none()
+            || !lock.manifest.engine.mode.has_native_r()
+            || !matches!(
+                &lock.manifest.engine.researcher,
+                Some(rz_experiments::RoventResearcher::Own { .. })
+            ))
+    {
+        return Err(error(
+            "InputLockUnsupportedV3",
+            "Own factory requires its controlled Collection and original Own researcher",
         ));
     }
     if collection.is_some()
@@ -1861,6 +1903,8 @@ fn admit_original_inner<'a>(
     let mut scope_reserved = None;
     let mut connected_parent = None;
     let mut post_auth = None;
+    let mut own_scope_leaf = None;
+    let mut own_guard_receipt = None;
     if let Some(admit_resource) = resource {
         let ResourceAdmissionV3 {
             require_control_dir,
@@ -1942,6 +1986,28 @@ fn admit_original_inner<'a>(
         control
             .check()
             .map_err(|failure| error("ResourceAdmission", failure))?;
+    }
+    if let Some(factory) = own_factory {
+        control
+            .check()
+            .map_err(|failure| error("CollectionAdmission", failure))?;
+        // The arena caller owns the external recovery entry before entering
+        // this callback. Factory return, error or panic is not evidence of
+        // native/teacher completion or permission to release that entry.
+        let product = factory(&lock, root, &lock_file, &control)?;
+        if !Arc::ptr_eq(&product.original_input_lock, &lock)
+            || !Arc::ptr_eq(&product.original_lock_file, &lock_file)
+        {
+            return Err(error("CollectionAdmission", "Own factory original input or lock owner differs"));
+        }
+        let owner = OriginalCollectionOwnerV3::Own(product.native_owner);
+        owner.register_startup_control(&control)?;
+        own_scope_leaf = Some(product.scope_leaf);
+        own_guard_receipt = Some((product.entry_identity, product.no_uci_dispatch_sink));
+        collection = Some(owner);
+        control
+            .check()
+            .map_err(|failure| error("CollectionAdmission", failure))?;
     }
     let receipt_writer = early_writer.or_else(|| {
         arguments
@@ -2170,6 +2236,8 @@ fn admit_original_inner<'a>(
         control,
         clock,
         collection,
+        own_scope_leaf,
+        own_guard_receipt,
         storage,
         selection_file: selection_file.map(Arc::new),
         lock_file,
@@ -2285,6 +2353,8 @@ pub(super) fn run_native_admitted(
         control,
         clock,
         collection,
+        own_scope_leaf,
+        own_guard_receipt,
         storage,
         selection_file,
         lock_file,
@@ -2295,6 +2365,27 @@ pub(super) fn run_native_admitted(
         go_observer,
         scope_reserved,
     } = original;
+    // Own is prepared only: no native session or worker can start until the
+    // original resource gate, product assembly and physical lifetime are
+    // connected and independently verified.
+    if let Some(OriginalCollectionOwnerV3::Own(owner)) = &collection {
+        if let Some((entry_identity, sink)) = own_guard_receipt {
+            // This evidence covers only this invocation's UCI-owned native
+            // constructor and worker dispatch. The factory, callbacks and a
+            // GPU may have independent activity requiring separate evidence.
+            sink(super::RoventOwnUciNoDispatchV3 {
+                native_owner: Arc::clone(owner),
+                original_input_lock: Arc::clone(&lock),
+                original_lock_file: Arc::clone(&lock_file),
+                entry_identity,
+            })?;
+        }
+        return Err(error(
+            "InputLockUnsupportedV3",
+            "Own V3 Collection launch remains guarded until its product and physical lifetime are connected",
+        )
+        .into());
+    }
     let own_board = matches!(
         sources.configuration().fields().execution,
         ExecutionConfiguration::OwnResearcher {
@@ -2550,6 +2641,7 @@ pub(super) fn run_native_admitted(
         selection_file.clone(),
         external_selection_file.clone(),
         Arc::clone(&lock_file),
+        own_scope_leaf,
         receipt_writer.clone(),
         Arc::clone(&owners),
     ));

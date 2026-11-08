@@ -20,6 +20,16 @@ pub(crate) struct PreparedManagedPcV3 {
     pub(crate) cleanup_until: Instant,
 }
 
+/// The same managed transport, but locked to the Own plan domain. It cannot
+/// call the PC-only `start` path.
+pub(crate) struct PreparedManagedOwnV3 {
+    pub(crate) inputs: Arc<PreparedPcCollectionInputsV3>,
+    pub(crate) output: Arc<ManagedOutputOwnerV3>,
+    pub(crate) arguments: Vec<String>,
+    pub(crate) work_until: Instant,
+    pub(crate) cleanup_until: Instant,
+}
+
 /// Start failures retain the original input/output and, if created, the same
 /// supervisor owner. The optional registry key is custody, not completion.
 pub(crate) enum ManagedPcStartErrorV3 {
@@ -225,6 +235,29 @@ pub(crate) fn prepare_managed_pc_v3(
     selection: ManagedCollectionCliV3,
     bootstrap_until: Instant,
 ) -> Result<PreparedManagedPcV3, ManagedPcPrepareErrorV3> {
+    prepare_managed_collection_v3(selection, bootstrap_until, false)
+}
+
+/// Open Own inputs and output under the same inherited observation owner.
+pub(crate) fn prepare_managed_own_v3(
+    selection: ManagedCollectionCliV3,
+    bootstrap_until: Instant,
+) -> Result<PreparedManagedOwnV3, ManagedPcPrepareErrorV3> {
+    let prepared = prepare_managed_collection_v3(selection, bootstrap_until, true)?;
+    Ok(PreparedManagedOwnV3 {
+        inputs: prepared.inputs,
+        output: prepared.output,
+        arguments: prepared.arguments,
+        work_until: prepared.work_until,
+        cleanup_until: prepared.cleanup_until,
+    })
+}
+
+fn prepare_managed_collection_v3(
+    selection: ManagedCollectionCliV3,
+    bootstrap_until: Instant,
+    own: bool,
+) -> Result<PreparedManagedPcV3, ManagedPcPrepareErrorV3> {
     let fds = ManagedCollectionInheritedFds::seal_exclusive(
         selection.channel,
         selection.output,
@@ -247,11 +280,16 @@ pub(crate) fn prepare_managed_pc_v3(
             Ok(window) => window,
             Err(error) => return Err(ManagedPcPrepareErrorV3::Deadline { error, observation }),
         };
-    let inputs = match PreparedPcCollectionInputsV3::open_from_managed_observation(
-        &mut observation,
-        pin,
-        bootstrap_until,
-    ) {
+    let inputs_result = if own {
+        PreparedPcCollectionInputsV3::open_own_from_managed_observation(
+            &mut observation, pin, bootstrap_until,
+        )
+    } else {
+        PreparedPcCollectionInputsV3::open_from_managed_observation(
+            &mut observation, pin, bootstrap_until,
+        )
+    };
+    let inputs = match inputs_result {
         Ok(inputs) => Arc::new(inputs),
         Err(error) => return Err(ManagedPcPrepareErrorV3::Inputs { error, observation }),
     };

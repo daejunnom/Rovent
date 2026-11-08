@@ -29,6 +29,21 @@ pub struct PcCollectionCliV3 {
 pub fn parse_pc_collection_cli_v3(
     arguments: Vec<String>,
 ) -> Result<Option<PcCollectionCliV3>, ArenaError> {
+    parse_collection_cli_v3(arguments, "pc")
+}
+
+/// Parse an Own /3 selector with the same pin and mixed-selector checks as
+/// the PC route. This does not authorize or start a native Own session.
+pub(crate) fn parse_own_collection_cli_v3(
+    arguments: Vec<String>,
+) -> Result<Option<PcCollectionCliV3>, ArenaError> {
+    parse_collection_cli_v3(arguments, "own")
+}
+
+fn parse_collection_cli_v3(
+    arguments: Vec<String>,
+    expected_mode: &str,
+) -> Result<Option<PcCollectionCliV3>, ArenaError> {
     if !arguments.iter().any(|arg| arg.starts_with("--v3-")) {
         return Ok(None);
     }
@@ -64,7 +79,7 @@ pub fn parse_pc_collection_cli_v3(
             .remove(key)
             .ok_or_else(|| invalid(format!("missing {key}")))
     };
-    check(take("--v3-mode")? == "pc", "unsupported Collection /3 mode")?;
+    check(take("--v3-mode")? == expected_mode, "unsupported Collection /3 mode")?;
     let plan_pin = RoventPublicationFile {
         path: take("--v3-plan")?,
         sha256: take("--v3-plan-sha256")?,
@@ -1812,5 +1827,23 @@ mod cli_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn own_and_pc_selector_domains_do_not_cross() {
+        let digest = format!("{:x}", Sha256::digest(b"own plan input"));
+        let arguments = vec![
+            "--v3-mode=own".to_owned(),
+            "--v3-plan=inputs/plan.json".to_owned(),
+            format!("--v3-plan-sha256={digest}"),
+            "--v3-plan-bytes=1".to_owned(),
+            "--process-epoch=9".to_owned(),
+        ];
+        let parsed = parse_own_collection_cli_v3(arguments.clone()).unwrap().unwrap();
+        assert_eq!(parsed.native_arguments, ["--process-epoch=9"]);
+        assert!(parse_pc_collection_cli_v3(arguments.clone()).is_err());
+        let mut duplicate = arguments;
+        duplicate.push("--v3-mode=pc".to_owned());
+        assert!(parse_own_collection_cli_v3(duplicate).is_err());
     }
 }

@@ -54,6 +54,8 @@ mod long_game_profile_v3;
 mod managed_output_fd_v2;
 mod own_nnuec_lock_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+pub(crate) mod own_recovery_v3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 #[allow(dead_code)]
 mod own_prepared_v3;
 pub(crate) mod own_publisher_v2;

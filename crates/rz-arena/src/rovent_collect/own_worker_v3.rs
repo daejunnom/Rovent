@@ -1555,7 +1555,13 @@ fn prepare_own_root_step_v3(
     }
     let stage = Arc::clone(state.stage.as_ref().expect("original stage retained"));
     {
-        let mut staged = stage.lock().map_err(|_| "Own /3 teacher stage poisoned")?;
+        let mut staged = match stage.try_lock() {
+            Ok(staged) => staged,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnPrepareStepV3::Pending),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("Own /3 teacher stage poisoned".into());
+            }
+        };
         let scope_pending = match state.scope_effects.try_lock() {
             Ok(slots) => slots.claim.is_some() && !slots.finished,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnPrepareStepV3::Pending),
@@ -1580,11 +1586,13 @@ fn prepare_own_root_step_v3(
             return Ok(OwnPrepareStepV3::Failed);
         }
     }
-    let session = stage
-        .lock()
-        .map_err(|_| "Own /3 stage poisoned")?
-        .session()
-        .ok_or("Own /3 session absent")?;
+    let session = match stage.try_lock() {
+        Ok(staged) => staged.session().ok_or("Own /3 session absent")?,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnPrepareStepV3::Pending),
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return Err("Own /3 stage poisoned".into());
+        }
+    };
     if state.next_actor < state.inputs.plan().teacher_slots.len() {
         if state.actor_effects.len() == state.next_actor {
             if state.actor_effects.try_reserve(1).is_err() { return Ok(OwnPrepareStepV3::Pending); }

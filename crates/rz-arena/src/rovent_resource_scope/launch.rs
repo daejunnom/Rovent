@@ -1804,7 +1804,7 @@ pub fn run_native_with_resources_v3(
     pin: RoventNativeResourcePlanPin,
     arguments: Vec<String>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, RoventNativeResourceRunFailure> {
-    run_native_with_resources_v3_inner(pin, arguments, false, None, None, None, None).map_err(
+    run_native_with_resources_v3_inner(pin, arguments, false, None, None, None, None, None).map_err(
         |error| match error {
             V3InnerFailure::BeforeControl(failure) | V3InnerFailure::Failed(failure) => failure,
             V3InnerFailure::Quarantined(quarantine) => quarantine.original_failure,
@@ -1818,7 +1818,7 @@ pub fn run_native_with_resources_v3_control(
     pin: RoventNativeResourcePlanPin,
     arguments: Vec<String>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure> {
-    run_native_with_resources_v3_inner(pin, arguments, true, None, None, None, None).map_err(
+    run_native_with_resources_v3_inner(pin, arguments, true, None, None, None, None, None).map_err(
         |error| match error {
             V3InnerFailure::BeforeControl(failure) => {
                 RoventControlledRunFailure::BeforeControl(failure)
@@ -2344,6 +2344,58 @@ type PcCollectionPostAuthV3 = Box<
 type PcCollectionRetainResourceV3 =
     Box<dyn FnOnce(&Arc<Mutex<NativeResourceCustody>>) -> Result<(), &'static str> + Send>;
 
+/// The factory receives this launch's original lock Arc only after resource
+/// admission. The caller must retain its own bounded recovery entry before
+/// invoking the runner, including if the factory panics or fails.
+pub(crate) type OwnCollectionFactoryV3 = Box<
+    dyn FnOnce(
+            &Arc<RoventInputLockV3>,
+            &Dir,
+            &Arc<File>,
+            &rz_uci::rovent_bootstrap::RoventStartupControl,
+        ) -> Result<rz_uci::rovent_bootstrap::launch::RoventOwnFactoryProductV3, RoventLaunchError>
+        + Send,
+>;
+
+pub(crate) type OwnCollectionRetainResourceV3 =
+    Box<dyn FnOnce(&Arc<Mutex<NativeResourceCustody>>) -> Result<(), &'static str> + Send>;
+
+/// Enter the original resource/control path only after consuming a single
+/// reservation for this same Own run. The reservation issues both callbacks
+/// from its original entry and retains the returned outcome or panic.
+pub(crate) fn run_own_collection_with_resources_v3_preowned(
+    reservation: crate::rovent_collect::launch::own_recovery_v3::OwnRunReservationV3,
+) -> Result<
+    crate::rovent_collect::launch::own_recovery_v3::OwnRunHandleV3,
+    (crate::rovent_collect::launch::own_recovery_v3::OwnRunReservationV3, &'static str),
+> {
+    let (pin, arguments) = match reservation.original_invocation() {
+        Ok(original) => original,
+        Err(error) => return Err((reservation, error)),
+    };
+    reservation.execute(move |factory, retain_resource| {
+        run_native_with_resources_v3_inner(
+            pin,
+            arguments,
+            true,
+            None,
+            None,
+            None,
+            Some(retain_resource),
+            Some(factory),
+        )
+        .map_err(|error| match error {
+            V3InnerFailure::BeforeControl(failure) => {
+                RoventControlledRunFailure::BeforeControl(failure)
+            }
+            V3InnerFailure::Failed(failure) => RoventControlledRunFailure::Failed(failure),
+            V3InnerFailure::Quarantined(quarantine) => {
+                RoventControlledRunFailure::Quarantined(quarantine)
+            }
+        })
+    })
+}
+
 /// The callback is invoked only after UCI authenticated the original parent.
 /// Its caller must pre-retain the original supervisor and partial start/join
 /// custody before calling this entry. It does not itself prove worker startup.
@@ -2412,6 +2464,7 @@ fn run_pc_collection_with_resources_v3_control_inner(
         Some(validate_collection),
         post_auth,
         retain_resource,
+        None,
     )
     .map_err(|error| match error {
         V3InnerFailure::BeforeControl(failure) => {
@@ -2457,7 +2510,31 @@ fn run_native_with_resources_v3_inner(
     >,
     post_auth: Option<PcCollectionPostAuthV3>,
     retain_resource: Option<PcCollectionRetainResourceV3>,
+    own_factory: Option<OwnCollectionFactoryV3>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, V3InnerFailure> {
+    // Never let an invalid Own invocation silently enter the ordinary or
+    // P-C resource path without its pre-retained original owner.
+    if own_factory.is_some()
+        && (!custody_control
+            || collection.is_some()
+            || validate_collection.is_some()
+            || post_auth.is_some()
+            || retain_resource.is_none())
+    {
+        return Err(V3InnerFailure::Failed(RoventNativeResourceRunFailure {
+            detail: "Own Collection resource admission owners conflict".into(),
+            custody: None,
+            system_v3: true,
+            native_failure: None,
+            native_recovery_attempts: Vec::new(),
+            control_panic: None,
+            control_panic_may_be_native: false,
+            cpu_supervisor_custody_unresolved: false,
+            control_scope_marker: None,
+            pre_native_admission: None,
+            factory_pre_native: None,
+        }));
+    }
     let prepare = || -> Result<NativeResourceCustody, ArenaError> {
         pin.validate()?;
         let root = Dir::open_ambient_dir(
@@ -2484,6 +2561,10 @@ fn run_native_with_resources_v3_inner(
     let custody = Arc::new(Mutex::new(state));
     // Propagate actual post-auth entry through every later failure projection.
     let post_auth_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Until the original Own factory and driver provide typed no-dispatch
+    // evidence, entering the factory is an unresolved resource owner even if
+    // UCI subsequently reports its own pre-native guard.
+    let own_factory_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let failure = |detail: String| RoventNativeResourceRunFailure {
         detail,
         custody: Some(Arc::clone(&custody)),
@@ -2632,8 +2713,8 @@ fn run_native_with_resources_v3_inner(
             )
             };
         }
-        let controlled = match (collection, post_auth) {
-            (Some(owner), Some(post_auth)) => {
+        let controlled = match (collection, post_auth, own_factory) {
+            (Some(owner), Some(post_auth), None) => {
                 let issuer = PcCollectionResourceStartIssuerV3 {
                     custody: Arc::clone(&custody),
                     native: Arc::clone(owner),
@@ -2647,15 +2728,25 @@ fn run_native_with_resources_v3_inner(
                     }
                 )
             }
-            (Some(owner), None) => run_controlled!(
+            (Some(owner), None, None) => run_controlled!(
                 rz_uci::rovent_bootstrap::launch::run_pc_collection_v3_with_resource_admission_retaining_connected_control_slot,
                 owner;
             ),
-            (None, None) => run_controlled!(
+            (None, None, None) => run_controlled!(
                 rz_uci::rovent_bootstrap::launch::run_with_v3_resource_admission_retaining_connected_control_slot;
             ),
-            (None, Some(_)) => {
-                return Err(failure("Collection post-auth owner missing".into()).into());
+            (None, None, Some(factory)) => {
+                let entered = Arc::clone(&own_factory_entered);
+                run_controlled!(
+                    rz_uci::rovent_bootstrap::launch::run_own_collection_v3_with_original_factory_retaining_connected_control_slot,
+                    move |lock: &Arc<RoventInputLockV3>, root: &Dir, file: &Arc<File>, control: &rz_uci::rovent_bootstrap::RoventStartupControl| {
+                        entered.store(true, std::sync::atomic::Ordering::Release);
+                        factory(lock, root, file, control)
+                    };
+                )
+            }
+            _ => {
+                return Err(failure("Collection resource admission owners conflict".into()).into());
             }
         };
         let outcome = match controlled {
@@ -2724,7 +2815,8 @@ fn run_native_with_resources_v3_inner(
     // BeforeNative distinguishes GPU entry from a partially started CPU
     // supervisor; it does not authorize releasing the shared resource owner.
     let post_auth_cpu_custody_unresolved =
-        post_auth_entered.load(std::sync::atomic::Ordering::Acquire);
+        post_auth_entered.load(std::sync::atomic::Ordering::Acquire)
+            || own_factory_entered.load(std::sync::atomic::Ordering::Acquire);
     let native_quarantined = post_auth_cpu_custody_unresolved
         || control_panic_may_be_native
         || matches!(

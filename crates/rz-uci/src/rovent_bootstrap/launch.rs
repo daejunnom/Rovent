@@ -1316,7 +1316,7 @@ pub fn run_with_v3_resource_admission_retaining_control_slot<'a, C: Send + 'stat
     ) -> Result<(), RoventLaunchError>
     + 'a,
 ) -> ControlledV3Result<C> {
-    run_with_v3_control_slot_inner(arguments, control, None, None, None, admit_resource)
+    run_with_v3_control_slot_inner(arguments, control, None, None, None, None, admit_resource)
 }
 
 /// The connected variant receives the very stream accepted by the original
@@ -1343,6 +1343,7 @@ pub fn run_with_v3_resource_admission_retaining_connected_control_slot<'a, C: Se
         arguments,
         control,
         Some(parent_stream),
+        None,
         None,
         None,
         admit_resource,
@@ -1380,6 +1381,7 @@ pub fn run_pc_collection_v3_with_resource_admission_retaining_connected_control_
         Some(parent_stream),
         Some(v3::OriginalCollectionOwnerV3::Pc(Arc::clone(collection))),
         None,
+        None,
         admit_resource,
     )
 }
@@ -1415,6 +1417,7 @@ pub fn run_pc_collection_v3_with_post_auth_resource_admission_retaining_connecte
         Some(parent_stream),
         Some(v3::OriginalCollectionOwnerV3::Pc(Arc::clone(collection))),
         Some(Box::new(post_auth)),
+        None,
         admit_resource,
     )
 }
@@ -1449,6 +1452,123 @@ pub fn run_own_collection_v3_with_resource_admission_retaining_connected_control
         Some(parent_stream),
         Some(v3::OriginalCollectionOwnerV3::Own(Arc::clone(collection))),
         None,
+        None,
+        admit_resource,
+    )
+}
+
+/// Result of the original arena factory after it has published the prepared
+/// Own owners to its externally retained recovery entry. The leaf is supplied
+/// by that trusted factory and must not own the external entry, a resource
+/// outcome or a scope key. It is not a native or physical completion proof.
+#[cfg(target_os = "linux")]
+pub struct RoventOwnFactoryProductV3 {
+    pub(super) native_owner: Arc<RoventOwnCollectionLaunchOwnerV3>,
+    pub(super) original_input_lock: Arc<RoventInputLockV3>,
+    pub(super) original_lock_file: Arc<std::fs::File>,
+    pub(super) scope_leaf: Box<dyn std::any::Any + Send>,
+    pub(super) entry_identity: Arc<()>,
+    pub(super) no_uci_dispatch_sink: Box<
+        dyn FnOnce(RoventOwnUciNoDispatchV3) -> Result<(), RoventLaunchError> + Send,
+    >,
+}
+
+/// This invocation's `run_native_admitted` reached its Own guard before it
+/// called a UCI-owned native constructor or dispatched a UCI-owned worker.
+/// It says nothing about work performed by callbacks, the teacher or GPU.
+/// Only the original guard can construct it; the recipient must compare all
+/// three owners and retain its own independent no-dispatch evidence.
+#[cfg(target_os = "linux")]
+pub struct RoventOwnUciNoDispatchV3 {
+    pub(super) native_owner: Arc<RoventOwnCollectionLaunchOwnerV3>,
+    pub(super) original_input_lock: Arc<RoventInputLockV3>,
+    pub(super) original_lock_file: Arc<std::fs::File>,
+    pub(super) entry_identity: Arc<()>,
+}
+
+#[cfg(target_os = "linux")]
+impl RoventOwnUciNoDispatchV3 {
+    pub fn matches_original(
+        &self,
+        native_owner: &Arc<RoventOwnCollectionLaunchOwnerV3>,
+        original_input_lock: &Arc<RoventInputLockV3>,
+        original_lock_file: &Arc<std::fs::File>,
+        entry_identity: &Arc<()>,
+    ) -> bool {
+        Arc::ptr_eq(&self.native_owner, native_owner)
+            && Arc::ptr_eq(&self.original_input_lock, original_input_lock)
+            && Arc::ptr_eq(&self.original_lock_file, original_lock_file)
+            && Arc::ptr_eq(&self.entry_identity, entry_identity)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RoventOwnFactoryProductV3 {
+    pub fn new(
+        native_owner: Arc<RoventOwnCollectionLaunchOwnerV3>,
+        original_input_lock: Arc<RoventInputLockV3>,
+        original_lock_file: Arc<std::fs::File>,
+        scope_leaf: Box<dyn std::any::Any + Send>,
+        entry_identity: Arc<()>,
+        no_uci_dispatch_sink: Box<
+            dyn FnOnce(RoventOwnUciNoDispatchV3) -> Result<(), RoventLaunchError> + Send,
+        >,
+    ) -> Self {
+        Self { native_owner, original_input_lock, original_lock_file, scope_leaf, entry_identity, no_uci_dispatch_sink }
+    }
+}
+
+#[cfg(target_os = "linux")]
+type OwnFactoryV3<'a> = Box<
+    dyn FnOnce(
+            &Arc<RoventInputLockV3>,
+            &Dir,
+            &Arc<std::fs::File>,
+            &RoventStartupControl,
+        ) -> Result<RoventOwnFactoryProductV3, RoventLaunchError>
+        + 'a,
+>;
+
+/// Prepare the original Own collection owner during the same controlled /3
+/// admission. The caller must pre-register and retain the external recovery
+/// entry before invoking this function, including across errors and panics.
+/// The factory must publish its exact prepared owners to that entry before it
+/// returns. Native/worker entry remains guarded; success of the factory does
+/// not prove a model execution, output publication or physical completion.
+#[cfg(target_os = "linux")]
+pub fn run_own_collection_v3_with_original_factory_retaining_connected_control_slot<
+    'a,
+    C: Send + 'static,
+>(
+    arguments: Vec<String>,
+    control: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+    parent_stream: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>,
+    factory: impl FnOnce(
+            &Arc<RoventInputLockV3>,
+            &Dir,
+            &Arc<std::fs::File>,
+            &RoventStartupControl,
+        ) -> Result<RoventOwnFactoryProductV3, RoventLaunchError>
+        + 'a,
+    admit_resource: impl FnOnce(
+            &Arc<RoventInputLockV3>,
+            &Dir,
+            &std::fs::File,
+            std::time::Instant,
+            std::time::Instant,
+            Option<&Dir>,
+            Option<&std::path::Path>,
+            &Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+        ) -> Result<(), RoventLaunchError>
+        + 'a,
+) -> ControlledV3Result<C> {
+    run_with_v3_control_slot_inner(
+        arguments,
+        control,
+        Some(parent_stream),
+        None,
+        None,
+        Some(Box::new(factory)),
         admit_resource,
     )
 }
@@ -1462,6 +1582,7 @@ fn run_with_v3_control_slot_inner<'a, C: Send + 'static>(
     post_auth: Option<
         Box<dyn FnOnce(&RoventPcCollectionStartGateV3) -> Result<(), RoventLaunchError> + 'a>,
     >,
+    own_factory: Option<OwnFactoryV3<'a>>,
     admit_resource: impl FnOnce(
         &Arc<RoventInputLockV3>,
         &Dir,
@@ -1530,8 +1651,8 @@ fn run_with_v3_control_slot_inner<'a, C: Send + 'static>(
                 )
             }),
         };
-        let original = match collection {
-            Some(collection) => v3::admit_original_collection(
+        let original = match (collection, own_factory) {
+            (Some(collection), None) => v3::admit_original_collection(
                 &arguments,
                 lock,
                 root,
@@ -1540,7 +1661,11 @@ fn run_with_v3_control_slot_inner<'a, C: Send + 'static>(
                 Some(resource),
                 collection,
             )?,
-            None => v3::admit_original(&arguments, lock, root, cwd, lock_file, Some(resource))?,
+            (None, Some(factory)) => v3::admit_original_own_factory(
+                &arguments, lock, root, cwd, lock_file, Some(resource), factory,
+            )?,
+            (None, None) => v3::admit_original(&arguments, lock, root, cwd, lock_file, Some(resource))?,
+            (Some(_), Some(_)) => return Err(error("CollectionAdmission", "conflicting original collection owners")),
         };
         Ok::<_, RoventLaunchError>((arguments, original))
     }));
