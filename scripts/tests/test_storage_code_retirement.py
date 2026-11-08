@@ -23,7 +23,9 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from managed_storage import StorageError, tree_size
-from storage_guard import lifetime
+from storage_guard import CatalogGuard, lifetime
+from storage_consumer_registry import (BINDING_NAME, ConsumerRegistry, bind_catalog,
+                                       mark_catalog_registry_unavailable)
 import storage_code_retirement as retirement
 import storage_maintenance as maintenance
 import test_storage_artifact_review as original_fixture
@@ -48,6 +50,11 @@ class CodeRetirementTests(unittest.TestCase):
 
     def setUp(self):
         original_fixture.ArtifactReviewTests.setUp(self)
+        # This completely controlled fixture has no legacy consumers; binding
+        # it is not an authorization to adopt a real nonempty catalog.
+        self.consumer_registry = ConsumerRegistry.initialize(self.base / "input-registry", scope="retirement-test")
+        with CatalogGuard(self.catalog / "catalog.lock") as guard:
+            bind_catalog(self.catalog, self.consumer_registry, guard)
 
     def retire(self):
         selected = original_fixture.dump(self.plan_path, self.plan)
@@ -90,6 +97,72 @@ class CodeRetirementTests(unittest.TestCase):
         self.assert_preserved(before)
         self.assertEqual(original_fixture.pin(Path(result["journal"]["path"])), result["journal"])
         self.assertTrue(Path(result["journal"]["path"]).is_relative_to(self.base))
+
+    def test_unbound_catalog_never_authorizes_retirement(self):
+        with CatalogGuard(self.catalog / "catalog.lock"):
+            (self.catalog / BINDING_NAME).unlink()
+        self.assert_refused("unbound consumer registry")
+
+    def test_required_unavailable_registry_preserves_candidate(self):
+        with CatalogGuard(self.catalog / "catalog.lock") as guard:
+            (self.catalog / BINDING_NAME).unlink()
+            mark_catalog_registry_unavailable(self.catalog, guard)
+        self.assert_refused("unconfigured consumer registry")
+
+    def test_registered_candidate_blocks_retirement_until_not_started_release(self):
+        lease = self.consumer_registry.register([self.code])
+        self.assert_refused("consumer dependency conflicts or unknown")
+        lease.close(not_started=True)
+        self.assertTrue(self.code.exists())
+
+    def test_future_registered_candidate_blocks_retirement(self):
+        lease = self.consumer_registry.register([], future_inputs=[self.code])
+        self.assert_refused("consumer dependency conflicts or unknown")
+        lease.close(not_started=True)
+
+    def test_unreadable_consumer_record_blocks_retirement(self):
+        lease = self.consumer_registry.register([self.base / "source"])
+        record = self.consumer_registry.root / ("consumer-" + lease.owner_id + ".json")
+        record.write_text("invalid", encoding="utf-8")
+        self.assert_refused("consumer dependency conflicts or unknown")
+
+    @privileged_linux_census
+    def test_unrelated_registered_input_does_not_block_retirement(self):
+        lease = self.consumer_registry.register([self.source])
+        result = self.retire()
+        self.assertTrue(result["deletion_performed"])
+        self.assertFalse(self.code.exists())
+        lease.close(not_started=True)
+
+    @privileged_linux_census
+    def test_registry_lock_is_held_across_candidate_unlink(self):
+        # A real concurrent registration cannot enter between the conflict
+        # observation and the candidate unlink.
+        import threading
+        from managed_storage import CatalogBusy
+
+        actual_unlink = os.unlink
+        observed = []
+
+        def unlink_with_contender(path, *args, **kwargs):
+            if path == self.code.name and kwargs.get("dir_fd") is not None:
+                def contend():
+                    try:
+                        with self.consumer_registry.guard():
+                            observed.append("unexpected_acquire")
+                    except CatalogBusy:
+                        observed.append("busy")
+                thread = threading.Thread(target=contend)
+                thread.start()
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(observed, ["busy"])
+            return actual_unlink(path, *args, **kwargs)
+
+        with patch.object(retirement.os, "unlink", side_effect=unlink_with_contender):
+            result = self.retire()
+        self.assertTrue(result["deletion_performed"])
+        self.assertEqual(observed, ["busy"])
 
     def test_active_original_row_is_preserved(self):
         self.replace_record(state="active")

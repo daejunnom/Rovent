@@ -511,7 +511,8 @@ def retire_code_cache(plan_pin, *, seconds=300):
     if sys.platform != "linux":
         raise CodeCacheRetirementUnsupported("code-cache retirement is supported only by native Linux observations")
     inputs = _Inputs(seconds)
-    guard = journal = None
+    guard = journal = dependency_guard = dependency_manager = None
+    dependency_guard_entered = False
     first = result = None
     retired, removed, last_attempt, census = [], 0, None, None
     evidence = {"schema": "rovezero.code-cache-retirement-failure.v1",
@@ -526,6 +527,17 @@ def retire_code_cache(plan_pin, *, seconds=300):
         inputs.directory(catalog, controlled=True)
         guard = CatalogGuard(catalog / "catalog.lock")
         guard.acquire()
+        # An unbound or unavailable catalog does not prove that other
+        # consumers have stopped using its inputs. Keep the catalog lock
+        # followed by its own registry lock through the final unlink.
+        from storage_consumer_registry import load_catalog_binding, require_catalog_binding
+        dependency_registry = load_catalog_binding(catalog, guard)
+        _need(dependency_registry is not None,
+              "unbound consumer registry; preserve retirement candidates")
+        require_catalog_binding(catalog, dependency_registry, guard)
+        dependency_manager = dependency_registry.guard()
+        dependency_guard = dependency_manager.__enter__()
+        dependency_guard_entered = True
         _refuse_custody_registry(catalog)
         rows = _catalog_rows(catalog)
         _need(not any(row["state"] == "active" for _, row, _ in rows),
@@ -577,6 +589,15 @@ def retire_code_cache(plan_pin, *, seconds=300):
         def recheck():
             inputs.check()
             guard.assert_held()
+            require_catalog_binding(catalog, dependency_registry, guard)
+            dependency_guard.check()
+            dependency = dependency_guard.conflicts(candidates)
+            _need(isinstance(dependency, dict)
+                  and dependency.get("coverage") == "registered_only"
+                  and isinstance(dependency.get("conflicts"), list)
+                  and isinstance(dependency.get("unknown"), list)
+                  and not dependency["conflicts"] and not dependency["unknown"],
+                  "consumer dependency conflicts or unknown; preserve retirement candidates")
             _refuse_custody_registry(catalog)
             current = _catalog_rows(catalog)
             _need(current == rows and all(read_record_snapshot(path, schema="rovezero.managed-output.v1")
@@ -666,6 +687,14 @@ def retire_code_cache(plan_pin, *, seconds=300):
                 else:
                     _note(first, "retirement journal FD close also failed: " + _describe(error))
         first = inputs.close(first)
+        if dependency_guard_entered:
+            try:
+                dependency_manager.__exit__(None, None, None)
+            except BaseException as error:
+                if first is None:
+                    first = error
+                else:
+                    _note(first, "consumer registry guard release also failed: " + _describe(error))
         if guard is not None:
             try:
                 guard.release()
