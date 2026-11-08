@@ -10,7 +10,7 @@ use rz_contracts::{
 };
 use rz_contracts::{EvalOutput, ExecutionId, PrecisionProfile};
 use rz_encoding::classical::{self, EncodedInput, Frame, HistoryFill, Input, HISTORY_FRAMES};
-use rz_position::{contracts::RulesState, Color, Piece, PieceKind, Square};
+use rz_position::{contracts::RulesState, Color, Piece, PieceKind, PositionSnapshot, Square};
 use std::sync::Arc;
 
 impl ModelAdapter for Lc0ModelAdapter {
@@ -178,6 +178,50 @@ impl Lc0ModelAdapter {
         })
     }
 
+    /// Experimental LC0 history semantics. This does not alter the existing
+    /// ModelAdapter, v1 binding, cache keys, or UCI selection. A consumer must
+    /// explicitly select and register the v2 semantics before using it.
+    pub fn project_lc0_v2(&self, state: &RulesState) -> Result<RulesProjection, ContractError> {
+        let snapshot = state.snapshot();
+        let mut frames = ProjectionFrames::try_new()?;
+        for history in snapshot.known_history().take(HISTORY_FRAMES) {
+            let identity = history.repetition_identity();
+            let ep = lc0_history_ep(&history);
+            let repeated = history.known_history().skip(1).any(|prior| {
+                prior.repetition_identity() == identity && lc0_history_ep(&prior) == ep
+            });
+            frames.push(Frame {
+                pieces: read_pieces(history.piece_bitboards(), |square| history.piece_at(square))?,
+                repeated,
+                en_passant_target: ep.map(Square::index),
+            })?;
+        }
+        let rights = snapshot.castling_rights();
+        Ok(RulesProjection {
+            frames,
+            black_to_move: snapshot.side_to_move() == Color::Black,
+            castling: [
+                rights & 2 != 0,
+                rights & 1 != 0,
+                rights & 8 != 0,
+                rights & 4 != 0,
+            ],
+            halfmove_clock: snapshot.halfmove_clock(),
+            history_fill: self.binding.history_fill(),
+        })
+    }
+
+    /// Encode v2 without issuing a v1 EvalInputKey or selecting it for play.
+    pub fn encode_lc0_v2(&self, state: &RulesState) -> Result<EncodedInput, ContractError> {
+        let projection = self.project_lc0_v2(state)?;
+        classical::encode(projection.input()).map_err(|_| {
+            failed(
+                ErrorCode::InvalidInput,
+                "LC0 v2 Rules projection cannot be encoded by this profile",
+            )
+        })
+    }
+
     pub fn input_key(
         &self,
         state: &RulesState,
@@ -302,6 +346,48 @@ impl Lc0ModelAdapter {
         *memo = Some(Arc::clone(&prepared));
         Ok(prepared)
     }
+}
+
+/// Semantic identifier for the explicit experimental projection, not a v1
+/// EncodingHandle or a claim that the complete v2 model path is registered.
+pub fn lc0_v2_projection_manifest(fill: HistoryFill) -> Digest {
+    Digest(crate::asset::sha256(
+        format!(
+            "rz-lc0-classical-projection-v2;lc0=fd71a2d921b689c5f479d3227c3806c8e272d9c5;ep=fen-root-or-pseudo-attacked-move;history={}",
+            fill.reference_option()
+        )
+        .as_bytes(),
+    ))
+}
+
+/// LC0 accepts the raw FEN-root EP square but records a played double push
+/// only when a side-to-move pawn attacks the target geometrically. Unlike
+/// the FIDE repetition identity, this deliberately does not test king safety.
+fn lc0_history_ep(history: &PositionSnapshot) -> Option<Square> {
+    let target = history.en_passant_target()?;
+    if history.known_history_len() == 1 {
+        return Some(target);
+    }
+    let (color, rank) = match history.side_to_move() {
+        Color::White => (0, target.rank().checked_sub(1)?),
+        Color::Black => (1, target.rank().checked_add(1)?),
+    };
+    if rank >= 8 {
+        return None;
+    }
+    let pawns = history.piece_bitboards()[color * 6];
+    let file = target.file();
+    for candidate in [file.checked_sub(1), file.checked_add(1)]
+        .into_iter()
+        .flatten()
+        .filter(|candidate| *candidate < 8)
+    {
+        let square = rank * 8 + candidate;
+        if pawns & (1u64 << square) != 0 {
+            return Some(target);
+        }
+    }
+    None
 }
 
 #[cfg(feature = "experimental-prepared-input")]
@@ -503,6 +589,129 @@ mod storage_tests {
             ErrorCode::ResourceExhausted
         );
         assert_eq!(storage.as_slice(), &[frame; HISTORY_FRAMES]);
+    }
+
+    // Baseline diagnostic for LC0 v0.32.1 fd71a2d, compiled independently
+    // with NO_PEXT: both special cases report zero repetitions after the
+    // indicated legal moves, while the start-position control reports one.
+    // The current Rules repetition identity intentionally remains FIDE-legal.
+    #[test]
+    fn lc0_ep_repetition_baseline_diagnostic() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            (
+                "k3r1n1/3p4/8/4P3/8/8/8/4K1N1 b - - 0 1",
+                &["d7d5", "g1f3", "g8f6", "f3g1", "f6g8"],
+                false,
+            ),
+            (
+                "k3r1n1/8/8/3pB3/8/8/8/4K1N1 w - d6 0 2",
+                &["g1f3", "g8f6", "f3g1", "f6g8"],
+                false,
+            ),
+            (
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                &["e2e4", "g8f6", "g1f3", "f6g8", "f3g1"],
+                true,
+            ),
+        ];
+        for fill in [HistoryFill::No, HistoryFill::RepeatOldest] {
+            for (fen, moves, lc0_repeated) in cases {
+                let mut position = Position::from_fen(fen).unwrap();
+                position.apply_uci_moves(moves).unwrap();
+                let frozen = ContractPosition::new(OwnerId(83), position)
+                    .export()
+                    .unwrap();
+                let snapshot = frozen.rules().snapshot();
+                let rules_repeated = snapshot
+                    .known_history()
+                    .skip(1)
+                    .any(|prior| prior.repetition_identity() == snapshot.repetition_identity());
+                let actual = projection(fill).project(frozen.rules()).unwrap();
+                let projected_repeated = actual.input().history[0].repeated;
+                let legacy_tensor = projection(fill).encode(frozen.rules()).unwrap();
+                let v2 = projection(fill).project_lc0_v2(frozen.rules()).unwrap();
+                let v2_tensor = projection(fill).encode_lc0_v2(frozen.rules()).unwrap();
+                eprintln!(
+                    "fill={fill:?} fen={fen} rules={rules_repeated} projection={projected_repeated} lc0={lc0_repeated}"
+                );
+                assert!(rules_repeated);
+                assert!(projected_repeated);
+                assert!(legacy_tensor.values()[12 * 64..13 * 64]
+                    .iter()
+                    .all(|value| *value == 1.0));
+                assert_eq!(v2.input().history[0].repeated, *lc0_repeated);
+                assert!(v2_tensor.values()[12 * 64..13 * 64]
+                    .iter()
+                    .all(|value| *value == f32::from(u8::from(*lc0_repeated))));
+            }
+        }
+    }
+
+    #[test]
+    fn lc0_v2_distinguishes_fen_root_and_played_ep_without_changing_rules() {
+        let root_fen = "k3r1n1/8/8/3pB3/8/8/8/4K1N1 w - d6 0 2";
+        let root = ContractPosition::new(OwnerId(84), Position::from_fen(root_fen).unwrap())
+            .export()
+            .unwrap();
+        assert_eq!(
+            lc0_history_ep(root.rules().snapshot()).map(Square::index),
+            Some(43)
+        );
+        for fill in [HistoryFill::No, HistoryFill::RepeatOldest] {
+            let adapter = projection(fill);
+            let input = adapter.encode_lc0_v2(root.rules()).unwrap();
+            assert!(input.inferred_ep_predecessor);
+            assert_eq!(input.known_frames, 1);
+            assert_eq!(
+                input.padded_frames,
+                match fill {
+                    HistoryFill::No => 1,
+                    HistoryFill::RepeatOldest => HISTORY_FRAMES - 1,
+                }
+            );
+            assert_ne!(lc0_v2_projection_manifest(fill), encoding_manifest(fill));
+        }
+        assert_ne!(
+            lc0_v2_projection_manifest(HistoryFill::No),
+            lc0_v2_projection_manifest(HistoryFill::RepeatOldest)
+        );
+
+        let mut no_attacker = Position::startpos();
+        no_attacker.apply_uci_moves(&["e2e4"]).unwrap();
+        let no_attacker = ContractPosition::new(OwnerId(85), no_attacker)
+            .export()
+            .unwrap();
+        assert_eq!(
+            no_attacker
+                .rules()
+                .snapshot()
+                .en_passant_target()
+                .map(Square::index),
+            Some(20)
+        );
+        assert_eq!(lc0_history_ep(no_attacker.rules().snapshot()), None);
+
+        let mut white_attacker =
+            Position::from_fen("k3r1n1/3p4/8/4P3/8/8/8/4K1N1 b - - 0 1").unwrap();
+        white_attacker.apply_uci_moves(&["d7d5"]).unwrap();
+        let white_attacker = ContractPosition::new(OwnerId(86), white_attacker)
+            .export()
+            .unwrap();
+        assert_eq!(
+            lc0_history_ep(white_attacker.rules().snapshot()).map(Square::index),
+            Some(43)
+        );
+
+        let mut black_attacker =
+            Position::from_fen("k5n1/8/8/8/4p3/8/3P4/4K1N1 w - - 0 1").unwrap();
+        black_attacker.apply_uci_moves(&["d2d4"]).unwrap();
+        let black_attacker = ContractPosition::new(OwnerId(87), black_attacker)
+            .export()
+            .unwrap();
+        assert_eq!(
+            lc0_history_ep(black_attacker.rules().snapshot()).map(Square::index),
+            Some(19)
+        );
     }
 
     #[test]
