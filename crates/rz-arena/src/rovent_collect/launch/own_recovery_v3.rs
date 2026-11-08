@@ -2,8 +2,9 @@
 //!
 //! This entry is WIP: no safe registry removal or managed CLI activation is
 //! provided yet. The first successful registration fixes the process-local
-//! profile, and even abandoned unstarted reservations stay registered. Until
-//! per-profile namespaces and original no-start/settlement removal exist,
+//! profile. An unstarted reservation may be reclaimed from its original
+//! registered entry, but the entry itself is not removed. Until per-profile
+//! namespaces and original no-start/settlement removal exist,
 //! repeated production use can exhaust its explicit capacity. A native guard,
 //! process return, or this registry alone does not prove teacher, output,
 //! control, or GPU physical completion.
@@ -26,7 +27,54 @@ use std::any::Any;
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
+
+// This gate controls only the right to invoke this entry's controlled action;
+// it is not proof about unrelated processes or physical GPU completion.
+#[repr(u8)]
+enum ReservationPhaseV3 {
+    Available = 0,
+    Held = 1,
+    Started = 2,
+}
+
+struct ReservationGateV3(AtomicU8);
+
+impl ReservationGateV3 {
+    fn held() -> Self {
+        Self(AtomicU8::new(ReservationPhaseV3::Held as u8))
+    }
+
+    fn reclaim(&self) -> bool {
+        self.0.compare_exchange(
+            ReservationPhaseV3::Available as u8,
+            ReservationPhaseV3::Held as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ).is_ok()
+    }
+
+    fn abandon_unstarted(&self) {
+        // Started is irreversible: dropping the token after execute must
+        // never make an in-flight or unresolved entry available again.
+        let _ = self.0.compare_exchange(
+            ReservationPhaseV3::Held as u8,
+            ReservationPhaseV3::Available as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn start(&self) -> bool {
+        self.0.compare_exchange(
+            ReservationPhaseV3::Held as u8,
+            ReservationPhaseV3::Started as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ).is_ok()
+    }
+}
 
 /// Pins only this invocation's original identity and input/output owners.
 /// In particular it cannot reach the external entry, its outcome or scope
@@ -56,6 +104,7 @@ pub(crate) enum OwnRunOutcomeV3 {
 
 struct OwnRunEntryV3 {
     identity: Arc<()>,
+    reservation: ReservationGateV3,
     inputs: Arc<PreparedPcCollectionInputsV3>,
     output: Arc<ManagedOutputOwnerV3>,
     arguments: Vec<String>,
@@ -82,6 +131,12 @@ fn registry() -> &'static Mutex<Option<OwnRunRegistryV3>> {
 /// count. Registration is not authority to start native or teacher work.
 pub(crate) struct OwnRunReservationV3 {
     entry: Arc<OwnRunEntryV3>,
+}
+
+impl Drop for OwnRunReservationV3 {
+    fn drop(&mut self) {
+        self.entry.reservation.abandon_unstarted();
+    }
 }
 
 /// Observation/recovery identity only; it does not grant release authority.
@@ -111,6 +166,26 @@ impl OwnRunHandleV3 {
         self.entry.outcome.try_lock()
             .map(|outcome| outcome.is_some())
             .map_err(|_| "Own /3 outcome slot unavailable")
+    }
+
+    /// Reclaim only this still-registered entry's original unstarted action
+    /// reservation. An outstanding token or an already-started action cannot
+    /// be duplicated. This does not settle the output, control, parent lease,
+    /// other processes, or any GPU work.
+    pub(crate) fn try_reacquire_reservation(
+        &self,
+    ) -> Result<Option<OwnRunReservationV3>, &'static str> {
+        let registry = registry().try_lock().map_err(|_| "Own /3 registry unavailable")?;
+        let Some(registry) = registry.as_ref() else {
+            return Err("Own /3 original recovery entry missing");
+        };
+        if !registry.entries.iter().any(|entry| Arc::ptr_eq(entry, &self.entry)) {
+            return Err("Own /3 original recovery entry missing");
+        }
+        if !self.entry.reservation.reclaim() {
+            return Ok(None);
+        }
+        Ok(Some(OwnRunReservationV3 { entry: Arc::clone(&self.entry) }))
     }
 
     /// Observe the original outcome without transferring its custody. A
@@ -166,6 +241,7 @@ impl OwnRunReservationV3 {
         }
         let entry = Arc::new(OwnRunEntryV3 {
             identity: Arc::new(()),
+            reservation: ReservationGateV3::held(),
             inputs: prepared.inputs,
             output: prepared.output,
             arguments: prepared.arguments,
@@ -231,6 +307,9 @@ impl OwnRunReservationV3 {
             };
             if state.in_flight {
                 return Err((self, "Own /3 original run already started"));
+            }
+            if !entry.reservation.start() {
+                return Err((self, "Own /3 original reservation unavailable"));
             }
             state.in_flight = true;
         }
@@ -326,4 +405,35 @@ fn own_factory(
         native, Arc::clone(lock), Arc::clone(lock_file), Box::new(leaf),
         Arc::clone(&entry.identity), sink,
     ))
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::ReservationGateV3;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn original_unstarted_reservation_has_one_reclaimer_and_started_is_not_reissued() {
+        let gate = Arc::new(ReservationGateV3::held());
+        assert!(!gate.reclaim(), "a live original reservation cannot be duplicated");
+        gate.abandon_unstarted();
+
+        let rendezvous = Arc::new(Barrier::new(3));
+        let successes = std::thread::scope(|threads| {
+            let workers: Vec<_> = (0..2).map(|_| {
+                let gate = Arc::clone(&gate);
+                let rendezvous = Arc::clone(&rendezvous);
+                threads.spawn(move || {
+                    rendezvous.wait();
+                    gate.reclaim()
+                })
+            }).collect();
+            rendezvous.wait();
+            workers.into_iter().map(|worker| if worker.join().unwrap() { 1 } else { 0 }).sum::<usize>()
+        });
+        assert_eq!(successes, 1, "the same original reservation has one owner");
+        assert!(gate.start());
+        gate.abandon_unstarted();
+        assert!(!gate.reclaim(), "started or uncertain work is not reissued");
+    }
 }
