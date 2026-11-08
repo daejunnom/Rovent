@@ -54,22 +54,44 @@ def _windows_boot_count(identifier):
 
 
 class CatalogGuard:
-    def __init__(self, path):
+    def __init__(self, path, *, create=True, expected_identity=None):
         self.path, self.stream = Path(path), None
         self.parent_identity = None
+        self.create = create
+        self.expected_identity = expected_identity
 
     def acquire(self):
         from managed_storage import CatalogBusy, StorageError, checked
         checked(self.path)
         parent = self.path.parent.stat()
         self.parent_identity = (parent.st_dev, parent.st_ino)
-        stream = self.path.open("a+b")
+        if self.create:
+            stream = self.path.open("a+b")
+        else:
+            flags = os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(self.path, flags)
+            try:
+                stream = os.fdopen(fd, "r+b")
+            except BaseException as error:
+                try:
+                    os.close(fd)
+                except BaseException as close_error:
+                    if hasattr(error, "add_note"):
+                        error.add_note("catalog guard descriptor close outcome unknown: "
+                                       + type(close_error).__name__)
+                raise
         try:
             info = os.fstat(stream.fileno())
             named = self.path.lstat()
             if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                     or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)):
                 raise StorageError("catalog guard identity changed")
+            if (self.expected_identity is not None and
+                    (self.parent_identity, (info.st_dev, info.st_ino)) != self.expected_identity):
+                raise StorageError("catalog guard original identity changed")
+            parent_after_open = self.path.parent.stat()
+            if self.parent_identity != (parent_after_open.st_dev, parent_after_open.st_ino):
+                raise StorageError("catalog guard parent changed")
             if os.name == "nt":
                 import msvcrt
                 if info.st_size == 0:
@@ -90,19 +112,33 @@ class CatalogGuard:
                     if exc.errno in (errno.EACCES, errno.EAGAIN):
                         raise CatalogBusy("catalog lock is held; retry may be possible") from exc
                     raise
-        except OSError as exc:
-            stream.close()
-            raise StorageError("catalog is active or lock unavailable; preserve it") from exc
-        except BaseException:
-            stream.close()
+            self.stream = stream
+            self.assert_held()
+        except BaseException as error:
+            # Close can fail after closing the OS descriptor; detach first so
+            # neither release nor __del__ can retry a possibly reused FD.
+            self.stream = None
+            close_error = None
+            try:
+                stream.close()
+            except BaseException as exc:
+                close_error = exc
+                if hasattr(error, "add_note"):
+                    error.add_note("catalog guard stream close outcome unknown: " + type(exc).__name__)
+            if isinstance(error, OSError):
+                translated = StorageError("catalog is active or lock unavailable; preserve it")
+                if close_error is not None and hasattr(translated, "add_note"):
+                    translated.add_note("catalog guard stream close outcome unknown: "
+                                        + type(close_error).__name__)
+                raise translated from error
             raise
-        self.stream = stream
         return self
 
     def release(self):
         if self.stream is not None:
-            self.stream.close()  # OS unlock, including abnormal process exit.
+            stream = self.stream
             self.stream = None
+            stream.close()  # OS unlock, including abnormal process exit.
 
     def assert_held(self):
         from managed_storage import StorageError, checked
@@ -114,12 +150,22 @@ class CatalogGuard:
         if (self.parent_identity != (parent.st_dev, parent.st_ino) or opened.st_nlink != 1
                 or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
             raise StorageError("catalog gate replaced; preserve artifacts")
+        if (self.expected_identity is not None and
+                ((parent.st_dev, parent.st_ino), (opened.st_dev, opened.st_ino)) != self.expected_identity):
+            raise StorageError("catalog gate original identity changed; preserve artifacts")
 
     def __enter__(self):
         return self.acquire()
 
-    def __exit__(self, *_):
-        self.release()
+    def __exit__(self, exc_type, error, traceback):
+        try:
+            self.release()
+        except BaseException as close_error:
+            if error is None:
+                raise
+            if hasattr(error, "add_note"):
+                error.add_note("catalog guard stream close outcome unknown: " + type(close_error).__name__)
+        return False
 
     def __del__(self):
         if getattr(self, "stream", None) is not None:

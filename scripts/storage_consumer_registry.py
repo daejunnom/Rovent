@@ -432,23 +432,39 @@ class ConsumerRegistry:
 class _RegistryGuard:
     def __init__(self, registry):
         self.registry = registry
-        self.lock = CatalogGuard(registry.root / "registry.lock")
+        self.lock = CatalogGuard(registry.root / "registry.lock", create=False,
+                                 expected_identity=registry._owner_identity)
 
     def __enter__(self):
-        # Check before acquiring, then check again while holding the opened
-        # lock. CatalogGuard can create a lock removed between these checks;
-        # the postcheck rejects that replacement before cleanup is allowed.
+        # The registry must reuse its original lock. The guard opens without
+        # creation and checks the pinned identity both before and after locking.
         self.registry._check_identity()
-        self.lock.acquire()
+        try:
+            self.lock.acquire()
+        except OSError as error:
+            raise StorageError("consumer registry original lock unavailable") from error
         try:
             self.check()
-        except BaseException:
-            self.lock.release()
+        except BaseException as error:
+            try:
+                self.lock.release()
+            except BaseException as close_error:
+                if hasattr(error, "add_note"):
+                    error.add_note("consumer registry guard close outcome unknown: "
+                                   + type(close_error).__name__)
             raise
         return self
 
-    def __exit__(self, *args):
-        self.lock.release()
+    def __exit__(self, exc_type, error, traceback):
+        try:
+            self.lock.release()
+        except BaseException as close_error:
+            if error is None:
+                raise
+            if hasattr(error, "add_note"):
+                error.add_note("consumer registry guard close outcome unknown: "
+                               + type(close_error).__name__)
+        return False
 
     def check(self):
         self.lock.assert_held()

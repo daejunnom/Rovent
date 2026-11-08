@@ -61,6 +61,82 @@ class ConsumerRegistryTests(unittest.TestCase):
                 self.fail("missing lock cannot authorize inspection or cleanup")
         self.assertFalse(lock.exists())
 
+    def test_registry_lock_removed_between_precheck_and_open_is_not_recreated(self):
+        lock = self.registry.root / "registry.lock"
+        actual_open = os.open
+
+        def remove_original_then_open(path, flags, *args, **kwargs):
+            if Path(path) == lock and flags & os.O_RDWR:
+                lock.unlink()
+            return actual_open(path, flags, *args, **kwargs)
+
+        with patch("storage_guard.os.open", side_effect=remove_original_then_open):
+            with self.assertRaises(StorageError):
+                with self.registry.guard():
+                    self.fail("a vanished original lock cannot authorize cleanup")
+        self.assertFalse(lock.exists())
+
+    def test_registry_lock_replaced_between_precheck_and_open_is_not_written(self):
+        lock = self.registry.root / "registry.lock"
+        actual_open = os.open
+
+        def replace_original_then_open(path, flags, *args, **kwargs):
+            if Path(path) == lock and flags & os.O_RDWR:
+                lock.rename(self.registry.root / "original.lock")
+                lock.write_bytes(b"")
+            return actual_open(path, flags, *args, **kwargs)
+
+        with patch("storage_guard.os.open", side_effect=replace_original_then_open):
+            with self.assertRaises(StorageError):
+                with self.registry.guard():
+                    self.fail("a replacement lock cannot authorize cleanup")
+        self.assertEqual(lock.read_bytes(), b"")
+
+    def test_guard_failed_acquire_preserves_error_and_does_not_retry_uncertain_close(self):
+        path = self.root / "close-failure.lock"
+        real_stream = path.open("w+b")
+
+        class ClosingThenFailing:
+            close_calls = 0
+
+            def fileno(self):
+                return real_stream.fileno()
+
+            def close(self):
+                self.close_calls += 1
+                real_stream.close()
+                raise OSError("close result unavailable")
+
+        stream = ClosingThenFailing()
+        guard = CatalogGuard(path, expected_identity=((0, 0), (0, 0)))
+        with patch.object(Path, "open", return_value=stream):
+            with self.assertRaisesRegex(StorageError, "original identity changed") as caught:
+                guard.acquire()
+        self.assertTrue(any("close outcome unknown" in note
+                            for note in getattr(caught.exception, "__notes__", [])))
+        self.assertIsNone(guard.stream)
+        guard.release()
+        self.assertEqual(stream.close_calls, 1)
+
+    def test_fdopen_failure_preserves_error_if_original_fd_close_is_unknown(self):
+        path = self.root / "fdopen-failure.lock"
+        path.write_bytes(b"")
+        real_close = os.close
+        close_calls = []
+
+        def close_then_fail(fd):
+            close_calls.append(fd)
+            real_close(fd)
+            raise OSError("close result unavailable")
+
+        with patch("storage_guard.os.fdopen", side_effect=RuntimeError("fdopen failed")), \
+                patch("storage_guard.os.close", side_effect=close_then_fail):
+            with self.assertRaisesRegex(RuntimeError, "fdopen failed") as caught:
+                CatalogGuard(path, create=False).acquire()
+        self.assertTrue(any("close outcome unknown" in note
+                            for note in getattr(caught.exception, "__notes__", [])))
+        self.assertEqual(len(close_calls), 1)
+
     def test_original_registry_object_rejects_same_id_directory_replacement(self):
         original = self.registry.root
         previous = self.root / "original-registry"
