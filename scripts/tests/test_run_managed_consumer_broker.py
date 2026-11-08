@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -19,9 +20,9 @@ import run_managed
 import storage_consumer_broker_budget
 import storage_consumer_broker_launch
 import storage_consumer_broker_quarantine
-from storage_consumer_registry import ConsumerRegistry
+from storage_consumer_registry import ConsumerRegistry, require_catalog_binding
 from managed_process import ProcessNotSpawned
-from managed_storage import StorageError
+from managed_storage import CatalogBusy, ManagedBuild, StorageError
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux child supervision required")
@@ -37,6 +38,7 @@ class RunManagedConsumerBrokerTests(unittest.TestCase):
         self.registry = ConsumerRegistry.initialize(self.root / "registry", scope="temporary-fixture")
         self.descriptor = self.root / "descriptor.json"
         self.descriptor.write_text("{}", encoding="ascii")
+        self.reader_marker = self.root / "reader-started"
         repo_scripts = str(Path(__file__).resolve().parents[1])
         source = textwrap.dedent(f"""
             import os, socket, sys, time
@@ -55,6 +57,7 @@ class RunManagedConsumerBrokerTests(unittest.TestCase):
             path = Path(sys.argv[1])
             client.add([path])
             def reader():
+                Path(sys.argv[2]).write_text("started", encoding="ascii")
                 time.sleep(5.3)
                 return path.read_text(encoding="ascii"), []
             try:
@@ -75,7 +78,7 @@ class RunManagedConsumerBrokerTests(unittest.TestCase):
                 "--consumer-registry-root", str(self.registry.root),
                 "--consumer-registry-id", self.registry.registry_id,
                 "--consumer-broker-reviewed-sha256", digest,
-                "--", sys.executable, str(self.script), str(self.descriptor)]
+                "--", sys.executable, str(self.script), str(self.descriptor), str(self.reader_marker)]
         env = {"XDG_CACHE_HOME": str(self.cache), "PATH": "/usr/bin:/bin", "LANG": "C",
                "PYTHONDONTWRITEBYTECODE": "1"}
         stderr = io.StringIO()
@@ -150,6 +153,60 @@ class RunManagedConsumerBrokerTests(unittest.TestCase):
         self.assertFalse((self.cache / "rovezero/build/managed-v1/owner.json").exists())
         with self.registry.guard() as guard:
             self.assertTrue(guard.conflicts([self.descriptor])["conflicts"])
+
+    def test_same_registry_cleaner_preserves_input_during_and_after_read(self):
+        with patch.object(rovezero_usage_snapshot, "warn_cached_total_usage", return_value=None):
+            cleaner = ManagedBuild(self.root / "other-managed-catalog", self.source,
+                                   purpose="cleanup-fixture", dependency_registry=self.registry).acquire()
+
+        def close_cleaner():
+            if not cleaner.finished:
+                cleaner.finish(exit_code=0, tree_gone=True, _not_dispatched=True)
+
+        self.addCleanup(close_cleaner)
+        self.descriptor = cleaner.target / "descriptor.json"
+        self.descriptor.write_text("{}", encoding="ascii")
+        stop = threading.Event()
+        attempt = {}
+
+        def observe_reader_and_clean():
+            while not stop.wait(0.01):
+                if self.reader_marker.exists():
+                    try:
+                        try:
+                            with self.registry.guard():
+                                attempt["registry_lock_busy"] = False
+                        except CatalogBusy:
+                            attempt["registry_lock_busy"] = True
+                        attempt["removed"] = cleaner._remove_with_dependencies(cleaner.target, cleaner.target.parent)
+                    except BaseException as error:
+                        attempt["error"] = type(error).__name__
+                    return
+
+        observer = threading.Thread(target=observe_reader_and_clean)
+        observer.start()
+        try:
+            code, receipt = self.execute(self.sha)
+        finally:
+            stop.set()
+            observer.join(timeout=2)
+        self.assertFalse(observer.is_alive())
+        self.assertEqual(code, 0, receipt)
+        self.assertEqual(attempt, {"registry_lock_busy": True, "removed": False})
+        self.assertTrue(self.descriptor.exists())
+        # The original broker retains its lease because process end is not a
+        # GPU fence, so the same production cleanup remains deferred afterward.
+        require_catalog_binding(cleaner.root, self.registry, cleaner.guard)
+        with self.registry.guard() as guard:
+            conflict = guard.conflicts([cleaner.target])
+        self.assertEqual(conflict["coverage"], "registered_only")
+        self.assertTrue(any(item["input"] == str(self.descriptor)
+                            and item["target"] == str(cleaner.target)
+                            and item["state"] == "physical_unknown_retained"
+                            for item in conflict["conflicts"]))
+        self.assertFalse(conflict["unknown"])
+        self.assertFalse(cleaner._remove_with_dependencies(cleaner.target, cleaner.target.parent))
+        self.assertTrue(self.descriptor.exists())
 
     def test_synthetic_unknown_group_resamples_dirty_budget_and_preserves_owner(self):
         code, receipt = self.execute(self.sha, simulate_unknown=True)
