@@ -1366,6 +1366,19 @@ enum CollectionInputsPurposeV3 {
     Own,
 }
 
+impl CollectionInputsPurposeV3 {
+    fn plan_schema(self) -> &'static str {
+        match self {
+            Self::Pc => ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN,
+            Self::Own => ROVENT_OWN_COLLECTION_LOCK_V3_LAUNCH_PLAN,
+        }
+    }
+
+    fn validate_plan_schema(self, schema: &str) -> Result<(), ArenaError> {
+        check(schema == self.plan_schema(), "Collection /3 explicit launch plan domain")
+    }
+}
+
 impl PreparedPcCollectionInputsV3 {
     /// Build the original owner from the same /2-inherited directory and plan
     /// descriptors. This is not native lock acceptance or output permission.
@@ -1373,6 +1386,29 @@ impl PreparedPcCollectionInputsV3 {
         observation: &mut super::managed_output_fd_v2::ObservedManagedPlanLeaseV2,
         plan_pin: &RoventPublicationFile,
         deadline: Instant,
+    ) -> Result<Self, ArenaError> {
+        Self::open_from_managed_observation_for(
+            observation, plan_pin, deadline, CollectionInputsPurposeV3::Pc,
+        )
+    }
+
+    /// Retain an Own-domain plan using the same live supervisor observation
+    /// and inherited descriptors. This grants no native or output authority.
+    pub(super) fn open_own_from_managed_observation(
+        observation: &mut super::managed_output_fd_v2::ObservedManagedPlanLeaseV2,
+        plan_pin: &RoventPublicationFile,
+        deadline: Instant,
+    ) -> Result<Self, ArenaError> {
+        Self::open_from_managed_observation_for(
+            observation, plan_pin, deadline, CollectionInputsPurposeV3::Own,
+        )
+    }
+
+    fn open_from_managed_observation_for(
+        observation: &mut super::managed_output_fd_v2::ObservedManagedPlanLeaseV2,
+        plan_pin: &RoventPublicationFile,
+        deadline: Instant,
+        purpose: CollectionInputsPurposeV3,
     ) -> Result<Self, ArenaError> {
         check(
             observation.matches_plan(&plan_pin.path, plan_pin.bytes, &plan_pin.sha256),
@@ -1391,10 +1427,7 @@ impl PreparedPcCollectionInputsV3 {
         let text = std::str::from_utf8(&original_plan.bytes)
             .map_err(|_| invalid("Collection /3 plan UTF8"))?;
         let plan: RoventCollectionLockV3LaunchPlan = rz_experiments::decode_json(text)?;
-        check(
-            plan.schema == ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN,
-            "Collection /3 explicit launch plan domain",
-        )?;
+        purpose.validate_plan_schema(&plan.schema)?;
         let original_manifest =
             OriginalPinnedFile::read(&directory, &plan.manifest, MANIFEST_MAX_BYTES)?;
         let text = std::str::from_utf8(&original_manifest.bytes)
@@ -1407,7 +1440,7 @@ impl PreparedPcCollectionInputsV3 {
             original_manifest,
             plan,
             manifest,
-            purpose: CollectionInputsPurposeV3::Pc,
+            purpose,
             managed_binding: Some(observation.original_binding()),
         })
     }
@@ -1431,14 +1464,7 @@ impl PreparedPcCollectionInputsV3 {
         let text = std::str::from_utf8(&original_plan.bytes)
             .map_err(|_| invalid("Collection /3 plan UTF8"))?;
         let plan: RoventCollectionLockV3LaunchPlan = rz_experiments::decode_json(text)?;
-        check(
-            plan.schema
-                == match purpose {
-                    CollectionInputsPurposeV3::Pc => ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN,
-                    CollectionInputsPurposeV3::Own => ROVENT_OWN_COLLECTION_LOCK_V3_LAUNCH_PLAN,
-                },
-            "Collection /3 explicit launch plan domain",
-        )?;
+        purpose.validate_plan_schema(&plan.schema)?;
         let original_manifest =
             OriginalPinnedFile::read(directory, &plan.manifest, MANIFEST_MAX_BYTES)?;
         let text = std::str::from_utf8(&original_manifest.bytes)
@@ -1717,6 +1743,49 @@ impl PreparedPcCollectionInputsV3 {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn purpose_schema_rejects_cross_domain() {
+        use CollectionInputsPurposeV3::{Own, Pc};
+        assert!(Pc.validate_plan_schema(ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN).is_ok());
+        assert!(Own.validate_plan_schema(ROVENT_OWN_COLLECTION_LOCK_V3_LAUNCH_PLAN).is_ok());
+        assert!(Pc.validate_plan_schema(ROVENT_OWN_COLLECTION_LOCK_V3_LAUNCH_PLAN).is_err());
+        assert!(Own.validate_plan_schema(ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN).is_err());
+    }
+
+    #[test]
+    fn original_plan_fd_retains_identity_and_shared_offset() {
+        use std::io::{Seek, SeekFrom};
+        use std::os::unix::fs::MetadataExt as _;
+        use std::time::Duration;
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        let bytes = std::fs::read(path).expect("tracked source fixture");
+        let mut original = std::fs::File::open(path).expect("tracked source descriptor");
+        original.seek(SeekFrom::Start(3)).unwrap();
+        let identity = original.metadata().unwrap();
+        let pin = RoventPublicationFile {
+            path: "inputs/test-plan.json".into(),
+            sha256: hex(Digest(Sha256::digest(&bytes).into())),
+            bytes: bytes.len() as u64,
+        };
+        let pinned = OriginalPinnedFile::from_original_plan(
+            original.try_clone().unwrap(), &pin, PLAN_MAX_BYTES,
+            Instant::now() + Duration::from_secs(5),
+        ).expect("retained original descriptor");
+        let retained = pinned._file.metadata().unwrap();
+        assert_eq!((identity.dev(), identity.ino()),
+            (cap_fs_ext::MetadataExt::dev(&retained), cap_fs_ext::MetadataExt::ino(&retained)));
+        assert_eq!(pinned.bytes(), bytes);
+        assert_eq!(original.stream_position().unwrap(), 3);
+        let mut wrong = pin.clone();
+        wrong.sha256 = "0".repeat(64);
+        assert!(OriginalPinnedFile::from_original_plan(
+            original.try_clone().unwrap(), &wrong, PLAN_MAX_BYTES,
+            Instant::now() + Duration::from_secs(5),
+        ).is_err());
+        assert_eq!(original.stream_position().unwrap(), 3);
+    }
 
     #[test]
     fn v3_selector_keeps_native_arguments_and_rejects_mixed_or_duplicate_inputs() {
