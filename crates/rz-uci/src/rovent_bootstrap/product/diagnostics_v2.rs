@@ -366,7 +366,7 @@ fn compact_storage(value: serde_json::Value) -> serde_json::Value {
                 "archive_owner":compact_archive_owner(&v["archive_owner"])
             })
         });
-    serde_json::json!({
+    let mut result = serde_json::json!({
         "status":if value["complete"] == true {"observed"} else {"unknown"},
         "phase_scope":facts.get("phase_scope"), "phase_receipts_known":facts.get("phase_receipts_known"),
         "phase_receipts":receipts, "empty_game_phase":empty,
@@ -375,7 +375,20 @@ fn compact_storage(value: serde_json::Value) -> serde_json::Value {
         "finish_completed":facts.get("finish_completed"),
         "physical_completion_attested":false,
         "scope":"bounded_original_storage_phase_only"
-    })
+    });
+    if let Some(receipt) = facts.get("empty_close_receipt").filter(|v| v.is_object()) {
+        result["empty_close_receipt"] = serde_json::json!({
+            "nonce": receipt.get("nonce"), "scope": receipt.get("scope"),
+            "owner_kind": receipt.get("owner_kind"),
+            "archive_owner": compact_archive_owner(&receipt["archive_owner"]),
+            "elapsed_ns": receipt.get("elapsed_ns")
+        });
+        result["empty_finish_complete"] = facts
+            .get("empty_finish_complete")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+    }
+    result
 }
 
 fn storage_observation<T: OriginalV2Observation>(
@@ -614,6 +627,27 @@ mod tests {
             )["status"],
             "unknown"
         );
+    }
+
+    #[test]
+    fn empty_archive_close_projects_the_original_distinct_receipt() {
+        let storage = compact_storage(serde_json::json!({"complete":true,"facts":{
+            "finish_completed":false,"empty_finish_complete":true,
+            "original_phase_join":{"worker_joined":true},
+            "empty_close_receipt":{"nonce":7,"scope":{"game":2},"owner_kind":"Pc",
+                "archive_owner":{"owner_id":13,"complete":true,"admission_closed":true},
+                "elapsed_ns":42}
+        }}));
+        assert_eq!(storage["empty_finish_complete"], true);
+        assert_eq!(storage["empty_close_receipt"]["nonce"], 7);
+        assert_eq!(storage["empty_close_receipt"]["scope"]["game"], 2);
+        assert_eq!(
+            storage["empty_close_receipt"]["archive_owner"]["owner_id"],
+            13
+        );
+        assert_eq!(storage["original_phase_join"]["worker_joined"], true);
+        assert_eq!(storage["finish_completed"], false);
+        assert_eq!(storage["physical_completion_attested"], false);
     }
 
     #[test]

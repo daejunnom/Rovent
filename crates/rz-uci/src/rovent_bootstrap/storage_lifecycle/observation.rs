@@ -202,8 +202,10 @@ pub(super) fn project<M: RoleModel + 'static>(
         }
         _ => false,
     };
-    let after_root_scope = core.phase_scope.filter(|_| root_phase_complete);
-    let after_finish_complete = core.phase_scope.is_some()
+    let after_root_scope = core
+        .phase_scope
+        .filter(|_| root_phase_complete && core.empty_close_receipt.is_none());
+    let registered_finish_complete = core.phase_scope.is_some()
         && selected == Some(1)
         && core.finish_completed
         && receipt_at(0).is_some_and(|receipt| {
@@ -216,6 +218,22 @@ pub(super) fn project<M: RoleModel + 'static>(
                     .archive_owner
                     .is_some_and(|owner| owner.complete && owner.admission_closed)
         });
+    // This receipt covers only the original empty setup/NewGame archive and
+    // is distinct from the checkpoint of a registered root.
+    let empty_finish_complete = selected == Some(0)
+        && core.empty_close_receipt.as_ref().is_some_and(|receipt| {
+            Some(receipt.scope) == core.phase_scope
+                && receipt.archive_owner.is_some_and(|owner| {
+                    owner.complete
+                        && owner.admission_closed
+                        && core.empty_game_phases.back().is_some_and(|empty| {
+                            empty.requested_scope == receipt.scope
+                                && empty.owner.owner_id == owner.owner_id
+                        })
+                })
+                && receipt.elapsed.as_nanos() <= u128::from(u64::MAX)
+        });
+    let after_finish_complete = registered_finish_complete || empty_finish_complete;
     let failure = core
         .first_failure
         .as_ref()
@@ -224,6 +242,7 @@ pub(super) fn project<M: RoleModel + 'static>(
     let quarantined = core.quarantine.is_some()
         || core.unexpected.is_some()
         || core.setup_rejected.is_some()
+        || core.empty_close_rejected.is_some()
         || core.setup_admission_rejection.is_some()
         || core.rejected_work.is_some()
         || core.caller_panic.is_some();
@@ -256,7 +275,13 @@ pub(super) fn project<M: RoleModel + 'static>(
             "last_join_observed":core.shutdown_observed.map(join),
             "last_join_observation_scope_known":core.shutdown.is_some(),
             "last_join_observation_scope":core.shutdown.and(core.phase_scope).map(scope),
-            "finish_completed":core.finish_completed,"first_failure_code":failure,
+            "finish_completed":core.finish_completed,
+            "empty_close_receipt":core.empty_close_receipt.as_ref().map(|receipt|json!({
+                "nonce":receipt.nonce,"scope":scope(receipt.scope),
+                "owner_kind":format!("{:?}",receipt.owner_kind),
+                "archive_owner":receipt.archive_owner.map(owner_observation),
+                "elapsed_ns":u64::try_from(receipt.elapsed.as_nanos()).ok()})),
+            "empty_finish_complete":empty_finish_complete,"first_failure_code":failure,
             "pending":pending,"quarantined":quarantined,"hot_semantic_owner":null,
             "physical_completion_attested":false,"capabilities_reissued":false}),
     }

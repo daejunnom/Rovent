@@ -57,12 +57,13 @@ fn admission(
     lock: Arc<RoventInputLockV3>,
     clock: &ProcessClock,
     implementation: Digest,
+    game: u64,
     root: u64,
 ) -> Arc<RoventRootAdmissionV3> {
     let position = Position::startpos();
     let authority = SearchAuthority {
         epoch: clock.epoch(),
-        game: GameGeneration(1),
+        game: GameGeneration(game),
         root: RootGeneration(root),
         implementation,
     };
@@ -110,8 +111,10 @@ pub(crate) fn run_original_v3_lifecycle(
     clock: &ProcessClock,
     implementation: Digest,
     shared: Arc<SharedRoventStorageRegistration>,
+    empty_close: bool,
+    new_game_close: bool,
 ) {
-    let original = admission(Arc::clone(&lock), clock, implementation, 1);
+    let original = admission(Arc::clone(&lock), clock, implementation, 1, 1);
     let scope = original.authority();
     let until = original.original_context().shutdown_deadline;
     let signal = CompletionSignal::default();
@@ -146,23 +149,67 @@ pub(crate) fn run_original_v3_lifecycle(
     let mut observation = lifecycle.observation();
     observation.require_after_root(scope);
     assert!(observation.complete);
-    let root = returned
-        .register_adaptive_root(&Position::startpos(), scope)
-        .unwrap();
-    returned.abandon_unconsumed_adaptive_root(scope).unwrap();
-    drop(root);
+    let empty_owner = lifecycle
+        .core
+        .empty_game_phases
+        .back()
+        .unwrap()
+        .owner
+        .owner_id;
+    if !empty_close || new_game_close {
+        let root = returned
+            .register_adaptive_root(&Position::startpos(), scope)
+            .unwrap();
+        returned.abandon_unconsumed_adaptive_root(scope).unwrap();
+        drop(root);
+    }
+    let (final_scope, final_owner, final_until, returned) = if new_game_close {
+        let next = admission(Arc::clone(&lock), clock, implementation, 2, 2);
+        let next_scope = next.authority();
+        let next_until = next.original_context().shutdown_deadline;
+        let returned_after_new_game = lifecycle
+            .prepare_v3(
+                StorageSemanticOwner::Pc(returned),
+                next,
+                true,
+                &Position::startpos(),
+                &signal,
+            )
+            .unwrap_or_else(|failure| panic!("V3 archive NewGame: {:?}", failure.failure));
+        let StorageSemanticOwner::Pc(next_owner) = returned_after_new_game else {
+            panic!("wrong returned owner after NewGame")
+        };
+        assert!(!original_store.matches(next_owner.stores()));
+        let phase = lifecycle.core.empty_game_phases.back().unwrap();
+        assert!(matches!(phase.kind, EmptyGamePhaseKind::NewGame));
+        assert_eq!(phase.requested_scope, next_scope);
+        assert_ne!(phase.owner.owner_id, empty_owner);
+        (next_scope, phase.owner.owner_id, next_until, next_owner)
+    } else {
+        (scope, empty_owner, until, returned)
+    };
     lifecycle
-        .finish(Some(StorageSemanticOwner::Pc(returned)), until, &signal)
+        .finish(Some(StorageSemanticOwner::Pc(returned)), final_until, &signal)
         .unwrap_or_else(|failure| panic!("V3 archive final worker: {:?}", failure.failure));
     let mut observation = lifecycle.observation();
     observation.require_after_finish();
     assert!(observation.complete);
-    assert!(lifecycle.core.finish_completed);
+    if empty_close {
+        let receipt = lifecycle.core.empty_close_receipt.as_ref().unwrap();
+        assert_eq!(receipt.scope, final_scope);
+        let closed = receipt.archive_owner.unwrap();
+        assert_eq!(closed.owner_id, final_owner);
+        assert!(closed.complete && closed.admission_closed);
+        assert!(!lifecycle.core.finish_completed);
+    } else {
+        assert!(lifecycle.core.finish_completed);
+        assert!(lifecycle.core.empty_close_receipt.is_none());
+    }
     assert!(lifecycle.core.shutdown.as_ref().unwrap().worker_joined);
 
     // Equal lock content in a different allocation is not the admitted owner.
     // Rejection occurs before starting any worker and retains this exact PC.
-    let different = admission(Arc::new(lock.as_ref().clone()), clock, implementation, 2);
+    let different = admission(Arc::new(lock.as_ref().clone()), clock, implementation, 1, 3);
     let owner = pc_owner(different.authority(), until);
     let rejected_ptr = std::ptr::from_ref(owner.as_ref());
     let rejected_store = owner.stores().read_owner();

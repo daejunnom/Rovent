@@ -81,6 +81,55 @@ impl UnusedArchiveSetupSeal {
         Ok(())
     }
 }
+/// The original ready game and Store, without asserting a registered root.
+/// In particular, `last` may belong to a previous game after NewGame.
+pub(super) struct EmptyArchiveGameSeal {
+    registry: Weak<()>,
+    store: StoreReadOwner,
+    scope: SearchAuthority,
+    next_nonce: u64,
+    previous: Option<SearchAuthority>,
+}
+impl EmptyArchiveGameSeal {
+    pub(super) fn validate<M: RoleModel>(
+        &self,
+        semantic: &PalsSemanticState<M>,
+    ) -> Result<(), PalsError> {
+        semantic.ensure_adaptive_logical_quiescence()?;
+        let registry = &semantic.adaptive_root_registry;
+        if !self.registry.ptr_eq(&semantic.adaptive_registry_identity())
+            || !self.store.matches(&semantic.stores)
+            || semantic.stores.generation() != 0
+            || semantic.stores.root().is_some()
+            || semantic.game_generation != Some(self.scope.game.0)
+            || registry.pending_nonce.is_some()
+            || registry.next_nonce != self.next_nonce
+            || registry.new_game_ready != Some(self.scope)
+            || registry.last.as_ref().map(|last| last.authority) != self.previous
+        {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        if let Some(last) = &registry.last {
+            let old = last.authority;
+            if old.game.0 >= self.scope.game.0
+                || old.epoch != self.scope.epoch
+                || old.implementation != self.scope.implementation
+                || old.root.0 >= self.scope.root.0
+                || last.owner.matches(&semantic.stores)
+            {
+                return Err(StoreError::StaleConsumer.into());
+            }
+            let previous = semantic
+                .archive_state
+                .previous_closed_owner
+                .ok_or(StoreError::StaleConsumer)?;
+            if !previous.admission_closed || !previous.complete {
+                return Err(StoreError::StaleConsumer.into());
+            }
+        }
+        Ok(())
+    }
+}
 /// NonClone and tied to one engine registry and its exact live Store. It proves
 /// a checked logical root registration only, never a physical release fence.
 pub struct AdaptiveRootRegistration {
@@ -126,6 +175,24 @@ impl IdleArchiveGameSeal {
 }
 
 impl<M: RoleModel> PalsSemanticState<M> {
+    pub(super) fn seal_empty_archive_game(
+        &self,
+        scope: SearchAuthority,
+    ) -> Result<EmptyArchiveGameSeal, PalsError> {
+        let seal = EmptyArchiveGameSeal {
+            registry: self.adaptive_registry_identity(),
+            store: self.stores.read_owner(),
+            scope,
+            next_nonce: self.adaptive_root_registry.next_nonce,
+            previous: self
+                .adaptive_root_registry
+                .last
+                .as_ref()
+                .map(|last| last.authority),
+        };
+        seal.validate(self)?;
+        Ok(seal)
+    }
     pub(super) fn seal_unused_engine_game_preparation(
         &self,
         scope: SearchAuthority,

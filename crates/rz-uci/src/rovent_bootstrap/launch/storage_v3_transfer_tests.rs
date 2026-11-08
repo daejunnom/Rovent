@@ -1,5 +1,5 @@
 //! CPU-only V3 transfer checks using an actual child process boundary.
-//! These do not start an archive worker, load a model, or prove a GPU fence.
+//! They exercise an archive worker, without model inference or a GPU fence.
 
 use super::*;
 use crate::rovent_bootstrap::process_boundary::{
@@ -16,12 +16,31 @@ use sha2::Sha256;
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 const CHILD_ROOT: &str = "ROVENT_V3_TRANSFER_TEST_ROOT";
+const EMPTY_CLOSE: &str = "ROVENT_V3_TRANSFER_TEST_EMPTY_CLOSE";
+const NEW_GAME_CLOSE: &str = "ROVENT_V3_TRANSFER_TEST_NEW_GAME_CLOSE";
+// Includes the fixture's initial image hash and its 300-second startup budget.
+const CHILD_TIMEOUT: Duration = Duration::from_secs(600);
+
+struct ChildCleanup {
+    child: Child,
+    reaped: bool,
+}
+
+impl Drop for ChildCleanup {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // Test failure/panic must not leave the process boundary fixture alive.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
 
 fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -50,6 +69,20 @@ fn artifact(path: &str, bytes: &[u8]) -> ArtifactRef {
 /// parent test harness. Child stdout belongs to this test only.
 #[test]
 fn v3_transfer_real_process_boundary_child() {
+    run_transfer_child(false, false);
+}
+
+#[test]
+fn v3_transfer_empty_root_calls_actual_finish() {
+    run_transfer_child(true, false);
+}
+
+#[test]
+fn v3_transfer_new_game_empty_root_calls_actual_finish() {
+    run_transfer_child(true, true);
+}
+
+fn run_transfer_child(empty_close: bool, new_game_close: bool) {
     let base = std::env::temp_dir().canonicalize().unwrap();
     let root = base.join(format!(
         "rovent-v3-transfer-{}-{}",
@@ -60,13 +93,51 @@ fn v3_transfer_real_process_boundary_child() {
     for name in ["private", "archive", "checkout", "protected"] {
         std::fs::create_dir(root.join(name)).unwrap();
     }
-    let output = Command::new(std::env::current_exe().unwrap())
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
         .current_dir(root.join("private"))
-        .env(CHILD_ROOT, &root)
+        .env(CHILD_ROOT, &root);
+    if empty_close {
+        child.env(EMPTY_CLOSE, "1");
+    } else {
+        child.env_remove(EMPTY_CLOSE);
+    }
+    if new_game_close {
+        child.env(NEW_GAME_CLOSE, "1");
+    } else {
+        child.env_remove(NEW_GAME_CLOSE);
+    }
+    // Files avoid a full stdout/stderr pipe blocking the child while the
+    // parent waits, and remain confined to this test's private temporary tree.
+    let stdout_path = root.join("child.stdout");
+    let stderr_path = root.join("child.stderr");
+    child
         .arg("v3_transfer_child_body")
         .arg("--nocapture")
-        .output()
-        .unwrap();
+        .stdout(Stdio::from(std::fs::File::create(&stdout_path).unwrap()))
+        .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()));
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    let mut running = ChildCleanup {
+        child: child.spawn().unwrap(),
+        reaped: false,
+    };
+    let (status, timed_out, kill_error) = loop {
+        if let Some(status) = running.child.try_wait().unwrap() {
+            running.reaped = true;
+            break (status, false, None);
+        }
+        if Instant::now() >= deadline {
+            // The child may have exited between try_wait and kill. wait still
+            // obtains its actual status and reaps it in either case.
+            let kill_error = running.child.kill().err().map(|error| error.to_string());
+            let status = running.child.wait().expect("reap timed-out fixture child");
+            running.reaped = true;
+            break (status, true, kill_error);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = std::fs::read(&stdout_path).unwrap();
+    let stderr = std::fs::read(&stderr_path).unwrap();
     // Only the freshly created child tree in the canonical temp directory.
     let info = std::fs::symlink_metadata(&root).unwrap();
     assert!(root.is_absolute() && root.parent() == Some(base.as_path()));
@@ -79,10 +150,10 @@ fn v3_transfer_real_process_boundary_child() {
     assert!(info.is_dir() && !info.file_type().is_symlink());
     std::fs::remove_dir_all(&root).unwrap();
     assert!(
-        output.status.success(),
-        "V3 transfer child failed: {}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        !timed_out && status.success(),
+        "V3 transfer child failed or exceeded {CHILD_TIMEOUT:?}: status={status}; kill_error={kill_error:?}; stdout={}\nstderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
     );
 }
 
@@ -330,6 +401,8 @@ fn v3_transfer_child_body() {
         &clock,
         implementation,
         shared,
+        std::env::var_os(EMPTY_CLOSE).is_some(),
+        std::env::var_os(NEW_GAME_CLOSE).is_some(),
     );
 
     // An original cancellation is never reset or renewed. A separately

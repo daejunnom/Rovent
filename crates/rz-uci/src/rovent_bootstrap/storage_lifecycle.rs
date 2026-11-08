@@ -17,7 +17,8 @@ use rz_search::pals::engine::adaptive_port::AdaptivePortModel;
 use rz_search::pals::engine::adaptive_port::archive_worker::{
     ArchiveOperation, ArchiveOperationKind, ArchiveOwner, ArchiveQuarantine,
     ArchiveShutdownReceipt, ArchiveTransfer, ArchiveWork, ArchiveWorkReceipt, ArchiveWorker,
-    ArchiveWorkerError, UnusedIdleArchiveSetupCompletion, UnusedIdleArchiveSetupReceipt,
+    ArchiveWorkerError, EmptyIdleArchiveCloseCompletion, EmptyIdleArchiveCloseReceipt,
+    UnusedIdleArchiveSetupCompletion, UnusedIdleArchiveSetupReceipt,
 };
 use rz_search::pals::engine::idle_archive::{
     IdleArchiveOwnerKind, IdleSemanticArchiveOwner, UnusedIdleArchiveSetup,
@@ -141,6 +142,12 @@ struct EmptyGamePhase {
 }
 
 enum Pending {
+    EmptyClose {
+        transfer: ArchiveTransfer,
+        scope: SearchAuthority,
+        owner_id: u64,
+        cleanup_until: Instant,
+    },
     Setup {
         transfer: ArchiveTransfer,
         scope: SearchAuthority,
@@ -157,12 +164,16 @@ enum Pending {
 impl Pending {
     fn transfer(&self) -> &ArchiveTransfer {
         match self {
-            Self::Setup { transfer, .. } | Self::Work { transfer, .. } => transfer,
+            Self::EmptyClose { transfer, .. }
+            | Self::Setup { transfer, .. }
+            | Self::Work { transfer, .. } => transfer,
         }
     }
     fn cleanup_until(&self) -> Instant {
         match self {
-            Self::Setup { cleanup_until, .. } | Self::Work { cleanup_until, .. } => *cleanup_until,
+            Self::EmptyClose { cleanup_until, .. }
+            | Self::Setup { cleanup_until, .. }
+            | Self::Work { cleanup_until, .. } => *cleanup_until,
         }
     }
 }
@@ -177,6 +188,8 @@ struct WorkerCustody<M: RoleModel + 'static = AdaptivePortModel> {
     setup: Option<UnusedIdleArchiveSetup>,
     setup_admission_rejection: Option<StorageSetupRejection>,
     setup_rejected: Option<Box<UnusedIdleArchiveSetupCompletion<M>>>,
+    empty_close_rejected: Option<Box<EmptyIdleArchiveCloseCompletion<M>>>,
+    empty_close_receipt: Option<EmptyIdleArchiveCloseReceipt>,
     quarantine: Option<Box<ArchiveQuarantine<M>>>,
     rejected_work: Option<Box<ArchiveWork>>,
     pending: Option<Pending>,
@@ -211,6 +224,8 @@ impl<M: RoleModel + 'static> WorkerCustody<M> {
             setup: None,
             setup_admission_rejection: None,
             setup_rejected: None,
+            empty_close_rejected: None,
+            empty_close_receipt: None,
             quarantine: None,
             rejected_work: None,
             pending: None,
@@ -278,6 +293,7 @@ impl<M: RoleModel + 'static> WorkerCustody<M> {
             || self.idle.is_some()
             || self.pending.is_some()
             || self.setup_rejected.is_some()
+            || self.empty_close_rejected.is_some()
             || self.quarantine.is_some()
             || self.unexpected.is_some()
         {
@@ -443,6 +459,43 @@ impl<M: RoleModel + 'static> WorkerCustody<M> {
         }
         Ok(())
     }
+    /// Close only the exact observed unregistered game, on the original worker.
+    /// A successful worker close is not a native or GPU physical fence.
+    fn submit_empty_close(
+        &mut self,
+        scope: SearchAuthority,
+        until: Instant,
+    ) -> Result<(), SearchSessionFailure> {
+        self.verify_empty_game_handoff(scope)?;
+        let owner_id = self
+            .empty_game_phases
+            .back()
+            .expect("verified phase")
+            .owner
+            .owner_id;
+        let owner = self.idle.take().expect("verified original Idle");
+        self.phase_scope = Some(scope);
+        match self
+            .worker
+            .as_mut()
+            .expect("original worker")
+            .submit_empty_idle_close(owner, scope, until)
+        {
+            Ok(transfer) => {
+                self.pending = Some(Pending::EmptyClose {
+                    transfer,
+                    scope,
+                    owner_id,
+                    cleanup_until: until,
+                })
+            }
+            Err(rejected) => {
+                self.idle = Some(rejected.owner);
+                return Err(self.fail("RoventStorageEmptyCloseSubmission", rejected.error));
+            }
+        }
+        Ok(())
+    }
     fn push_receipt(&mut self, receipt: ArchiveWorkReceipt) {
         match self.receipt_sequence.checked_add(1) {
             Some(next) => self.receipt_sequence = next,
@@ -455,6 +508,42 @@ impl<M: RoleModel + 'static> WorkerCustody<M> {
     }
     fn pump(&mut self) {
         match self.pending.as_ref() {
+            Some(Pending::EmptyClose {
+                transfer,
+                scope,
+                owner_id,
+                ..
+            }) => {
+                let scope = *scope;
+                let owner_id = *owner_id;
+                let nonce = transfer.nonce();
+                match self
+                    .worker
+                    .as_mut()
+                    .expect("original worker")
+                    .try_receive_empty_idle_close(transfer)
+                {
+                    Ok(Some(completed)) => {
+                        self.pending.take();
+                        match completed.install(scope, nonce, owner_id) {
+                            Ok((owner, receipt)) => {
+                                self.idle = Some(owner);
+                                self.empty_close_receipt = Some(receipt);
+                            }
+                            Err(completed) => {
+                                let error = format!("{:?}", completed.failure());
+                                self.empty_close_rejected = Some(Box::new(completed));
+                                self.fail("RoventStorageEmptyCloseReturn", error);
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.poll_error.get_or_insert(error);
+                        self.fail("RoventStorageEmptyClosePoll", error);
+                    }
+                }
+            }
             Some(Pending::Setup {
                 transfer,
                 scope,
@@ -1062,7 +1151,7 @@ impl<M: RoleModel + 'static> SessionStorageLifecycle<M> {
         until: Instant,
         signal: &CompletionSignal,
     ) -> Result<(), StorageLifecycleFailure<M>> {
-        if self.core.finish_completed
+        if (self.core.finish_completed || self.core.empty_close_receipt.is_some())
             && self.core.shutdown.is_some()
             && self.core.first_failure.is_none()
         {
@@ -1089,7 +1178,11 @@ impl<M: RoleModel + 'static> SessionStorageLifecycle<M> {
                     failure,
                 })?;
         }
-        if self.core.first_failure.is_none() && self.configured() && !self.core.finish_completed {
+        if self.core.first_failure.is_none()
+            && self.configured()
+            && !self.core.finish_completed
+            && self.core.empty_close_receipt.is_none()
+        {
             self.core.ensure_worker(signal)?;
             let Some(scope) = self.core.last_scope else {
                 return Err(self
@@ -1097,15 +1190,32 @@ impl<M: RoleModel + 'static> SessionStorageLifecycle<M> {
                     .fail("RoventStorageFinish", "original scope absent")
                     .into());
             };
-            let _ = self.core.work(
-                scope,
-                ArchiveOperation::FinishIdleGame,
-                ArchiveOperationKind::FinishIdleGame,
-                until,
-                until,
-                &AtomicBool::new(false),
-                signal,
-            );
+            // Only the exact empty setup/NewGame observation can select the
+            // separate close path. Search independently verifies the original
+            // registry, Store, game, and pending state before closing it.
+            let empty = self.core.empty_game_phases.back().is_some_and(|phase| {
+                phase.requested_scope == scope
+                    && self.core.idle.as_ref().is_some_and(|idle| {
+                        idle.stores().generation() == 0
+                            && idle.stores().root().is_none()
+                            && idle.stores().hot_stats() == Default::default()
+                    })
+            });
+            if empty {
+                if self.core.submit_empty_close(scope, until).is_ok() {
+                    let _ = self.core.wait(until, &AtomicBool::new(false), signal);
+                }
+            } else {
+                let _ = self.core.work(
+                    scope,
+                    ArchiveOperation::FinishIdleGame,
+                    ArchiveOperationKind::FinishIdleGame,
+                    until,
+                    until,
+                    &AtomicBool::new(false),
+                    signal,
+                );
+            }
         }
         let joined = self.core.join(until, signal);
         if let Some(failure) = &self.core.first_failure {
@@ -1250,6 +1360,41 @@ mod tests {
         core.ensure_worker(signal).unwrap();
         core.submit_setup(payload, scope(), until).unwrap();
         core.wait(until, &AtomicBool::new(false), signal).unwrap();
+    }
+
+    #[test]
+    fn empty_original_archive_close_has_own_receipt_and_worker_join() {
+        let mut scratch = Scratch::new();
+        let until = Instant::now() + Duration::from_secs(20);
+        let signal = CompletionSignal::default();
+        let mut core = WorkerCustody::new();
+        configure(
+            &mut core,
+            pc(until),
+            setup(&scratch, limits(), until, Arc::new(AtomicBool::new(false))),
+            until,
+            &signal,
+        );
+        core.observe_empty_game(EmptyGamePhaseKind::UnusedSetup, scope())
+            .unwrap();
+        core.join(until, &signal).unwrap();
+        core.verify_empty_game_handoff(scope()).unwrap();
+        core.worker.take();
+        let owner_id = core.empty_game_phases.back().unwrap().owner.owner_id;
+        core.ensure_worker(&signal).unwrap();
+        core.submit_empty_close(scope(), until).unwrap();
+        core.wait(until, &AtomicBool::new(false), &signal).unwrap();
+        let receipt = core.empty_close_receipt.as_ref().unwrap();
+        assert_eq!(receipt.scope, scope());
+        assert_eq!(receipt.archive_owner.unwrap().owner_id, owner_id);
+        assert!(receipt.archive_owner.unwrap().admission_closed);
+        assert!(!core.finish_completed); // not a registered-root checkpoint
+        core.join(until, &signal).unwrap();
+        let mut observed = observation::project(&core);
+        observed.require_after_finish();
+        assert!(observed.complete); // archive worker evidence, not native fence
+        drop(core);
+        scratch.1 = true;
     }
 
     #[test]
