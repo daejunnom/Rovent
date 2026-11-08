@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from storage_consumer_broker_transport import (BrokerTransportError, MAX_PACKET_BYTES,
+from storage_consumer_broker_transport import (BrokerPeerEOF, BrokerTransportError, MAX_PACKET_BYTES,
                                                 open_pair, receive_packet, send_packet)
 
 
@@ -47,8 +47,14 @@ class ConsumerBrokerTransportTests(unittest.TestCase):
 
     def test_eof_is_not_an_empty_success(self):
         self.left.close()
-        with self.assertRaises(BrokerTransportError):
+        with self.assertRaises(BrokerPeerEOF):
             receive_packet(self.right, self._same_process)
+
+    def test_empty_packet_is_malformed_not_clean_eof(self):
+        self.left.send(b"")
+        with self.assertRaises(BrokerTransportError) as caught:
+            receive_packet(self.right, self._same_process)
+        self.assertNotIsInstance(caught.exception, BrokerPeerEOF)
 
     def test_unexpected_descriptor_is_rejected_and_closed(self):
         read_fd, write_fd = os.pipe()

@@ -88,6 +88,7 @@ class ManagedBrokerLaunchTests(unittest.TestCase):
         self.manager.environment = lambda: {}
         self.fake_group = SimpleNamespace(_owner_pid=os.getpid(), _child=None, _completed=False)
         self.pins = [patch("storage_consumer_broker_launch.PinnedBrokerDomain", FakeDomain),
+                     patch("storage_consumer_broker_launch.ObservedReaderProfile", FakeProfile),
                      patch("storage_consumer_broker_launch.ReviewedReaderContract", FakeContract),
                      patch("storage_consumer_broker_launch._ordered_roots", return_value=[self.manager.root]),
                      patch("storage_consumer_broker_launch.OwnedProcessGroup", return_value=self.fake_group),
@@ -210,6 +211,18 @@ class ManagedBrokerLaunchTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     other.assert_spawn_command(other.command, self.manager.source)
                 self.assertFalse(other._attempted)
+            finally:
+                self.assertTrue(other.finish(tree_gone=False))
+
+    def test_automatic_profile_has_no_review_contract(self):
+        group = SimpleNamespace(_owner_pid=os.getpid(), _child=None, _completed=False)
+        with patch("storage_consumer_broker_launch.OwnedProcessGroup", return_value=group):
+            profile = FakeProfile(self.manager)
+            other = ManagedBrokerLaunch(self.manager, [], reader_profile=profile)
+            try:
+                self.assertIsNone(other.reader_contract)
+                self.assertIs(other.reader_profile, profile)
+                other.assert_spawn_command(other.command, self.manager.source)
             finally:
                 self.assertTrue(other.finish(tree_gone=False))
 

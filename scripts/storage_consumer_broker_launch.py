@@ -15,7 +15,7 @@ import sys
 from managed_process import OwnedProcessGroup, ProcessNotSpawned
 from managed_storage import StorageError
 from storage_consumer_broker_binding import PinnedBrokerDomain, _ordered_roots
-from storage_consumer_broker_profile import ReviewedReaderContract
+from storage_consumer_broker_profile import ObservedReaderProfile, ReviewedReaderContract
 from storage_consumer_broker_supervisor import ConsumerBrokerSupervisor
 from storage_consumer_broker_transport import open_pair
 
@@ -31,15 +31,19 @@ def _same_process_cwd(pid, source):
 class ManagedBrokerLaunch:
     """Keep the original manager, process-group owner and pinned domain alive."""
 
-    def __init__(self, manager, catalogs, *, reader_contract=None):
+    def __init__(self, manager, catalogs, *, reader_contract=None, reader_profile=None):
         if sys.platform != "linux" or not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
             raise StorageError("Linux original process supervision required")
         self.manager = manager
         if reader_contract is not None and (type(reader_contract) is not ReviewedReaderContract
                                             or reader_contract.profile._manager is not manager):
             raise StorageError("original manager's reviewed reader contract required")
+        if reader_profile is not None and (reader_contract is not None or type(reader_profile) is not ObservedReaderProfile
+                                           or reader_profile._manager is not manager):
+            raise StorageError("original manager's observed reader profile required")
         self.reader_contract = reader_contract
-        self._command = None if reader_contract is None else reader_contract.profile.command
+        self.reader_profile = reader_contract.profile if reader_contract is not None else reader_profile
+        self._command = None if self.reader_profile is None else self.reader_profile.command
         self._owner_pid, self._uid, self._gid = os.getpid(), os.getuid(), os.getgid()
         self.roots = _ordered_roots(manager, catalogs)
         self.domain = PinnedBrokerDomain(manager, self.roots)
@@ -77,10 +81,10 @@ class ManagedBrokerLaunch:
     def assert_spawn_command(self, command, cwd):
         """Bind this exact immutable argv and original source cwd to spawn."""
         self._assert_supervisor()
-        if (self.reader_contract is None or self._command is None
-                or command is not self._command or self.reader_contract.profile.command is not self._command
+        if (self.reader_profile is None or self._command is None
+                or command is not self._command or self.reader_profile.command is not self._command
                 or os.path.realpath(os.fspath(cwd)) != os.path.realpath(os.fspath(self.manager.source))
-                or not self.reader_contract.profile.unchanged()):
+                or not self.reader_profile.unchanged()):
             raise StorageError("original profiled command and source cwd required")
         if self._attempted:
             raise StorageError("broker spawn already attempted")
@@ -186,9 +190,9 @@ class ManagedBrokerLaunch:
                 except OSError as error:
                     close_errors.append(error)
         self._child_endpoint = self._parent = None
-        if self.reader_contract is not None:
+        if self.reader_profile is not None:
             try:
-                self.reader_contract.profile.close()
+                self.reader_profile.close()
             except (OSError, StorageError) as error:
                 close_errors.append(error)
         try:

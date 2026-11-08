@@ -21,6 +21,30 @@ _READER_NAMES = {"rovent_v3_parent.py", "rovent_before_native_owner.py",
 _SCRIPT_BYTES_LIMIT = 8 * 1024 * 1024
 
 
+def is_supported_reader_command(source, command):
+    """Recognize only explicit direct reader entrypoints, without adopting data."""
+    if sys.platform != "linux" or not isinstance(command, (list, tuple)) or len(command) < 2:
+        return False
+    try:
+        interpreter, requested = Path(command[0]), Path(command[1])
+        if (not interpreter.is_absolute()
+                or os.path.realpath(interpreter) != os.path.realpath(sys.executable)):
+            return False
+        source = Path(os.path.realpath(source))
+        requested = requested if requested.is_absolute() else source / requested
+        if requested.name not in _READER_NAMES:
+            return False
+        if any(argument in ("-h", "--help") for argument in command[2:]):
+            return False
+        # Availability is only a candidate for protocol use, not evidence
+        # that the selected reader actually participates. Its handshake and
+        # registered leases are observed separately.
+        return ((source / "scripts" / "storage_consumer_broker_client.py").is_file()
+                and Path(os.path.realpath(requested)) == source / "scripts" / requested.name)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _stamp(info):
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 

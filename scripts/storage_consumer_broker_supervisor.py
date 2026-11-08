@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from storage_consumer_broker_state import ConsumerBrokerState
-from storage_consumer_broker_transport import BrokerTransportError, receive_packet, send_packet
+from storage_consumer_broker_transport import BrokerPeerEOF, BrokerTransportError, receive_packet, send_packet
 
 
 class ConsumerBrokerSupervisor:
@@ -34,6 +34,15 @@ class ConsumerBrokerSupervisor:
                                           assert_child, clock=clock, hold_on_failure=True)
         self._deadline = None
         self._revoked = False
+        self._messages_observed = 0
+
+    @property
+    def participation(self):
+        return "messages_observed" if self._messages_observed else "no_messages_observed"
+
+    @property
+    def lease_count(self):
+        return self._state.lease_count
 
     @property
     def transaction_active(self):
@@ -69,9 +78,18 @@ class ConsumerBrokerSupervisor:
             if self._deadline is not None and self._clock() >= self._deadline:
                 raise BrokerTransportError("child transaction deadline elapsed; drain required")
             for _ in range(maximum_packets):
-                message = receive_packet(self._endpoint, self._assert_peer)
+                try:
+                    message = receive_packet(self._endpoint, self._assert_peer)
+                except BrokerPeerEOF:
+                    if self._messages_observed == 0 and not self._state.transaction_active:
+                        # An old checkout may ignore the optional channel. No
+                        # registration or protection is inferred from EOF.
+                        self.revoke()
+                        return
+                    raise
                 if message is None:
                     return
+                self._messages_observed += 1
                 kind = message.get("kind")
                 sequence = message.get("request_id")
                 if type(kind) is not str or type(sequence) is not int:

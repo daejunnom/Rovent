@@ -110,6 +110,23 @@ class ConsumerBrokerSupervisorTests(unittest.TestCase):
             self.broker.service()
         self.assertFalse(self.locked)
 
+    def test_clean_eof_before_any_message_is_not_registered(self):
+        self.child.close()
+        self.broker.service()
+        self.assertEqual(self.broker.participation, "no_messages_observed")
+        self.assertEqual(self.broker.lease_count, 0)
+        self.broker.finish(child_never_dispatched=False, tree_gone=True)
+
+    def test_eof_after_begin_remains_failure_and_keeps_guard(self):
+        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0, "descriptor": None})
+        self.child.close()
+        with self.assertRaises(BrokerTransportError):
+            self.broker.service()
+        self.assertEqual(self.broker.participation, "messages_observed")
+        self.assertTrue(self.locked)
+        self.broker.finish(child_never_dispatched=False, tree_gone=True)
+        self.assertFalse(self.locked)
+
     def test_done_does_not_release_lease_or_imply_physical_completion(self):
         self.request({"kind": "begin", "request_id": 1, "deadline": 20.0, "descriptor": None})
         self.request({"kind": "commit", "request_id": 1,

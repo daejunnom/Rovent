@@ -24,6 +24,10 @@ class BrokerTransportError(RuntimeError):
     pass
 
 
+class BrokerPeerEOF(BrokerTransportError):
+    """The peer closed without an empty or malformed packet."""
+
+
 def open_pair():
     """Create private packet endpoints; neither is inheritable by default."""
     if os.name != "posix" or not all(hasattr(socket, name) for name in
@@ -113,6 +117,10 @@ def receive_packet(endpoint, assert_peer):
             credentials.append(struct.unpack("3i", value))
         else:
             unexpected = True
+    # Linux can echo the requested MSG_CMSG_CLOEXEC bit in msg_flags even
+    # for a clean EOF; no other returned flag or ancillary data is ignored.
+    if not data and not ancillary and not (flags & ~socket.MSG_CMSG_CLOEXEC):
+        raise BrokerPeerEOF("broker peer closed")
     if (not data or len(data) > MAX_PACKET_BYTES or unexpected or len(credentials) != 1
             or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)):
         raise BrokerTransportError("closed, truncated or invalid broker packet")

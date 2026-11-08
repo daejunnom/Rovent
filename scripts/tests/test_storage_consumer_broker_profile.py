@@ -8,7 +8,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from managed_storage import StorageError
-from storage_consumer_broker_profile import ObservedReaderProfile, ReviewedReaderContract
+from storage_consumer_broker_profile import (ObservedReaderProfile, ReviewedReaderContract,
+                                            is_supported_reader_command)
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux source descriptor required")
@@ -18,6 +19,7 @@ class ObservedReaderProfileTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         (self.root / "scripts").mkdir()
+        (self.root / "scripts" / "storage_consumer_broker_client.py").write_text("# synthetic module\n", encoding="utf-8")
         self.script = self.root / "scripts" / "rovent_v3_parent.py"
         self.script.write_text("# synthetic only\n", encoding="utf-8")
         self.manager = SimpleNamespace(source=self.root, _assert_owner=lambda: None)
@@ -39,6 +41,14 @@ class ObservedReaderProfileTests(unittest.TestCase):
         other.write_text("# synthetic only\n", encoding="utf-8")
         with self.assertRaises(StorageError):
             ObservedReaderProfile(self.manager, [sys.executable, str(other)])
+
+    def test_only_supported_direct_reader_is_recognized_for_automatic_path(self):
+        self.assertTrue(is_supported_reader_command(self.root, [sys.executable, str(self.script)]))
+        self.assertFalse(is_supported_reader_command(self.root, [sys.executable, "-c", "pass"]))
+        self.assertFalse(is_supported_reader_command(self.root, ["python", str(self.script)]))
+        self.assertFalse(is_supported_reader_command(self.root, [sys.executable, str(self.script), "--help"]))
+        (self.root / "scripts" / "storage_consumer_broker_client.py").unlink()
+        self.assertFalse(is_supported_reader_command(self.root, [sys.executable, str(self.script)]))
 
     def test_relative_interpreter_is_rejected(self):
         with self.assertRaises(StorageError):

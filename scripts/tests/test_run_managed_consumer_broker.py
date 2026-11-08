@@ -39,11 +39,12 @@ class RunManagedConsumerBrokerTests(unittest.TestCase):
         self.descriptor = self.root / "descriptor.json"
         self.descriptor.write_text("{}", encoding="ascii")
         self.reader_marker = self.root / "reader-started"
-        repo_scripts = str(Path(__file__).resolve().parents[1])
+        repo_scripts = Path(__file__).resolve().parents[1]
+        for name in ("storage_consumer_broker_client.py", "storage_consumer_broker_transport.py"):
+            (self.source / "scripts" / name).write_bytes((repo_scripts / name).read_bytes())
         source = textwrap.dedent(f"""
             import os, socket, sys, time
             from pathlib import Path
-            sys.path.insert(0, {repo_scripts!r})
             from storage_consumer_broker_client import ConsumerBrokerClient
             fd = int(os.environ.pop("RZ_CONSUMER_BROKER_FD"))
             parent = int(os.environ.pop("RZ_CONSUMER_BROKER_PARENT_PID"))
@@ -73,12 +74,14 @@ class RunManagedConsumerBrokerTests(unittest.TestCase):
 
     def execute(self, digest, *, simulate_unknown=False, simulate_spawn_unknown=False,
                 simulate_manager_finish_failure=False, simulate_predispatch_finish_failure=False,
-                simulate_arm_failure=False, simulate_proven_no_spawn=False, simulate_interruption=False):
+                simulate_arm_failure=False, simulate_proven_no_spawn=False, simulate_interruption=False,
+                automatic=False):
         argv = ["run_managed", "--source-root", str(self.source), "--timeout", "20",
                 "--consumer-registry-root", str(self.registry.root),
-                "--consumer-registry-id", self.registry.registry_id,
-                "--consumer-broker-reviewed-sha256", digest,
-                "--", sys.executable, str(self.script), str(self.descriptor), str(self.reader_marker)]
+                "--consumer-registry-id", self.registry.registry_id]
+        if not automatic:
+            argv.extend(["--consumer-broker-reviewed-sha256", digest])
+        argv.extend(["--", sys.executable, str(self.script), str(self.descriptor), str(self.reader_marker)])
         env = {"XDG_CACHE_HOME": str(self.cache), "PATH": "/usr/bin:/bin", "LANG": "C",
                "PYTHONDONTWRITEBYTECODE": "1"}
         stderr = io.StringIO()
@@ -153,6 +156,81 @@ class RunManagedConsumerBrokerTests(unittest.TestCase):
         self.assertFalse((self.cache / "rovezero/build/managed-v1/owner.json").exists())
         with self.registry.guard() as guard:
             self.assertTrue(guard.conflicts([self.descriptor])["conflicts"])
+
+    def test_bound_catalog_automatically_brokers_supported_reader_without_sha_input(self):
+        code, receipt = self.execute(self.sha, automatic=True)
+        self.assertEqual(code, 0, receipt)
+        line = next(item for item in receipt.splitlines() if item.startswith("managed_consumer_broker_profile="))
+        observation = json.loads(line.split("=", 1)[1])
+        self.assertEqual(observation["reader_contract"], "automatic_unreviewed")
+        self.assertEqual(observation["imports"], "unknown")
+        with self.registry.guard() as guard:
+            self.assertTrue(guard.conflicts([self.descriptor])["conflicts"])
+
+    def test_automatic_unknown_does_not_use_reviewed_guard_release(self):
+        code, receipt = self.execute(self.sha, automatic=True, simulate_unknown=True)
+        self.assertEqual(code, 125, receipt)
+        line = next(item for item in receipt.splitlines() if item.startswith("managed_consumer_broker_quarantine="))
+        handle = json.loads(line.split("=", 1)[1])["handle"]
+        self.assertFalse(self.last_launch._closed)
+        self.assertTrue((self.cache / "rovezero/build/managed-v1/owner.json").exists())
+        with patch.object(managed_outputs, "finalize_supervised_outputs", return_value=None), \
+                patch.object(run_managed, "sample_output_budget", return_value=None), \
+                patch.object(rovezero_usage_snapshot, "warn_cached_total_usage", return_value=None):
+            result = self.quarantine.reobserve(handle, seconds=0.1)
+        self.assertEqual(result["state"], "group_reobserved_owner_finalized")
+        self.assertEqual(result["physical_completion"], "unknown")
+
+    def test_supported_reader_without_registry_keeps_legacy_path(self):
+        self.script.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        argv = ["run_managed", "--source-root", str(self.source), "--timeout", "20", "--",
+                sys.executable, str(self.script)]
+        env = {"XDG_CACHE_HOME": str(self.cache), "PATH": "/usr/bin:/bin", "LANG": "C"}
+        stderr = io.StringIO()
+        with patch.object(sys, "argv", argv), patch.dict(os.environ, env, clear=True), \
+                patch.object(run_managed, "sample_output_budget", return_value=None), \
+                patch.object(managed_outputs, "finalize_supervised_outputs", return_value=None), \
+                patch.object(rovezero_usage_snapshot, "warn_cached_total_usage", return_value=None), \
+                patch.object(rovezero_usage_snapshot, "claim_total_usage_maintenance", return_value=False), \
+                contextlib.redirect_stderr(stderr):
+            code = run_managed.main()
+        self.assertEqual(code, 0, stderr.getvalue())
+        self.assertNotIn("managed_consumer_broker_profile=", stderr.getvalue())
+
+    def test_legacy_checkout_without_client_module_keeps_normal_result(self):
+        (self.source / "scripts" / "storage_consumer_broker_client.py").unlink()
+        self.script.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        code, receipt = self.execute(self.sha, automatic=True)
+        self.assertEqual(code, 0, receipt)
+        self.assertNotIn("managed_consumer_broker_profile=", receipt)
+
+    def test_clean_eof_without_handshake_preserves_child_result_not_protection(self):
+        self.script.write_text("import os, time\nos.close(int(os.environ['RZ_CONSUMER_BROKER_FD']))\n"
+                               "time.sleep(0.5)\n", encoding="utf-8")
+        code, receipt = self.execute(self.sha, automatic=True)
+        self.assertEqual(code, 0, receipt)
+        line = next(item for item in receipt.splitlines() if item.startswith("managed_consumer_broker_observation="))
+        observation = json.loads(line.split("=", 1)[1])
+        self.assertEqual(observation["participation"], "no_messages_observed")
+        self.assertEqual(observation["registered_scope"], "no_consumer_lease_observed")
+        self.assertEqual(observation["registered_lease_count"], 0)
+
+    def test_help_skips_automatic_broker_with_bound_registry(self):
+        self.script.write_text("import argparse\nargparse.ArgumentParser().parse_args()\n", encoding="utf-8")
+        argv = ["run_managed", "--source-root", str(self.source), "--timeout", "20",
+                "--consumer-registry-root", str(self.registry.root), "--consumer-registry-id",
+                self.registry.registry_id, "--", sys.executable, str(self.script), "--help"]
+        env = {"XDG_CACHE_HOME": str(self.cache), "PATH": "/usr/bin:/bin", "LANG": "C"}
+        stderr = io.StringIO()
+        with patch.object(sys, "argv", argv), patch.dict(os.environ, env, clear=True), \
+                patch.object(run_managed, "sample_output_budget", return_value=None), \
+                patch.object(managed_outputs, "finalize_supervised_outputs", return_value=None), \
+                patch.object(rovezero_usage_snapshot, "warn_cached_total_usage", return_value=None), \
+                patch.object(rovezero_usage_snapshot, "claim_total_usage_maintenance", return_value=False), \
+                contextlib.redirect_stderr(stderr):
+            code = run_managed.main()
+        self.assertEqual(code, 0, stderr.getvalue())
+        self.assertNotIn("managed_consumer_broker_profile=", stderr.getvalue())
 
     def test_same_registry_cleaner_preserves_input_during_and_after_read(self):
         with patch.object(rovezero_usage_snapshot, "warn_cached_total_usage", return_value=None):
