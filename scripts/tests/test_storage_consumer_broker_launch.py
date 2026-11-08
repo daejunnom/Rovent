@@ -139,6 +139,20 @@ class ManagedBrokerLaunchTests(unittest.TestCase):
         self.assertEqual(self.launch.domain.leases[0].state, "physical_unknown")
         self.assertEqual(self.launch.budget_deferred_count, 1)
 
+    def test_finalization_failure_preserves_error_and_closes_other_resources(self):
+        import time
+        self.exchange({"kind": "begin", "request_id": 1, "deadline": time.monotonic() + 10, "descriptor": None})
+        self.exchange({"kind": "commit", "request_id": 1, "inputs": ["/asset"], "future_inputs": []})
+        self.fake_group._completed = True
+        original = RuntimeError("original transaction finalization failure")
+        with patch.object(self.launch.broker, "finish", side_effect=original):
+            with self.assertRaises(RuntimeError) as raised:
+                self.launch.finish(tree_gone=True)
+        self.assertIs(raised.exception, original)
+        self.assertTrue(self.launch.domain.closed)
+        self.assertTrue(self.launch._closed)
+        self.assertEqual(self.launch.domain.leases[0].state, "active")
+
     def test_unknown_group_keeps_exact_active_domain_until_drain(self):
         import time
         self.exchange({"kind": "begin", "request_id": 1, "deadline": time.monotonic() + 10, "descriptor": None})

@@ -229,9 +229,27 @@ class ManagedBrokerLaunch:
                     return False
             else:
                 return False
+        primary = None
         if self.broker is not None:
-            self.broker.revoke()
+            try:
+                self.broker.revoke()
+            except BaseException as error:
+                primary = error
             if tree_gone or self._not_dispatched:
-                self.broker.finish(child_never_dispatched=self._not_dispatched, tree_gone=tree_gone)
-        self._close_resources()
+                try:
+                    self.broker.finish(child_never_dispatched=self._not_dispatched, tree_gone=tree_gone)
+                except BaseException as error:
+                    if primary is None:
+                        primary = error
+                    elif hasattr(primary, "add_note"):
+                        primary.add_note("broker transaction close outcome unknown: " + type(error).__name__)
+        try:
+            self._close_resources()
+        except BaseException as error:
+            if primary is None:
+                raise
+            if hasattr(primary, "add_note"):
+                primary.add_note("other broker resource close outcome unknown: " + type(error).__name__)
+        if primary is not None:
+            raise primary
         return True

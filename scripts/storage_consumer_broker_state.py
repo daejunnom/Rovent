@@ -91,6 +91,7 @@ class ConsumerBrokerState:
         self._leases = []
         self._broken = False
         self._lock_release_unknown = False
+        self._descriptor_close_unknown = False
         self._publication_unknown = False
         self._unknown_owner_id = None
         self._finalized = False
@@ -121,6 +122,10 @@ class ConsumerBrokerState:
         return self._lock_release_unknown
 
     @property
+    def descriptor_close_unknown(self):
+        return self._descriptor_close_unknown
+
+    @property
     def publication_unknown(self):
         """True means the designated registry row may require preservation."""
         return self._publication_unknown
@@ -139,11 +144,15 @@ class ConsumerBrokerState:
         if stack is not None:
             try:
                 stack.close()
-            except BaseException:
+            except BaseException as error:
                 # ExitStack may already have popped a failed callback. Neither
                 # lock ownership nor successful unlock can be inferred here.
                 self._broken = True
-                self._lock_release_unknown = True
+                from storage_consumer_broker_coverage import DescriptorCloseUnknown
+                if self._descriptor_pin is not None and self._descriptor_pin.close_unknown:
+                    self._descriptor_close_unknown = True
+                if not isinstance(error, DescriptorCloseUnknown):
+                    self._lock_release_unknown = True
                 raise
         self._stack = self._guard = self._request = self._deadline = self._descriptor_pin = None
 
@@ -176,14 +185,18 @@ class ConsumerBrokerState:
             self._stack, self._guard = stack, guard
             self._request, self._deadline = request_id, deadline
             self._descriptor_pin = descriptor_pin
-        except BaseException:
+        except BaseException as original:
             try:
                 stack.close()
-            except BaseException:
+            except BaseException as cleanup_error:
                 self._broken = True
                 self._lock_release_unknown = True
                 self._stack = stack
-                raise
+                if hasattr(original, "add_note"):
+                    original.add_note("broker transaction cleanup outcome unknown: " + type(cleanup_error).__name__)
+            if getattr(original, "descriptor_close_unknown", False):
+                self._descriptor_close_unknown = True
+                self._broken = True
             raise
 
     def commit(self, request_id, inputs, *, future_inputs=()):
@@ -200,6 +213,7 @@ class ConsumerBrokerState:
                 self._release_transaction()
             raise BrokerStateError("transaction expired")
         succeeded = False
+        primary = None
         try:
             if self._descriptor_pin is not None:
                 self._descriptor_pin.verify()
@@ -236,9 +250,20 @@ class ConsumerBrokerState:
             if self._clock() >= self._deadline:
                 raise BrokerStateError("transaction expired during registration; lease preserved")
             succeeded = True
+        except BaseException as error:
+            primary = error
+            if getattr(error, "descriptor_close_unknown", False):
+                self._descriptor_close_unknown = True
+            raise
         finally:
             if succeeded or not self._hold_on_failure:
-                self._release_transaction()
+                try:
+                    self._release_transaction()
+                except BaseException as cleanup_error:
+                    if primary is None:
+                        raise
+                    if hasattr(primary, "add_note"):
+                        primary.add_note("broker transaction cleanup outcome unknown: " + type(cleanup_error).__name__)
         return request_id
 
     def abort(self, request_id):

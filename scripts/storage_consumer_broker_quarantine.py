@@ -75,9 +75,13 @@ class BrokerQuarantine:
     def observation(self, key):
         with self._lock:
             entry = self._entry(key)
+            launch = entry.get("launch")
+            broker = getattr(launch, "broker", None)
+            descriptor_close_unknown = getattr(broker, "descriptor_close_unknown", None)
             return {"handle": key, "state": entry["state"], "scope": "original_process_only",
                     "process_exit_lock_survival": "not_claimed", "physical_completion": "unknown",
                     "owner_kind": entry.get("owner_kind", "reservation"),
+                    "descriptor_close_unknown": descriptor_close_unknown,
                     "shared_catalog_guard": "may_block_until_release",
                     "other_catalog_independence": "requires_disjoint_locks_and_dependencies"}
 

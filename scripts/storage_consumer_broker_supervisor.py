@@ -54,6 +54,10 @@ class ConsumerBrokerSupervisor:
         return self._state.publication_unknown
 
     @property
+    def descriptor_close_unknown(self):
+        return self._state.descriptor_close_unknown
+
+    @property
     def unknown_owner_id(self):
         return self._state.unknown_owner_id
 
@@ -120,8 +124,12 @@ class ConsumerBrokerSupervisor:
                 if kind == "done":
                     self.revoke()
                     return
-        except BaseException:
-            self.revoke()
+        except BaseException as original:
+            try:
+                self.revoke()
+            except BaseException as close_error:
+                if hasattr(original, "add_note"):
+                    original.add_note("broker admission close outcome unknown: " + type(close_error).__name__)
             raise
 
     def finish(self, *, child_never_dispatched, tree_gone):

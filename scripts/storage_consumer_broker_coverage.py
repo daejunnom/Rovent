@@ -19,6 +19,19 @@ _MAX_LEASES = 128
 _MAX_PARTS = 128
 
 
+class DescriptorCloseUnknown(StorageError):
+    """An original descriptor close was attempted but its outcome is unknown."""
+
+    descriptor_close_unknown = True
+
+
+def _mark_close_unknown(error):
+    """Retain a separate observation on the original raised exception."""
+    error.descriptor_close_unknown = True
+    if hasattr(error, "add_note"):
+        error.add_note("descriptor close outcome unknown; preserve the original consumer lease")
+
+
 def _nonsecret_path(value):
     path = Path(value)
     if len(path.parts) > _MAX_PARTS:
@@ -110,9 +123,12 @@ class DescriptorCoveragePin:
             try:
                 self.close()
             except BaseException as close_error:
-                if hasattr(error, "add_note"):
-                    error.add_note("descriptor pin close outcome unknown: " + type(close_error).__name__)
+                _mark_close_unknown(error)
             raise
+
+    @property
+    def close_unknown(self):
+        return self._close_unknown
 
     def verify(self):
         if self._closed or self._close_unknown:
@@ -135,10 +151,11 @@ class DescriptorCoveragePin:
             if (_identity(source_fd, directory=self._source_kind == "directory") != self._source_identity
                     or _identity(target_fd, directory=False) != self._target_identity):
                 raise StorageError("named descriptor or source was replaced")
+        except OSError as error:
+            primary = StorageError("descriptor or registered source unavailable")
+            raise primary from error
         except BaseException as error:
             primary = error
-            if isinstance(error, OSError):
-                raise StorageError("descriptor or registered source unavailable") from error
             raise
         finally:
             close_error = None
@@ -150,14 +167,16 @@ class DescriptorCoveragePin:
                         self._close_unknown = True
                         close_error = close_error or error
             if close_error is not None:
-                if primary is not None and hasattr(primary, "add_note"):
-                    primary.add_note("descriptor verification fd close outcome unknown")
+                if primary is not None:
+                    _mark_close_unknown(primary)
                 elif primary is None:
-                    raise StorageError("descriptor verification fd close outcome unknown") from close_error
+                    raise DescriptorCloseUnknown("descriptor verification fd close outcome unknown") from close_error
         self._guard.check()
 
     def close(self):
         if self._closed:
+            if self._close_unknown:
+                raise DescriptorCloseUnknown("descriptor pin close outcome unknown")
             return
         self._closed = True
         error = None
@@ -171,15 +190,22 @@ class DescriptorCoveragePin:
                     self._close_unknown = True
                     error = error or exc
         if error is not None:
-            raise StorageError("descriptor pin close outcome unknown") from error
+            raise DescriptorCloseUnknown("descriptor pin close outcome unknown") from error
+        if self._close_unknown:
+            raise DescriptorCloseUnknown("descriptor verification fd close outcome unknown")
 
     def __enter__(self):
         if self._closed:
             raise StorageError("descriptor coverage pin is closed")
         return self
 
-    def __exit__(self, *_):
-        self.close()
+    def __exit__(self, _type, error, _traceback):
+        try:
+            self.close()
+        except DescriptorCloseUnknown:
+            if error is None:
+                raise
+            _mark_close_unknown(error)
 
 
 def pin_descriptor_coverage(guard, leases, descriptor):
