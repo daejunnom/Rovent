@@ -24,7 +24,9 @@ fn invalid(message: &str) -> ArenaError {
 /// System CUDA execution needs a separate lock and child receipt; it must not
 /// reinterpret an existing V5 capture or silently choose another backend.
 pub(super) fn legacy_cuda_execution_disabled() -> ArenaError {
-    invalid("G0 legacy CUDA bundle execution is disabled; system CUDA execution is not yet connected")
+    invalid(
+        "G0 legacy CUDA bundle execution is disabled; system CUDA execution is not yet connected",
+    )
 }
 
 fn backend_error(error: BackendError) -> ArenaError {

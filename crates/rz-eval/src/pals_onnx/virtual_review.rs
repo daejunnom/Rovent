@@ -3071,7 +3071,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn capture_entry_attempt_only_preserves_proof_for_confirmed_rejection() {
-
         let source = VirtualReviewHeldFileSources::new(
             std::fs::File::open(std::env::current_exe().unwrap()).unwrap(),
             Vec::new(),

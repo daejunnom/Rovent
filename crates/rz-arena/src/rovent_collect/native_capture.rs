@@ -16,8 +16,9 @@ use rz_uci::pals_native::ticketed::{
 };
 use std::cell::Cell;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
-    mpsc, Arc, Mutex,
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+    mpsc,
 };
 
 /// A ticket's independent speculative handoff state. It never proves NN
@@ -585,14 +586,14 @@ impl RoventNativeCaptureRegistration {
             Ok(value) => value,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
             Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(invalid("capture registrations poisoned"))
+                return Err(invalid("capture registrations poisoned"));
             }
         };
         let mut roots = match self.speculative_roots_v3.try_lock() {
             Ok(value) => value,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
             Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(invalid("lock-v3 speculative root custody poisoned"))
+                return Err(invalid("lock-v3 speculative root custody poisoned"));
             }
         };
         if !root.same_registration_owner(&self.speculative_owner_v3)

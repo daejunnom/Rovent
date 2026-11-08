@@ -391,9 +391,9 @@ impl PcCollectionOwnersV3 {
     pub(crate) fn caller_source_receipt(
         &self,
     ) -> Option<Result<super::caller_source_v3::CallerSourceReceiptV3, ArenaError>> {
-        self.caller_boundary.get().map(
-            super::caller_source_v3::CallerSourceReceiptV3::from_validated_boundary,
-        )
+        self.caller_boundary
+            .get()
+            .map(super::caller_source_v3::CallerSourceReceiptV3::from_validated_boundary)
     }
 
     /// Only an authenticated UCI gate and the same admitted arena resource
@@ -503,10 +503,12 @@ impl PcCollectionOwnersV3 {
                                 detail: error.to_string(),
                             },
                         )?;
-                    let _ = validate_owner.caller_boundary.set(ValidatedCallerBoundaryV3 {
-                        inputs: Arc::clone(&validate_owner.inputs),
-                        lock: Arc::clone(lock),
-                    });
+                    let _ = validate_owner
+                        .caller_boundary
+                        .set(ValidatedCallerBoundaryV3 {
+                            inputs: Arc::clone(&validate_owner.inputs),
+                            lock: Arc::clone(lock),
+                        });
                     validate_output
                         .authorize_original_boundary(&validate_owner.inputs)
                         .map_err(
@@ -594,15 +596,16 @@ impl PcCollectionRunV3 {
     ) -> Result<PcDriverPollV3<Option<Self>>, PcDriverEvidenceErrorV3> {
         use super::pc_recovery_v3::{PcRunRecoveryKeyV3, PcRunRecoveryStateV3};
         use crate::rovent_resource_scope::launch::RoventPcCollectionRecoveryErrorV3;
-        let snapshot = match PcRunRecoveryKeyV3::try_recovery_snapshot_for_supervisor(
-            owners.supervisor(),
-        )? {
-            PcDriverPollV3::Pending => return Ok(PcDriverPollV3::Pending),
-            PcDriverPollV3::Ready(None) => return Ok(PcDriverPollV3::Ready(None)),
-            PcDriverPollV3::Ready(Some(snapshot)) => snapshot,
-        };
+        let snapshot =
+            match PcRunRecoveryKeyV3::try_recovery_snapshot_for_supervisor(owners.supervisor())? {
+                PcDriverPollV3::Pending => return Ok(PcDriverPollV3::Pending),
+                PcDriverPollV3::Ready(None) => return Ok(PcDriverPollV3::Ready(None)),
+                PcDriverPollV3::Ready(Some(snapshot)) => snapshot,
+            };
         if !Arc::ptr_eq(&snapshot.owners, owners) || !Arc::ptr_eq(&snapshot.output, output) {
-            return Err(PcDriverEvidenceErrorV3::Invalid("original recovery owners differ"));
+            return Err(PcDriverEvidenceErrorV3::Invalid(
+                "original recovery owners differ",
+            ));
         }
         let outcome = match snapshot.outcome_key.try_recover_typed() {
             Ok(Some(outcome)) => outcome,
@@ -619,7 +622,9 @@ impl PcCollectionRunV3 {
             PcRunRecoveryStateV3::Returned | PcRunRecoveryStateV3::Panicked => true,
             PcRunRecoveryStateV3::Executing => false,
             PcRunRecoveryStateV3::Prepared => {
-                return Err(PcDriverEvidenceErrorV3::Invalid("outcome was not executing"));
+                return Err(PcDriverEvidenceErrorV3::Invalid(
+                    "outcome was not executing",
+                ));
             }
         };
         Ok(PcDriverPollV3::Ready(Some(Self {
@@ -641,9 +646,9 @@ impl PcCollectionRunV3 {
         output: &Arc<ManagedOutputOwnerV3>,
     ) -> Result<Option<Self>, &'static str> {
         use super::pc_recovery_v3::PcRunRecoveryStateV3;
-        let Some(recovery) = super::pc_recovery_v3::PcRunRecoveryKeyV3::recover_for_supervisor(
-            owners.supervisor(),
-        )? else {
+        let Some(recovery) =
+            super::pc_recovery_v3::PcRunRecoveryKeyV3::recover_for_supervisor(owners.supervisor())?
+        else {
             return Ok(None);
         };
         let (original_owners, original_output) = recovery.original_owners()?;
@@ -772,7 +777,9 @@ impl PcCollectionRunV3 {
                 if matches!(
                     self.outcome
                         .try_recover_original_before_native_until(poll_until),
-                    Some(rz_uci::rovent_bootstrap::launch::V3BeforeNativeScopeRecovery::Recovered { .. })
+                    Some(
+                        rz_uci::rovent_bootstrap::launch::V3BeforeNativeScopeRecovery::Recovered { .. }
+                    )
                 ) {
                     self.before_native_recovered = true;
                 }
@@ -1281,7 +1288,9 @@ impl ManagedOutputOwnerV3 {
             },
         };
         if Instant::now() >= self.work_until {
-            return Err(unstarted("collection work deadline expired before publication".into()));
+            return Err(unstarted(
+                "collection work deadline expired before publication".into(),
+            ));
         }
         if !finished.matches_original_manifest(self.inputs.manifest()) {
             return Err(unstarted(
@@ -1328,7 +1337,9 @@ impl ManagedOutputOwnerV3 {
                 state.check_chunks_binding().map_err(io)?;
                 if phase == RoventPublicationHookPhaseV3::Before && event.is_mutation() {
                     if !state.publication_attempted && Instant::now() >= self.work_until {
-                        return Err(invalid("collection work deadline expired before publication"));
+                        return Err(invalid(
+                            "collection work deadline expired before publication",
+                        ));
                     }
                     state.publication_attempted = true;
                     state.uncertain = true;

@@ -28,10 +28,7 @@ impl PreparedLongGameProfileV3 {
     /// Open only an explicitly supplied pin under the original inputs
     /// directory. The shared reader validates path components, regular file,
     /// size and raw SHA while retaining the original file handle.
-    pub(crate) fn open(
-        directory: &Dir,
-        pin: &RoventPublicationFile,
-    ) -> Result<Self, ArenaError> {
+    pub(crate) fn open(directory: &Dir, pin: &RoventPublicationFile) -> Result<Self, ArenaError> {
         let original_directory = directory.try_clone().map_err(io)?.into_std_file();
         let original_profile = OriginalPinnedFile::read(directory, pin, PROFILE_MAX_BYTES)?;
         let profile: LongGameProfileV3 = serde_json::from_slice(original_profile.bytes())

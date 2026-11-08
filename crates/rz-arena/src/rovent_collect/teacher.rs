@@ -16,6 +16,9 @@ pub(super) mod exact_observation_v2;
 pub(super) mod lock_v2_policy;
 #[allow(dead_code)]
 pub(super) mod lock_v2_row_pump;
+#[cfg(all(feature = "pals-collection-onnx", target_os = "linux"))]
+#[allow(dead_code)]
+pub(super) mod policy_prepare_v3;
 mod session;
 mod typed_failure_projection;
 mod v2_actor_preflight;
@@ -23,13 +26,7 @@ mod v2_actor_preflight;
 pub(super) mod v2_session;
 #[cfg(all(feature = "pals-collection-onnx", target_os = "linux"))]
 #[allow(dead_code)]
-pub(super) mod v3_session;
-#[cfg(all(feature = "pals-collection-onnx", target_os = "linux"))]
-#[allow(dead_code)]
 pub(super) mod v3_dispatch;
-#[cfg(all(feature = "pals-collection-onnx", target_os = "linux"))]
-#[allow(dead_code)]
-pub(super) mod v3_pump;
 #[cfg(all(feature = "pals-collection-onnx", target_os = "linux"))]
 #[allow(dead_code)]
 pub(super) mod v3_policy;
@@ -38,7 +35,10 @@ pub(super) mod v3_policy;
 pub(super) mod v3_policy_consumer;
 #[cfg(all(feature = "pals-collection-onnx", target_os = "linux"))]
 #[allow(dead_code)]
-pub(super) mod policy_prepare_v3;
+pub(super) mod v3_pump;
+#[cfg(all(feature = "pals-collection-onnx", target_os = "linux"))]
+#[allow(dead_code)]
+pub(super) mod v3_session;
 pub use session::*;
 mod pump;
 pub use pump::*;

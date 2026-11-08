@@ -1343,11 +1343,9 @@ fn cost_common_six(
                         match &after {
                             Ok(after) => {
                                 sample["backend_after"] = stats_json(after);
-                                sample["returned_physical_nn_inputs_delta"] = json!(
-                                    after
-                                        .completed_nn_inputs
-                                        .checked_sub(before.completed_nn_inputs)
-                                );
+                                sample["returned_physical_nn_inputs_delta"] = json!(after
+                                    .completed_nn_inputs
+                                    .checked_sub(before.completed_nn_inputs));
                                 sample["owner_idle_after_call"] = json!(true);
                             }
                             Err(error) => sample["after_stats_failure"] = cost_failure(error),
@@ -2273,22 +2271,18 @@ mod conv_selection_tests {
             CheckerProvider::CudaControl,
             CheckerProvider::CudaControlShim,
         ] {
-            assert!(
-                provider
-                    .config(Some(CostProfile::CommonSixConvDefault))
-                    .is_err()
-            );
+            assert!(provider
+                .config(Some(CostProfile::CommonSixConvDefault))
+                .is_err());
         }
     }
 
     #[test]
     fn default_cost_tf32_request_is_required_without_mutating_process_environment() {
         let profile = CostProfile::CommonSixConvDefault;
-        assert!(
-            profile
-                .validate_tf32_override(Some(std::ffi::OsStr::new("0")))
-                .is_ok()
-        );
+        assert!(profile
+            .validate_tf32_override(Some(std::ffi::OsStr::new("0")))
+            .is_ok());
         for value in [
             None,
             Some(std::ffi::OsStr::new("1")),

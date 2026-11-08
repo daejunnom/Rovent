@@ -17,7 +17,7 @@ use super::policy_row_pipeline_v3::PolicyRowPipelineOwnerV3;
 use super::speculative_route_v3::SpeculativeRootV3;
 use super::teacher::v3_pump::TeacherPumpV3;
 use super::teacher::v3_session::TeacherSessionStagingV3;
-use super::{invalid, ArenaError};
+use super::{ArenaError, invalid};
 use rz_search::pals::engine::adaptive_port::AdaptivePortQuestion;
 use rz_uci::pals_adaptive::{
     AdaptiveCollectionBoundaryV2, AdaptiveCollectionObserverBoxV3,
@@ -32,7 +32,7 @@ use rz_uci::pals_adaptive::{
 use rz_uci::pals_native::ticketed::VirtualReviewTicketOutput;
 use rz_uci::rovent_bootstrap::{RoventNativeBackend, RoventStartupControl};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock, TryLockError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak, mpsc};
 
 type Output = VirtualReviewTicketOutput;
 type Backend = RoventNativeBackend<AdaptivePortQuestion>;
@@ -155,7 +155,7 @@ impl RoventOwnTeacherRouteRetirementV3 {
             Ok(custody) => custody,
             Err(TryLockError::WouldBlock) => return Ok(None),
             Err(TryLockError::Poisoned(_)) => {
-                return Err(invalid("Own /3 returned custody poisoned"))
+                return Err(invalid("Own /3 returned custody poisoned"));
             }
         };
         if !slot
@@ -281,7 +281,7 @@ impl RoventOwnCollectionBridgeV3 {
                 Ok(state) => state,
                 Err(TryLockError::WouldBlock) => return Ok(None),
                 Err(TryLockError::Poisoned(_)) => {
-                    return Err(invalid("Own /3 root custody poisoned"))
+                    return Err(invalid("Own /3 root custody poisoned"));
                 }
             };
             let Some(slot) = state
@@ -442,7 +442,7 @@ impl RoventOwnCollectionBridgeV3 {
                     };
                 }
                 GameDispatchOutcomeV3::Disconnected => {
-                    return Err("Own /3 supervisor request channel disconnected")
+                    return Err("Own /3 supervisor request channel disconnected");
                 }
                 GameDispatchOutcomeV3::Full
                 | GameDispatchOutcomeV3::Aborted
@@ -1128,7 +1128,7 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
                     error: AdaptiveManagerError::Invalid("Own /3 game dispatch channel rejected"),
                     admission,
                     owners: Box::new(()),
-                })
+                });
             }
         }
         let index = match state
@@ -1259,14 +1259,14 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
                 Ok(false) => {
                     return Ok(RoventBoardCollectionAdmissionOutcomeV3::PendingUncertain {
                         admission,
-                    })
+                    });
                 }
                 Err(error) => {
                     return Err(RoventBoardCollectionAdmissionFailureV3 {
                         error: AdaptiveManagerError::Invalid(error),
                         admission,
                         owners: Box::new(()),
-                    })
+                    });
                 }
             }
         }

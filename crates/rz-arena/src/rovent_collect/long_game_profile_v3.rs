@@ -8,8 +8,7 @@
 use rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3;
 use serde::{Deserialize, Serialize};
 
-pub(crate) const LONG_GAME_PROFILE_DOMAIN: &str =
-    "rz-rovent-collection-long-game-profile/1";
+pub(crate) const LONG_GAME_PROFILE_DOMAIN: &str = "rz-rovent-collection-long-game-profile/1";
 
 /// Root admissions and chess plies are separate quantities: an engine can
 /// search a position more than once, and a side need not search every ply.

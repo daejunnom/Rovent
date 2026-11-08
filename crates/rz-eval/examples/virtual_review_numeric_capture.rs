@@ -1532,7 +1532,11 @@ impl Error for CapturePanicFailure {}
 
 #[cfg(target_os = "linux")]
 impl SystemCaptureWorker {
-    fn finish_preserving_owner(&mut self, work_until: Instant, cleanup_until: Instant) -> Result<()> {
+    fn finish_preserving_owner(
+        &mut self,
+        work_until: Instant,
+        cleanup_until: Instant,
+    ) -> Result<()> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.finish_supervised(work_until, cleanup_until)
         })) {
@@ -1697,7 +1701,7 @@ impl SystemCaptureWorker {
                                 return Err(
                                     "system worker joined while original lease remained unresolved"
                                         .into(),
-                                )
+                                );
                             }
                         }
                     }
@@ -1751,10 +1755,7 @@ impl SystemCaptureWorker {
                     self.send_supervisor(b"UNKNOWN");
                     unknown_sent = true;
                 }
-                Self::report_recovery_control_failure(
-                    recovery_failures,
-                    &first_recovery_failure,
-                );
+                Self::report_recovery_control_failure(recovery_failures, &first_recovery_failure);
                 self.send_supervisor(b"UNRESOLVED");
                 quarantine_notified = true;
             }
@@ -1765,7 +1766,11 @@ impl SystemCaptureWorker {
                         &first_recovery_failure,
                     );
                     self.send_release_proof();
-                    return if quarantine_notified { Err(first_error) } else { Ok(()) };
+                    return if quarantine_notified {
+                        Err(first_error)
+                    } else {
+                        Ok(())
+                    };
                 }
                 Err(error) if self.quarantined && quarantine_error.is_none() => {
                     quarantine_error = Some(error);
@@ -1792,7 +1797,11 @@ impl SystemCaptureWorker {
                             &first_recovery_failure,
                         );
                         self.send_release_proof();
-                        return if quarantine_notified { Err(first_error) } else { Ok(()) };
+                        return if quarantine_notified {
+                            Err(first_error)
+                        } else {
+                            Ok(())
+                        };
                     }
                     if quarantined
                         && !quarantine_notified

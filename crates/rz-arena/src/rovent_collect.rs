@@ -1089,8 +1089,6 @@ pub use teacher::{
     RoventCollectionTeacherFailure, RoventCollectionTeacherPump, RoventCollectionTeacherSession,
     RoventCollectionTeacherShutdown, RoventRegisteredTeacher, RoventTeacherBinding,
 };
-#[cfg(feature = "pals-collection-onnx")]
-mod native_capture;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod capture_router_v3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
@@ -1098,6 +1096,8 @@ mod game_authority_v3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 #[allow(dead_code)]
 mod long_game_profile_v3;
+#[cfg(feature = "pals-collection-onnx")]
+mod native_capture;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod speculative_route_v3;
 #[cfg(feature = "pals-collection-onnx")]
@@ -1116,24 +1116,24 @@ mod own_hooks_lock_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod own_hooks_lock_v3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
-mod own_worker_v3;
-#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod own_root_router_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod own_worker_supervisor_v2;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod own_worker_v3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod pc_hooks_lock_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod pc_hooks_lock_v3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
-mod pc_worker_v3;
-#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
-mod policy_row_pipeline_v3;
-#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod pc_root_router_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 #[allow(dead_code)]
 mod pc_worker_supervisor_v2;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod pc_worker_v3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod policy_row_pipeline_v3;
 #[cfg(feature = "pals-collection-onnx")]
 pub use observer::*;
 #[cfg(feature = "pals-collection-onnx")]

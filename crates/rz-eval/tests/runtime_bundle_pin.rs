@@ -181,22 +181,18 @@ fn alias_manifest_binds_closed_declarations_and_preserves_legacy_digest() {
         assert!(!format!("{invalid:?}").contains("/lib/"));
     }
     let json = manifest_json(&aliases);
-    assert!(
-        CudaRuntimeBundleSpec::from_json(&json.replacen(
-            "\"target\":",
-            "\"unknown\":0,\"target\":",
-            1
-        ))
-        .is_err()
-    );
-    assert!(
-        CudaRuntimeBundleSpec::from_json(&json.replacen(
-            "\"target\":",
-            "\"filename\":\"duplicate\",\"target\":",
-            1
-        ))
-        .is_err()
-    );
+    assert!(CudaRuntimeBundleSpec::from_json(&json.replacen(
+        "\"target\":",
+        "\"unknown\":0,\"target\":",
+        1
+    ))
+    .is_err());
+    assert!(CudaRuntimeBundleSpec::from_json(&json.replacen(
+        "\"target\":",
+        "\"filename\":\"duplicate\",\"target\":",
+        1
+    ))
+    .is_err());
     assert_eq!(legacy.digest().unwrap(), legacy_digest);
 }
 

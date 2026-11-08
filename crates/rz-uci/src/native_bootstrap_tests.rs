@@ -854,7 +854,11 @@ fn legacy_cuda_config_is_readable_but_cannot_start_or_copy_assets() {
         .err()
         .expect("legacy CUDA must fail before opening the synthetic asset paths");
     assert!(matches!(error, NativeBootstrapError::Config(_)));
-    assert!(error.to_string().contains("legacy CUDA bundle execution is disabled"));
+    assert!(
+        error
+            .to_string()
+            .contains("legacy CUDA bundle execution is disabled")
+    );
 }
 
 #[test]

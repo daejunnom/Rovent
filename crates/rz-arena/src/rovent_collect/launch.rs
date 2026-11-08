@@ -40,16 +40,18 @@ pub const ROVENT_COLLECTION_LAUNCH_PLAN: &str = "rz-rovent-collection-launch/1";
 /// It cannot reconstruct a root admission or claim teacher completion.
 pub const ROVENT_COLLECTION_LOCK_V2_LAUNCH_PLAN: &str = "rz-rovent-collection-lock-v2-launch/1";
 const ROVENT_LOCK_V2_PLAN_MAX_BYTES: u64 = 256 << 10;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod caller_source_v3;
 mod cohort;
 mod cohort_audit;
 mod cohort_driver;
 mod cohort_prepare;
 mod intervention;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
-mod managed_output_fd_v2;
-#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 #[allow(dead_code)]
 mod long_game_profile_v3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod managed_output_fd_v2;
 mod own_nnuec_lock_v2;
 pub(crate) mod own_publisher_v2;
 mod partial_collection_v1;
@@ -61,14 +63,12 @@ pub mod partial_game_v2;
 mod pc_cli_managed_v3;
 mod pc_lock_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
-mod caller_source_v3;
-#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod pc_lock_v3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+pub mod pc_managed_entry_v3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 #[allow(dead_code)]
 mod pc_managed_prepare_v3;
-#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
-pub mod pc_managed_entry_v3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 #[allow(dead_code)]
 mod pc_recovery_v3;

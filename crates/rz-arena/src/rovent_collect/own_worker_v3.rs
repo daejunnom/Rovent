@@ -26,7 +26,7 @@ use super::teacher::v3_session::{
     TeacherSessionStagingV3, TeacherStartErrorV3,
 };
 use super::writer_lock_v3::RoventCorpusWriterLockV3;
-use super::{invalid, ArenaError};
+use super::{ArenaError, invalid};
 use rz_uci::pals_adaptive::{
     AdaptiveCollectionError, RoventBoardCollectionWorkerKeyV3, RoventBoardCollectionWorkerStageV3,
     RoventBoardCollectionWorkerV3, RoventBoardRootHandoffReceiverV3, RoventBoardRootHandoffV3,

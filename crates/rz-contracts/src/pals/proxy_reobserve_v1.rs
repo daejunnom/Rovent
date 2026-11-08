@@ -2,8 +2,8 @@
 //! This separate wire does not renew execution authority or prove a fence.
 
 use super::proxy_entry_smoke_grant_v1::{
-    PROXY_ENTRY_SMOKE_REQUEST_BYTES, ProxyEntrySmokePhase, ProxyEntrySmokeRequest,
-    ProxyEntrySmokeScope,
+    ProxyEntrySmokePhase, ProxyEntrySmokeRequest, ProxyEntrySmokeScope,
+    PROXY_ENTRY_SMOKE_REQUEST_BYTES,
 };
 
 pub const FRAME_LIMIT: usize = 4096;

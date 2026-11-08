@@ -300,11 +300,9 @@ mod tests {
         }
         let mut bad_scope = request.scope;
         bad_scope.owner_id = [0; 16];
-        assert!(
-            ProxyEntrySmokeRequest { scope: bad_scope }
-                .encode()
-                .is_err()
-        );
+        assert!(ProxyEntrySmokeRequest { scope: bad_scope }
+            .encode()
+            .is_err());
         let grant = ProxyEntrySmokeGrant {
             scope: scope(DeadlineRole::Baseline, ProxyEntrySmokePhase::Run),
             remaining_ns: 0,

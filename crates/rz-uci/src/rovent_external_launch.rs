@@ -60,9 +60,9 @@ pub use collection_teacher::{
 pub use collection_teacher::{
     BoundCollectionTeacherActorV3, BoundTeacherSpawnCauseV3, BoundTeacherSpawnFailureV3,
     RoventCollectionTeacherLifecycleV3, RoventCollectionTeacherPhysicalOwnerV3,
-    RoventTeacherNoChildRetirementTokenV3, RoventTeacherRetiredActorV3,
-    RoventTeacherPolicyCustodyV3, RoventTeacherPolicyEvidenceV3, RoventTeacherPolicySealErrorV3,
-    RoventTeacherPolicySealFailureKindV3,
+    RoventTeacherNoChildRetirementTokenV3, RoventTeacherPolicyCustodyV3,
+    RoventTeacherPolicyEvidenceV3, RoventTeacherPolicySealErrorV3,
+    RoventTeacherPolicySealFailureKindV3, RoventTeacherRetiredActorV3,
     RoventTeacherRetirementTokenV3, RoventTeacherScopeAggregateAckV3,
     RoventTeacherScopeAggregateFailureV3, RoventTeacherWorkerTerminalTokenV3,
     TeacherActorBindingErrorV3, TeacherRecoveryCustodianV3, TeacherRecoveryKeyV3,

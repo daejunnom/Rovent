@@ -7,8 +7,8 @@
 //! owner of the original connection.
 
 use super::proxy_entry_smoke_grant_v1::{
-    PROXY_ENTRY_SMOKE_REQUEST_BYTES, ProxyEntrySmokePhase, ProxyEntrySmokeRequest,
-    ProxyEntrySmokeScope,
+    ProxyEntrySmokePhase, ProxyEntrySmokeRequest, ProxyEntrySmokeScope,
+    PROXY_ENTRY_SMOKE_REQUEST_BYTES,
 };
 
 pub const SMOKE_CANCEL_DOMAIN: &str = "rz-pals-proxy-entry-smoke-cancel/1";
@@ -119,7 +119,7 @@ impl SmokeCancelAckV1 {
 mod tests {
     use super::*;
     use crate::pals::{
-        cancel_control_v1::{CANCEL_REQUEST_BYTES, CancelRequest},
+        cancel_control_v1::{CancelRequest, CANCEL_REQUEST_BYTES},
         deadline_grant_v1::{DeadlinePhase, DeadlineRole, DeadlineScope},
         proxy_entry_smoke_grant_v1::ProxyEntrySmokePolicy,
     };
