@@ -157,29 +157,16 @@ class RunManagedConsumerBrokerTests(unittest.TestCase):
         with self.registry.guard() as guard:
             self.assertTrue(guard.conflicts([self.descriptor])["conflicts"])
 
-    def test_bound_catalog_automatically_brokers_supported_reader_without_sha_input(self):
+    def test_bound_catalog_does_not_automatically_enroll_reader(self):
+        self.script.write_text(
+            "import os\nassert 'RZ_CONSUMER_BROKER_FD' not in os.environ\n",
+            encoding="utf-8")
         code, receipt = self.execute(self.sha, automatic=True)
         self.assertEqual(code, 0, receipt)
-        line = next(item for item in receipt.splitlines() if item.startswith("managed_consumer_broker_profile="))
-        observation = json.loads(line.split("=", 1)[1])
-        self.assertEqual(observation["reader_contract"], "automatic_unreviewed")
-        self.assertEqual(observation["imports"], "unknown")
+        self.assertNotIn("managed_consumer_broker_profile=", receipt)
         with self.registry.guard() as guard:
-            self.assertTrue(guard.conflicts([self.descriptor])["conflicts"])
-
-    def test_automatic_unknown_does_not_use_reviewed_guard_release(self):
-        code, receipt = self.execute(self.sha, automatic=True, simulate_unknown=True)
-        self.assertEqual(code, 125, receipt)
-        line = next(item for item in receipt.splitlines() if item.startswith("managed_consumer_broker_quarantine="))
-        handle = json.loads(line.split("=", 1)[1])["handle"]
-        self.assertFalse(self.last_launch._closed)
-        self.assertTrue((self.cache / "rovezero/build/managed-v1/owner.json").exists())
-        with patch.object(managed_outputs, "finalize_supervised_outputs", return_value=None), \
-                patch.object(run_managed, "sample_output_budget", return_value=None), \
-                patch.object(rovezero_usage_snapshot, "warn_cached_total_usage", return_value=None):
-            result = self.quarantine.reobserve(handle, seconds=0.1)
-        self.assertEqual(result["state"], "group_reobserved_owner_finalized")
-        self.assertEqual(result["physical_completion"], "unknown")
+            self.assertFalse(guard.conflicts([self.descriptor])["conflicts"])
+        self.assertFalse((self.cache / "rovezero/build/managed-v1/owner.json").exists())
 
     def test_supported_reader_without_registry_keeps_legacy_path(self):
         self.script.write_text("raise SystemExit(0)\n", encoding="utf-8")
@@ -207,7 +194,8 @@ class RunManagedConsumerBrokerTests(unittest.TestCase):
     def test_clean_eof_without_handshake_preserves_child_result_not_protection(self):
         self.script.write_text("import os, time\nos.close(int(os.environ['RZ_CONSUMER_BROKER_FD']))\n"
                                "time.sleep(0.5)\n", encoding="utf-8")
-        code, receipt = self.execute(self.sha, automatic=True)
+        digest = hashlib.sha256(self.script.read_bytes()).hexdigest()
+        code, receipt = self.execute(digest)
         self.assertEqual(code, 0, receipt)
         line = next(item for item in receipt.splitlines() if item.startswith("managed_consumer_broker_observation="))
         observation = json.loads(line.split("=", 1)[1])

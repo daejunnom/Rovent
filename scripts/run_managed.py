@@ -186,8 +186,6 @@ def _main(*, output_preservation=None, interruption=None) -> int:
     budget_gate = None
     quarantine = quarantine_key = None
     quarantine_retained = False
-    from storage_consumer_broker_profile import is_supported_reader_command
-    automatic_reader = is_supported_reader_command(args.source_root, command)
 
     def retain_broker_unknown(reason, *, finalization_unknown=False):
         nonlocal quarantine_retained
@@ -258,8 +256,10 @@ def _main(*, output_preservation=None, interruption=None) -> int:
             if consumer_lease is not None:
                 environment["RZ_CONSUMER_LEASE_OWNER_ID"] = consumer_lease.owner_id
                 environment["CUDA_VISIBLE_DEVICES"] = "-1"
-            if (args.consumer_broker_reviewed_sha256 is not None
-                    or (automatic_reader and manager.dependency_registry is not None)):
+            # A bound catalog alone does not prove physical completion of the
+            # reader's work.  Until that evidence is available, automatic
+            # enrollment would leave an unknown lease on every normal run.
+            if args.consumer_broker_reviewed_sha256 is not None:
                 from storage_consumer_broker_launch import ManagedBrokerLaunch
                 from storage_consumer_broker_profile import ObservedReaderProfile, ReviewedReaderContract
                 if quarantine_key is None:
@@ -268,13 +268,10 @@ def _main(*, output_preservation=None, interruption=None) -> int:
                     quarantine_key = quarantine.reserve()
                 profile = ObservedReaderProfile(manager, command)
                 try:
-                    if args.consumer_broker_reviewed_sha256 is not None:
-                        contract = ReviewedReaderContract(
-                            profile, reviewed_sha256=args.consumer_broker_reviewed_sha256,
-                            descriptor_content_only=True, derived_content_after_ack=True)
-                        broker_launch = ManagedBrokerLaunch(manager, verified_catalogs, reader_contract=contract)
-                    else:
-                        broker_launch = ManagedBrokerLaunch(manager, verified_catalogs, reader_profile=profile)
+                    contract = ReviewedReaderContract(
+                        profile, reviewed_sha256=args.consumer_broker_reviewed_sha256,
+                        descriptor_content_only=True, derived_content_after_ack=True)
+                    broker_launch = ManagedBrokerLaunch(manager, verified_catalogs, reader_contract=contract)
                 except BaseException as error:
                     try:
                         profile.close()
@@ -284,8 +281,7 @@ def _main(*, output_preservation=None, interruption=None) -> int:
                 environment = broker_launch.environment()
                 try:
                     observation = profile.observation()
-                    observation["reader_contract"] = ("caller_declared_review" if args.consumer_broker_reviewed_sha256
-                                                      else "automatic_unreviewed")
+                    observation["reader_contract"] = "caller_declared_review"
                     print("managed_consumer_broker_profile=" + json.dumps(observation, sort_keys=True),
                           file=sys.stderr)
                 except Exception:

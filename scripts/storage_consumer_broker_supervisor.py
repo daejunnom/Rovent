@@ -1,8 +1,9 @@
 """Nonblocking protocol adapter for the original supervisor's broker state.
 
-This adapter is not wired to run_managed. Its caller must supply the original
-catalog/registry transaction, process-lifetime identity validators, original
-owned process-group drain, budget scheduling and lease retention.
+``run_managed`` uses this adapter through its explicit broker opt-in; automatic
+enrollment is disabled. The caller supplies the original catalog/registry
+transaction, process-lifetime identity validators, owned process-group drain,
+budget scheduling and lease retention.
 """
 from __future__ import annotations
 

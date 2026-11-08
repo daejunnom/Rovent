@@ -1,8 +1,9 @@
 """Original Linux supervisor ownership adapter for an opt-in broker.
 
-This module is not wired to ``run_managed``. The eventual caller must only
-enable approved consumers whose descriptor readers and source identity have
-been separately checked. Process-group completion is not a GPU fence.
+``run_managed`` connects this module only through an explicit reviewed-reader
+opt-in; automatic enrollment is disabled. The caller must ensure the reader's
+declared scope and source identity have been separately checked. Process-group
+completion is not a GPU fence.
 """
 from __future__ import annotations
 
