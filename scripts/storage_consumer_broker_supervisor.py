@@ -90,9 +90,14 @@ class ConsumerBrokerSupervisor:
                 elif kind == "abort" and set(message) == {"kind", "request_id"}:
                     self._state.abort(sequence)
                     self._deadline = None
+                elif kind == "done" and set(message) == {"kind", "request_id"}:
+                    self._state.done(sequence)
                 else:
                     raise BrokerTransportError("unexpected broker message")
                 send_packet(self._endpoint, {"kind": "ack", "phase": kind, "request_id": sequence})
+                if kind == "done":
+                    self.revoke()
+                    return
         except BaseException:
             self.revoke()
             raise

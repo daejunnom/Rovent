@@ -4,9 +4,52 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import select
+import socket
 import time
 
 from storage_consumer_broker_transport import BrokerTransportError, receive_packet, send_packet
+
+
+def inherited_supervisor_client(*, source, registry):
+    """Admit a Linux inherited socket only with a verified direct owner.
+
+    This is not an adversarial same-UID security boundary. The connected
+    supervisor must itself verify and hold its original manager/catalog and
+    registry guards. No broker environment means the legacy path remains.
+    Before parent validation an environment-supplied number is not treated as
+    an owned descriptor and is not closed; process exit remains its owner.
+    """
+    raw_fd = os.environ.pop("RZ_CONSUMER_BROKER_FD", None)
+    raw_parent = os.environ.pop("RZ_CONSUMER_BROKER_PARENT_PID", None)
+    if raw_fd is None and raw_parent is None:
+        return None
+    if (raw_fd is None or raw_parent is None or not raw_fd.isascii() or not raw_fd.isdecimal()
+            or not raw_parent.isascii() or not raw_parent.isdecimal()):
+        raise BrokerTransportError("complete inherited broker identity required")
+    fd, parent_pid = int(raw_fd), int(raw_parent)
+    if fd < 3 or parent_pid <= 1 or parent_pid != os.getppid():
+        raise BrokerTransportError("original direct broker supervisor required")
+    root = os.environ.get("RZ_MANAGED_BUILD_ROOT")
+    token = os.environ.get("RZ_MANAGED_BUILD_TOKEN")
+    if not root or not token or registry is None:
+        raise BrokerTransportError("original managed owner and registry required")
+    endpoint = None
+    try:
+        endpoint = socket.socket(fileno=fd)
+        if (endpoint.family != socket.AF_UNIX
+                or endpoint.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_SEQPACKET
+                or endpoint.getsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED) != 1):
+            raise BrokerTransportError("original credentialled broker socket required")
+        endpoint.set_inheritable(False)
+        endpoint.setblocking(False)
+        from storage_consumer_broker_identity import OriginalSupervisorIdentity
+        identity = OriginalSupervisorIdentity(root=root, source=source, token=token, parent_pid=parent_pid,
+                                              registry_root=registry.root, registry_id=registry.registry_id)
+        return ConsumerBrokerClient(endpoint, identity.check_peer)
+    except BaseException:
+        if endpoint is not None:
+            endpoint.close()
+        raise
 
 
 class ConsumerBrokerClient:
@@ -73,7 +116,8 @@ class ConsumerBrokerClient:
         if not callable(reader):
             raise ValueError("descriptor reader required")
         self._sequence += 1
-        if self._sequence > 128:
+        # Reserve one sequence for an orderly DONE handshake.
+        if self._sequence > 127:
             self.close()
             raise BrokerTransportError("consumer broker request limit reached")
         sequence = self._sequence
@@ -106,3 +150,15 @@ class ConsumerBrokerClient:
 
     def add(self, paths):
         self.read_and_register(lambda: (None, paths))
+
+    def finish(self):
+        """Close request admission; no lease or physical completion is claimed."""
+        if self._closed:
+            return
+        self._sequence += 1
+        deadline = self._clock() + min(self._maximum_seconds, 2.0)
+        try:
+            self._exchange({"kind": "done", "request_id": self._sequence},
+                           "done", self._sequence, deadline)
+        finally:
+            self.close()

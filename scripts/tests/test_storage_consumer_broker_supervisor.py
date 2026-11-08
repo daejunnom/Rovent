@@ -101,6 +101,25 @@ class ConsumerBrokerSupervisorTests(unittest.TestCase):
             self.broker.service()
         self.assertFalse(self.locked)
 
+    def test_done_does_not_release_lease_or_imply_physical_completion(self):
+        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0})
+        self.request({"kind": "commit", "request_id": 1,
+                      "inputs": ["/asset"], "future_inputs": []})
+        done = self.request({"kind": "done", "request_id": 2})
+        self.assertEqual(done["phase"], "done")
+        self.assertEqual(self.leases[0].state, "active")
+        self.broker.finish(child_never_dispatched=False, tree_gone=True)
+        self.assertEqual(self.leases[0].state, "physical_unknown")
+
+    def test_done_during_read_revokes_without_releasing_guard(self):
+        self.request({"kind": "begin", "request_id": 1, "deadline": 20.0})
+        send_packet(self.child, {"kind": "done", "request_id": 2})
+        with self.assertRaises(RuntimeError):
+            self.broker.service()
+        self.assertTrue(self.locked)
+        self.broker.finish(child_never_dispatched=False, tree_gone=True)
+        self.assertFalse(self.locked)
+
     def test_child_identity_loss_during_commit_retains_guard_until_drain(self):
         self.request({"kind": "begin", "request_id": 1, "deadline": 20.0})
         self.child_alive = False

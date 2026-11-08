@@ -93,6 +93,7 @@ class ConsumerBrokerState:
         self._publication_unknown = False
         self._unknown_owner_id = None
         self._finalized = False
+        self._admission_closed = False
 
     def _check(self, *, child=False, preserve_on_failure=False):
         if (os.getpid() != self._pid or threading.get_ident() != self._thread
@@ -147,6 +148,8 @@ class ConsumerBrokerState:
 
     def begin(self, request_id, *, deadline):
         self._check(child=True, preserve_on_failure=self._hold_on_failure)
+        if self._admission_closed:
+            raise BrokerStateError("consumer admission already closed")
         if self._stack is not None:
             raise BrokerStateError("transaction already active")
         if type(request_id) is not int or request_id <= self._last_request:
@@ -241,6 +244,16 @@ class ConsumerBrokerState:
         if not self._hold_on_failure:
             self._release_transaction()
         return True
+
+    def done(self, request_id):
+        """Close request admission without deciding any lease's lifetime."""
+        self._check(child=True, preserve_on_failure=self._hold_on_failure)
+        if (self._admission_closed or self._stack is not None or type(request_id) is not int
+                or request_id <= self._last_request or self._requests_started >= self._maximum_requests):
+            raise BrokerStateError("done requires a new request and no active transaction")
+        self._last_request = request_id
+        self._requests_started += 1
+        self._admission_closed = True
 
     def release_after_drain(self, *, tree_gone):
         """Unlock a failed transaction only after the original group is gone.
