@@ -59,6 +59,25 @@ def _registry_directory_stamp(root):
     return (info.st_dev, info.st_ino, info.st_mode, info.st_mtime_ns, info.st_ctime_ns)
 
 
+def _registry_owner_identity(root):
+    """Observe the registry directory and the actual shared lock, without links.
+
+    This pins an existing owner's identity for this object lifetime only; it
+    does not make a newly constructed object a recovery authority.
+    """
+    checked(root)
+    checked(root / "registry.lock")
+    try:
+        directory = root.stat(follow_symlinks=False)
+        lock = (root / "registry.lock").stat(follow_symlinks=False)
+    except OSError as error:
+        raise StorageError("consumer registry owner identity unavailable") from error
+    if (not stat.S_ISDIR(directory.st_mode) or not stat.S_ISREG(lock.st_mode)
+            or lock.st_nlink != 1 or not directory.st_ino or not lock.st_ino):
+        raise StorageError("consumer registry owner identity unavailable")
+    return ((directory.st_dev, directory.st_ino), (lock.st_dev, lock.st_ino))
+
+
 def _absolute(value):
     path = Path(value)
     if not path.is_absolute() or ".." in path.parts:
@@ -164,10 +183,13 @@ def mark_catalog_registry_unavailable(root, guard, *, force_bound=False):
 def require_catalog_binding(root, registry, guard):
     if type(registry) is not ConsumerRegistry:
         raise StorageError("pinned consumer registry required")
+    registry._check_identity()
     existing = load_catalog_binding(root, guard)
     if (existing is None or existing.root != registry.root
-            or existing.registry_id != registry.registry_id):
+            or existing.registry_id != registry.registry_id
+            or existing._owner_identity != registry._owner_identity):
         raise StorageError("catalog consumer registry binding missing or differs")
+    registry._check_identity()
     return existing
 
 
@@ -279,6 +301,7 @@ class ConsumerRegistry:
         if not isinstance(registry_id, str) or not _ID.fullmatch(registry_id):
             raise StorageError("pinned consumer registry identity required")
         self.registry_id = registry_id
+        self._owner_identity = _registry_owner_identity(self.root)
         self._check_identity()
 
     @classmethod
@@ -311,11 +334,15 @@ class ConsumerRegistry:
         return cls(root, registry_id=identity)
 
     def _check_identity(self):
+        if _registry_owner_identity(self.root) != self._owner_identity:
+            raise StorageError("consumer registry original owner identity changed")
         record, _, _ = read_record_snapshot(self.root / "registry.json", schema=REGISTRY_SCHEMA)
         if (record.get("registry_id") != self.registry_id or
                 record.get("sharing") not in ("owner", "group") or
                 not isinstance(record.get("scope"), str) or not record["scope"]):
             raise StorageError("consumer registry identity changed")
+        if _registry_owner_identity(self.root) != self._owner_identity:
+            raise StorageError("consumer registry original owner identity changed")
         return record
 
     def _write(self, path, value):
@@ -408,6 +435,10 @@ class _RegistryGuard:
         self.lock = CatalogGuard(registry.root / "registry.lock")
 
     def __enter__(self):
+        # Check before acquiring, then check again while holding the opened
+        # lock. CatalogGuard can create a lock removed between these checks;
+        # the postcheck rejects that replacement before cleanup is allowed.
+        self.registry._check_identity()
         self.lock.acquire()
         try:
             self.check()

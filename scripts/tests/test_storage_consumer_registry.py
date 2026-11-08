@@ -43,6 +43,35 @@ class ConsumerRegistryTests(unittest.TestCase):
         self.assertFalse((self.registry.root / ("consumer-" + lease.owner_id + ".json")).exists())
         self.assertTrue((self.registry.root / "registry-history.json").exists())
 
+    def test_original_registry_object_rejects_replaced_lock_before_next_guard(self):
+        lease = self.registry.register([self.a])
+        lock = self.registry.root / "registry.lock"
+        lock.rename(self.registry.root / "original.lock")
+        lock.write_bytes(b"")
+        with self.assertRaises(StorageError):
+            with self.registry.guard():
+                self.fail("a replacement lock cannot authorize inspection or cleanup")
+        self.assertTrue((self.registry.root / ("consumer-" + lease.owner_id + ".json")).exists())
+
+    def test_missing_original_registry_lock_is_not_recreated_by_guard(self):
+        lock = self.registry.root / "registry.lock"
+        lock.rename(self.registry.root / "original.lock")
+        with self.assertRaises(StorageError):
+            with self.registry.guard():
+                self.fail("missing lock cannot authorize inspection or cleanup")
+        self.assertFalse(lock.exists())
+
+    def test_original_registry_object_rejects_same_id_directory_replacement(self):
+        original = self.registry.root
+        previous = self.root / "original-registry"
+        original.rename(previous)
+        original.mkdir()
+        (original / "registry.json").write_bytes((previous / "registry.json").read_bytes())
+        (original / "registry.lock").write_bytes(b"")
+        with self.assertRaises(StorageError):
+            with self.registry.guard():
+                self.fail("a copied registry ID cannot replace the original owner")
+
     def test_file_hardlink_alias_is_a_conflict(self):
         source = self.a / "weights"
         source.write_bytes(b"x")
