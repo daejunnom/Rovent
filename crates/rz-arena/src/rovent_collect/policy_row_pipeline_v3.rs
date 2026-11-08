@@ -869,6 +869,13 @@ impl PolicyRowPipelineV3 {
         if self.failure.is_some() || self.appended {
             return PolicyPipelineProgressV3::Failed;
         }
+        // A previous flush has already moved the writer's bytes into this
+        // retained packet. If persistence was Busy, request another attempt
+        // before accepting more rows; re-flushing the now-empty writer would
+        // otherwise lose the ChunkReady signal for this original packet.
+        if self.pending.is_some() && self.output_chunk.is_some() {
+            return PolicyPipelineProgressV3::ChunkReady;
+        }
         let needs_flush = match (self.writer.as_ref(), self.pending.as_ref()) {
             (Some(writer), Some(pending)) => {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

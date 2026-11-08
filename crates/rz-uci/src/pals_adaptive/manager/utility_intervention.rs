@@ -38,6 +38,19 @@ pub enum UtilityInterventionSourceDisposition<Q> {
     Trial(Box<UtilityInterventionTrialAdmission<Q>>),
     Rejected(Box<UtilityInterventionTrialAdmissionRejection<Q>>),
 }
+
+/// The original admitted trial must stay owned even if a later manager
+/// validation fails. In particular, do not drop it while propagating a
+/// fallible budget or source-offer recheck.
+fn retain_then_recheck<T, R, E>(
+    slot: &mut Option<T>,
+    trial: T,
+    recheck: impl FnOnce(&T) -> Result<R, E>,
+) -> Result<R, E> {
+    debug_assert!(slot.is_none());
+    *slot = Some(trial);
+    recheck(slot.as_ref().expect("retained original intervention trial"))
+}
 pub(super) struct UtilityInterventionState<Q> {
     pub(super) profile: Digest,
     pub(super) prelude_cutoff: Instant,
@@ -404,34 +417,39 @@ where
             }
             UtilityInterventionSourceDisposition::Trial(trial) => {
                 let trial = *trial;
-                let valid = trial.profile_digest() == bounds.0
-                    && trial.snapshot.authority() == self.registration.authority
-                    && trial.snapshot.root_budget()
-                        == self.driver.rovent_root_budget()?.ok_or(
-                            AdaptiveManagerError::Invalid("intervention root budget absent"),
-                        )?
-                    && trial.snapshot.clock().domain() == self.clock.domain()
-                    && trial.snapshot.clock().origin() == self.clock.origin();
-                let source = trial
-                    .snapshot
-                    .actual
-                    .offers()
-                    .iter()
-                    .find(|o| o.frame() == trial.source_frame())
-                    .ok_or(AdaptiveManagerError::Invalid(
-                        "intervention original source offer missing",
-                    ))?;
-                let recipient = source.recipient();
-                let target = trial.profile().target_record;
-                self.utility_intervention
+                let registration = &self.registration;
+                let driver = &self.driver;
+                let clock = &self.clock;
+                let slot = &mut self
+                    .utility_intervention
                     .as_mut()
                     .expect("intervention")
-                    .trial = Some(trial);
-                if !valid {
-                    return Err(AdaptiveManagerError::Invalid(
-                        "intervention original trial registration differs",
-                    ));
-                }
+                    .trial;
+                let (recipient, target) = retain_then_recheck(slot, trial, |trial| {
+                    let valid = trial.profile_digest() == bounds.0
+                        && trial.snapshot.authority() == registration.authority
+                        && trial.snapshot.root_budget()
+                            == driver.rovent_root_budget()?.ok_or(
+                                AdaptiveManagerError::Invalid("intervention root budget absent"),
+                            )?
+                        && trial.snapshot.clock().domain() == clock.domain()
+                        && trial.snapshot.clock().origin() == clock.origin();
+                    let source = trial
+                        .snapshot
+                        .actual
+                        .offers()
+                        .iter()
+                        .find(|o| o.frame() == trial.source_frame())
+                        .ok_or(AdaptiveManagerError::Invalid(
+                            "intervention original source offer missing",
+                        ))?;
+                    if !valid {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "intervention original trial registration differs",
+                        ));
+                    }
+                    Ok((source.recipient(), trial.profile().target_record))
+                })?;
                 self.utility_route_sequence = self.utility_route_sequence.checked_add(1).ok_or(
                     AdaptiveManagerError::Capacity("intervention action sequence"),
                 )?;
@@ -766,5 +784,37 @@ where
         // A detached-copy failure is retained as Unknown; the same actual
         // actor/engine still proceeds through its required release and drain.
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod original_trial_recheck_tests {
+    use super::retain_then_recheck;
+    use std::sync::Arc;
+
+    #[test]
+    fn failed_manager_rechecks_keep_the_exact_original_trial() {
+        for error in [
+            "budget lookup failed",
+            "intervention root budget absent",
+            "intervention original source offer missing",
+            "intervention original trial registration differs",
+        ] {
+            let original = Arc::new(());
+            let weak = Arc::downgrade(&original);
+            let mut custody = None;
+            let result: Result<(), &str> = retain_then_recheck(&mut custody, original, |trial| {
+                assert!(Arc::ptr_eq(
+                    trial,
+                    &weak.upgrade().expect("original is held")
+                ));
+                Err(error)
+            });
+            assert_eq!(result, Err(error));
+            let retained = custody.as_ref().expect("failed trial remains held");
+            assert!(Arc::ptr_eq(retained, &weak.upgrade().expect("same owner")));
+            drop(custody);
+            assert!(weak.upgrade().is_none());
+        }
     }
 }

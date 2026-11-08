@@ -300,7 +300,6 @@ impl Handle {
     /// does not write to stderr or any file. Call only after owner dispatch has
     /// stopped; absence due to lock contention or poisoning is unknown.
     #[cfg(feature = "archive-origin-diagnostics")]
-    #[allow(dead_code)] // The managed external collector is connected later.
     pub(super) fn take_archive_origins(&self) -> Option<ArchiveOriginSnapshot> {
         let mut state = self.0.try_lock().ok()?;
         let observation = std::mem::take(&mut state.archive_origins);
@@ -336,6 +335,40 @@ impl Handle {
                 })
             );
         }
+        // This is emitted after the original runner's cleanup attempt. The
+        // bounded events identify views observed at the original submission
+        // callback; neither callback nor output proves physical execution or
+        // completion. A busy/poisoned observer stays unknown.
+        #[cfg(feature = "archive-origin-diagnostics")]
+        {
+            let report = archive_origin_report(self.take_archive_origins());
+            let _ = writeln!(std::io::stderr().lock(), "{report}");
+        }
+    }
+}
+
+#[cfg(feature = "archive-origin-diagnostics")]
+fn archive_origin_report(snapshot: Option<ArchiveOriginSnapshot>) -> Value {
+    match snapshot {
+        Some(snapshot) => json!({
+            "domain": "rz-selected-archive-origin-observation/1",
+            "scope": "bounded_original_submission_callbacks_only",
+            "owner_match_scope": "positive_events_only_verified_at_view_selection",
+            "events": snapshot.observation.events,
+            "omitted_events": snapshot.observation.omitted_events,
+            "unknown_records": snapshot.observation.unknown_records,
+            "binding_mismatches": snapshot.observation.binding_mismatches,
+            "unavailable": snapshot.observation.unavailable,
+            "observer_unavailable": snapshot.observer_unavailable,
+            "lock_contention_coverage": "unknown",
+            "physical_completion": "unknown",
+        }),
+        None => json!({
+            "domain": "rz-selected-archive-origin-observation/1",
+            "scope": "bounded_original_submission_callbacks_only",
+            "unavailable": "observation_busy_or_poisoned",
+            "physical_completion": "unknown",
+        }),
     }
 }
 
@@ -387,6 +420,14 @@ mod tests {
             taken.observation.events.front().unwrap().request_sequence,
             1
         );
+        let report = archive_origin_report(Some(taken));
+        assert_eq!(report["events"].as_array().unwrap().len(), MAX_ROWS);
+        assert_eq!(report["omitted_events"], 1);
+        assert_eq!(report["physical_completion"], "unknown");
+        assert_eq!(report["lock_contention_coverage"], "unknown");
+        let unavailable = archive_origin_report(None);
+        assert_eq!(unavailable["unavailable"], "observation_busy_or_poisoned");
+        assert_eq!(unavailable["physical_completion"], "unknown");
         let second = handle
             .take_archive_origins()
             .expect("uncontended second take");
