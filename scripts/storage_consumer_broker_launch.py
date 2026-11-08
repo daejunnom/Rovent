@@ -8,37 +8,56 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+import stat
 import sys
 
 from managed_process import OwnedProcessGroup, ProcessNotSpawned
 from managed_storage import StorageError
 from storage_consumer_broker_binding import PinnedBrokerDomain, _ordered_roots
+from storage_consumer_broker_profile import ReviewedReaderContract
 from storage_consumer_broker_supervisor import ConsumerBrokerSupervisor
 from storage_consumer_broker_transport import open_pair
+
+
+def _same_process_cwd(pid, source):
+    """Compare one Linux child cwd observation with the original source inode."""
+    child_cwd = os.stat(Path("/proc") / str(pid) / "cwd")
+    source_cwd = os.stat(source)
+    return (stat.S_ISDIR(child_cwd.st_mode) and stat.S_ISDIR(source_cwd.st_mode)
+            and (child_cwd.st_dev, child_cwd.st_ino) == (source_cwd.st_dev, source_cwd.st_ino))
 
 
 class ManagedBrokerLaunch:
     """Keep the original manager, process-group owner and pinned domain alive."""
 
-    def __init__(self, manager, catalogs, *, reader_scope_proven=False):
+    def __init__(self, manager, catalogs, *, reader_contract=None):
         if sys.platform != "linux" or not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
             raise StorageError("Linux original process supervision required")
         self.manager = manager
-        if type(reader_scope_proven) is not bool:
-            raise StorageError("explicit reader scope required")
-        self.reader_scope_proven = reader_scope_proven
+        if reader_contract is not None and (type(reader_contract) is not ReviewedReaderContract
+                                            or reader_contract.profile._manager is not manager):
+            raise StorageError("original manager's reviewed reader contract required")
+        self.reader_contract = reader_contract
+        self._command = None if reader_contract is None else reader_contract.profile.command
         self._owner_pid, self._uid, self._gid = os.getpid(), os.getuid(), os.getgid()
         self.roots = _ordered_roots(manager, catalogs)
         self.domain = PinnedBrokerDomain(manager, self.roots)
         self.group = OwnedProcessGroup()
         self._parent = self._child_endpoint = self._child = self.broker = None
         self._attempted = self._not_dispatched = self._closed = False
+        self._spawn_armed = False
         self.budget_deferred_count = 0
         self.first_transport_failure = None
+        self.child_cwd_observation = "not_observed"
         try:
             self._parent, self._child_endpoint = open_pair()
-        except BaseException:
-            self.domain.close()
+        except BaseException as error:
+            try:
+                self.domain.close()
+            except BaseException as close_error:
+                if hasattr(error, "add_note"):
+                    error.add_note("broker domain close unknown: " + type(close_error).__name__)
             raise
 
     def environment(self):
@@ -50,6 +69,21 @@ class ManagedBrokerLaunch:
                    RZ_CONSUMER_BROKER_PARENT_PID=str(self._owner_pid),
                    RZ_CONSUMER_INPUT_CATALOGS=json.dumps([str(root) for root in self.roots], ensure_ascii=True))
         return env
+
+    @property
+    def command(self):
+        return self._command
+
+    def assert_spawn_command(self, command, cwd):
+        """Bind this exact immutable argv and original source cwd to spawn."""
+        self._assert_supervisor()
+        if (self.reader_contract is None or self._command is None
+                or command is not self._command or self.reader_contract.profile.command is not self._command
+                or os.path.realpath(os.fspath(cwd)) != os.path.realpath(os.fspath(self.manager.source))):
+            raise StorageError("original profiled command and source cwd required")
+        if self._attempted:
+            raise StorageError("broker spawn already attempted")
+        self._spawn_armed = True
 
     @property
     def child_fds(self):
@@ -79,8 +113,8 @@ class ManagedBrokerLaunch:
 
     def mark_dispatch_attempted(self):
         self._assert_supervisor()
-        if self._attempted:
-            raise StorageError("broker child dispatch already attempted")
+        if self._attempted or not self._spawn_armed:
+            raise StorageError("verified broker spawn required")
         self._attempted = True
 
     def mark_pre_dispatch_failure(self, error):
@@ -90,12 +124,21 @@ class ManagedBrokerLaunch:
         self._not_dispatched = True
 
     def on_spawn(self):
-        self._assert_supervisor()
-        if not self._attempted or self.group._child is None or self.broker is not None:
+        if self.group._child is None or self._child is not None or self.broker is not None:
             raise StorageError("original process group spawn required")
+        # Keep the original child object even when subsequent validation fails;
+        # the same process group must still be drained by run_group.
         self._child = self.group._child
         self._child_endpoint.close()
         self._child_endpoint = None
+        self._assert_supervisor()
+        if not self._attempted or not self._spawn_armed or self._child.args is not self._command:
+            raise StorageError("original profiled command required")
+        try:
+            self.child_cwd_observation = ("matches" if _same_process_cwd(self._child.pid, self.manager.source)
+                                          else "differs")
+        except OSError:
+            self.child_cwd_observation = "unavailable"
         self.broker = ConsumerBrokerSupervisor(self._parent, self.domain.transaction,
                                                self._assert_supervisor, self._assert_child,
                                                self._assert_peer)
@@ -132,12 +175,14 @@ class ManagedBrokerLaunch:
         if tree_gone and (self._child is None or self.group._child is not self._child
                           or self.group._completed is not True):
             raise StorageError("original group completion not observed")
+        if self._child is not None and not self._attempted and not tree_gone:
+            return False
         if self._attempted and self._child is None and not self._not_dispatched:
             return False
         if self._attempted and not self._not_dispatched and not tree_gone:
             if self.broker is not None:
                 self.broker.revoke()
-                if self.reader_scope_proven:
+                if self.reader_contract is not None and self.reader_contract.allows_unknown_abandon():
                     self.broker.abandon_unknown(reader_scope_proven=True)
                 else:
                     return False
@@ -147,12 +192,24 @@ class ManagedBrokerLaunch:
             self.broker.revoke()
             if tree_gone or self._not_dispatched:
                 self.broker.finish(child_never_dispatched=self._not_dispatched, tree_gone=tree_gone)
-        if self._child_endpoint is not None:
-            self._child_endpoint.close()
-            self._child_endpoint = None
-        if self._parent is not None:
-            self._parent.close()
-            self._parent = None
-        self.domain.close()
+        close_errors = []
+        for endpoint in (self._child_endpoint, self._parent):
+            if endpoint is not None:
+                try:
+                    endpoint.close()
+                except OSError as error:
+                    close_errors.append(error)
+        self._child_endpoint = self._parent = None
+        if self.reader_contract is not None:
+            try:
+                self.reader_contract.profile.close()
+            except (OSError, StorageError) as error:
+                close_errors.append(error)
+        try:
+            self.domain.close()
+        except (OSError, StorageError) as error:
+            close_errors.append(error)
         self._closed = True
+        if close_errors:
+            raise StorageError("broker descriptor close outcome unknown") from close_errors[0]
         return True
