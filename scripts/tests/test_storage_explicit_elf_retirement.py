@@ -1,5 +1,6 @@
 """Temporary fixture ELF only; never accesses project output or GPUs."""
 from pathlib import Path
+from contextlib import nullcontext
 import json
 import os
 import sys
@@ -70,9 +71,21 @@ class ExplicitRetirementTests(unittest.TestCase):
     def run_explicit(self):
         # Only temporary fixtures bypass the unconnected cross-catalog gate;
         # these tests do not establish that production dependencies are safe.
-        with patch.object(explicit, "CROSS_CATALOG_DEPENDENCY_GATE_CONNECTED", True):
+        # The small in-memory lock double exercises retirement sequencing,
+        # while real registries below exercise the actual binding contract.
+        binding = (patch.object(explicit, "require_catalog_binding")
+                   if isinstance(self.dependencies, _DependencyGuard) else nullcontext())
+        with patch.object(explicit, "CROSS_CATALOG_DEPENDENCY_GATE_CONNECTED", True), binding:
             return explicit.retire_explicit_cpu_elf(fixture.dump(self.plan_path, self.plan), seconds=30,
                                                     dependency_registry=self.dependencies)
+
+    def bound_registry(self):
+        from storage_consumer_registry import ConsumerRegistry, bind_catalog
+        from storage_guard import CatalogGuard
+        registry = ConsumerRegistry.initialize(self.base / "registry", scope="isolated_test")
+        with CatalogGuard(self.catalog / "catalog.lock") as guard:
+            bind_catalog(self.catalog, registry, guard)
+        return registry
 
     def test_registered_conflict_and_unknown_preserve_original(self):
         for field in ("conflicting", "unknown"):
@@ -97,8 +110,7 @@ class ExplicitRetirementTests(unittest.TestCase):
         self.assertFalse(self.dependencies.held)
 
     def test_real_registered_consumer_blocks_until_explicit_close(self):
-        from storage_consumer_registry import ConsumerRegistry
-        registry = ConsumerRegistry.initialize(self.base / "registry", scope="isolated_test")
+        registry = self.bound_registry()
         lease = registry.register([self.leaf])
         self.dependencies = registry
         with self.assertRaisesRegex(StorageError, "consumer dependency"):
@@ -110,14 +122,35 @@ class ExplicitRetirementTests(unittest.TestCase):
         self.assertFalse(self.leaf.exists())
 
     def test_unrelated_registered_input_does_not_block(self):
-        from storage_consumer_registry import ConsumerRegistry
-        registry = ConsumerRegistry.initialize(self.base / "registry", scope="isolated_test")
+        registry = self.bound_registry()
         lease = registry.register([self.source])
         self.dependencies = registry
         with patch.object(explicit.base, "_process_census", return_value={"scope": "test_mock"}):
             self.run_explicit()
         self.assertFalse(self.leaf.exists())
         lease.close(not_started=True)
+
+    def test_unbound_different_registry_and_required_marker_preserve_leaf(self):
+        from storage_consumer_registry import ConsumerRegistry, bind_catalog, mark_catalog_registry_unavailable
+        from storage_guard import CatalogGuard
+        registry = ConsumerRegistry.initialize(self.base / "registry", scope="isolated_test")
+        other = ConsumerRegistry.initialize(self.base / "other-registry", scope="isolated_test")
+        self.dependencies = registry
+        with self.assertRaises(StorageError):
+            self.run_explicit()
+        self.assertTrue(self.leaf.exists())
+        with CatalogGuard(self.catalog / "catalog.lock") as guard:
+            bind_catalog(self.catalog, registry, guard)
+        self.dependencies = other
+        with self.assertRaises(StorageError):
+            self.run_explicit()
+        self.assertTrue(self.leaf.exists())
+        with CatalogGuard(self.catalog / "catalog.lock") as guard:
+            mark_catalog_registry_unavailable(self.catalog, guard, force_bound=True)
+        self.dependencies = registry
+        with self.assertRaises(StorageError):
+            self.run_explicit()
+        self.assertTrue(self.leaf.exists())
 
     def test_explicit_leaf_only_marker_and_receipt_are_preserved(self):
         before = [p.read_bytes() for p in (self.record_path, self.output / ".rovezero-output.json", self.receipt)]

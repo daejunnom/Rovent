@@ -14,6 +14,7 @@ import sys
 import storage_artifact_review as review
 from managed_storage import StorageError, read_record_snapshot
 from managed_outputs import _catalog_rows, _refuse_custody_registry
+from storage_consumer_registry import require_catalog_binding
 from storage_guard import CatalogGuard, lifetime, owner_proven_dead
 import storage_code_retirement as base
 
@@ -134,6 +135,10 @@ def retire_explicit_cpu_elf(plan_pin, *, seconds=300, dependency_registry=None):
         inputs.directory(catalog, controlled=True)
         guard = CatalogGuard(catalog / "catalog.lock")
         guard.acquire()
+        # A registry selected by the caller has no cleanup authority unless
+        # this exact catalog is bound to it. In particular an unconfigured
+        # marker or a different registry must preserve the retirement target.
+        require_catalog_binding(catalog, dependency_registry, guard)
         # Catalog -> registry is the common lock order.  Keep the registry
         # lock until after the last unlink: a consumer must not register an
         # input in the gap between this check and that unlink.
@@ -200,6 +205,7 @@ def retire_explicit_cpu_elf(plan_pin, *, seconds=300, dependency_registry=None):
         def recheck():
             inputs.check()
             guard.assert_held()
+            require_catalog_binding(catalog, dependency_registry, guard)
             dependencies_clear()
             _refuse_custody_registry(catalog)
             current = _catalog_rows(catalog)
