@@ -143,30 +143,41 @@ def prepare_consumer_output_catalog(registry, catalog=None):
     registered inputs. Its required marker makes compliant cleanup defer;
     normal producer admission remains independent of that maintenance state.
     """
-    from storage_consumer_registry import (BINDING_NAME, REQUIRED_MARKER_NAME,
-        ConsumerRegistry, bind_catalog, load_catalog_binding, mark_catalog_registry_unavailable)
+    from storage_consumer_registry import ConsumerRegistry
     if type(registry) is not ConsumerRegistry:
         raise StorageError("pinned consumer registry required")
     catalog = checked(catalog or canonical_catalog())
     catalog.mkdir(parents=True, exist_ok=True)
     with CatalogGuard(catalog / "catalog.lock") as guard:
-        if os.path.lexists(catalog / REQUIRED_MARKER_NAME):
-            # Validate marker without treating it as proof of an empty domain.
-            from storage_consumer_registry import REQUIRED_MARKER_SCHEMA
-            read_record_snapshot(catalog / REQUIRED_MARKER_NAME, schema=REQUIRED_MARKER_SCHEMA)
-            return {"status": "cleanup_deferred_required_marker", "coverage": "registered_only"}
-        bound = load_catalog_binding(catalog, guard)
-        if bound is not None:
-            if bound.root != registry.root or bound.registry_id != registry.registry_id:
-                mark_catalog_registry_unavailable(catalog, guard, force_bound=True)
-                return {"status": "cleanup_deferred_registry_mismatch", "coverage": "registered_only"}
-            return {"status": "bound", "coverage": "registered_only"}
-        entries = [item for item in catalog.iterdir() if item.name not in ("catalog.lock", BINDING_NAME)]
-        if entries:
-            mark_catalog_registry_unavailable(catalog, guard)
-            return {"status": "cleanup_deferred_legacy_rows", "coverage": "registered_only"}
-        bind_catalog(catalog, registry, guard)
-        return {"status": "bound_new_empty_catalog", "coverage": "registered_only"}
+        return _prepare_consumer_output_catalog_locked(registry, catalog, guard)
+
+
+def _prepare_consumer_output_catalog_locked(registry, catalog, guard):
+    """Existing catalog guard only; never adopt legacy rows or reacquire it."""
+    from storage_consumer_registry import (BINDING_NAME, REQUIRED_MARKER_NAME,
+        ConsumerRegistry, bind_catalog, load_catalog_binding, mark_catalog_registry_unavailable)
+    if type(registry) is not ConsumerRegistry:
+        raise StorageError("pinned consumer registry required")
+    catalog = checked(catalog)
+    if not isinstance(guard, CatalogGuard) or checked(guard.path) != catalog / "catalog.lock":
+        raise StorageError("original output catalog guard required")
+    guard.assert_held()
+    if os.path.lexists(catalog / REQUIRED_MARKER_NAME):
+        from storage_consumer_registry import REQUIRED_MARKER_SCHEMA
+        read_record_snapshot(catalog / REQUIRED_MARKER_NAME, schema=REQUIRED_MARKER_SCHEMA)
+        return {"status": "cleanup_deferred_required_marker", "coverage": "registered_only"}
+    bound = load_catalog_binding(catalog, guard)
+    if bound is not None:
+        if bound.root != registry.root or bound.registry_id != registry.registry_id:
+            mark_catalog_registry_unavailable(catalog, guard, force_bound=True)
+            return {"status": "cleanup_deferred_registry_mismatch", "coverage": "registered_only"}
+        return {"status": "bound", "coverage": "registered_only"}
+    entries = [item for item in catalog.iterdir() if item.name not in ("catalog.lock", BINDING_NAME)]
+    if entries:
+        mark_catalog_registry_unavailable(catalog, guard)
+        return {"status": "cleanup_deferred_legacy_rows", "coverage": "registered_only"}
+    bind_catalog(catalog, registry, guard)
+    return {"status": "bound_new_empty_catalog", "coverage": "registered_only"}
 
 
 def _read(path):
@@ -322,6 +333,7 @@ class OutputLease:
             if type(dependency_registry) is not ConsumerRegistry:
                 raise StorageError("explicit initialized consumer registry required")
         self.dependency_registry = dependency_registry
+        self.consumer_catalog_observation = {"status": "not_requested", "binding_confirmed": False}
         self.output, self.source = checked(output), checked(source)
         self.catalog = checked(catalog or canonical_catalog())
         if (preservation_session is not None or unattributed_preservation is not None) and self.catalog != checked(canonical_catalog()):
@@ -928,6 +940,26 @@ class OutputLease:
                     raise
                 time.sleep(min(0.1, remaining))
         try:
+            if self.dependency_registry is not None:
+                try:
+                    catalog_observation = _prepare_consumer_output_catalog_locked(
+                        self.dependency_registry, self.catalog, self.guard)
+                except (StorageError, OSError) as error:
+                    # Failure to verify a participating registry must never
+                    # become permission for legacy cleanup. If even a durable
+                    # deferral marker cannot be established, this particular
+                    # admission fails; unrelated producers are unaffected.
+                    from storage_consumer_registry import mark_catalog_registry_unavailable
+                    try:
+                        mark_catalog_registry_unavailable(self.catalog, self.guard, force_bound=True)
+                    except (StorageError, OSError) as marker_error:
+                        raise StorageError("consumer output cleanup deferral unavailable") from marker_error
+                    catalog_observation = {"status": "cleanup_deferred_registry_unavailable",
+                                           "coverage": "unknown", "error_type": type(error).__name__}
+                confirmed = catalog_observation["status"] in ("bound", "bound_new_empty_catalog")
+                self.consumer_catalog_observation = {**catalog_observation, "binding_confirmed": confirmed}
+                if not confirmed:
+                    _warn_unrelated_output("consumer catalog binding unconfirmed; cleanup deferred")
             rows = self._rows()
             custody_keys = self._quarantine_view.keys if self._quarantine_view is not None else frozenset()
             # Explicit historical custody selections retain their original
