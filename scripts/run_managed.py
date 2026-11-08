@@ -159,11 +159,19 @@ def _main(*, output_preservation=None, interruption=None) -> int:
                         help="Participating catalog bound to the same registry; repeat per catalog")
     parser.add_argument("--consumer-input-cpu-only", action="store_true",
                         help="Declare the PALS validator CPU-only for supervisor cleanup")
+    parser.add_argument("--consumer-broker-reviewed-sha256",
+                        help="Opt in to a reviewed reader scope bound to the actual script SHA-256")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command or not 1 <= args.timeout <= 3600:
         parser.error("a command and timeout of 1..3600 seconds are required")
+    if args.consumer_broker_reviewed_sha256 is not None:
+        digest = args.consumer_broker_reviewed_sha256
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            parser.error("reviewed reader SHA-256 must be 64 lowercase hexadecimal digits")
+        if args.consumer_input or args.consumer_future_input or args.consumer_input_cpu_only:
+            parser.error("brokered readers and the separate CPU validator profile cannot be combined")
     # Windows CreateProcess does not perform POSIX PATH lookup for argv[0].
     program = shutil.which(command[0])
     if program is None or Path(program).suffix.lower() in {".bat", ".cmd"}:
@@ -174,6 +182,7 @@ def _main(*, output_preservation=None, interruption=None) -> int:
     verified_catalogs = []
     consumer_dispatched = False
     consumer_closed = False
+    broker_launch = None
     try:
         if interruption is not None and interruption["signal"] is not None:
             return 128 + int(interruption["signal"])
@@ -203,6 +212,27 @@ def _main(*, output_preservation=None, interruption=None) -> int:
             if consumer_lease is not None:
                 environment["RZ_CONSUMER_LEASE_OWNER_ID"] = consumer_lease.owner_id
                 environment["CUDA_VISIBLE_DEVICES"] = "-1"
+            if args.consumer_broker_reviewed_sha256 is not None:
+                from storage_consumer_broker_launch import ManagedBrokerLaunch
+                from storage_consumer_broker_profile import ObservedReaderProfile, ReviewedReaderContract
+                profile = ObservedReaderProfile(manager, command)
+                try:
+                    contract = ReviewedReaderContract(
+                        profile, reviewed_sha256=args.consumer_broker_reviewed_sha256,
+                        descriptor_content_only=True, derived_content_after_ack=True)
+                    broker_launch = ManagedBrokerLaunch(manager, verified_catalogs, reader_contract=contract)
+                except BaseException as error:
+                    try:
+                        profile.close()
+                    except BaseException as close_error:
+                        error.add_note("reader profile close unknown: " + type(close_error).__name__)
+                    raise
+                environment = broker_launch.environment()
+                try:
+                    print("managed_consumer_broker_profile=" + json.dumps(profile.observation(), sort_keys=True),
+                          file=sys.stderr)
+                except Exception:
+                    pass
             if output_preservation is not None:
                 manager.sample_output_budget()
             else:
@@ -217,6 +247,11 @@ def _main(*, output_preservation=None, interruption=None) -> int:
         except BaseException as error:
             # This try ends before run_group: no payload child was dispatched.
             # Keep the first failure if original-owner cleanup also fails.
+            if broker_launch is not None:
+                try:
+                    broker_launch.finish(tree_gone=False)
+                except BaseException as cleanup_error:
+                    error.add_note("pre-dispatch broker cleanup unknown: " + type(cleanup_error).__name__)
             try:
                 if output_preservation is None:
                     manager.finish(exit_code=125, tree_gone=True, _not_dispatched=True)
@@ -228,7 +263,7 @@ def _main(*, output_preservation=None, interruption=None) -> int:
                 _emit_storage_cleanup_failure(cleanup_error)
             raise
 
-        def check_budget():
+        def sample_budget():
             nonlocal budget_failure
             # Aggregate storage is observed separately. Reading its bounded
             # cache cannot delay the child with a full build-tree traversal;
@@ -250,10 +285,28 @@ def _main(*, output_preservation=None, interruption=None) -> int:
                 # after that same cleanup; do not alter its type or message.
                 budget_failure = exc
                 raise
+        budget_gate = None
+        if broker_launch is not None:
+            from storage_consumer_broker_budget import BrokerBudgetGate
+            budget_gate = BrokerBudgetGate(
+                sample_budget,
+                lambda: broker_launch.broker is not None and broker_launch.broker.transaction_active)
+
+        def check_budget():
+            if budget_gate is None:
+                sample_budget()
+            else:
+                budget_gate.sample()
+
+        def broker_tick():
+            broker_launch.on_tick()
+            budget_gate.after_tick()
         if interruption is not None and interruption["signal"] is not None:
             # This branch precedes any spawn attempt, so the original manager
             # can finalize its own lease without inventing child evidence.
             exit_code = 128 + int(interruption["signal"])
+            if broker_launch is not None:
+                broker_launch.finish(tree_gone=False)
             if output_preservation is None:
                 receipt = manager.finish(exit_code=exit_code, tree_gone=True, _not_dispatched=True)
             else:
@@ -263,11 +316,111 @@ def _main(*, output_preservation=None, interruption=None) -> int:
             except BaseException:
                 pass
             return exit_code
+        if broker_launch is not None:
+            try:
+                launch_command = broker_launch.command
+                broker_launch.assert_spawn_command(launch_command, manager.source)
+                child_fds = broker_launch.child_fds
+                broker_launch.mark_dispatch_attempted()
+            except BaseException as error:
+                try:
+                    broker_launch.finish(tree_gone=False)
+                except BaseException as cleanup_error:
+                    error.add_note("pre-dispatch broker cleanup unknown: " + type(cleanup_error).__name__)
+                try:
+                    if output_preservation is None:
+                        manager.finish(exit_code=125, tree_gone=True, _not_dispatched=True)
+                    else:
+                        manager.finish(exit_code=125, tree_gone=True)
+                except BaseException as cleanup_error:
+                    error.add_note("pre-dispatch manager cleanup unknown: " + type(cleanup_error).__name__)
+                raise
         # Set before even attempting dispatch: a launcher failure with uncertain
         # child creation must never use the no-child cleanup shortcut.
         manager._dispatch_started = True
         consumer_dispatched = True
-        code, gone, failure = run_group(command, manager.source, environment, args.timeout, check_budget)
+        if broker_launch is None:
+            code, gone, failure = run_group(command, manager.source, environment, args.timeout, check_budget)
+        else:
+            from managed_process import ProcessNotSpawned
+            try:
+                code, gone, failure = run_group(
+                    launch_command, manager.source, environment, args.timeout, check_budget,
+                    pass_fds=child_fds, on_spawn=broker_launch.on_spawn, on_tick=broker_tick,
+                    owned_group=broker_launch.group, on_stop=broker_launch.on_stop,
+                    verify_before_spawn=True)
+            except ProcessNotSpawned as error:
+                try:
+                    broker_launch.mark_pre_dispatch_failure(error)
+                    broker_launch.finish(tree_gone=False)
+                except BaseException as cleanup_error:
+                    error.add_note("pre-dispatch broker cleanup unknown: " + type(cleanup_error).__name__)
+                manager._dispatch_started = False
+                consumer_dispatched = False
+                try:
+                    if output_preservation is None:
+                        manager.finish(exit_code=125, tree_gone=True, _not_dispatched=True)
+                    else:
+                        manager.finish(exit_code=125, tree_gone=True)
+                except BaseException as cleanup_error:
+                    error.add_note("pre-dispatch manager cleanup unknown: " + type(cleanup_error).__name__)
+                raise
+            except BaseException as error:
+                # No broker exists until the original group's Popen object is
+                # bound. If Popen itself raised, close only this owner's unserved
+                # channel/pins; child creation and manager owner remain unknown.
+                if broker_launch.group._child is None:
+                    try:
+                        broker_launch.revoke_unconfirmed_spawn()
+                        try:
+                            print("managed_consumer_broker_spawn=" + json.dumps({
+                                "spawn": "unknown", "unserved_channel": "revoked",
+                                "manager_owner": "preserved", "physical_completion": "unknown",
+                            }, sort_keys=True), file=sys.stderr)
+                        except Exception:
+                            pass
+                    except BaseException as cleanup_error:
+                        error.add_note("unconfirmed spawn broker close unknown: " + type(cleanup_error).__name__)
+                        try:
+                            print("managed_consumer_broker_close_warning=" + type(cleanup_error).__name__,
+                                  file=sys.stderr)
+                        except Exception:
+                            pass
+                raise
+            if not broker_launch.finish(tree_gone=gone):
+                raise StorageError("broker original group or reader scope remains unknown; preserve owner")
+            try:
+                print("managed_consumer_broker_observation=" + json.dumps({
+                    "registered_scope": "participating_bound_catalogs_only",
+                    "reader_source": "observed_script_only",
+                    "imports": "unknown", "same_descriptor_fd": "unknown",
+                    "nonparticipating_writers": "unknown", "physical_completion": "unknown",
+                    "original_group_gone": gone,
+                    "child_cwd_post_spawn": broker_launch.child_cwd_observation,
+                    "deferred_budget_count": budget_gate.deferred_count,
+                    "deferred_budget_pending_before_final_check": budget_gate.deferred,
+                    "transport_failure_type": broker_launch.first_transport_failure,
+                }, sort_keys=True), file=sys.stderr)
+            except Exception:
+                pass
+            final_budget_status = "no_deferred_check"
+            try:
+                if budget_gate.finish():
+                    final_budget_status = "deferred_check_completed"
+            except Exception as error:
+                final_budget_status = "deferred_check_failed_" + type(error).__name__
+                if failure is None:
+                    failure = "post-broker deferred budget check failed: " + type(error).__name__
+                if code == 0:
+                    code = 125
+            try:
+                print("managed_consumer_broker_budget=" + json.dumps({
+                    "status": final_budget_status,
+                    "group_scope": "gone" if gone else "unknown",
+                    "final_peak_attested": False,
+                }, sort_keys=True), file=sys.stderr)
+            except Exception:
+                pass
         if consumer_lease is not None and gone is True:
             # The validator can invoke a caller-provided binary. Process-tree
             # termination and CUDA_VISIBLE_DEVICES do not prove that every

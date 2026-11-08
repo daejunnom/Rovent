@@ -163,6 +163,41 @@ class ManagedBrokerLaunch:
         if self.broker is not None:
             self.broker.revoke()
 
+    def revoke_unconfirmed_spawn(self):
+        """Revoke unserved admission without deciding whether Popen started.
+
+        This is valid only before an original child was bound and before a
+        broker existed, so no registration ACK or broker lease was issued.
+        It does not close the manager owner or claim that the process is gone.
+        """
+        self._assert_supervisor()
+        if (not self._attempted or self._not_dispatched or self.group._child is not None
+                or self._child is not None or self.broker is not None):
+            raise StorageError("unbound unconfirmed broker spawn required")
+        self._close_resources()
+
+    def _close_resources(self):
+        close_errors = []
+        for endpoint in (self._child_endpoint, self._parent):
+            if endpoint is not None:
+                try:
+                    endpoint.close()
+                except OSError as error:
+                    close_errors.append(error)
+        self._child_endpoint = self._parent = None
+        if self.reader_contract is not None:
+            try:
+                self.reader_contract.profile.close()
+            except (OSError, StorageError) as error:
+                close_errors.append(error)
+        try:
+            self.domain.close()
+        except (OSError, StorageError) as error:
+            close_errors.append(error)
+        self._closed = True
+        if close_errors:
+            raise StorageError("broker descriptor close outcome unknown") from close_errors[0]
+
     def finish(self, *, tree_gone):
         """Return False while a dispatched original group remains unresolved.
 
@@ -192,24 +227,5 @@ class ManagedBrokerLaunch:
             self.broker.revoke()
             if tree_gone or self._not_dispatched:
                 self.broker.finish(child_never_dispatched=self._not_dispatched, tree_gone=tree_gone)
-        close_errors = []
-        for endpoint in (self._child_endpoint, self._parent):
-            if endpoint is not None:
-                try:
-                    endpoint.close()
-                except OSError as error:
-                    close_errors.append(error)
-        self._child_endpoint = self._parent = None
-        if self.reader_contract is not None:
-            try:
-                self.reader_contract.profile.close()
-            except (OSError, StorageError) as error:
-                close_errors.append(error)
-        try:
-            self.domain.close()
-        except (OSError, StorageError) as error:
-            close_errors.append(error)
-        self._closed = True
-        if close_errors:
-            raise StorageError("broker descriptor close outcome unknown") from close_errors[0]
+        self._close_resources()
         return True
