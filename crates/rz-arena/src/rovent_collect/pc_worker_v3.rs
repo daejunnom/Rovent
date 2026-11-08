@@ -7,8 +7,8 @@ use super::capture_router_v3::CaptureRouterV3;
 use super::launch::ManagedOutputOwnerV3;
 use super::observer_lock_v3::RoventCollectionOwnerLockV3;
 use super::pc_hooks_lock_v3::{
-    PcPreparedOutcomeV3, PcPreparedRootV3, PcQuotaOutcomeV3, PcReceivedRootV3, PcRootAccountingV3,
-    RoventPcCollectionBridgeV3,
+    PcPreparedOutcomeV3, PcPreparedRootV3, PcQuotaEvidenceErrorV3, PcQuotaOutcomeV3,
+    PcReceivedRootV3, PcRootAccountingV3, RoventPcCollectionBridgeV3,
 };
 use super::policy_row_pipeline_v3::{
     PolicyChunkPersistenceV3, PolicyOutputOwnerV3, PolicyRootRetainedOwnerV3,
@@ -657,10 +657,95 @@ impl PcRootRecoveryV3 {
     }
 }
 
+#[cfg(test)]
+mod teacher_reservation_tests {
+    use super::*;
+
+    #[test]
+    fn contended_reservation_retries_the_same_root_without_marking_failure() {
+        // Exercise an actual try-lock contention and the production outcome
+        // handler. The test ledger models a single original root; it is not a
+        // native collection admission or physical worker proof.
+        let root = Arc::new(());
+        let ledger = Mutex::new((Arc::clone(&root), false));
+        let reserve = |requested: &Arc<()>| {
+            let mut entry = match ledger.try_lock() {
+                Ok(entry) => entry,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(PcQuotaEvidenceErrorV3::Busy);
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(PcQuotaEvidenceErrorV3::Poisoned);
+                }
+            };
+            if !Arc::ptr_eq(requested, &entry.0) {
+                return Err(PcQuotaEvidenceErrorV3::WrongRoot);
+            }
+            if entry.1 {
+                return Ok(PcQuotaOutcomeV3::AlreadyReserved);
+            }
+            entry.1 = true;
+            Ok(PcQuotaOutcomeV3::Reserved)
+        };
+        let mut reserved = false;
+        let mut failure = None;
+        let held = ledger.lock().unwrap();
+        assert!(matches!(
+            apply_teacher_reservation_v3(reserve(&root), &mut reserved, &mut failure),
+            Some(PcPrepareStepV3::Pending)
+        ));
+        assert!(!reserved && failure.is_none() && !held.1);
+        drop(held);
+        assert!(
+            apply_teacher_reservation_v3(reserve(&root), &mut reserved, &mut failure).is_none()
+        );
+        assert!(reserved && failure.is_none() && ledger.lock().unwrap().1);
+    }
+
+    #[test]
+    fn reservation_ownership_and_poison_errors_remain_failures() {
+        for error in [
+            PcQuotaEvidenceErrorV3::Poisoned,
+            PcQuotaEvidenceErrorV3::WrongRoot,
+            PcQuotaEvidenceErrorV3::AlreadyRetired,
+            PcQuotaEvidenceErrorV3::MissingTeacherAggregate,
+        ] {
+            let mut reserved = false;
+            let mut failure = None;
+            assert!(matches!(
+                apply_teacher_reservation_v3(Err(error), &mut reserved, &mut failure),
+                Some(PcPrepareStepV3::Failed)
+            ));
+            assert!(!reserved && failure.is_some());
+        }
+    }
+}
+
 pub(crate) enum PcPrepareStepV3 {
     Pending,
     Published,
     Failed,
+}
+
+// Keep both the ownership failure and the reservation bit unchanged while a
+// contended ledger is retried for the same received root.
+fn apply_teacher_reservation_v3(
+    result: Result<PcQuotaOutcomeV3, PcQuotaEvidenceErrorV3>,
+    reserved: &mut bool,
+    failure: &mut Option<String>,
+) -> Option<PcPrepareStepV3> {
+    match result {
+        Ok(PcQuotaOutcomeV3::Reserved) => {
+            *reserved = true;
+            None
+        }
+        Ok(PcQuotaOutcomeV3::Busy | PcQuotaOutcomeV3::Exhausted)
+        | Err(PcQuotaEvidenceErrorV3::Busy) => Some(PcPrepareStepV3::Pending),
+        _ => {
+            *failure = Some("teacher quota is not owned by this recovery".into());
+            Some(PcPrepareStepV3::Failed)
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3152,15 +3237,15 @@ fn prepare_root_step_v3(
         return Ok(PcPrepareStepV3::Failed);
     }
     if !state.teacher_reserved {
-        match bridge.try_reserve_teacher(&admission) {
-            Ok(PcQuotaOutcomeV3::Reserved) => state.teacher_reserved = true,
-            Ok(PcQuotaOutcomeV3::Busy | PcQuotaOutcomeV3::Exhausted) => {
-                return Ok(PcPrepareStepV3::Pending);
-            }
-            _ => {
-                state.failure = Some("teacher quota is not owned by this recovery".into());
-                return Ok(PcPrepareStepV3::Failed);
-            }
+        let result = bridge.try_reserve_teacher(&admission);
+        // Split mutable borrows of fields through the original recovery guard.
+        let state = &mut *state;
+        if let Some(step) = apply_teacher_reservation_v3(
+            result,
+            &mut state.teacher_reserved,
+            &mut state.failure,
+        ) {
+            return Ok(step);
         }
     }
     let inputs = bridge.inputs();
