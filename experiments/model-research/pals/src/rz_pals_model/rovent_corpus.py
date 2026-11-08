@@ -789,6 +789,19 @@ def _identity(info):
             info.st_mtime_ns, info.st_ctime_ns)
 
 
+def _cross_source_identity(info):
+    """Compare path and descriptor identity without conflating Windows ctime APIs.
+
+    CPython on Windows may report the NT change time for path stat and the
+    creation time for descriptor fstat. Each source's ctime is still compared
+    against its own later observation. Birth time remains an additional
+    cross-source identity when the interpreter exposes it.
+    """
+    if os.name != "nt":
+        return _identity(info)
+    return (_identity(info)[:-1], getattr(info, "st_birthtime_ns", None))
+
+
 def _read_pinned_bytes(path, expected_sha256, expected_bytes, maximum, *, suffixes=(".json",), read_accounting=None):
     """Pin raw bytes through one descriptor before payload decoding."""
     sha(expected_sha256)
@@ -814,7 +827,7 @@ def _read_pinned_bytes(path, expected_sha256, expected_bytes, maximum, *, suffix
         # The legacy None path preserves its original buffering behavior.
         with os.fdopen(descriptor, "rb", buffering=0 if read_accounting is not None else -1) as source:
             opened = os.fstat(source.fileno())
-            if _identity(opened) != _identity(before):
+            if _cross_source_identity(opened) != _cross_source_identity(before):
                 raise ValueError("original corpus file changed before read")
             chunks, observed, total = [], hashlib.sha256(), 0
             read_maximum = expected_bytes if read_accounting is not None else maximum
@@ -828,7 +841,8 @@ def _read_pinned_bytes(path, expected_sha256, expected_bytes, maximum, *, suffix
                 chunks.append(block)
             after_fd = os.fstat(source.fileno())
         after_path = path.lstat()
-        if (_identity(before) != _identity(after_fd) or _identity(before) != _identity(after_path)
+        if (_identity(opened) != _identity(after_fd) or _identity(before) != _identity(after_path)
+                or _cross_source_identity(after_fd) != _cross_source_identity(after_path)
                 or total != expected_bytes or observed.hexdigest() != expected_sha256):
             raise ValueError("original corpus raw byte pin/identity mismatch")
         _regular_path(path, suffixes=suffixes)
