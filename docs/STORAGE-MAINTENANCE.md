@@ -9,7 +9,10 @@
 일반 실행은 `python scripts/run_managed.py -- cargo ...`를 사용한다. 별도 진단이
 필요하면 `--purpose startup-caller`처럼 **안정적인 목적 이름**을 지정한다.
 시각·SHA·PID마다 target 형제 폴더를 만들지 않는다. checkout과 purpose가 함께
-슬롯을 식별하며 기본 슬롯도 같은 카탈로그의 8GiB/12GiB/최대 4개 계산에 들어간다.
+슬롯을 식별하며 기본 슬롯도 같은 카탈로그의 기본 슬롯당 8GiB·카탈로그 18GiB
+관측 기준·최대 4개 슬롯 계산에 들어간다. 카탈로그 총량 기준은 완료 슬롯의 정리
+판단에 쓰이며, 보호된 자료 때문에 총량을 낮출 수 없어도 그 초과만으로 현재 독립
+실행을 중단하지 않는다. 슬롯별 실행 후 정리와 슬롯 수 조건은 별도다.
 `CARGO_TARGET_DIR`로 관리 영역 밖을 지정하면 기존처럼 거부한다.
 
 직접 Cargo를 실행하거나 임의 경로에 복사한 과거 target에는 관리 코드의 소유권이
@@ -20,8 +23,11 @@
 
 `managed_outputs.py`는 모델 검증과 followup 실행기의 새 출력에 공통 카탈로그를
 연결한다. 모델 검증은 기본 8GiB를 예약하고, followup은 기존 출력 상한을 예약한다.
-등록 결과 전체의 기본 상한은 18GiB이며 최대 1,024개 기록을 허용한다. 완료·실패
-결과도 합계에 포함한다. 여유가 부족하면 새 실행을 거부한다.
+등록 결과 전체의 기본 관측 기준은 18GiB이며 최대 1,024개 기록을 허용한다. 완료·
+실패 결과와 다른 실행의 예약도 계수에 포함할 수 있다. 총계나 새 예약을 더한 값이
+18GiB를 넘어도 그 사실만으로 새 실행을 거부하거나 실행 중인 작업을 종료하지 않는다.
+이는 예약·논리 길이에 기반한 카탈로그 계수이며, 디스크 실사용 경고와 다르다.
+각 출력의 `reserve` 초과, 기록 수·소유권·종료 확인 등은 별도의 실행 조건으로 유지된다.
 
 카탈로그 위치는 Windows `%APPDATA%/RoveZero/storage/outputs-v1`, Linux
 `${XDG_CACHE_HOME:-$HOME/.cache}/rovezero/storage/outputs-v1`, CI
@@ -31,12 +37,13 @@ reports/runs 경로를 유지하며, 경로·inode·소유 token을 카탈로그
 fresh 경로는 deferred 예약으로 남겨 CLI 계약을 보존한다.
 
 - 14일의 검토 기한은 **회수·보존 결정을 검토할 시점**이다. 만료가 모델·PGN·원시
-  로그·실패 결과의 삭제 권한이 되지 않는다. 결과가 한도를 채우면 먼저 보존 근거와
-  원래 native retention journal을 확인하고 별도 유지보수를 진행한다.
+  로그·실패 결과의 삭제 권한이 되지 않는다. 실제 사용량 경고가 발생하면 보존 근거와
+  원래 native retention journal을 확인해 정리 가능 자료를 구분한다.
 - 카탈로그는 과거 reports/runs를 자동으로 순회·등록하지 않는다. 따라서 초기 도입
   시 기존 미등록 자료까지 18GiB 안으로 줄였다는 주장은 하지 않는다.
-- 실행 중 run_managed의 5초 관측과 producer의 검사, 종료 시 최종 크기 검사를
-  함께 사용한다. 관측 사이 증가는 가능하며 kernel quota나 물리 사용량 제한은 아니다.
+- 실행 중 run_managed의 주기적 관측과 producer의 검사, 종료 시 최종 크기 검사를
+  함께 사용한다. 개별 출력이 예약을 초과하면 오류와 증거를 보존하며 실행 종료가
+  필요할 수 있다. 관측 사이 증가는 가능하며 kernel quota나 물리 사용량 제한은 아니다.
 - `tree_gone`이 True가 아니면 active 예약을 유지하여 다음 producer를 차단한다.
   모델 검증의 venv는 바깥 관리 scratch에 남기고, 원 감독자가 실제 자식 트리 종료를
   확인한 뒤에만 임시 자료를 회수하고 같은 owner에 묶인 출력을 확정한다.
@@ -53,6 +60,29 @@ CI native bundle은 원 FD→private ELF→tar의 custody를 먼저 검증한다
 command tree 종료가 확인된 뒤 target·cargo-home·tmp·private ELF만 정리한다.
 원시 logs, artifact와 build receipt는 남긴다. `compile-cleanup.json`의 최종 상태는
 build 성공 영수증과 별도로 확인하며 실패는 `cleanup-failure.json`과 exit에 남긴다.
+
+## 전체 사용량 관측과 경고
+
+`rovezero_total_usage.py`는 명시된 root와 지정한 부모 아래의 관련 경로를 범위·시간·
+항목 수 제한 안에서 읽기 전용으로 관측한다. 미등록 자료도 관측 범위 안에 있으면
+포함하되 자동으로 소유권을 인정하거나 삭제 대상으로 등록하지 않는다. 같은 호스트의
+root 중첩과 hardlink는 가능한 범위에서 중복을 줄인다. 결과의 논리 길이와 할당량은
+관측된 하한이며 경로 교체, 접근 불가·비밀 이름 제외·다른 mount·기한 등의 누락은
+부분 관측 또는 unknown으로 남긴다. reflink 공유, 파일시스템 metadata, Windows 전체와
+VHD의 실제 물리 할당량을 이 값에서 확정하지 않는다.
+
+설치된 Linux systemd observer는 기본적으로 부팅 5분 후와 이후 30분 간격으로,
+설치된 Windows observer는 구성된 예약 관측을 통해 snapshot을 갱신한다. 기본 Linux
+관측은 root와 일반 사용자의 기본 cache 및 관련 임시 경로를 살피며, 비표준 XDG·사용자
+경로 등은 빠질 수 있다. Windows 관측도 기본 roaming 및 발견된 package-local root에
+한정된다. 설치 여부·접근 가능한 root·양쪽 관측의 신선도와 범위는 환경마다 다르다.
+
+관리 실행은 캐시된 전체 사용량 snapshot을 읽어 **관측된 할당량 하한이 기본 18GiB를
+초과하면 경고**한다. 관측이 부분적이거나 오래됐거나 없으면 그 한계를 함께 표시하거나
+unknown으로 둔다. snapshot 자체는 권한·정리 허가가 아니며 관측 실패나 총량 경고는
+독립 실행을 종료하지 않는다. 종료 후 유효한 초과 관측이 있고 실행 트리 종료가 확인된
+경우에만 보호 조건을 다시 검사하는 유한한 완료 빌드 정리 시도를 할 수 있다. 관측 범위에
+포함된 모든 미등록 자료를 자동 삭제하거나 18GiB 이하로 되돌림을 보장하지 않는다.
 
 ## 중단 lease 복구
 
@@ -143,7 +173,8 @@ inventory는 최대 16개의 **명시적·겹치지 않는 root**만 길이 기�
 서로 다른 root의 hardlink 중복과 VHD 안팎의 물리 사용량은 합계에서 해결하지 않는다.
 파일 삭제와 VHD 축소는 별개이며 전역 WSL 종료·압축을 자동 실행하지 않는다.
 
-등록 카탈로그 밖의 임의 스크립트·수동 복사는 이 한도를 우회할 수 있다. 새 대형
+등록 카탈로그 밖의 임의 스크립트·수동 복사는 카탈로그 계수에서 빠질 수 있다. 전체
+사용량 관측도 설정된 범위 밖이나 접근 불가 자료까지 완전하게 보장하지 않는다. 새 대형
 producer는 `OutputLease` 또는 기존 native retention 접점에 연결해야 한다.
 기존 미등록 자료의 분류·회수는 실제 소유자·사용 여부·보존 근거 확인 후의 별도 작업이다.
 
@@ -205,7 +236,7 @@ python -I -S -B scripts/storage_maintenance.py retire-code-cache --plan <absolut
 
 입력 수·압축 해제량과 요청한 1~600초의 내부 관측 창을 제한한다. OS I/O 중단까지의
 hard timeout과 자식 트리 종료가 필요하면 기존 `run_managed.py` 감독 아래 실행한다.
-새 예약을 늘리거나 카탈로그를 수정하지 않고, 보존 결과의 18GiB·14일 검토 정책,
+새 예약을 늘리거나 카탈로그를 수정하지 않고, 보존 결과의 18GiB 관측 기준·14일 검토 정책,
 만료가 삭제 권한이 아니라는 규칙, GPU physical unknown의 보존을 유지한다. 반복 실행의
 검증 결과도 실제 source·plan·환경과 함께 보관하며 과거 성공을 현재 apply에 재사용하지 않는다.
 
@@ -225,7 +256,7 @@ unknown은 읽기 전용으로 보존하며, 원 owner·삭제 권한·물리 �
 뒤, 현재 boot·mount namespace·source6를 실제 held FD로 다시 관측한다. 역사 anchor와
 새 출력에 한정한 `CurrentExclusionSession`은 별도 타입이다. 원 unknown subtree와 그
 모든 ancestor/descendant는 새 출력 범위에서 제외한다. 원 reservation charge·registry
-metadata·새 출력의 journal/payload를 동일한 18GiB 합계와 새 reserve에 포함한다.
+metadata·새 출력의 journal/payload를 동일한 카탈로그 계수와 새 reserve에 포함한다.
 
 현재 관측은 최대 30초이며 원 관측의 deadline을 늘리지 않는다. 다음 관측은 독립된
 새 실제 검증으로 만들고 이전 관측을 닫는다. 이 갱신은 제품 요청·실험의 원 hard
@@ -267,7 +298,7 @@ source6과 다른 source7 domain이며 자동 변환하지 않는다. 기본값�
 정확한 bytes, bounded corpus와 독립 ZIP의 모든 파일을 대조한다. ZIP은 중앙 디렉터리를
 할당하기 전에 개수·크기를 제한하며, 이번 형식은 ZIP64와 분할 archive를 거절한다.
 현재 corpus의 UID나 관측 identity는 원 owner의 증거로 사용하지 않는다. 원 reservation
-이상과 회수 ZIP·registry·관측 문서·새 active reservation을 18GiB에서 보수적으로 계수한다.
+이상과 회수 ZIP·registry·관측 문서·새 active reservation을 카탈로그 계수에서 보수적으로 반영한다.
 범위를 맞추기 위해 원 예약을 줄이거나 실패 자료를 삭제하지 않는다.
 
 새 producer는 기존 자료·회수본·control 경로와 분리된 fresh 출력만 등록한다. 관리 빌드의
