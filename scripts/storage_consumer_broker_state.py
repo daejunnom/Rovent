@@ -173,11 +173,12 @@ class ConsumerBrokerState:
                 raise
             raise
 
-    def commit(self, request_id, inputs):
+    def commit(self, request_id, inputs, *, future_inputs=()):
         self._check(child=True)
-        if self._stack is None or request_id != self._request:
+        if self._stack is None or type(request_id) is not int or request_id != self._request:
             raise BrokerStateError("no matching transaction")
-        if not isinstance(inputs, (list, tuple)) or len(inputs) > 4096:
+        if (not isinstance(inputs, (list, tuple)) or not isinstance(future_inputs, (list, tuple))
+                or len(inputs) + len(future_inputs) > 4096):
             self._release_transaction()
             raise BrokerStateError("bounded input list required")
         if self._clock() >= self._deadline:
@@ -185,10 +186,10 @@ class ConsumerBrokerState:
             raise BrokerStateError("transaction expired")
         try:
             # Empty input lists are valid when the descriptor names no assets.
-            if inputs:
+            if inputs or future_inputs:
                 owner_id = uuid.uuid4().hex
                 try:
-                    lease = self._guard.register(inputs, owner_id=owner_id)
+                    lease = self._guard.register(inputs, owner_id=owner_id, future_inputs=future_inputs)
                     # Keep custody before unlocking or attempting a response.
                     self._leases.append(lease)
                 except BaseException as error:
@@ -220,7 +221,7 @@ class ConsumerBrokerState:
 
     def abort(self, request_id):
         self._check(child=True)
-        if self._stack is None or request_id != self._request:
+        if self._stack is None or type(request_id) is not int or request_id != self._request:
             raise BrokerStateError("no matching transaction")
         self._release_transaction()
 

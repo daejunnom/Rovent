@@ -40,6 +40,7 @@ class Fixture:
         self.leases = []
         self.rows = {}
         self.fail_register = False
+        self.future_inputs = None
 
     def assert_owner(self):
         if not self.owner_alive:
@@ -59,11 +60,12 @@ class Fixture:
         finally:
             self.locked = False
 
-    def register(self, inputs, *, owner_id):
+    def register(self, inputs, *, owner_id, future_inputs=()):
         if not self.locked:
             raise AssertionError("registration must hold the guards")
         if self.fail_register:
             raise RuntimeError("registration failed")
+        self.future_inputs = list(future_inputs)
         lease = FakeLease()
         self.rows[owner_id] = lease
         self.leases.append(lease)
@@ -81,6 +83,29 @@ class Fixture:
 
 
 class ConsumerBrokerStateTests(unittest.TestCase):
+    def test_boolean_and_float_do_not_match_integer_request(self):
+        for invalid_id in (True, 1.0):
+            with self.subTest(invalid_id=invalid_id):
+                fixture = Fixture()
+                state = fixture.state()
+                state.begin(1, deadline=20)
+                with self.assertRaises(BrokerStateError):
+                    state.commit(invalid_id, ["/input"])
+                with self.assertRaises(BrokerStateError):
+                    state.abort(invalid_id)
+                self.assertTrue(fixture.locked)
+                state.abort(1)
+                self.assertFalse(fixture.locked)
+
+    def test_future_inputs_are_registered_under_same_guard(self):
+        fixture = Fixture()
+        state = fixture.state()
+        state.begin(1, deadline=20)
+        state.commit(1, ["/source"], future_inputs=["/future"])
+        self.assertEqual(fixture.future_inputs, ["/future"])
+        state.finish(child_never_dispatched=False, tree_gone=False)
+        self.assertEqual(fixture.leases[0].state, "active")
+
     @unittest.skipUnless(os.name == "posix", "POSIX registry fixture")
     def test_absence_proof_uses_original_registry_guard(self):
         from storage_consumer_registry import ConsumerRegistry
@@ -133,7 +158,7 @@ class ConsumerBrokerStateTests(unittest.TestCase):
         state = fixture.state()
         unidentifiable_rows = []
 
-        def partial_publish(inputs, *, owner_id):
+        def partial_publish(inputs, *, owner_id, future_inputs=()):
             row = {"state": "active", "inputs": list(inputs)}
             unidentifiable_rows.append(row)
             fixture.rows[owner_id] = row
@@ -185,8 +210,8 @@ class ConsumerBrokerStateTests(unittest.TestCase):
         state = fixture.state()
         register = fixture.register
 
-        def late_register(inputs, *, owner_id):
-            lease = register(inputs, owner_id=owner_id)
+        def late_register(inputs, *, owner_id, future_inputs=()):
+            lease = register(inputs, owner_id=owner_id, future_inputs=future_inputs)
             fixture.now = 20
             return lease
 
