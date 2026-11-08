@@ -151,6 +151,13 @@ fn v3_allocation_joins_exact_v3_root_and_preserves_v1_wire() {
     let mut wire = serde_json::to_value(&old_lock.manifest).unwrap();
     let object = wire.as_object_mut().unwrap();
     object.insert("domain".into(), json!(crate::ROVENT_EXECUTION_V3_DOMAIN));
+    let coordinator = object
+        .get_mut("coordinator")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    coordinator.remove("original_root_budget_sha256");
+    coordinator.remove("original_deadline_seal_sha256");
     object.insert("startup_document".into(), artifact("startup"));
     object.insert("startup_configuration_sha256".into(), json!(sha_value('4')));
     object.insert(

@@ -73,6 +73,13 @@ fn lock_v3(base: &RoventInputLock) -> RoventInputLockV3 {
     let mut wire = serde_json::to_value(&v2.manifest).unwrap();
     let object = wire.as_object_mut().unwrap();
     object.insert("domain".into(), json!(crate::ROVENT_EXECUTION_V3_DOMAIN));
+    let coordinator = object
+        .get_mut("coordinator")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    coordinator.remove("original_root_budget_sha256");
+    coordinator.remove("original_deadline_seal_sha256");
     object.insert(
         "system_runtime_lock".into(),
         serde_json::to_value(
