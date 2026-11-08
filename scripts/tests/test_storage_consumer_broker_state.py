@@ -83,6 +83,22 @@ class Fixture:
 
 
 class ConsumerBrokerStateTests(unittest.TestCase):
+    def test_hold_policy_keeps_guard_on_expiry_and_owner_failure(self):
+        fixture = Fixture()
+        state = ConsumerBrokerState(fixture.transaction, fixture.assert_owner, fixture.assert_child,
+                                    clock=lambda: fixture.now, hold_on_failure=True)
+        state.begin(1, deadline=11)
+        fixture.now = 11
+        self.assertTrue(state.expire())
+        self.assertTrue(fixture.locked)
+        fixture.owner_alive = False
+        with self.assertRaises(RuntimeError):
+            state.expire()
+        self.assertTrue(fixture.locked)
+        fixture.owner_alive = True
+        state.release_after_drain(tree_gone=True)
+        self.assertFalse(fixture.locked)
+
     def test_boolean_and_float_do_not_match_integer_request(self):
         for invalid_id in (True, 1.0):
             with self.subTest(invalid_id=invalid_id):

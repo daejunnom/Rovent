@@ -61,7 +61,7 @@ class ConsumerBrokerState:
     """
 
     def __init__(self, transaction_factory, assert_supervisor, assert_child, *, clock=time.monotonic,
-                 maximum_seconds=30.0, maximum_requests=128):
+                 maximum_seconds=30.0, maximum_requests=128, hold_on_failure=False):
         if not all(callable(fn) for fn in (transaction_factory, assert_supervisor, assert_child,
                                             clock)):
             raise ValueError("transaction factory, identity checks and clock are required")
@@ -69,6 +69,8 @@ class ConsumerBrokerState:
             raise ValueError("bounded transaction duration required")
         if type(maximum_requests) is not int or not 1 <= maximum_requests <= 128:
             raise ValueError("bounded request count required")
+        if type(hold_on_failure) is not bool:
+            raise ValueError("explicit failure retention policy required")
         self._factory = transaction_factory
         self._assert_supervisor = assert_supervisor
         self._assert_child = assert_child
@@ -76,6 +78,7 @@ class ConsumerBrokerState:
         self._prove_absent = _exact_registry_row_absent
         self._maximum_seconds = float(maximum_seconds)
         self._maximum_requests = maximum_requests
+        self._hold_on_failure = hold_on_failure
         self._requests_started = 0
         self._pid = os.getpid()
         self._thread = threading.get_ident()
@@ -91,7 +94,7 @@ class ConsumerBrokerState:
         self._unknown_owner_id = None
         self._finalized = False
 
-    def _check(self, *, child=False):
+    def _check(self, *, child=False, preserve_on_failure=False):
         if (os.getpid() != self._pid or threading.get_ident() != self._thread
                 or self._broken or self._finalized):
             raise BrokerStateError("original broker owner unavailable")
@@ -102,7 +105,8 @@ class ConsumerBrokerState:
         except BaseException:
             # The original process may still close its own transaction when
             # child identity or the original owner scope has disappeared.
-            self._release_transaction()
+            if not preserve_on_failure:
+                self._release_transaction()
             raise
 
     @property
@@ -142,7 +146,7 @@ class ConsumerBrokerState:
         self._stack = self._guard = self._request = self._deadline = None
 
     def begin(self, request_id, *, deadline):
-        self._check(child=True)
+        self._check(child=True, preserve_on_failure=self._hold_on_failure)
         if self._stack is not None:
             raise BrokerStateError("transaction already active")
         if type(request_id) is not int or request_id <= self._last_request:
@@ -174,16 +178,19 @@ class ConsumerBrokerState:
             raise
 
     def commit(self, request_id, inputs, *, future_inputs=()):
-        self._check(child=True)
+        self._check(child=True, preserve_on_failure=self._hold_on_failure)
         if self._stack is None or type(request_id) is not int or request_id != self._request:
             raise BrokerStateError("no matching transaction")
         if (not isinstance(inputs, (list, tuple)) or not isinstance(future_inputs, (list, tuple))
                 or len(inputs) + len(future_inputs) > 4096):
-            self._release_transaction()
+            if not self._hold_on_failure:
+                self._release_transaction()
             raise BrokerStateError("bounded input list required")
         if self._clock() >= self._deadline:
-            self._release_transaction()
+            if not self._hold_on_failure:
+                self._release_transaction()
             raise BrokerStateError("transaction expired")
+        succeeded = False
         try:
             # Empty input lists are valid when the descriptor names no assets.
             if inputs or future_inputs:
@@ -215,22 +222,36 @@ class ConsumerBrokerState:
             self._assert_child()
             if self._clock() >= self._deadline:
                 raise BrokerStateError("transaction expired during registration; lease preserved")
+            succeeded = True
         finally:
-            self._release_transaction()
+            if succeeded or not self._hold_on_failure:
+                self._release_transaction()
         return request_id
 
     def abort(self, request_id):
-        self._check(child=True)
+        self._check(child=True, preserve_on_failure=self._hold_on_failure)
         if self._stack is None or type(request_id) is not int or request_id != self._request:
             raise BrokerStateError("no matching transaction")
         self._release_transaction()
 
     def expire(self):
-        self._check()
+        self._check(preserve_on_failure=self._hold_on_failure)
         if self._stack is None or self._clock() < self._deadline:
             return False
-        self._release_transaction()
+        if not self._hold_on_failure:
+            self._release_transaction()
         return True
+
+    def release_after_drain(self, *, tree_gone):
+        """Unlock a failed transaction only after the original group is gone.
+
+        This does not repair a broken registry or close/transition any lease.
+        """
+        if (os.getpid() != self._pid or threading.get_ident() != self._thread
+                or self._finalized or self._lock_release_unknown or tree_gone is not True):
+            raise BrokerStateError("original supervisor and observed drain required")
+        self._assert_supervisor()
+        self._release_transaction()
 
     def finish(self, *, child_never_dispatched, tree_gone):
         """Release guards; close only proven unstarted leases, else preserve.
