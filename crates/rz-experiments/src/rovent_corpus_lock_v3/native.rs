@@ -7,7 +7,7 @@ use crate::rovent_corpus_v2::RoventCorpusManifestV2;
 use crate::{
     ManifestError, NativeRuntimeSourceV6, RoventExternalProfilePin, RoventInputLockV3,
     RoventModelPin, RoventRootAllocationClockV3, RoventRootDescriptorV3,
-    SystemLibraryObservationV6,
+    SystemLibraryObservationV6, SystemRuntimeSpecV6,
 };
 use rz_contracts::{Digest, rovent::ExecutionMode};
 use serde::Deserialize;
@@ -70,6 +70,33 @@ struct StartupObservation {
     validator_loaded: bool,
     physical_workers_created: usize,
     neural_service_executed: bool,
+}
+
+/// Checks the system provider observation without deriving readiness from a
+/// startup domain or from the mere presence of registered libraries.
+fn validate_system_startup(
+    observed: &StartupObservation,
+    system: &SystemRuntimeSpecV6,
+) -> Result<(), ManifestError> {
+    let core = system
+        .libraries
+        .iter()
+        .find(|item| item.role == "ort-core")
+        .ok_or_else(|| ManifestError::Integrity("system ORT core identity missing".into()))?;
+    system.validate_ready_observed(&observed.system_libraries)?;
+    require(
+        matches!(
+            observed.domain.as_str(),
+            "rz-rovent-native-startup/1" | "rz-rovent-native-system-startup/1"
+        ) && observed.runtime_library_sha256 == core.sha256
+            && observed.system_runtime_identity_sha256 == system.system_identity_sha256
+            && observed
+                .unregistered_native_mappings
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+            && observed.provider_ready,
+        "lock-v3 collection system CUDA startup observation mismatch",
+    )
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -154,11 +181,6 @@ pub fn validate_lock_v3_root_metadata(
             ));
         }
     };
-    let core = system
-        .libraries
-        .iter()
-        .find(|item| item.role == "ort-core")
-        .ok_or_else(|| ManifestError::Integrity("system ORT core identity missing".into()))?;
     let mode = match lock.manifest.engine.mode {
         ExecutionMode::HybridPcr => "hybrid_pcr",
         ExecutionMode::HybridPc => "hybrid_pc",
@@ -175,7 +197,7 @@ pub fn validate_lock_v3_root_metadata(
     let bounded_allocation = RoventRootAllocationClockV3::from_json(&allocation_json)?;
     bounded_descriptor.verify_against(lock)?;
     bounded_allocation.verify_against(&bounded_descriptor, lock)?;
-    system.validate_ready_observed(&observed.system_libraries)?;
+    validate_system_startup(observed, system)?;
     require(
         expected_sha256.as_str() == Some(root_digest.as_str())
             && root.schema == ROVENT_LOCK_V3_ROOT_DOMAIN
@@ -193,17 +215,9 @@ pub fn validate_lock_v3_root_metadata(
             && declared.encoding == model.encoding
             && declared.validator_model == lock.manifest.engine.pc.validator
             && declared.teacher_profiles == lock.manifest.engine.teachers
-            && observed.domain == "rz-rovent-native-startup/1"
             && observed.process_epoch == root.process_epoch
             && observed.process_epoch != 0
             && observed.weights_sha256 == model.weights.sha256
-            && observed.runtime_library_sha256 == core.sha256
-            && observed.system_runtime_identity_sha256 == system.system_identity_sha256
-            && observed
-                .unregistered_native_mappings
-                .as_ref()
-                .is_some_and(Vec::is_empty)
-            && observed.provider_ready
             && observed.startup_configuration_sha256 == lock.manifest.startup_configuration_sha256
             && observed.search_configuration_sha256
                 == lock.manifest.startup_search_configuration_sha256
@@ -295,4 +309,96 @@ pub fn validate_native_lifecycle_lock_v3(
             && namespace["representation_encoding_sha256"] == native.encoding_sha256,
         "lock-v3 native ticket/source/namespace does not match root",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SystemLibrarySpecV6, SystemPlatformV6};
+
+    fn ready_system() -> (SystemRuntimeSpecV6, StartupObservation) {
+        let libraries: Vec<_> = ["ort-core", "ort-provider-cuda"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, role)| SystemLibrarySpecV6 {
+                role: role.into(),
+                requested_path: format!("/usr/lib/{role}.so"),
+                canonical_path: format!("/usr/lib/{role}.so.1"),
+                version: None,
+                sha256: format!("{:064x}", index + 1),
+                bytes: (index + 1) as u64,
+                device: 5,
+                inode: (index + 1) as u64,
+                required_mapping: true,
+            })
+            .collect();
+        let observations = libraries
+            .iter()
+            .map(|library| SystemLibraryObservationV6 {
+                role: library.role.clone(),
+                canonical_path: library.canonical_path.clone(),
+                sha256: library.sha256.clone(),
+                bytes: library.bytes,
+                device: library.device,
+                inode: library.inode,
+                mapped: Some(true),
+            })
+            .collect();
+        let system = SystemRuntimeSpecV6 {
+            platform: SystemPlatformV6::Linux,
+            system_identity_sha256: format!("{:064x}", 42),
+            cuda_device_id: 0,
+            cuda_arena_bytes: 1024,
+            startup_ms: 1000,
+            drain_ms: 200,
+            capture_max_libraries: 2,
+            capture_max_file_bytes: 2,
+            capture_max_total_bytes: 3,
+            capture_timeout_ms: 100,
+            libraries,
+        };
+        let observed = StartupObservation {
+            domain: "rz-rovent-native-system-startup/1".into(),
+            process_epoch: 1,
+            mode: "cpu_pc".into(),
+            topology: "roles_only".into(),
+            weights_sha256: "1".repeat(64),
+            export_manifest_sha256: "2".repeat(64),
+            backend_sha256: "3".repeat(64),
+            runtime_library_sha256: system.libraries[0].sha256.clone(),
+            system_runtime_identity_sha256: system.system_identity_sha256.clone(),
+            system_libraries: observations,
+            unregistered_native_mappings: Some(vec![]),
+            provider_ready: true,
+            native_configuration_sha256: "4".repeat(64),
+            startup_configuration_sha256: "5".repeat(64),
+            search_configuration_sha256: "6".repeat(64),
+            validator_loaded: false,
+            physical_workers_created: 1,
+            neural_service_executed: false,
+        };
+        (system, observed)
+    }
+
+    #[test]
+    fn system_startup_accepts_actual_and_legacy_domains_without_relaxing_readiness() {
+        let (system, mut observed) = ready_system();
+        validate_system_startup(&observed, &system).unwrap();
+        observed.domain = "rz-rovent-native-startup/1".into();
+        validate_system_startup(&observed, &system).unwrap();
+        observed.domain = "rz-rovent-native-unknown/1".into();
+        assert!(validate_system_startup(&observed, &system).is_err());
+        observed.domain = "rz-rovent-native-system-startup/1".into();
+        observed.provider_ready = false;
+        assert!(validate_system_startup(&observed, &system).is_err());
+        observed.provider_ready = true;
+        observed.system_libraries[1].mapped = None;
+        assert!(validate_system_startup(&observed, &system).is_err());
+        observed.system_libraries[1].mapped = Some(true);
+        observed.system_runtime_identity_sha256 = "0".repeat(64);
+        assert!(validate_system_startup(&observed, &system).is_err());
+        observed.system_runtime_identity_sha256 = system.system_identity_sha256.clone();
+        observed.unregistered_native_mappings = None;
+        assert!(validate_system_startup(&observed, &system).is_err());
+    }
 }
