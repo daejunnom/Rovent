@@ -758,13 +758,15 @@ def _consumer_plan(plan_path, consumer):
 
 
 def _finish_consumer_observation(consumer, *, original_scope_closed):
-    if not consumer.dispatched:
-        consumer.close_if_not_dispatched()
-    elif original_scope_closed:
-        # This only changes owner state; it deliberately keeps every input
-        # protected because process/cgroup exit is not a GPU fence.
-        for lease in reversed(consumer.leases):
-            lease.retain_unknown(tree_gone=True)
+    try:
+        if not consumer.dispatched:
+            consumer.close_if_not_dispatched()
+        elif original_scope_closed:
+            # Process/cgroup exit is not a GPU fence.
+            for lease in reversed(consumer.leases):
+                lease.retain_unknown(tree_gone=True)
+    finally:
+        consumer.finish_broker()
 
 
 def run_managed(plan_path, *, consumer_args=None):
@@ -800,6 +802,10 @@ def _run_managed_registered(plan_path, *, consumer_args, interruption):
                 consumer.close_if_not_dispatched()
             except BaseException as close_error:
                 error.add_note("consumer input close also failed: " + str(close_error))
+        try:
+            consumer.finish_broker()
+        except BaseException as close_error:
+            error.add_note("broker admission close unconfirmed: " + type(close_error).__name__)
         raise
     try:
         _finish_consumer_observation(consumer, original_scope_closed=True)
@@ -1308,6 +1314,10 @@ def _run_direct_registered_scoped(args, interruption):
                 consumer.close_if_not_dispatched()
             except BaseException as close_error:
                 error.add_note("consumer input close also failed: " + str(close_error))
+        try:
+            consumer.finish_broker()
+        except BaseException as close_error:
+            error.add_note("broker admission close unconfirmed: " + type(close_error).__name__)
         raise
     try:
         # Direct mode observes a process group, not a contained original tree;

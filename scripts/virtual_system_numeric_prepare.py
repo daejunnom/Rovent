@@ -49,6 +49,9 @@ class NumericInputRegistration:
         self.leases = []
         self.catalogs = []
         self.dispatched = False
+        self._broker = None
+        broker_requested = ("RZ_CONSUMER_BROKER_FD" in os.environ
+                            or "RZ_CONSUMER_BROKER_PARENT_PID" in os.environ)
         env_root = os.environ.get("RZ_CONSUMER_REGISTRY_ROOT")
         env_id = os.environ.get("RZ_CONSUMER_REGISTRY_ID")
         env_required = os.environ.get("RZ_CONSUMER_REGISTRY_REQUIRED", "0")
@@ -64,10 +67,13 @@ class NumericInputRegistration:
         else:
             root, registry_id = env_root, env_id
         if root is None:
-            if args.consumer_registry_required or env_required == "1" or args.consumer_input_catalog:
+            if (args.consumer_registry_required or env_required == "1" or args.consumer_input_catalog
+                    or broker_requested):
                 raise StorageError("participating consumer registry is required")
             return
         catalogs = list(args.consumer_input_catalog)
+        explicit_catalogs = {checked(Path(path)) for path in catalogs}
+        inherited_roots = set()
         inherited_catalogs = os.environ.get("RZ_CONSUMER_INPUT_CATALOGS")
         if inherited_catalogs:
             if len(inherited_catalogs) > 65536:
@@ -80,15 +86,35 @@ class NumericInputRegistration:
                     or any(type(value) is not str or not Path(value).is_absolute() for value in values)):
                 raise StorageError("absolute inherited consumer catalogs required")
             catalogs.extend(Path(value) for value in values)
+            inherited_roots = {checked(Path(value)) for value in values}
+        if broker_requested and (not inherited_roots or not explicit_catalogs.issubset(inherited_roots)):
+            raise StorageError("broker requires supervisor-authorized participating catalogs")
         if not catalogs or len(catalogs) > 32 or any(not Path(p).is_absolute() for p in catalogs):
             raise StorageError("at least one already-bound input catalog is required")
         from storage_consumer_registry import ConsumerRegistry
         self.registry = ConsumerRegistry(root, registry_id=registry_id)
         self.catalogs = sorted({checked(p) for p in catalogs},
                                key=lambda p: os.path.normcase(str(p)))
-        self.add(inputs)
+        if broker_requested:
+            from storage_consumer_broker_client import inherited_supervisor_client
+            self._broker = inherited_supervisor_client(source=Path(__file__).resolve().parent.parent,
+                                                       registry=self.registry)
+            if self._broker is None:
+                raise StorageError("inherited broker unavailable")
+        try:
+            self.add(inputs)
+        except BaseException as error:
+            if self._broker is not None:
+                try:
+                    self._broker.finish()
+                except BaseException as close_error:
+                    if hasattr(error, "add_note"):
+                        error.add_note("broker admission close unconfirmed: " + type(close_error).__name__)
+            raise
 
     def _locked(self, stack):
+        if getattr(self, "_broker", None) is not None:
+            raise RuntimeError("brokered consumer must not reacquire catalog locks")
         from storage_consumer_registry import require_catalog_binding
         from storage_guard import CatalogGuard
         for root in self.catalogs:
@@ -101,6 +127,9 @@ class NumericInputRegistration:
             return
         paths = list(dict.fromkeys(Path(p) for p in inputs))
         if paths:
+            if getattr(self, "_broker", None) is not None:
+                self._broker.add(paths)
+                return
             with ExitStack() as stack:
                 guard = self._locked(stack)
                 self.leases.append(guard.register(paths))
@@ -109,6 +138,8 @@ class NumericInputRegistration:
         """Read a registered small descriptor and register its paths atomically."""
         if self.registry is None:
             return reader()[0]
+        if getattr(self, "_broker", None) is not None:
+            return self._broker.read_and_register(reader)
         with ExitStack() as stack:
             guard = self._locked(stack)
             value, paths = reader()
@@ -121,6 +152,8 @@ class NumericInputRegistration:
         """Read a protected descriptor and atomically register both input kinds."""
         if self.registry is None:
             return reader()[0]
+        if getattr(self, "_broker", None) is not None:
+            return self._broker.read_and_register_with_future(reader)
         with ExitStack() as stack:
             guard = self._locked(stack)
             value, inputs, future = reader()
@@ -136,6 +169,12 @@ class NumericInputRegistration:
             for lease in reversed(self.leases):
                 lease.close(not_started=True)
             self.leases.clear()
+
+    def finish_broker(self):
+        """Close only broker admission; the supervisor retains lease custody."""
+        broker = getattr(self, "_broker", None)
+        if broker is not None:
+            broker.finish()
 
 
 def _regular_fd(path, limit):
@@ -326,8 +365,19 @@ def main():
         except BaseException as close_error:
             if hasattr(error, "add_note"):
                 error.add_note("consumer input close also failed: " + str(close_error))
+        try:
+            consumer.finish_broker()
+        except BaseException as close_error:
+            if hasattr(error, "add_note"):
+                error.add_note("broker admission close unconfirmed: " + type(close_error).__name__)
         raise
-    consumer.close_if_not_dispatched()
+    try:
+        consumer.close_if_not_dispatched()
+    finally:
+        try:
+            consumer.finish_broker()
+        except Exception as error:
+            print("consumer_broker_close_warning=" + type(error).__name__, file=sys.stderr)
     return result
 
 

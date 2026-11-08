@@ -3,6 +3,8 @@
 The peer check is not an adversarial same-UID security boundary and does not
 prove an OS lock. The supervisor must independently hold and verify its
 original catalog guard and registry binding while handling each request.
+Registry ID/content checks here do not pin the registry directory, record, or
+lock inode and do not establish protection against same-ID path replacement.
 """
 from __future__ import annotations
 
