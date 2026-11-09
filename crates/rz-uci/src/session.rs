@@ -830,11 +830,16 @@ fn checked_option_value(
     let value = match kind {
         OptionKind::Button if text.is_none() => return Ok(None),
         OptionKind::Button => return Err(invalid()),
-        OptionKind::Check { .. } => match text {
-            Some("true") => OptionValue::Check(true),
-            Some("false") => OptionValue::Check(false),
-            _ => return Err(invalid()),
-        },
+        OptionKind::Check { .. } => {
+            let text = text.ok_or_else(invalid)?;
+            if text.eq_ignore_ascii_case("true") {
+                OptionValue::Check(true)
+            } else if text.eq_ignore_ascii_case("false") {
+                OptionValue::Check(false)
+            } else {
+                return Err(invalid());
+            }
+        }
         OptionKind::Spin { min, max, .. } => {
             let text = text.ok_or_else(invalid)?;
             let value = text.parse::<i64>().map_err(|_| invalid())?;
@@ -853,10 +858,23 @@ fn checked_option_value(
         }
         OptionKind::Combo { choices, .. } => {
             let text = text.ok_or_else(invalid)?;
-            if !choices.iter().any(|choice| choice == text) {
-                return Err(invalid());
-            }
-            OptionValue::Combo(text.to_owned())
+            // Preserve exact matches for legacy registrations whose choices
+            // differ only in case. A non-exact spelling is accepted only when
+            // it selects one unambiguous advertised choice.
+            let selected =
+                if let Some(exact) = choices.iter().find(|choice| choice.as_str() == text) {
+                    exact
+                } else {
+                    let mut matches = choices
+                        .iter()
+                        .filter(|choice| choice.eq_ignore_ascii_case(text));
+                    let first = matches.next().ok_or_else(invalid)?;
+                    if matches.next().is_some() {
+                        return Err(invalid());
+                    }
+                    first
+                };
+            OptionValue::Combo(selected.clone())
         }
     };
     Ok(Some(value))

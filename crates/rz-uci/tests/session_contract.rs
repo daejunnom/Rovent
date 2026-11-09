@@ -1212,7 +1212,6 @@ fn options_are_validated_transactionally_and_copied_into_search_start() {
         "setoption name Hash value NaN",
         "setoption name Hash",
         "setoption name Use Cache value yes",
-        "setoption name Use Cache value TRUE",
         "setoption name Search Policy value Unknown",
         "setoption name Weights File value 123456789012345678901",
         "setoption name Clear Hash value 1",
@@ -1245,6 +1244,70 @@ fn options_are_validated_transactionally_and_copied_into_search_start() {
         session.option_values().get("Weights File"),
         Some(&OptionValue::String(String::new()))
     );
+}
+
+#[test]
+fn option_values_ignore_ascii_case_only_when_choice_is_unambiguous() {
+    let mut session = session(FixturePort::default());
+    for (line, name, expected) in [
+        (
+            "setoption name Use Cache value TRUE",
+            "Use Cache",
+            OptionValue::Check(true),
+        ),
+        (
+            "setoption name use cache value FaLsE",
+            "Use Cache",
+            OptionValue::Check(false),
+        ),
+        (
+            "setoption name Search Policy value fixture",
+            "Search Policy",
+            OptionValue::Combo("Fixture".into()),
+        ),
+        (
+            "setoption name Weights File value Ab/Cd.ONNX",
+            "Weights File",
+            OptionValue::String("Ab/Cd.ONNX".into()),
+        ),
+    ] {
+        let out = session.handle_line(line);
+        assert!(out.accepted, "{line}");
+        assert_eq!(session.option_values().get(name), Some(&expected));
+        assert!(
+            matches!(out.effects.as_slice(), [Effect::OptionChanged { name: changed, value }] if changed == name && value == &expected)
+        );
+    }
+
+    let mut specs = options();
+    let policy = specs
+        .iter_mut()
+        .find(|option| option.name == "Search Policy")
+        .unwrap();
+    policy.kind = OptionKind::Combo {
+        default: "Alpha".into(),
+        choices: vec!["Alpha".into(), "aLPHA".into()],
+    };
+    let mut ambiguous = Session::new(
+        FixturePort::default(),
+        identity(),
+        specs,
+        ParserLimits::default(),
+    )
+    .unwrap();
+    for exact in ["Alpha", "aLPHA"] {
+        let out = ambiguous.handle_line(&format!("setoption name Search Policy value {exact}"));
+        assert!(out.accepted);
+        assert!(
+            matches!(out.effects.as_slice(), [Effect::OptionChanged { value: OptionValue::Combo(value), .. }] if value == exact)
+        );
+    }
+    let before = ambiguous.option_values().clone();
+    let rejected = ambiguous.handle_line("setoption name Search Policy value ALPHA");
+    assert!(!rejected.accepted);
+    assert!(has_code(&rejected, "InvalidOption"));
+    assert!(rejected.effects.is_empty());
+    assert_eq!(ambiguous.option_values(), &before);
 }
 
 #[test]
