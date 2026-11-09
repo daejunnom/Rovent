@@ -5578,6 +5578,10 @@ pub fn assemble_pals_core_receipt(
                 view,
                 &options,
                 &per_role[index],
+                crate::external_uci::preflight_advertisement(
+                    &receipts.external_preflight,
+                    &view.id,
+                )?,
             )?;
         }
         let native_pgn_artifact = receipts

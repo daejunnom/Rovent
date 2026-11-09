@@ -245,13 +245,147 @@ pub fn uci_preflight_commands(
     }
     Ok(text.into_bytes())
 }
+
+// The public legacy constructor above predates typed advertisements. Production
+// preflights use this path so an empty string is never mistaken for a button.
+pub(crate) fn typed_uci_preflight_commands(
+    ad: &ExternalUciAdvertisement,
+    requested: &BTreeMap<String, String>,
+    compiler_probe: bool,
+) -> Result<Vec<u8>, ArenaError> {
+    validate_uci_options(ad, &ad.name, requested)?;
+    let mut text = String::from("uci\n");
+    for (name, value) in requested {
+        text.push_str(&uci_option_command(ad, name, value)?);
+        text.push('\n');
+    }
+    text.push_str("isready\nposition startpos\ngo nodes 1\nstop\nisready\n");
+    if compiler_probe {
+        text.push_str("compiler\n");
+    }
+    text.push_str("quit\n");
+    if text.len() > 64 * 1024 {
+        return Err(invalid("protocol input budget exceeded"));
+    }
+    Ok(text.into_bytes())
+}
+
+fn uci_option_command(
+    ad: &ExternalUciAdvertisement,
+    name: &str,
+    value: &str,
+) -> Result<String, ArenaError> {
+    let declaration = ad
+        .options
+        .get(name)
+        .ok_or_else(|| invalid("requested option not advertised"))?;
+    Ok(match declaration {
+        UciOptionDeclaration::Button => format!("setoption name {name}"),
+        _ => format!("setoption name {name} value {value}"),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn requested_commands_observed(
+    ad: &ExternalUciAdvertisement,
+    requested: &BTreeMap<String, String>,
+    sent: &BTreeMap<String, u32>,
+) -> bool {
+    requested.iter().all(|(k, v)| {
+        uci_option_command(ad, k, v)
+            .is_ok_and(|command| sent.get(&command).is_some_and(|n| *n == 2))
+    })
+}
+
+// Fastchess's key=value CLI rejects empty values. Its button adapter uses
+// `true` to send a value-less UCI command; it has no representation for an
+// empty string option. Only an exactly matched original engine argument is
+// rewritten, after the advertisement has been validated.
+#[cfg(target_os = "linux")]
+pub(crate) fn project_fastchess_options(
+    args: &mut [std::ffi::OsString],
+    engine_id: &str,
+    ad: &ExternalUciAdvertisement,
+    requested: &BTreeMap<String, String>,
+) -> Result<(), ArenaError> {
+    validate_uci_options(ad, &ad.name, requested)?;
+    let mut sections = Vec::new();
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "-engine" {
+            let end = args[i + 1..]
+                .iter()
+                .position(|a| a.to_str().is_some_and(|s| s.starts_with('-')))
+                .map_or(args.len(), |offset| i + 1 + offset);
+            if args[i + 1..end]
+                .iter()
+                .any(|a| a == &std::ffi::OsString::from(format!("name={engine_id}")))
+            {
+                sections.push((i + 1, end));
+            }
+        }
+    }
+    if sections.len() != 1 {
+        return Err(invalid("engine option section missing or ambiguous"));
+    }
+    let (start, end) = sections[0];
+    let mut changes = Vec::new();
+    for (name, value) in requested {
+        let declaration = ad
+            .options
+            .get(name)
+            .ok_or_else(|| invalid("requested option not advertised"))?;
+        if value.is_empty() && !matches!(declaration, UciOptionDeclaration::Button) {
+            return Err(invalid(
+                "empty string option unsupported by pinned Fastchess CLI",
+            ));
+        }
+        let prefix = format!("option.{name}=");
+        let indices: Vec<_> = (start..end)
+            .filter(|&i| args[i].to_str().is_some_and(|s| s.starts_with(&prefix)))
+            .collect();
+        if indices.len() != 1
+            || args[indices[0]] != std::ffi::OsString::from(format!("{prefix}{value}"))
+        {
+            return Err(invalid(
+                "engine option argument missing, changed or ambiguous",
+            ));
+        }
+        if matches!(declaration, UciOptionDeclaration::Button) {
+            changes.push((
+                indices[0],
+                std::ffi::OsString::from(format!("{prefix}true")),
+            ));
+        }
+    }
+    for (index, value) in changes {
+        args[index] = value;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn preflight_advertisement<'a>(
+    receipts: &'a [ExternalUciPreflight],
+    engine_id: &str,
+) -> Result<&'a ExternalUciAdvertisement, ArenaError> {
+    let mut found = receipts.iter().filter(|p| p.engine_id == engine_id);
+    let receipt = found
+        .next()
+        .ok_or_else(|| invalid("engine preflight advertisement missing"))?;
+    if found.next().is_some() {
+        return Err(invalid("engine preflight advertisement ambiguous"));
+    }
+    Ok(&receipt.advertisement)
+}
 #[cfg(target_os = "linux")]
 pub(crate) fn audit_external_game_protocol(
     stdout: &[u8],
     e: &ExternalUciEndpointV2,
     resolved_options: &BTreeMap<String, String>,
     external_pids: &[u32],
+    ad: &ExternalUciAdvertisement,
 ) -> Result<ExternalGameObservation, ArenaError> {
+    validate_uci_options(ad, &e.expected_uci_name, resolved_options)?;
     let text = std::str::from_utf8(stdout).map_err(|_| invalid("runner log is not UTF-8"))?;
     if text.len() > 64 * 1024 * 1024 {
         return Err(invalid("runner trace budget exceeded"));
@@ -286,10 +420,7 @@ pub(crate) fn audit_external_game_protocol(
             _ => {}
         }
     }
-    let options_ok = resolved_options.iter().all(|(k, v)| {
-        sent.get(&format!("setoption name {k} value {v}"))
-            .is_some_and(|n| *n == 2)
-    });
+    let options_ok = requested_commands_observed(ad, resolved_options, &sent);
     if names.len() != 2
         || names.iter().any(|n| n != &e.expected_uci_name)
         || uciok_count != 2
@@ -384,5 +515,72 @@ mod tests {
                 .unwrap()
                 .contains("\"actual_value\":null")
         );
+    }
+
+    #[test]
+    fn typed_preflight_distinguishes_button_and_empty_string() {
+        let ad = parse_uci_advertisement(b"id name Test\noption name Clear Hash type button\noption name Path type string default\nuciok\n").unwrap();
+        let requested =
+            BTreeMap::from([("Clear Hash".into(), "".into()), ("Path".into(), "".into())]);
+        let wire = String::from_utf8(typed_uci_preflight_commands(&ad, &requested, false).unwrap())
+            .unwrap();
+        assert!(wire.contains("setoption name Clear Hash\n"));
+        assert!(wire.contains("setoption name Path value \n"));
+        assert!(!wire.contains("setoption name Clear Hash value"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fastchess_projection_requires_advertised_button_and_exact_engine_arguments() {
+        use std::ffi::OsString;
+        let ad = parse_uci_advertisement(b"id name Test\noption name Clear Hash type button\noption name Path type string default\nuciok\n").unwrap();
+        let button = BTreeMap::from([("Clear Hash".into(), "".into())]);
+        let original: Vec<OsString> = [
+            "-engine",
+            "name=first",
+            "option.Clear Hash=",
+            "-engine",
+            "name=second",
+            "option.Clear Hash=",
+            "-each",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        let mut args = original.clone();
+        project_fastchess_options(&mut args, "first", &ad, &button).unwrap();
+        assert_eq!(args[2], "option.Clear Hash=true");
+        assert_eq!(args[5], "option.Clear Hash=");
+        assert!(project_fastchess_options(&mut args, "first", &ad, &button).is_err());
+        let mut missing = original.clone();
+        assert!(project_fastchess_options(&mut missing, "absent", &ad, &button).is_err());
+        assert_eq!(missing, original);
+        let mut duplicate = original.clone();
+        duplicate.insert(3, "option.Clear Hash=".into());
+        assert!(project_fastchess_options(&mut duplicate, "first", &ad, &button).is_err());
+        let mut empty_string = original;
+        empty_string[2] = "option.Path=".into();
+        let before = empty_string.clone();
+        let requested = BTreeMap::from([("Path".into(), "".into())]);
+        assert!(project_fastchess_options(&mut empty_string, "first", &ad, &requested).is_err());
+        assert_eq!(empty_string, before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn game_audit_requires_typed_exact_wire_commands() {
+        let ad = parse_uci_advertisement(b"id name Test\noption name Clear Hash type button\noption name Path type string default\nuciok\n").unwrap();
+        let requested = BTreeMap::from([
+            ("Clear Hash".into(), "".into()),
+            ("Path".into(), "abc".into()),
+        ]);
+        let mut sent = BTreeMap::from([
+            ("setoption name Clear Hash".into(), 2),
+            ("setoption name Path value abc".into(), 2),
+        ]);
+        assert!(requested_commands_observed(&ad, &requested, &sent));
+        sent.remove("setoption name Clear Hash");
+        sent.insert("setoption name Clear Hash value ".into(), 2);
+        assert!(!requested_commands_observed(&ad, &requested, &sent));
     }
 }

@@ -4424,7 +4424,11 @@ pub(crate) mod linux {
             preflight_runtime_totals(owner)?;
             let advertisement = crate::parse_uci_advertisement(&process.stdout)?;
             crate::validate_uci_options(&advertisement, &e.expected_uci_name, &requested)?;
-            let commands = crate::uci_preflight_commands(&requested, e.family == "stockfish")?;
+            let commands = crate::external_uci::typed_uci_preflight_commands(
+                &advertisement,
+                &requested,
+                e.family == "stockfish",
+            )?;
             preflight_runtime_totals(owner)?;
             limits.wall_ms = clamp_original_wall(
                 limits.wall_ms,
@@ -4703,6 +4707,29 @@ pub(crate) mod linux {
         let (external_preflight, preflight_artifacts) =
             preflight_endpoints(bundle, cancel, run_id, v6_deadline)?;
         let owner = bundle.owner.as_mut().expect("prepared native owner");
+        // The invocation (including any V6 listener overrides) was assembled
+        // before engine identification. Apply only the validated option adapter
+        // in place, while preserving all other original invocation arguments.
+        for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+            if let Some(e) = owner.spec.engine_view(role)?.external {
+                let requested = owner
+                    .spec
+                    .external_options(role)?
+                    .iter()
+                    .map(|(k, v)| {
+                        crate::external_uci::resolve_asset_tokens(v, e, &owner.snapshot.pins)
+                            .map(|v| (k.clone(), v))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
+                let ad = crate::external_uci::preflight_advertisement(&external_preflight, &e.id)?;
+                crate::external_uci::project_fastchess_options(
+                    &mut owner.snapshot.invocation.args,
+                    &e.id,
+                    ad,
+                    &requested,
+                )?;
+            }
+        }
         crate::emit_native_phase("prelaunch_verification_started");
         let mut rolling = SnapshotCacheHint::rolling(
             owner.spec.advise_drop_input_cache(),
@@ -5027,6 +5054,9 @@ pub(crate) mod linux {
                                         e,
                                         &options,
                                         &role_pids,
+                                        crate::external_uci::preflight_advertisement(
+                                            &receipt.external_preflight, &e.id,
+                                        )?,
                                     )
                                 }) {
                                 Ok(a) => receipt.external_execution.push(a),
