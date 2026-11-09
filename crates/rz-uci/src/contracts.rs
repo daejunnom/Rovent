@@ -527,7 +527,9 @@ impl ContractSessionOwner {
                 };
                 match built {
                     Ok(current) => {
-                        if limits.uses_default_resource_limits() {
+                        if limits.uses_default_resource_limits(
+                            current.binding.budget_kind() == BudgetKind::UciTime,
+                        ) {
                             let wall_ms = self.settings.untimed_limit.as_millis();
                             let notice = match current.binding.node_budget_semantics() {
                                 NodeBudgetSemantics::LegacySimulations => format!(
