@@ -85,6 +85,11 @@ const MAX_LOCK_BYTES: u64 = 1 << 20;
 const MAX_SELECTION_BYTES: u64 = 64 << 10;
 
 mod cohort_prepare;
+// Compile the unconnected outer-owner transport only for focused Linux tests.
+// This declaration is not a product dispatch or an admission capability.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "launch/owner_ipc.rs"]
+mod owner_ipc_test_only;
 mod collection;
 mod collection_v2_observer;
 #[cfg(test)]
