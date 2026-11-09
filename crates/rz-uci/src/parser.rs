@@ -73,12 +73,11 @@ pub struct GoLimits {
 impl GoLimits {
     /// No UCI stop criterion was supplied; the configured resource profile
     /// remains a finite execution boundary and must be reported to the GUI.
-    pub(crate) fn uses_default_resource_limits(&self) -> bool {
+    pub(crate) fn uses_default_resource_limits(&self, has_uci_time_budget: bool) -> bool {
         !self.infinite
             && !self.ponder
             && self.movetime_ms.is_none()
-            && self.white_time_ms.is_none()
-            && self.black_time_ms.is_none()
+            && !has_uci_time_budget
             && self.nodes.is_none()
             && self.depth_plies.is_none()
             && self.mate_moves.is_none()
@@ -475,9 +474,6 @@ fn parse_go(
         i += 2;
     }
     let has_clock = limits.white_time_ms.is_some() || limits.black_time_ms.is_some();
-    if limits.white_time_ms.is_some() != limits.black_time_ms.is_some() {
-        return Err(ParseError::Malformed("clock mode requires wtime and btime"));
-    }
     if !has_clock
         && (limits.white_increment_ms.is_some()
             || limits.black_increment_ms.is_some()

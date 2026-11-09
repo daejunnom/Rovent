@@ -342,13 +342,60 @@ fn go_parses_each_supported_budget_mode_without_losing_units() {
 }
 
 #[test]
+fn go_accepts_either_side_clock_without_inventing_the_other() {
+    for (line, expected) in [
+        (
+            "go wtime 1000",
+            GoLimits {
+                white_time_ms: Some(1000),
+                ..GoLimits::default()
+            },
+        ),
+        (
+            "go btime 0",
+            GoLimits {
+                black_time_ms: Some(0),
+                ..GoLimits::default()
+            },
+        ),
+        (
+            "go ponder wtime 1000 winc 7 nodes 4",
+            GoLimits {
+                ponder: true,
+                white_time_ms: Some(1000),
+                white_increment_ms: Some(7),
+                nodes: Some(4),
+                ..GoLimits::default()
+            },
+        ),
+        (
+            "go movetime 20 btime 1000 binc 9",
+            GoLimits {
+                movetime_ms: Some(20),
+                black_time_ms: Some(1000),
+                black_increment_ms: Some(9),
+                ..GoLimits::default()
+            },
+        ),
+    ] {
+        assert_eq!(parse_default(line), Ok(Command::Go(expected)), "{line}");
+    }
+    assert!(matches!(
+        parse_default("go infinite wtime 1"),
+        Err(ParseError::Malformed(_))
+    ));
+    assert!(matches!(
+        parse_default("go infinite btime 1"),
+        Err(ParseError::Malformed(_))
+    ));
+}
+
+#[test]
 fn go_rejects_conflicts_missing_fields_duplicates_and_overflow() {
     for line in [
         "go movetime",
         "go nodes 0",
         "go movestogo 0 wtime 1 btime 1",
-        "go wtime 1",
-        "go btime 1",
         "go winc 1",
         "go binc 1",
         "go movestogo 1",

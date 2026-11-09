@@ -406,22 +406,18 @@ impl PreparedSearchBinding {
             NodeBudgetSemantics::RoventPositionVisits => settings.max_simulations,
         };
 
-        let clock_control = if let (Some(white), Some(black)) =
-            (limits.white_time_ms, limits.black_time_ms)
-        {
-            // validate_limits established that both side clocks exist.
-            let (remaining, increment) = match side {
-                SideToMove::White => (white, limits.white_increment_ms.unwrap_or(0)),
-                SideToMove::Black => (black, limits.black_increment_ms.unwrap_or(0)),
-            };
-            Some(TimeControl::Clock {
-                remaining: Duration::from_millis(remaining),
-                increment: Duration::from_millis(increment),
-                moves_to_go: limits.moves_to_go,
-            })
-        } else {
-            None
+        // The opponent's clock never supplies a budget for the side to move.
+        // If the current side's clock is absent, the independent movetime or
+        // the configured finite resource wall remains the controlling budget.
+        let (remaining, increment) = match side {
+            SideToMove::White => (limits.white_time_ms, limits.white_increment_ms.unwrap_or(0)),
+            SideToMove::Black => (limits.black_time_ms, limits.black_increment_ms.unwrap_or(0)),
         };
+        let clock_control = remaining.map(|remaining| TimeControl::Clock {
+            remaining: Duration::from_millis(remaining),
+            increment: Duration::from_millis(increment),
+            moves_to_go: limits.moves_to_go,
+        });
         let movetime_control = limits
             .movetime_ms
             .map(|value| TimeControl::MoveTime(Duration::from_millis(value)));
@@ -572,11 +568,6 @@ fn validate_limits(
         return Err(BuildSearchError::InvalidGo("movestogo must be positive"));
     }
     let has_clock = limits.white_time_ms.is_some() || limits.black_time_ms.is_some();
-    if limits.white_time_ms.is_some() != limits.black_time_ms.is_some() {
-        return Err(BuildSearchError::InvalidGo(
-            "clock mode requires both side clocks",
-        ));
-    }
     if !has_clock
         && (limits.white_increment_ms.is_some()
             || limits.black_increment_ms.is_some()
@@ -673,6 +664,75 @@ mod tests {
     }
 
     #[test]
+    fn single_side_clock_uses_only_current_side_and_preserves_finite_fallback() {
+        let now = Instant::now();
+        for semantics in [
+            NodeBudgetSemantics::LegacySimulations,
+            NodeBudgetSemantics::RoventPositionVisits,
+        ] {
+            for (side, line, remaining, increment) in [
+                (SideToMove::White, "go wtime 30000 winc 1000", 30000, 1000),
+                (SideToMove::Black, "go btime 60000 binc 2000", 60000, 2000),
+                (SideToMove::White, "go wtime 0 winc 1000", 0, 1000),
+                (SideToMove::Black, "go btime 0 binc 2000", 0, 2000),
+            ] {
+                let (_, limits) = start(&mut session(), line);
+                let actual =
+                    PreparedSearchBinding::prepare(&limits, side, now, settings(), None, semantics)
+                        .unwrap();
+                let expected = TimeBudget::new(
+                    now,
+                    TimeControl::Clock {
+                        remaining: Duration::from_millis(remaining),
+                        increment: Duration::from_millis(increment),
+                        moves_to_go: None,
+                    },
+                    settings().time_config,
+                )
+                .unwrap();
+                assert_eq!(*actual.budget(), expected, "{line}");
+                assert_eq!(actual.budget_kind(), BudgetKind::UciTime);
+            }
+            for (side, line) in [
+                (SideToMove::White, "go btime 60000 binc 2000"),
+                (SideToMove::Black, "go wtime 30000 winc 1000"),
+            ] {
+                let (_, limits) = start(&mut session(), line);
+                let actual =
+                    PreparedSearchBinding::prepare(&limits, side, now, settings(), None, semantics)
+                        .unwrap();
+                let expected = TimeBudget::new(
+                    now,
+                    TimeControl::MoveTime(settings().untimed_limit),
+                    settings().time_config,
+                )
+                .unwrap();
+                assert_eq!(*actual.budget(), expected, "{line}");
+                assert_eq!(actual.budget_kind(), BudgetKind::ResourceWall);
+                let mut bounded = limits.clone();
+                bounded.movetime_ms = Some(1500);
+                let actual = PreparedSearchBinding::prepare(
+                    &bounded,
+                    side,
+                    now,
+                    settings(),
+                    None,
+                    semantics,
+                )
+                .unwrap();
+                let expected = TimeBudget::new(
+                    now,
+                    TimeControl::MoveTime(Duration::from_millis(1500)),
+                    settings().time_config,
+                )
+                .unwrap();
+                assert_eq!(*actual.budget(), expected, "{line}");
+                assert_eq!(actual.budget_kind(), BudgetKind::UciTime);
+            }
+        }
+    }
+
+    #[test]
     fn own_side_clock_and_increment_are_selected_from_checked_side() {
         let now = Instant::now();
         let (ticket, limits) = start(
@@ -727,7 +787,12 @@ mod tests {
                     .zip(expected_allocations)
                 {
                     let combined = PreparedSearchBinding::prepare(
-                        &limits, side, now, settings(), None, semantics,
+                        &limits,
+                        side,
+                        now,
+                        settings(),
+                        None,
+                        semantics,
                     )
                     .unwrap();
                     let mut move_only = limits.clone();
@@ -736,14 +801,24 @@ mod tests {
                     move_only.white_increment_ms = None;
                     move_only.black_increment_ms = None;
                     let move_budget = *PreparedSearchBinding::prepare(
-                        &move_only, side, now, settings(), None, semantics,
+                        &move_only,
+                        side,
+                        now,
+                        settings(),
+                        None,
+                        semantics,
                     )
                     .unwrap()
                     .budget();
                     let mut clock_only = limits.clone();
                     clock_only.movetime_ms = None;
                     let clock_budget = *PreparedSearchBinding::prepare(
-                        &clock_only, side, now, settings(), None, semantics,
+                        &clock_only,
+                        side,
+                        now,
+                        settings(),
+                        None,
+                        semantics,
                     )
                     .unwrap()
                     .budget();
@@ -755,7 +830,9 @@ mod tests {
                     );
                     assert_eq!(
                         actual.admission_deadline,
-                        move_budget.admission_deadline.min(clock_budget.admission_deadline)
+                        move_budget
+                            .admission_deadline
+                            .min(clock_budget.admission_deadline)
                     );
                     assert_eq!(
                         actual.hard_deadline,
@@ -763,9 +840,14 @@ mod tests {
                     );
                     assert_eq!(
                         actual.output_deadline,
-                        move_budget.output_deadline.min(clock_budget.output_deadline)
+                        move_budget
+                            .output_deadline
+                            .min(clock_budget.output_deadline)
                     );
-                    assert_eq!(actual.allocation, move_budget.allocation.min(clock_budget.allocation));
+                    assert_eq!(
+                        actual.allocation,
+                        move_budget.allocation.min(clock_budget.allocation)
+                    );
                     assert_eq!(combined.budget_kind(), BudgetKind::UciTime);
                 }
             }
@@ -817,7 +899,7 @@ mod tests {
         let active = session.active_ticket();
         let invalid = PreparedSearchBinding::prepare(
             &GoLimits {
-                white_time_ms: Some(1000),
+                moves_to_go: Some(0),
                 ..GoLimits::default()
             },
             SideToMove::White,
@@ -1353,6 +1435,7 @@ mod tests {
             },
             GoLimits {
                 white_time_ms: Some(1000),
+                infinite: true,
                 ..GoLimits::default()
             },
             GoLimits {

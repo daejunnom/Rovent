@@ -446,11 +446,224 @@ fn assert_mixed_boundaries(
     move_budget: &rz_search::time::TimeBudget,
     clock_budget: &rz_search::time::TimeBudget,
 ) {
-    assert_eq!(actual.soft_deadline, move_budget.soft_deadline.min(clock_budget.soft_deadline));
-    assert_eq!(actual.admission_deadline, move_budget.admission_deadline.min(clock_budget.admission_deadline));
-    assert_eq!(actual.hard_deadline, move_budget.hard_deadline.min(clock_budget.hard_deadline));
-    assert_eq!(actual.output_deadline, move_budget.output_deadline.min(clock_budget.output_deadline));
-    assert_eq!(actual.allocation, move_budget.allocation.min(clock_budget.allocation));
+    assert_eq!(
+        actual.soft_deadline,
+        move_budget.soft_deadline.min(clock_budget.soft_deadline)
+    );
+    assert_eq!(
+        actual.admission_deadline,
+        move_budget
+            .admission_deadline
+            .min(clock_budget.admission_deadline)
+    );
+    assert_eq!(
+        actual.hard_deadline,
+        move_budget.hard_deadline.min(clock_budget.hard_deadline)
+    );
+    assert_eq!(
+        actual.output_deadline,
+        move_budget
+            .output_deadline
+            .min(clock_budget.output_deadline)
+    );
+    assert_eq!(
+        actual.allocation,
+        move_budget.allocation.min(clock_budget.allocation)
+    );
+}
+
+#[test]
+fn actual_owner_single_side_clock_uses_current_side_or_finite_wall() {
+    use rz_search::time::{TimeBudget, TimeControl};
+    for (position, command, own_remaining, increment, notice) in [
+        (
+            "position startpos",
+            "go wtime 30000 winc 1000",
+            Some(30000),
+            1000,
+            false,
+        ),
+        (
+            "position startpos moves e2e4",
+            "go btime 60000 binc 2000",
+            Some(60000),
+            2000,
+            false,
+        ),
+        (
+            "position startpos",
+            "go btime 60000 binc 2000",
+            None,
+            0,
+            true,
+        ),
+        (
+            "position startpos moves e2e4",
+            "go wtime 30000 winc 1000",
+            None,
+            0,
+            true,
+        ),
+        (
+            "position startpos",
+            "go movetime 4000 btime 60000",
+            None,
+            0,
+            false,
+        ),
+    ] {
+        let (mut owner, mut session, acknowledgments) = search_driver_output_fixture(false);
+        let gate = install_probe(&mut owner, &mut session);
+        let (sender, events) = event_channel();
+        let mut positioned = owner.handle(&mut session, Event::Line(position.into()));
+        assert!(positioned.accepted, "{:?}", positioned.diagnostics);
+        dispatch_all(&mut owner, &sender, &mut positioned);
+        let mut start = owner.handle(&mut session, Event::Line(command.into()));
+        assert!(start.accepted, "{command}: {:?}", start.diagnostics);
+        assert_eq!(
+            start
+                .protocol
+                .iter()
+                .any(|line| line.contains("go uses configured resource wall")),
+            notice,
+            "{command}"
+        );
+        dispatch_all(&mut owner, &sender, &mut start);
+        let delivered = gate.delivered();
+        let actual = delivered.context.original_time_budget.unwrap();
+        let control = if let Some(remaining) = own_remaining {
+            TimeControl::Clock {
+                remaining: Duration::from_millis(remaining),
+                increment: Duration::from_millis(increment),
+                moves_to_go: None,
+            }
+        } else if command.contains("movetime") {
+            TimeControl::MoveTime(Duration::from_millis(4000))
+        } else {
+            TimeControl::MoveTime(owner.settings.search.untimed_limit)
+        };
+        let expected =
+            TimeBudget::new(actual.start, control, owner.settings.search.time_config).unwrap();
+        assert_eq!(actual, expected, "{command}");
+        let completed = finish_worker(&mut owner, &mut session, &events);
+        let moves = bestmoves(&completed);
+        assert_eq!(moves.len(), 1, "{command}");
+        let movement = BoardMove::from_uci(moves[0]).unwrap();
+        assert!(
+            delivered
+                .position
+                .ordered_legal_moves()
+                .moves()
+                .contains(&movement)
+        );
+        assert_eq!(acknowledgments.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn actual_owner_single_side_ponderhit_keeps_worker_and_side_budget() {
+    use rz_search::time::{TimeBudget, TimeControl};
+    for (position, command, own_remaining, increment) in [
+        (
+            "position startpos",
+            "go ponder wtime 30000 winc 1000 nodes 7",
+            Some(30000),
+            1000,
+        ),
+        (
+            "position startpos moves e2e4",
+            "go ponder btime 60000 binc 2000 nodes 7",
+            Some(60000),
+            2000,
+        ),
+        (
+            "position startpos",
+            "go ponder btime 60000 nodes 7",
+            None,
+            0,
+        ),
+        (
+            "position startpos moves e2e4",
+            "go ponder wtime 30000 nodes 7",
+            None,
+            0,
+        ),
+    ] {
+        let (mut owner, mut session, acknowledgments) = search_driver_output_fixture(false);
+        let gate = install_probe(&mut owner, &mut session);
+        let (sender, events) = event_channel();
+        let mut positioned = owner.handle(&mut session, Event::Line(position.into()));
+        assert!(positioned.accepted, "{:?}", positioned.diagnostics);
+        dispatch_all(&mut owner, &sender, &mut positioned);
+        let mut start = owner.handle(&mut session, Event::Line(command.into()));
+        assert!(start.accepted, "{command}: {:?}", start.diagnostics);
+        assert!(
+            !start
+                .protocol
+                .iter()
+                .any(|line| line.contains("go uses configured resource wall"))
+        );
+        let ticket = session.active_ticket().unwrap();
+        dispatch_all(&mut owner, &sender, &mut start);
+        let delivered = gate.delivered();
+        let original = delivered.context.original_time_budget.unwrap();
+        let hit_result = owner.handle(&mut session, Event::Line("ponderhit".into()));
+        assert!(hit_result.accepted, "{:?}", hit_result.diagnostics);
+        no_restart_or_cancel(&hit_result);
+        assert_eq!(session.active_ticket(), Some(ticket));
+        gate.wait_for(|state| state.observed_hit);
+        let snapshot = delivered
+            .context
+            .effective_clock
+            .as_ref()
+            .unwrap()
+            .snapshot(Instant::now());
+        let hit = snapshot.hit().unwrap();
+        let control = if let Some(remaining) = own_remaining {
+            TimeControl::Clock {
+                remaining: Duration::from_millis(remaining),
+                increment: Duration::from_millis(increment),
+                moves_to_go: None,
+            }
+        } else {
+            TimeControl::MoveTime(owner.settings.search.untimed_limit)
+        };
+        let recomputed =
+            TimeBudget::new(hit.hit_at(), control, owner.settings.search.time_config).unwrap();
+        let effective = hit.budget();
+        assert_eq!(
+            effective.soft_deadline,
+            original.soft_deadline.min(recomputed.soft_deadline)
+        );
+        assert_eq!(
+            effective.admission_deadline,
+            original
+                .admission_deadline
+                .min(recomputed.admission_deadline)
+        );
+        assert_eq!(
+            effective.hard_deadline,
+            original.hard_deadline.min(recomputed.hard_deadline)
+        );
+        assert_eq!(
+            effective.output_deadline,
+            original.output_deadline.min(recomputed.output_deadline)
+        );
+        assert_eq!(gate.state.lock().unwrap().runs, 1);
+        gate.release();
+        let completed = finish_worker(&mut owner, &mut session, &events);
+        let moves = bestmoves(&completed);
+        assert_eq!(moves.len(), 1, "{command}");
+        let movement = BoardMove::from_uci(moves[0]).unwrap();
+        assert!(
+            delivered
+                .position
+                .ordered_legal_moves()
+                .moves()
+                .contains(&movement)
+        );
+        assert_eq!(acknowledgments.lock().unwrap().len(), 1);
+    }
 }
 
 #[test]
@@ -466,24 +679,42 @@ fn actual_owner_driver_mixed_time_for_both_sides_publishes_legal_bestmove() {
             let mut positioned = owner.handle(&mut session, Event::Line(position.into()));
             assert!(positioned.accepted, "{:?}", positioned.diagnostics);
             dispatch_all(&mut owner, &sender, &mut positioned);
-            let command = format!("go movetime {movetime} wtime 30000 btime 60000 winc 1000 binc 2000 nodes 7");
+            let command = format!(
+                "go movetime {movetime} wtime 30000 btime 60000 winc 1000 binc 2000 nodes 7"
+            );
             let mut start = owner.handle(&mut session, Event::Line(command));
             assert!(start.accepted, "{:?}", start.diagnostics);
             dispatch_all(&mut owner, &sender, &mut start);
             let delivered = gate.delivered();
             let actual = delivered.context.original_time_budget.unwrap();
             let (move_budget, clock_budget) = mixed_expected_budgets(
-                actual.start, owner.settings.search.time_config, movetime, remaining, increment,
+                actual.start,
+                owner.settings.search.time_config,
+                movetime,
+                remaining,
+                increment,
             );
             assert_mixed_boundaries(&actual, &move_budget, &clock_budget);
-            assert_eq!(delivered.context.control.soft_deadline, actual.soft_deadline);
-            assert_eq!(delivered.context.control.admission_deadline, actual.admission_deadline);
+            assert_eq!(
+                delivered.context.control.soft_deadline,
+                actual.soft_deadline
+            );
+            assert_eq!(
+                delivered.context.control.admission_deadline,
+                actual.admission_deadline
+            );
             assert_eq!(delivered.context.control.deadline, actual.hard_deadline);
             let completed = finish_worker(&mut owner, &mut session, &events);
             let moves = bestmoves(&completed);
             assert_eq!(moves.len(), 1);
             let movement = BoardMove::from_uci(moves[0]).unwrap();
-            assert!(delivered.position.ordered_legal_moves().moves().contains(&movement));
+            assert!(
+                delivered
+                    .position
+                    .ordered_legal_moves()
+                    .moves()
+                    .contains(&movement)
+            );
             assert_eq!(acknowledgments.lock().unwrap().len(), 1);
         }
     }
@@ -502,7 +733,9 @@ fn actual_owner_ponderhit_mixed_time_is_capped_and_keeps_same_worker() {
             let mut positioned = owner.handle(&mut session, Event::Line(position.into()));
             assert!(positioned.accepted, "{:?}", positioned.diagnostics);
             dispatch_all(&mut owner, &sender, &mut positioned);
-            let command = format!("go ponder movetime {movetime} wtime 30000 btime 60000 winc 1000 binc 2000 nodes 7");
+            let command = format!(
+                "go ponder movetime {movetime} wtime 30000 btime 60000 winc 1000 binc 2000 nodes 7"
+            );
             let mut start = owner.handle(&mut session, Event::Line(command));
             assert!(start.accepted, "{:?}", start.diagnostics);
             let ticket = session.active_ticket().unwrap();
@@ -514,25 +747,67 @@ fn actual_owner_ponderhit_mixed_time_is_capped_and_keeps_same_worker() {
             no_restart_or_cancel(&hit_result);
             assert_eq!(session.active_ticket(), Some(ticket));
             gate.wait_for(|state| state.observed_hit);
-            let snapshot = delivered.context.effective_clock.as_ref().unwrap().snapshot(Instant::now());
+            let snapshot = delivered
+                .context
+                .effective_clock
+                .as_ref()
+                .unwrap()
+                .snapshot(Instant::now());
             let hit = snapshot.hit().unwrap();
             let (move_budget, clock_budget) = mixed_expected_budgets(
-                hit.hit_at(), owner.settings.search.time_config, movetime, remaining, increment,
+                hit.hit_at(),
+                owner.settings.search.time_config,
+                movetime,
+                remaining,
+                increment,
             );
             let effective = hit.budget();
-            assert_eq!(effective.soft_deadline, original.soft_deadline.min(move_budget.soft_deadline).min(clock_budget.soft_deadline));
-            assert_eq!(effective.admission_deadline, original.admission_deadline.min(move_budget.admission_deadline).min(clock_budget.admission_deadline));
-            assert_eq!(effective.hard_deadline, original.hard_deadline.min(move_budget.hard_deadline).min(clock_budget.hard_deadline));
-            assert_eq!(effective.output_deadline, original.output_deadline.min(move_budget.output_deadline).min(clock_budget.output_deadline));
+            assert_eq!(
+                effective.soft_deadline,
+                original
+                    .soft_deadline
+                    .min(move_budget.soft_deadline)
+                    .min(clock_budget.soft_deadline)
+            );
+            assert_eq!(
+                effective.admission_deadline,
+                original
+                    .admission_deadline
+                    .min(move_budget.admission_deadline)
+                    .min(clock_budget.admission_deadline)
+            );
+            assert_eq!(
+                effective.hard_deadline,
+                original
+                    .hard_deadline
+                    .min(move_budget.hard_deadline)
+                    .min(clock_budget.hard_deadline)
+            );
+            assert_eq!(
+                effective.output_deadline,
+                original
+                    .output_deadline
+                    .min(move_budget.output_deadline)
+                    .min(clock_budget.output_deadline)
+            );
             assert_eq!(effective.start, original.start);
-            assert_eq!(effective.start + effective.allocation, effective.output_deadline);
+            assert_eq!(
+                effective.start + effective.allocation,
+                effective.output_deadline
+            );
             assert_eq!(gate.state.lock().unwrap().runs, 1);
             gate.release();
             let completed = finish_worker(&mut owner, &mut session, &events);
             let moves = bestmoves(&completed);
             assert_eq!(moves.len(), 1);
             let movement = BoardMove::from_uci(moves[0]).unwrap();
-            assert!(delivered.position.ordered_legal_moves().moves().contains(&movement));
+            assert!(
+                delivered
+                    .position
+                    .ordered_legal_moves()
+                    .moves()
+                    .contains(&movement)
+            );
             assert_eq!(acknowledgments.lock().unwrap().len(), 1);
         }
     }
