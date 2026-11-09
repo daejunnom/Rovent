@@ -37,6 +37,9 @@ pub(crate) enum TeacherPolicyConsumerProgressV3 {
     Appended,
     AppendedEvidenceStored,
     ChunkReady,
+    /// The original revoked row and capability are held by this root's
+    /// retained owner; the original completion is still held here.
+    CanceledRetained,
     Rejected,
     Unknown,
 }
@@ -58,6 +61,8 @@ pub(crate) struct TeacherPolicyConsumerV3 {
     appended_in_output: bool,
     processed: TeacherProcessedOwnerV3,
     retained: PolicyRootRetainedOwnerV3,
+    pc_revoked_retention_pending: bool,
+    pc_revoked_retained: bool,
     authority_unknown: bool,
 }
 
@@ -68,6 +73,24 @@ struct TeacherProcessedV3 {
     admission: RoventCollectionRootAdmissionV3,
     capacity: usize,
     originals: Vec<TeacherCompletedV3>,
+    /// Canceled tickets are not successful policy publications.
+    revoked: Vec<TeacherCompletedV3>,
+}
+
+fn completion_retention_has_space(successful: usize, revoked: usize, capacity: usize) -> bool {
+    successful.saturating_add(revoked) < capacity
+}
+
+#[cfg(test)]
+mod completion_retention_tests {
+    use super::completion_retention_has_space;
+
+    #[test]
+    fn successful_and_revoked_completions_share_the_root_bound() {
+        assert!(completion_retention_has_space(1, 1, 3));
+        assert!(!completion_retention_has_space(2, 1, 3));
+        assert!(!completion_retention_has_space(usize::MAX, 1, 3));
+    }
 }
 
 /// The same bounded original-completion owner must be held by root recovery
@@ -87,6 +110,7 @@ impl TeacherProcessedOwnerV3 {
             admission,
             capacity,
             originals: Vec::new(),
+            revoked: Vec::new(),
         }))))
     }
     pub(crate) fn same_owner(&self, other: &Self) -> bool {
@@ -209,6 +233,8 @@ impl TeacherPolicyConsumerOwnerV3 {
                 appended_in_output: false,
                 processed: processed.clone(),
                 retained: retained.clone(),
+                pc_revoked_retention_pending: false,
+                pc_revoked_retained: false,
                 authority_unknown: false,
             }),
         ))))
@@ -533,6 +559,74 @@ impl TeacherPolicyConsumerV3 {
         })
     }
 
+    /// P-C only: quarantine an exact revoked ticket in its original root
+    /// while holding the same shared-pipeline guard that observed rejection.
+    /// A busy/full retained owner leaves the original shared slot untouched;
+    /// later calls retry retention and never append the rejected ticket again.
+    pub(crate) fn try_append_policy_pc(
+        &mut self,
+    ) -> Result<TeacherPolicyConsumerProgressV3, ArenaError> {
+        if self.authority_unknown {
+            return Ok(TeacherPolicyConsumerProgressV3::Unknown);
+        }
+        if !self.prepared_transferred || self.policy_appended {
+            return Ok(TeacherPolicyConsumerProgressV3::NotReady);
+        }
+        let Some(completed) = self.completed.as_ref() else {
+            return Ok(TeacherPolicyConsumerProgressV3::NotReady);
+        };
+        let ticket = completed.capsule.ticket();
+        let admission = completed.capsule.admission();
+        let mut pipeline = match self.pipeline.try_lock().map_err(invalid)? {
+            Some(guard) => guard,
+            None => return Ok(TeacherPolicyConsumerProgressV3::Busy),
+        };
+        if !self.pc_revoked_retention_pending {
+            match pipeline.try_append(admission, &ticket) {
+                PolicyPipelineProgressV3::Appended => {
+                    self.policy_appended = true;
+                    return Ok(TeacherPolicyConsumerProgressV3::Appended);
+                }
+                PolicyPipelineProgressV3::ChunkReady => {
+                    return Ok(TeacherPolicyConsumerProgressV3::ChunkReady);
+                }
+                PolicyPipelineProgressV3::Busy => return Ok(TeacherPolicyConsumerProgressV3::Busy),
+                PolicyPipelineProgressV3::NotReady => {
+                    return Ok(TeacherPolicyConsumerProgressV3::NotReady);
+                }
+                PolicyPipelineProgressV3::Unknown => {
+                    self.authority_unknown = true;
+                    return Ok(TeacherPolicyConsumerProgressV3::Unknown);
+                }
+                PolicyPipelineProgressV3::Failed => {
+                    if !pipeline.known_revocation_matches(admission, &ticket) {
+                        return Ok(TeacherPolicyConsumerProgressV3::Rejected);
+                    }
+                    self.pc_revoked_retention_pending = true;
+                }
+            }
+        }
+        if !pipeline.known_revocation_matches(admission, &ticket) {
+            // The original rejection changed or vanished unexpectedly.
+            self.authority_unknown = true;
+            return Ok(TeacherPolicyConsumerProgressV3::Unknown);
+        }
+        Ok(
+            match pipeline.try_retain_known_rejection(&self.retained, admission, &ticket)? {
+                PolicyRetentionOutcomeV3::Transferred => {
+                    self.pc_revoked_retention_pending = false;
+                    self.pc_revoked_retained = true;
+                    TeacherPolicyConsumerProgressV3::CanceledRetained
+                }
+                PolicyRetentionOutcomeV3::Busy => TeacherPolicyConsumerProgressV3::Busy,
+                PolicyRetentionOutcomeV3::NotReady | PolicyRetentionOutcomeV3::OtherRoot => {
+                    TeacherPolicyConsumerProgressV3::NotReady
+                }
+                PolicyRetentionOutcomeV3::Capacity => TeacherPolicyConsumerProgressV3::OutputHeld,
+            },
+        )
+    }
+
     /// Transfer original appended evidence only into the same pipeline's
     /// typed game-output owner; no arbitrary destination is accepted.
     pub(crate) fn try_retain_appended(
@@ -609,7 +703,11 @@ impl TeacherPolicyConsumerV3 {
         if !self.route.matches_admission(&processed.admission) {
             return Err(invalid("V3 processed completion original root changed"));
         }
-        if processed.originals.len() >= processed.capacity {
+        if !completion_retention_has_space(
+            processed.originals.len(),
+            processed.revoked.len(),
+            processed.capacity,
+        ) {
             return Ok(TeacherPolicyConsumerProgressV3::OutputHeld);
         }
         processed
@@ -625,6 +723,66 @@ impl TeacherPolicyConsumerV3 {
         self.policy_appended = false;
         self.appended_retained = false;
         self.appended_in_output = false;
+        self.seal_state = TeacherPolicySealStepV3::Ready;
+        Ok(TeacherPolicyConsumerProgressV3::CompletionStored)
+    }
+
+    /// Preserve a revoked ticket's original completion separately from
+    /// successfully appended policy completions. A row/capability retention
+    /// transfer must already have succeeded for this same consumer ticket.
+    pub(crate) fn try_retain_revoked_completion_pc(
+        &mut self,
+    ) -> Result<TeacherPolicyConsumerProgressV3, ArenaError> {
+        if self.authority_unknown {
+            return Ok(TeacherPolicyConsumerProgressV3::Unknown);
+        }
+        if !self.pc_revoked_retained
+            || self.pc_revoked_retention_pending
+            || !self.prepared_transferred
+            || self.policy_appended
+            || self.appended_retained
+            || self.appended_in_output
+            || self.sealed.is_some()
+            || self.rejection.is_some()
+            || self.panic.is_some()
+            || self.completed.is_none()
+        {
+            return Ok(TeacherPolicyConsumerProgressV3::NotReady);
+        }
+        let mut processed = match self.processed.0.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(TeacherPolicyConsumerProgressV3::Busy),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(invalid("V3 revoked completion owner poisoned"));
+            }
+        };
+        let completed = self.completed.as_ref().expect("checked completion");
+        if !self.route.matches_admission(&processed.admission)
+            || !completed
+                .capsule
+                .admission()
+                .same_original_admission(&processed.admission)
+        {
+            return Err(invalid("V3 revoked completion original root changed"));
+        }
+        if !completion_retention_has_space(
+            processed.originals.len(),
+            processed.revoked.len(),
+            processed.capacity,
+        ) {
+            return Ok(TeacherPolicyConsumerProgressV3::OutputHeld);
+        }
+        processed
+            .revoked
+            .try_reserve(1)
+            .map_err(|_| invalid("V3 revoked completion storage allocation"))?;
+        let original = self
+            .completed
+            .take()
+            .expect("validated original completion");
+        processed.revoked.push(original);
+        self.pc_revoked_retained = false;
+        self.prepared_transferred = false;
         self.seal_state = TeacherPolicySealStepV3::Ready;
         Ok(TeacherPolicyConsumerProgressV3::CompletionStored)
     }

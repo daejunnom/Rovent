@@ -52,6 +52,20 @@ pub(super) enum PolicyPipelineFailureV3 {
     ReceiptReadPanic(Box<dyn std::any::Any + Send>),
 }
 
+/// Only a positively identified foreign ticket may wait behind a known
+/// revocation. Missing scope and every other failure retain their old result.
+fn defer_foreign_revocation(
+    failure: Option<&PolicyPipelineFailureV3>,
+    scope_matches: Option<bool>,
+) -> bool {
+    matches!(
+        failure,
+        Some(PolicyPipelineFailureV3::GateRejected(
+            TargetBeginRejectionV3::Revoked
+        ))
+    ) && matches!(scope_matches, Some(false))
+}
+
 /// Pipeline-local result only; worker, native and parent lease termination
 /// remain independently owned and independently evidenced.
 pub(super) enum PolicyFinalizationV3 {
@@ -551,6 +565,16 @@ impl PolicyRowPipelineV3 {
             return PolicyPrepareOutcomeV3::Unknown;
         }
         if self.failure.is_some() {
+            if let Some(original) = sealed.as_ref() {
+                let capsule = original.capsule();
+                let ticket = capsule.ticket();
+                if defer_foreign_revocation(
+                    self.failure.as_ref(),
+                    self.revocation_scope_matches(capsule.admission(), &ticket),
+                ) {
+                    return PolicyPrepareOutcomeV3::NotReady;
+                }
+            }
             return PolicyPrepareOutcomeV3::Failed;
         }
         if self.row.is_none()
@@ -647,6 +671,39 @@ impl PolicyRowPipelineV3 {
         }
         self.row.as_ref().map(|row| {
             row.admission().same_original_admission(admission) && row.ticket() == *ticket
+        })
+    }
+
+    /// Identify only a known revoked publication held by this exact root and
+    /// ticket. This is not a transfer, write, physical completion, or permit
+    /// to discard the original pending row and capability.
+    pub(super) fn known_revocation_matches(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+        ticket: &rz_contracts::pals_adaptive::RoleTicketEnvelope,
+    ) -> bool {
+        !self.is_uncertain()
+            && matches!(
+                self.failure.as_ref(),
+                Some(PolicyPipelineFailureV3::GateRejected(
+                    TargetBeginRejectionV3::Revoked
+                ))
+            )
+            && self.revocation_scope_matches(admission, ticket) == Some(true)
+    }
+
+    /// A gate rejection comes from the pending publication itself; a row in
+    /// a different stage cannot establish that rejection's original scope.
+    fn revocation_scope_matches(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+        ticket: &rz_contracts::pals_adaptive::RoleTicketEnvelope,
+    ) -> Option<bool> {
+        self.pending.as_ref().map(|pending| {
+            pending
+                .original_admission()
+                .same_original_admission(admission)
+                && pending.ticket() == *ticket
         })
     }
 
@@ -1154,5 +1211,35 @@ impl PolicyRowPipelineV3 {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod revocation_scope_tests {
+    use super::*;
+
+    #[test]
+    fn only_known_foreign_revocation_is_deferred() {
+        let revoked = PolicyPipelineFailureV3::GateRejected(TargetBeginRejectionV3::Revoked);
+        assert!(defer_foreign_revocation(Some(&revoked), Some(false)));
+        assert!(!defer_foreign_revocation(Some(&revoked), Some(true)));
+        assert!(!defer_foreign_revocation(Some(&revoked), None));
+        assert!(!defer_foreign_revocation(None, Some(false)));
+    }
+
+    #[test]
+    fn foreign_scope_does_not_hide_other_or_unknown_failures() {
+        for reason in [
+            TargetBeginRejectionV3::Uncertain,
+            TargetBeginRejectionV3::Poisoned,
+            TargetBeginRejectionV3::AlreadyCommitted,
+        ] {
+            let failure = PolicyPipelineFailureV3::GateRejected(reason);
+            assert!(!defer_foreign_revocation(Some(&failure), Some(false)));
+        }
+        let panic = PolicyPipelineFailureV3::BeforeAppendPanic(Box::new("original panic"));
+        assert!(!defer_foreign_revocation(Some(&panic), Some(false)));
+        let uncertain = PolicyPipelineFailureV3::AppendUncertain;
+        assert!(!defer_foreign_revocation(Some(&uncertain), Some(false)));
     }
 }

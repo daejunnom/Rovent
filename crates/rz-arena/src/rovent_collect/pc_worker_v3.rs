@@ -2089,6 +2089,9 @@ enum ConsumerPhaseV3 {
     Append,
     RetainAppend,
     RetainCompletion,
+    /// The revoked row is retained, but its original completion still needs
+    /// transfer to this root's separate bounded revoked-completion owner.
+    CanceledRetained,
     Rejected,
     Unknown,
 }
@@ -5721,9 +5724,10 @@ impl PcRootRecoveryV3 {
                 ConsumerPhaseV3::Prepare => guard.try_prepare_sealed(),
                 ConsumerPhaseV3::Candidate => guard.try_prepare_candidate(),
                 ConsumerPhaseV3::Capability => guard.try_transfer_capability(),
-                ConsumerPhaseV3::Append => guard.try_append_policy(),
+                ConsumerPhaseV3::Append => guard.try_append_policy_pc(),
                 ConsumerPhaseV3::RetainAppend => guard.try_retain_appended(),
                 ConsumerPhaseV3::RetainCompletion => guard.try_retain_processed_completion(),
+                ConsumerPhaseV3::CanceledRetained => guard.try_retain_revoked_completion_pc(),
                 ConsumerPhaseV3::Rejected => return Ok(P::Rejected),
                 ConsumerPhaseV3::Unknown => return Ok(P::Unknown),
             }));
@@ -5766,6 +5770,16 @@ impl PcRootRecoveryV3 {
                 if matches!(self.consumer_phase, ConsumerPhaseV3::RetainCompletion) =>
             {
                 self.consumer_phase = ConsumerPhaseV3::Receive
+            }
+            Ok(Ok(P::CompletionStored))
+                if matches!(self.consumer_phase, ConsumerPhaseV3::CanceledRetained) =>
+            {
+                self.consumer_phase = ConsumerPhaseV3::Receive
+            }
+            Ok(Ok(P::CanceledRetained))
+                if matches!(self.consumer_phase, ConsumerPhaseV3::Append) =>
+            {
+                self.consumer_phase = ConsumerPhaseV3::CanceledRetained
             }
             Ok(Ok(P::Busy | P::NotReady | P::OutputHeld)) => {}
             Ok(Ok(P::ChunkReady)) => {
