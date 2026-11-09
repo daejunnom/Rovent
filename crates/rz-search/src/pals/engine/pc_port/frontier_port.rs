@@ -143,9 +143,13 @@ impl<M: RoleModel> PcSemanticPort<M> {
         self.rovent_frontier()
             .and_then(|frontier| {
                 let goal = frontier.registration().goal;
+                // Both UCI limits apply when present. Keep the larger mate
+                // lane (root loss at 2N) but never exceed a shorter depth.
                 goal.depth_plies
                     .map(|depth| usize::from(depth.get()))
-                    .or_else(|| goal.mate_moves.map(|moves| usize::from(moves.get()) * 2))
+                    .into_iter()
+                    .chain(goal.mate_moves.map(|moves| usize::from(moves.get()) * 2))
+                    .min()
             })
             .unwrap_or(self.owner.config.line_plies)
             .min(usize::from(self.owner.profile.maximum_root_prefix_plies))

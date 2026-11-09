@@ -144,6 +144,29 @@ fn repair_port_with_goal(goal: SearchGoal) -> GoalPort {
 }
 
 #[test]
+fn mixed_go_limits_bound_optional_repair_by_earlier_horizon() {
+    // The final case checks that the fixture can actually admit Repair when
+    // both limits leave enough room, rather than only observing an empty queue.
+    for (depth, mate, horizon, admitted) in [(8, 1, 2, false), (2, 3, 2, false), (8, 3, 6, true)] {
+        let mut port = repair_port_with_goal(SearchGoal {
+            depth_plies: NonZeroU16::new(depth),
+            mate_moves: NonZeroU16::new(mate),
+        });
+        assert_eq!(port.continuation_limit(), horizon);
+        let input = port.next_role().unwrap().expect("root proposal");
+        assert_eq!(input.question.context.purpose, RoleQueryPurpose::ProposePolicy);
+        assert!(input.question.context.prefix.is_empty());
+        let selected = Some(BoardMove::from_uci("e2e4").unwrap());
+        let (accepted, output) =
+            accepted_scripted(&mut port, &input, 1, selected, [0.25, 0.50, 0.25]);
+        let physical = evidence(&port, &input, 1);
+        port.consume_accepted(&input, &accepted, &output, Some(physical))
+            .unwrap();
+        assert_eq!(!port.repair_cycles.as_ref().unwrap().active.is_empty(), admitted);
+    }
+}
+
+#[test]
 fn shallow_original_depth_completes_fresh_without_out_of_horizon_repair() {
     for depth in [1, 2] {
         let mut port = repair_port_with_goal(SearchGoal {
