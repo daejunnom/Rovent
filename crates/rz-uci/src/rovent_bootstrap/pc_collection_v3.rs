@@ -418,6 +418,38 @@ pub struct RoventPcCollectionWorkerSpawnFailureV3 {
     pub task: RoventPcRootWorkerTaskV3,
 }
 
+/// Failure details retained separately from a task that may hold the
+/// recovery owner. This value is not, on its own, proof of a spawn attempt:
+/// the existing public failure can also be assembled by a caller. Only the
+/// same producer's original result slot can establish its origin.
+pub struct RoventPcCollectionWorkerSpawnFailureDetailsV3 {
+    admission: RoventCollectionRootAdmissionV3,
+    error: std::io::Error,
+}
+
+impl RoventPcCollectionWorkerSpawnFailureDetailsV3 {
+    pub fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
+        self.admission.same_original_admission(admission)
+    }
+
+    pub fn error(&self) -> &std::io::Error {
+        &self.error
+    }
+}
+
+impl RoventPcCollectionWorkerSpawnFailureV3 {
+    /// Separate the retained diagnostics from the original task without
+    /// invoking or dropping it. The caller must explicitly dispose of or
+    /// retain the task outside any owner lock and account for a failing drop.
+    /// This decomposition does not prove that task disposal completed.
+    pub fn into_details_and_task(
+        self,
+    ) -> (RoventPcCollectionWorkerSpawnFailureDetailsV3, RoventPcRootWorkerTaskV3) {
+        let Self { admission, error, task } = self;
+        (RoventPcCollectionWorkerSpawnFailureDetailsV3 { admission, error }, task)
+    }
+}
+
 pub enum RoventPcCollectionWorkerJoinFailureV3 {
     WrongRoot,
     AlreadyJoined,
@@ -462,6 +494,23 @@ impl RoventPcCollectionWorkerV3 {
     /// Identity only; this does not attest worker or teacher completion.
     pub fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
         self.admission.same_original_admission(admission)
+    }
+
+    /// Store this original spawn result in the caller's already-owned slot
+    /// before returning. A full slot rejects the attempt without spawning and
+    /// returns the original admission and task to their caller. A stored
+    /// worker or failure proves only the spawn result, not physical completion.
+    /// If `spawn` unwinds, callers must retain the unresolved claim as unknown.
+    pub fn spawn_into(
+        admission: RoventCollectionRootAdmissionV3,
+        task: RoventPcRootWorkerTaskV3,
+        destination: &mut Option<Result<Self, RoventPcCollectionWorkerSpawnFailureV3>>,
+    ) -> Result<(), (RoventCollectionRootAdmissionV3, RoventPcRootWorkerTaskV3)> {
+        if destination.is_some() {
+            return Err((admission, task));
+        }
+        *destination = Some(Self::spawn(admission, task));
+        Ok(())
     }
 
     pub fn spawn(

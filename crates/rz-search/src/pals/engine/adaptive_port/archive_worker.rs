@@ -8,7 +8,7 @@ use super::profiled_retirement_archive::{
 };
 use super::{AdaptiveEnginePort, PalsEngine, PalsError, RoleModel};
 use super::{ProfiledExternalRetirementIdentity, ProfiledExternalRootRetirement};
-use crate::pals::engine::adaptive_root::UnusedArchiveSetupSeal;
+use crate::pals::engine::adaptive_root::{EmptyArchiveGameSeal, UnusedArchiveSetupSeal};
 use crate::pals::engine::archive_lifecycle::IdleArchiveCheckpoint;
 use crate::pals::engine::idle_archive::{
     IdleArchiveOwnerKind, IdleArchiveTransitionKind, IdleSemanticArchiveOwner,
@@ -298,6 +298,69 @@ pub struct UnusedIdleArchiveSetupRejected<M: RoleModel> {
     pub owner: IdleSemanticArchiveOwner<M>,
     pub setup: UnusedIdleArchiveSetup,
     pub error: PalsError,
+}
+/// Empty-game closure is a Store lifecycle observation, not a root or GPU fence.
+#[derive(Clone, Debug)]
+pub struct EmptyIdleArchiveCloseReceipt {
+    pub nonce: u64,
+    pub scope: SearchAuthority,
+    pub owner_kind: IdleArchiveOwnerKind,
+    pub archive_owner: Option<ArchiveOwnerSnapshot>,
+    pub elapsed: Duration,
+}
+pub struct EmptyIdleArchiveCloseRejected<M: RoleModel> {
+    pub owner: IdleSemanticArchiveOwner<M>,
+    pub error: PalsError,
+}
+pub struct EmptyIdleArchiveCloseCompletion<M: RoleModel> {
+    owner: IdleSemanticArchiveOwner<M>,
+    seal: EmptyArchiveGameSeal,
+    idle_identity: Weak<()>,
+    before: ArchiveOwnerSnapshot,
+    deadline: Instant,
+    cancel: Arc<AtomicBool>,
+    receipt: EmptyIdleArchiveCloseReceipt,
+    result: Result<(), ArchiveQuarantineReason>,
+}
+pub struct EmptyIdleArchiveCloseShutdownParts<M: RoleModel> {
+    pub owner: IdleSemanticArchiveOwner<M>,
+    pub receipt: EmptyIdleArchiveCloseReceipt,
+    pub result: Result<(), ArchiveQuarantineReason>,
+}
+impl<M: RoleModel> EmptyIdleArchiveCloseCompletion<M> {
+    pub fn receipt(&self) -> &EmptyIdleArchiveCloseReceipt { &self.receipt }
+    pub fn failure(&self) -> Option<&ArchiveQuarantineReason> { self.result.as_ref().err() }
+    #[allow(clippy::result_large_err)]
+    pub fn install(mut self, expected_scope: SearchAuthority, expected_nonce: u64, expected_owner_id: u64)
+        -> Result<(IdleSemanticArchiveOwner<M>, EmptyIdleArchiveCloseReceipt), Self> {
+        if self.result.is_ok() {
+            self.result = (|| {
+                let invalid = ArchiveQuarantineReason::InvalidReturn;
+                if self.receipt.scope != expected_scope || self.receipt.nonce != expected_nonce
+                    || self.before.owner_id != expected_owner_id
+                    || !self.idle_identity.ptr_eq(&self.owner.identity())
+                    || self.receipt.owner_kind != self.owner.owner_kind() {
+                    return Err(invalid("empty archive close identity"));
+                }
+                if self.cancel.load(Ordering::Acquire) { return Err(ArchiveQuarantineReason::Canceled); }
+                if Instant::now() >= self.deadline { return Err(ArchiveQuarantineReason::Deadline); }
+                self.seal.validate(self.owner.semantic()).map_err(ArchiveQuarantineReason::Operation)?;
+                let actual = self.owner.archive_owner_snapshot().map_err(ArchiveQuarantineReason::Operation)?;
+                if actual != self.receipt.archive_owner || actual.is_none_or(|closed| {
+                    closed.owner_id != self.before.owner_id || !closed.admission_closed || !closed.complete
+                        || closed.root_sha256 != self.before.root_sha256
+                        || closed.repository_sha256 != self.before.repository_sha256
+                        || closed.committed_chunks != 0 || closed.reserved_generations != 0
+                }) { return Err(invalid("empty archive close actual owner")); }
+                Ok(())
+            })();
+        }
+        if self.result.is_err() { self.owner.retain_empty_close_failure(); return Err(self); }
+        Ok((self.owner, self.receipt))
+    }
+    pub fn into_owner_for_shutdown(self) -> EmptyIdleArchiveCloseShutdownParts<M> {
+        EmptyIdleArchiveCloseShutdownParts { owner: self.owner, receipt: self.receipt, result: self.result }
+    }
 }
 /// A wrong/late install retains the complete original owner and held payload.
 /// This is not a root-registration or native physical completion receipt.
@@ -1055,15 +1118,22 @@ struct SetupCommand<M: RoleModel> {
     scope: SearchAuthority,
     nonce: u64,
 }
+struct EmptyCloseCommand<M: RoleModel> {
+    owner: IdleSemanticArchiveOwner<M>, seal: EmptyArchiveGameSeal,
+    before: ArchiveOwnerSnapshot, idle_identity: Weak<()>, scope: SearchAuthority,
+    nonce: u64, deadline: Instant, cancel: Arc<AtomicBool>,
+}
 #[allow(clippy::large_enum_variant)]
 enum WorkerCommand<M: RoleModel> {
     Maintenance(Command<M>),
     Setup(SetupCommand<M>),
+    EmptyClose(EmptyCloseCommand<M>),
 }
 #[allow(clippy::large_enum_variant)]
 enum WorkerCompletion<M: RoleModel> {
     Maintenance(ArchiveCompletion<M>),
     Setup(UnusedIdleArchiveSetupCompletion<M>),
+    EmptyClose(EmptyIdleArchiveCloseCompletion<M>),
 }
 pub struct ArchiveWorker<M: RoleModel + 'static> {
     identity: Arc<()>,
@@ -1074,6 +1144,7 @@ pub struct ArchiveWorker<M: RoleModel + 'static> {
     next_nonce: u64,
     pending: Option<(u64, Arc<AtomicBool>)>,
     pending_setup: bool,
+    pending_empty_close: bool,
     shutdown_receipt: Option<ArchiveShutdownReceipt>,
     shutdown_unknown: bool,
 }
@@ -1109,6 +1180,10 @@ impl<M: RoleModel + 'static> ArchiveWorker<M> {
                             let completed = execute_unused_setup(command);
                             (completed.receipt.nonce, WorkerCompletion::Setup(completed))
                         }
+                        WorkerCommand::EmptyClose(command) => {
+                            let completed = execute_empty_close(command);
+                            (completed.receipt.nonce, WorkerCompletion::EmptyClose(completed))
+                        }
                     };
                     // Ownership always resides in the shared one-owner slot.
                     // The channel carries only notification, so dropping its
@@ -1137,6 +1212,7 @@ impl<M: RoleModel + 'static> ArchiveWorker<M> {
             next_nonce: 1,
             pending: None,
             pending_setup: false,
+            pending_empty_close: false,
             shutdown_receipt: None,
             shutdown_unknown: false,
         })
@@ -1201,7 +1277,9 @@ impl<M: RoleModel + 'static> ArchiveWorker<M> {
             )),
             Err(
                 TrySendError::Full(WorkerCommand::Setup(_))
-                | TrySendError::Disconnected(WorkerCommand::Setup(_)),
+                | TrySendError::Disconnected(WorkerCommand::Setup(_))
+                | TrySendError::Full(WorkerCommand::EmptyClose(_))
+                | TrySendError::Disconnected(WorkerCommand::EmptyClose(_)),
             ) => unreachable!("submitted maintenance variant"),
         }
     }
@@ -1278,8 +1356,59 @@ impl<M: RoleModel + 'static> ArchiveWorker<M> {
             )),
             Err(
                 TrySendError::Full(WorkerCommand::Maintenance(_))
-                | TrySendError::Disconnected(WorkerCommand::Maintenance(_)),
+                | TrySendError::Disconnected(WorkerCommand::Maintenance(_))
+                | TrySendError::Full(WorkerCommand::EmptyClose(_))
+                | TrySendError::Disconnected(WorkerCommand::EmptyClose(_)),
             ) => unreachable!("submitted setup variant"),
+        }
+    }
+    #[allow(clippy::result_large_err)]
+    pub fn submit_empty_idle_close(&mut self, owner: IdleSemanticArchiveOwner<M>, scope: SearchAuthority, deadline: Instant)
+        -> Result<ArchiveTransfer, EmptyIdleArchiveCloseRejected<M>> {
+        let rejected = |owner, error| EmptyIdleArchiveCloseRejected { owner, error };
+        let invalid = |s| PalsError::Store(StoreError::InvalidConditions(s));
+        if self.pending.is_some() { return Err(rejected(owner, invalid("archive worker busy"))); }
+        let Some(sender) = &self.command else { return Err(rejected(owner, invalid("archive worker closed"))); };
+        if Instant::now() >= deadline { return Err(rejected(owner, invalid("empty close deadline expired"))); }
+        let (seal, before) = match owner.seal_empty_close(scope) { Ok(value) => value, Err(error) => return Err(rejected(owner, error)) };
+        let nonce = self.next_nonce;
+        let Some(next) = nonce.checked_add(1) else { return Err(rejected(owner, invalid("archive transfer sequence exhausted"))); };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let idle_identity = owner.identity();
+        let message = WorkerCommand::EmptyClose(EmptyCloseCommand { owner, seal, before, idle_identity, scope, nonce, deadline, cancel: Arc::clone(&cancel) });
+        match sender.try_send(message) {
+            Ok(()) => {
+                self.next_nonce = next;
+                self.pending = Some((nonce, Arc::clone(&cancel)));
+                self.pending_setup = false;
+                self.pending_empty_close = true;
+                Ok(ArchiveTransfer { nonce, worker: Arc::clone(&self.identity), cancel })
+            }
+            Err(TrySendError::Full(WorkerCommand::EmptyClose(message))) => Err(rejected(message.owner, invalid("archive command full"))),
+            Err(TrySendError::Disconnected(WorkerCommand::EmptyClose(message))) => Err(rejected(message.owner, invalid("archive worker unavailable"))),
+            Err(_) => unreachable!("submitted empty close variant"),
+        }
+    }
+    pub fn try_receive_empty_idle_close(&mut self, transfer: &ArchiveTransfer)
+        -> Result<Option<EmptyIdleArchiveCloseCompletion<M>>, ArchiveWorkerError> {
+        if !self.pending_empty_close || !Arc::ptr_eq(&transfer.worker, &self.identity)
+            || self.pending.as_ref().map(|p| p.0) != Some(transfer.nonce) {
+            return Err(ArchiveWorkerError::StaleTransfer);
+        }
+        match self.completion.try_recv() {
+            Ok(nonce) => {
+                if nonce != transfer.nonce { return Err(ArchiveWorkerError::CompletionUnknown); }
+                let mut slot = self.orphan.lock().unwrap_or_else(|p| p.into_inner());
+                if !matches!(slot.as_ref(), Some(WorkerCompletion::EmptyClose(_))) {
+                    return Err(ArchiveWorkerError::CompletionUnknown);
+                }
+                let Some(WorkerCompletion::EmptyClose(completion)) = slot.take() else { unreachable!("checked empty close completion"); };
+                self.pending = None;
+                self.pending_empty_close = false;
+                Ok(Some(completion))
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(ArchiveWorkerError::CompletionUnknown),
         }
     }
     /// Nonblocking manager poll. mpsc supplies the existing bounded completion
@@ -1288,7 +1417,7 @@ impl<M: RoleModel + 'static> ArchiveWorker<M> {
         &mut self,
         transfer: &ArchiveTransfer,
     ) -> Result<Option<ArchiveCompletion<M>>, ArchiveWorkerError> {
-        if self.pending_setup
+        if self.pending_setup || self.pending_empty_close
             || !Arc::ptr_eq(&transfer.worker, &self.identity)
             || self.pending.as_ref().map(|p| p.0) != Some(transfer.nonce)
         {
@@ -1420,6 +1549,31 @@ impl<M: RoleModel + 'static> Drop for ArchiveWorker<M> {
         }
         self.command.take();
     }
+}
+
+fn execute_empty_close<M: RoleModel>(mut command: EmptyCloseCommand<M>) -> EmptyIdleArchiveCloseCompletion<M> {
+    let started = Instant::now();
+    let mut result = catch_archive_work(|| {
+        if command.cancel.load(Ordering::Acquire) { return Err(ArchiveQuarantineReason::Canceled); }
+        if Instant::now() >= command.deadline { return Err(ArchiveQuarantineReason::Deadline); }
+        command.seal.validate(command.owner.semantic()).map_err(ArchiveQuarantineReason::Operation)?;
+        let (_, current) = command.owner.seal_empty_close(command.scope).map_err(ArchiveQuarantineReason::Operation)?;
+        if current != command.before { return Err(ArchiveQuarantineReason::InvalidReturn("empty archive changed before close")); }
+        command.owner.close_archive_owner().map_err(ArchiveQuarantineReason::Operation)?;
+        Ok(())
+    });
+    if result.is_ok() && command.cancel.load(Ordering::Acquire) { result = Err(ArchiveQuarantineReason::Canceled); }
+    if result.is_ok() && Instant::now() >= command.deadline { result = Err(ArchiveQuarantineReason::Deadline); }
+    let actual = match command.owner.archive_owner_snapshot() {
+        Ok(actual) => actual,
+        Err(error) => { if result.is_ok() { result = Err(ArchiveQuarantineReason::Operation(error)); } None }
+    };
+    if result.is_err() { command.owner.retain_empty_close_failure(); }
+    let receipt = EmptyIdleArchiveCloseReceipt { nonce: command.nonce, scope: command.scope,
+        owner_kind: command.owner.owner_kind(), archive_owner: actual, elapsed: started.elapsed() };
+    EmptyIdleArchiveCloseCompletion { owner: command.owner, seal: command.seal,
+        idle_identity: command.idle_identity, before: command.before, deadline: command.deadline,
+        cancel: command.cancel, receipt, result }
 }
 
 fn execute_unused_setup<M: RoleModel>(

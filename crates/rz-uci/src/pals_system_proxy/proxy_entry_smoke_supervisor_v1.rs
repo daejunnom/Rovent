@@ -12,6 +12,9 @@ use super::{
     },
     proxy_entry_smoke_cancel_v1::NoGameCancelReceiverV1,
     proxy_entry_smoke_prepare_v1::{OriginalProxyStdioV1, PreparedNoGameGrantOwnersV1},
+    proxy_reobserve_gateway_v1::{
+        CompletedProxyReobserveV1, ProxyReobserveGatewayProgressV1, ProxyReobserveGatewayV1,
+    },
     relay,
     runner_v6::{
         PalsProxySupervisorV6, ProxyStageV6, ProxySupervisorObservationV6,
@@ -39,10 +42,25 @@ pub(super) struct NoGamePreparedSupervisorV1 {
     pub bundle: ProxyEntryNoGameAdmittedBundleV1,
     pub receipt: ProxyEntryNoGameSmokeReceiptV1,
     supervisor: PalsProxySupervisorV6,
+    reobserve_gateway: ProxyReobserveGatewayV1,
     cancel_attached: bool,
 }
 
 impl NoGamePreparedSupervisorV1 {
+    /// Explicit transition to observation on the retained Run-grant stream.
+    /// The caller retains this same owner through every finite poll window.
+    pub(super) fn poll_arena_reobserve(
+        &mut self,
+        until: Instant,
+    ) -> io::Result<ProxyReobserveGatewayProgressV1> {
+        self.reobserve_gateway
+            .poll(&mut self.bundle.inputs.run, &mut self.supervisor, until)
+    }
+
+    pub(super) fn take_arena_reobserve_evidence(&mut self) -> Option<CompletedProxyReobserveV1> {
+        self.reobserve_gateway.take_completed()
+    }
+
     /// The caller must separately prove this is the original role listener.
     /// Failure returns the same socket; peer identity comes from the held run
     /// grant and the actual cancel stream, never the supplied wire fields.
@@ -306,6 +324,7 @@ pub(super) fn prepare_supervisor(
         bundle,
         receipt,
         supervisor,
+        reobserve_gateway: ProxyReobserveGatewayV1::new(),
         cancel_attached: false,
     })
 }

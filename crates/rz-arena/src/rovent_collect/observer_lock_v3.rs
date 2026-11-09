@@ -212,6 +212,49 @@ impl RoventCollectionOwnerLockV3 {
         })
     }
 
+    /// Read-only check of this original owner's pre-admission preparation.
+    /// `None` means the owner is busy; it is not evidence that preparation
+    /// succeeded, that a native observer was installed, or that any worker
+    /// or device work has completed.
+    pub(super) fn try_matches_prepared_original(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+        route: &SpeculativeRootV3,
+    ) -> Result<Option<bool>, ArenaError> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err(invalid("lock-v3 owner poisoned")),
+        };
+        Ok(Some(
+            state.registration.same_original_owner(&self.registration)
+                && state.registration.owns_speculative_root_v3(route)
+                && route.matches_admission(admission)
+                && state.admission.is_none()
+                && !state.settled
+                && state
+                    .prepared_admission
+                    .as_ref()
+                    .is_some_and(|original| original.same_original_admission(admission))
+                && state
+                    .route_admission
+                    .as_ref()
+                    .is_some_and(|original| original.same_original_admission(admission))
+                && state
+                    .speculative_root
+                    .as_ref()
+                    .is_some_and(|original| original.same_original_route(route))
+                && state.position.is_some()
+                && state
+                    .producer
+                    .as_ref()
+                    .is_some_and(|producer| producer.validate_admission(admission).is_ok())
+                && state.staged.is_empty()
+                && state.pending.is_empty()
+                && state.handled.is_empty(),
+        ))
+    }
+
     /// Bind this root to the supervisor-retained game pipeline. The same
     /// game owner may be bound by later roots, but a root cannot switch slots.
     pub(super) fn try_bind_policy_pipeline(
@@ -913,6 +956,13 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
                         },
                     );
                     Ok(AdaptiveCollectionDispatchV2::Busy)
+                }
+                LockV3RegistrationAttempt::Canceled(reservation) => {
+                    // The original abort fence rejects this late admission.
+                    // Retain the exact reservation for the normal cleanup
+                    // owner; this is not a capture or physical completion.
+                    state.failed_reservations.push(Staged { ticket, reservation });
+                    Err(invalid("lock-v3 registration canceled by original pre-route fence"))
                 }
                 LockV3RegistrationAttempt::Failed(error, reservation) => {
                     state.failed_reservations.push(Staged {

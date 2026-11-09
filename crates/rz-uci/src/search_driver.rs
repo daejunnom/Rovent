@@ -15,7 +15,7 @@ use sha2::{Digest as _, Sha256};
 use std::{
     fmt,
     sync::{
-        Arc, Mutex, TryLockError,
+        Arc, Mutex, OnceLock, TryLockError, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -66,7 +66,248 @@ pub struct SearchSessionContext {
 /// opt-in collection owner. Normal search never installs or reads it.
 pub const ROVENT_COLLECTION_ABORT_BIT: u64 = 1u64 << 63;
 
+// The V3 root word is independent of both the V2 game marker and the V3
+// game-wide authority word. The actual Start only requests cancellation; it
+// does not mutate the native target-revocation gate or attest completion.
+const V3_ROOT_CANCEL: u64 = 1 << 63;
+const V3_ROOT_UNKNOWN: u64 = 1 << 62;
+const V3_ROOT_BOUND: u64 = 1 << 61;
+const V3_ROOT_READY: u64 = 1 << 60;
+const V3_ROOT_COUNT_MASK: u64 = V3_ROOT_READY - 1;
+
+/// One root's original Start cancellation and in-flight acquisition gate.
+/// This object does not own, or hold a reference to, a game or native owner.
+#[derive(Debug, Default)]
+pub struct RoventRootCancelGateV3 {
+    word: AtomicU64,
+    // Start retains the gate. The reverse edge must remain weak, otherwise
+    // the Start and a finished root could retain each other forever.
+    original_start: OnceLock<Weak<crate::engine::DriverStartSource>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventRootCancelClaimErrorV3 {
+    NotBound,
+    Canceled,
+    Unknown,
+    Capacity,
+}
+
+/// Read-only original-Start association; this is not a completion receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventRootCancelBindingV3 {
+    Pending,
+    Bound,
+    Canceled,
+    Unknown,
+    Foreign,
+}
+
+/// Acquisition state only. Quiescence is not a worker or device fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventRootClaimObservationV3 {
+    NotBound,
+    NotCanceled,
+    Active,
+    Quiescent,
+    Unknown,
+}
+
+/// One acquisition already ordered against the original Start's cancellation.
+/// Resolving it does not establish worker, device, or output completion.
+#[must_use]
+#[derive(Debug)]
+pub struct RoventRootCancelClaimV3 {
+    gate: Arc<RoventRootCancelGateV3>,
+    // A claim retains its actual Start while it can authorize acquisition.
+    // The gate itself keeps only a Weak reference, so this is not a cycle.
+    _original_start: Arc<crate::engine::DriverStartSource>,
+    resolved: bool,
+}
+
+impl RoventRootCancelGateV3 {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// An observation only; in-flight work can remain after cancellation.
+    pub fn is_cancel_requested(&self) -> bool {
+        self.word.load(Ordering::SeqCst) & V3_ROOT_CANCEL != 0
+    }
+
+    /// Observe outstanding acquisitions only after this root is canceled;
+    /// before cancellation a new claim can still start at any time.
+    pub fn observe_canceled_claims(&self) -> RoventRootClaimObservationV3 {
+        let value = self.word.load(Ordering::SeqCst);
+        if value & V3_ROOT_UNKNOWN != 0 {
+            RoventRootClaimObservationV3::Unknown
+        } else if value & V3_ROOT_BOUND == 0 {
+            RoventRootClaimObservationV3::NotBound
+        } else if value & V3_ROOT_CANCEL == 0 {
+            RoventRootClaimObservationV3::NotCanceled
+        } else if value & V3_ROOT_COUNT_MASK != 0 {
+            RoventRootClaimObservationV3::Active
+        } else {
+            RoventRootClaimObservationV3::Quiescent
+        }
+    }
+
+    fn binding_state(&self) -> RoventRootCancelBindingV3 {
+        let value = self.word.load(Ordering::SeqCst);
+        if value & V3_ROOT_UNKNOWN != 0 {
+            RoventRootCancelBindingV3::Unknown
+        } else if value & V3_ROOT_CANCEL != 0 {
+            RoventRootCancelBindingV3::Canceled
+        } else if value & (V3_ROOT_BOUND | V3_ROOT_READY) == (V3_ROOT_BOUND | V3_ROOT_READY) {
+            RoventRootCancelBindingV3::Bound
+        } else {
+            RoventRootCancelBindingV3::Pending
+        }
+    }
+
+    /// Order a single original acquisition against this root's UCI cancel.
+    /// The caller must retain the claim with the actual operation owner.
+    pub fn try_claim(self: &Arc<Self>) -> Result<RoventRootCancelClaimV3, RoventRootCancelClaimErrorV3> {
+        let initial = self.word.load(Ordering::SeqCst);
+        if initial & V3_ROOT_UNKNOWN != 0 {
+            return Err(RoventRootCancelClaimErrorV3::Unknown);
+        }
+        if initial & V3_ROOT_CANCEL != 0 {
+            return Err(RoventRootCancelClaimErrorV3::Canceled);
+        }
+        let original_start = match self.original_start.get() {
+            None => return Err(RoventRootCancelClaimErrorV3::NotBound),
+            Some(original) => match original.upgrade() {
+                Some(start) => start,
+                None => {
+                    self.mark_unknown();
+                    return Err(RoventRootCancelClaimErrorV3::Unknown);
+                }
+            },
+        };
+        let mut value = self.word.load(Ordering::SeqCst);
+        loop {
+            if value & V3_ROOT_UNKNOWN != 0 {
+                return Err(RoventRootCancelClaimErrorV3::Unknown);
+            }
+            if value & V3_ROOT_CANCEL != 0 {
+                return Err(RoventRootCancelClaimErrorV3::Canceled);
+            }
+            if value & (V3_ROOT_BOUND | V3_ROOT_READY) != (V3_ROOT_BOUND | V3_ROOT_READY) {
+                return Err(RoventRootCancelClaimErrorV3::NotBound);
+            }
+            if value & V3_ROOT_COUNT_MASK == V3_ROOT_COUNT_MASK {
+                return Err(RoventRootCancelClaimErrorV3::Capacity);
+            }
+            match self.word.compare_exchange(value, value + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Ok(RoventRootCancelClaimV3 {
+                    gate: Arc::clone(self), _original_start: original_start, resolved: false,
+                }),
+                Err(observed) => value = observed,
+            }
+        }
+    }
+
+    pub(crate) fn bind_once(&self, start: &Arc<crate::engine::DriverStartSource>) -> bool {
+        if self.original_start.set(Arc::downgrade(start)).is_err() {
+            return false;
+        }
+        let mut current = self.word.load(Ordering::SeqCst);
+        loop {
+            // A root owner may request revocation before its Start hook is
+            // installed. Preserve that request while binding this identity.
+            if current & !V3_ROOT_CANCEL != 0 {
+                self.mark_unknown();
+                return false;
+            }
+            match self.word.compare_exchange(current, current | V3_ROOT_BOUND,
+                                             Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub(crate) fn matches_original_start(&self, start: &Arc<crate::engine::DriverStartSource>) -> Option<bool> {
+        self.original_start.get().map(|original| Weak::ptr_eq(original, &Arc::downgrade(start)))
+    }
+
+    pub(crate) fn mark_ready(&self) -> bool {
+        self.word.compare_exchange(V3_ROOT_BOUND, V3_ROOT_BOUND | V3_ROOT_READY,
+                                   Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    }
+
+    /// Request only logical root cancellation. The original route owner must
+    /// separately revoke its targets and settle or quarantine physical work.
+    pub fn request_cancel(&self) {
+        self.word.fetch_or(V3_ROOT_CANCEL, Ordering::SeqCst);
+    }
+
+    pub(crate) fn mark_unknown(&self) {
+        self.word.fetch_or(V3_ROOT_UNKNOWN, Ordering::SeqCst);
+    }
+}
+
+impl RoventRootCancelClaimV3 {
+    /// Called only after the caller has settled its original acquisition.
+    /// Unknown device or process completion remains separately owned.
+    pub fn resolve(mut self) -> Result<(), RoventRootCancelClaimErrorV3> {
+        let mut value = self.gate.word.load(Ordering::SeqCst);
+        loop {
+            if value & V3_ROOT_COUNT_MASK == 0 {
+                self.gate.mark_unknown();
+                return Err(RoventRootCancelClaimErrorV3::Unknown);
+            }
+            match self.gate.word.compare_exchange(value, value - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => { self.resolved = true; return Ok(()); }
+                Err(observed) => value = observed,
+            }
+        }
+    }
+}
+
+impl Drop for RoventRootCancelClaimV3 {
+    fn drop(&mut self) {
+        if !self.resolved {
+            // Retain the count as well as the uncertainty: a lost token is
+            // never silently refunded or treated as a physical fence.
+            self.gate.mark_unknown();
+        }
+    }
+}
+
 impl SearchSessionContext {
+    /// Bind a V3 root-only cancellation gate to this exact original Start.
+    /// A later independent Start must use a different gate.
+    #[cfg(feature = "pals-adaptive")]
+    pub fn bind_original_collection_root_cancel_v3(
+        &self,
+        gate: Arc<RoventRootCancelGateV3>,
+    ) -> Result<(), ContractError> {
+        self.original_start.as_ref().ok_or_else(|| {
+            ContractError::new(ErrorCode::IdentityMismatch, Stage::Admission,
+                               "original UCI Start absent")
+        })?.bind_collection_root_cancel_v3(self, gate)
+    }
+
+    /// Re-observe the original Start/gate association without taking a lock.
+    /// A matching canceled gate is still the same original gate; cancellation
+    /// does not certify physical completion.
+    #[cfg(feature = "pals-adaptive")]
+    pub fn observe_original_collection_root_cancel_v3(
+        &self,
+        gate: &Arc<RoventRootCancelGateV3>,
+    ) -> RoventRootCancelBindingV3 {
+        let Some(start) = self.original_start.as_ref() else {
+            return RoventRootCancelBindingV3::Foreign;
+        };
+        match start.matches_collection_root_cancel_v3(self, gate) {
+            None => RoventRootCancelBindingV3::Pending,
+            Some(false) => RoventRootCancelBindingV3::Foreign,
+            Some(true) => gate.binding_state(),
+        }
+    }
+
     /// Bind the exact original Start to its optional Collection game word and
     /// root target flag. UCI stop touches only these shared atomic owners.
     #[cfg(feature = "pals-adaptive")]

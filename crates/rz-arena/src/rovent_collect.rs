@@ -1152,6 +1152,10 @@ pub use historical_native_lock_v2::{
     VerifiedHistoricalNativeRootMetadataV2, verify_historical_lock_v2_record_evidence,
     verify_historical_native_root_metadata_v2,
 };
+mod historical_native_lock_v3;
+pub use historical_native_lock_v3::{
+    VerifiedHistoricalNativeRootMetadataV3, verify_historical_lock_v3_record_evidence,
+};
 mod historical_scope;
 pub use external_scope::{
     RoventHistoricalExternalSource, verify_historical_external_source_input_lock,

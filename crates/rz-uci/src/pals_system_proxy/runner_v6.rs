@@ -343,8 +343,14 @@ impl PalsProxySupervisorV6 {
             .pending_reobserve
             .as_mut()
             .ok_or_else(|| io::Error::other("child observation not started"))?;
-        if pending.result.is_some() || until <= Instant::now() {
+        if pending.result.is_some() {
             return Err(io::Error::other("child observation cannot be resumed"));
+        }
+        if until <= Instant::now() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "child observation window expired",
+            ));
         }
         pending.until = until;
         Ok(())

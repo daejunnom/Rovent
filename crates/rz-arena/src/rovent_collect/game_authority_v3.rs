@@ -35,6 +35,39 @@ enum PhaseV3 {
     Unknown,
 }
 
+/// The independently observable operations belonging to one original P-C
+/// recovery. An acquisition claim is not worker or device completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PcOperationKindV3 {
+    RouteInstall,
+    NativeWorker,
+    AttachRoute,
+    PrepareAdmission,
+    BindPolicyConsumer,
+    PublishPrepared,
+}
+
+/// Produced by the original recovery's operation slot. `NoEffect` may only
+/// represent a producer result that proves no effect occurred.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PcOperationObservationV3 {
+    Pending,
+    NoEffect,
+    FailedNoEffect,
+    Committed,
+    Unknown,
+}
+
+struct PcOperationRecordV3 {
+    root: RoventCollectionRootAdmissionV3,
+    kind: PcOperationKindV3,
+    slot: Arc<()>,
+    generation: u64,
+    active: bool,
+    retryable: bool,
+    failed_no_effect: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum GameEffectKindV3 {
     TeacherScope,
@@ -147,9 +180,13 @@ struct StateV3<S> {
     first: Option<RoventCollectionRootAdmissionV3>,
     pending: Vec<RoventCollectionRootAdmissionV3>,
     admitted: Vec<RoventCollectionRootAdmissionV3>,
+    // P-C roots own independent Start cancellation gates. Own roots keep their
+    // existing execution path until their original Start is wired separately.
+    pc_root_cancel: Vec<(RoventCollectionRootAdmissionV3, Arc<rz_uci::search_driver::RoventRootCancelGateV3>)>,
     dispatching: Vec<RoventCollectionRootAdmissionV3>,
     dispatched: Vec<RoventCollectionRootAdmissionV3>,
     effects: Vec<GameEffectRecordV3>,
+    pc_operations: Vec<PcOperationRecordV3>,
 }
 
 pub(super) struct GameAuthorityV3<S> {
@@ -183,6 +220,8 @@ pub(super) enum GameStepV3 {
     Busy,
     Closed,
     Aborted,
+    /// This original Start/root is canceled; the game may admit a later root.
+    RootCanceled,
     Failed,
     Unknown,
     Capacity,
@@ -213,9 +252,11 @@ impl<S> GameAuthorityV3<S> {
                 first: None,
                 pending: Vec::new(),
                 admitted: Vec::new(),
+                pc_root_cancel: Vec::new(),
                 dispatching: Vec::new(),
                 dispatched: Vec::new(),
                 effects: Vec::new(),
+                pc_operations: Vec::new(),
             }),
         })
     }
@@ -330,6 +371,7 @@ impl<S> GameAuthorityV3<S> {
         if !state.pending.is_empty()
             || !state.dispatching.is_empty()
             || state.effects.iter().any(|effect| effect.active)
+            || state.pc_operations.iter().any(|operation| operation.active)
             || self.control.load(Ordering::SeqCst) & !CONTROL_FLAGS != 0
         {
             return Ok(None);
@@ -373,6 +415,169 @@ impl<S> GameAuthorityV3<S> {
                 self.unknown.store(true, Ordering::SeqCst);
                 Err(GameStepV3::Unknown)
             }
+        }
+    }
+
+    /// Bind only the root gate already installed on this exact UCI Start.
+    /// A canceled root remains bound so its original no-send/worker custody
+    /// can be settled; this never asserts a native or device completion.
+    pub(super) fn try_bind_pc_root_cancel(
+        &self,
+        root: &RoventCollectionRootAdmissionV3,
+        gate: &Arc<rz_uci::search_driver::RoventRootCancelGateV3>,
+    ) -> GameStepV3 {
+        use rz_uci::search_driver::RoventRootCancelBindingV3 as Binding;
+        match root.root_admission().original_context()
+            .observe_original_collection_root_cancel_v3(gate)
+        {
+            Binding::Bound | Binding::Canceled => {}
+            Binding::Pending => return GameStepV3::Busy,
+            Binding::Unknown => return GameStepV3::Unknown,
+            Binding::Foreign => return GameStepV3::Foreign,
+        }
+        let mut state = match self.lock() {
+            Ok(state) => state,
+            Err(error) => return error,
+        };
+        if !matches!(state.phase, PhaseV3::Open | PhaseV3::AdmissionSealed) {
+            return GameStepV3::Closed;
+        }
+        if !state.admitted.iter().any(|original| original.same_original_admission(root)) {
+            return GameStepV3::Foreign;
+        }
+        if let Some((_, existing)) = state.pc_root_cancel.iter()
+            .find(|(original, _)| original.same_original_admission(root))
+        {
+            return if Arc::ptr_eq(existing, gate) { GameStepV3::Existing }
+                   else { GameStepV3::Foreign };
+        }
+        if state.pc_root_cancel.len() >= usize::from(self.inputs.plan().maximum_roots)
+            || state.pc_root_cancel.try_reserve(1).is_err()
+        {
+            return GameStepV3::Capacity;
+        }
+        state.pc_root_cancel.push((root.clone(), Arc::clone(gate)));
+        GameStepV3::Ready
+    }
+
+    /// Observe the gate installed by the original Start for this exact root.
+    /// This reports a request only; it is not a no-send or completion proof.
+    pub(super) fn try_observe_pc_root_cancel(
+        &self,
+        root: &RoventCollectionRootAdmissionV3,
+    ) -> GameStepV3 {
+        use rz_uci::search_driver::RoventRootCancelBindingV3 as Binding;
+        let state = match self.lock() {
+            Ok(state) => state,
+            Err(error) => return error,
+        };
+        if !state.admitted.iter().any(|original| original.same_original_admission(root)) {
+            return GameStepV3::Foreign;
+        }
+        let Some((_, gate)) = state.pc_root_cancel.iter()
+            .find(|(original, _)| original.same_original_admission(root)) else {
+                return GameStepV3::Busy;
+            };
+        match root.root_admission().original_context()
+            .observe_original_collection_root_cancel_v3(gate)
+        {
+            Binding::Bound => GameStepV3::Ready,
+            Binding::Canceled => GameStepV3::RootCanceled,
+            Binding::Pending => GameStepV3::Busy,
+            Binding::Unknown => GameStepV3::Unknown,
+            Binding::Foreign => GameStepV3::Foreign,
+        }
+    }
+
+    /// Cancel and all root-local producer claims settled on the same Start.
+    /// This does not prove worker, target, native, or device completion.
+    pub(super) fn try_observe_pc_root_cancel_quiescent(
+        &self,
+        root: &RoventCollectionRootAdmissionV3,
+    ) -> GameStepV3 {
+        let state = match self.lock() {
+            Ok(state) => state,
+            Err(error) => return error,
+        };
+        self.observe_pc_root_cancel_quiescent_locked(&state, root)
+    }
+
+    fn observe_pc_root_cancel_quiescent_locked(
+        &self,
+        state: &StateV3<S>,
+        root: &RoventCollectionRootAdmissionV3,
+    ) -> GameStepV3 {
+        use rz_uci::search_driver::{RoventRootCancelBindingV3 as Binding,
+            RoventRootClaimObservationV3 as Observation};
+        if !state.admitted.iter().any(|original| original.same_original_admission(root)) {
+            return GameStepV3::Foreign;
+        }
+        let Some((_, gate)) = state.pc_root_cancel.iter()
+            .find(|(original, _)| original.same_original_admission(root)) else {
+                return GameStepV3::Busy;
+            };
+        match root.root_admission().original_context()
+            .observe_original_collection_root_cancel_v3(gate)
+        {
+            Binding::Canceled => {}
+            Binding::Bound | Binding::Pending => return GameStepV3::Busy,
+            Binding::Unknown => return GameStepV3::Unknown,
+            Binding::Foreign => return GameStepV3::Foreign,
+        }
+        match gate.observe_canceled_claims() {
+            Observation::Quiescent => GameStepV3::Ready,
+            Observation::NotBound | Observation::NotCanceled | Observation::Active => GameStepV3::Busy,
+            Observation::Unknown => GameStepV3::Unknown,
+        }
+    }
+
+    /// A P-C effect must claim the same root-local atomic word that the
+    /// original Start cancels. Looking at a cancellation bool and later
+    /// claiming the separate game word would leave a check/act race.
+    fn try_claim_pc_root_cancel(
+        &self,
+        state: &StateV3<S>,
+        root: &RoventCollectionRootAdmissionV3,
+    ) -> Result<rz_uci::search_driver::RoventRootCancelClaimV3, GameStepV3> {
+        use rz_uci::search_driver::RoventRootCancelClaimErrorV3 as Error;
+        let Some((_, gate)) = state.pc_root_cancel.iter()
+            .find(|(original, _)| original.same_original_admission(root)) else {
+                return Err(GameStepV3::Busy);
+            };
+        gate.try_claim().map_err(|error| match error {
+            Error::NotBound => GameStepV3::Busy,
+            Error::Canceled => GameStepV3::RootCanceled,
+            Error::Unknown => GameStepV3::Unknown,
+            Error::Capacity => GameStepV3::Capacity,
+        })
+    }
+
+    /// If the independent game-wide CAS rejects an attempt, the original
+    /// root claim has made no producer call and may be explicitly returned.
+    fn return_unstarted_pc_root_claim(
+        &self,
+        claim: Option<rz_uci::search_driver::RoventRootCancelClaimV3>,
+        result: GameStepV3,
+    ) -> GameStepV3 {
+        if claim.is_some_and(|claim| claim.resolve().is_err()) {
+            self.unknown.store(true, Ordering::SeqCst);
+            GameStepV3::Unknown
+        } else {
+            result
+        }
+    }
+
+    /// Resolve only after the original producer outcome has been retained by
+    /// the matching game claim. This is not a worker join or physical fence.
+    fn resolve_pc_root_claim(
+        &self,
+        claim: &mut Option<rz_uci::search_driver::RoventRootCancelClaimV3>,
+    ) -> bool {
+        if claim.take().is_some_and(|claim| claim.resolve().is_err()) {
+            self.unknown.store(true, Ordering::SeqCst);
+            false
+        } else {
+            true
         }
     }
 
@@ -490,6 +695,7 @@ impl<S> GameAuthorityV3<S> {
             Err(e) => return e,
         };
         if state.effects.iter().any(|effect| effect.active)
+            || state.pc_operations.iter().any(|operation| operation.active)
             || self.control.load(Ordering::SeqCst) & !(EFFECT_CLAIM - 1) != 0
         {
             return GameStepV3::Busy;
@@ -549,10 +755,21 @@ impl<S> GameAuthorityV3<S> {
         let actor = source.actor.clone();
         let retained_actor = source.actor.clone();
         let owner = Arc::clone(self);
+        let mut root_claim = if matches!(
+            &source.original,
+            GameEffectOriginalV3::PcScope { .. } | GameEffectOriginalV3::PcActor { .. }
+        ) {
+            match self.try_claim_pc_root_cancel(&state, &source.root) {
+                Ok(claim) => Some(claim),
+                Err(error) => return error,
+            }
+        } else {
+            None
+        };
         let mut current = self.control.load(Ordering::SeqCst);
         loop {
             if current & ABORT_REQUESTED != 0 {
-                return GameStepV3::Aborted;
+                return self.return_unstarted_pc_root_claim(root_claim.take(), GameStepV3::Aborted);
             }
             if current
                 & (ADMISSION_SEALED
@@ -561,10 +778,10 @@ impl<S> GameAuthorityV3<S> {
                     | PUBLICATION_NOT_STARTED)
                 != 0
             {
-                return GameStepV3::Closed;
+                return self.return_unstarted_pc_root_claim(root_claim.take(), GameStepV3::Closed);
             }
             let Some(next) = current.checked_add(EFFECT_CLAIM) else {
-                return GameStepV3::Capacity;
+                return self.return_unstarted_pc_root_claim(root_claim.take(), GameStepV3::Capacity);
             };
             match self
                 .control
@@ -587,6 +804,7 @@ impl<S> GameAuthorityV3<S> {
             kind: source.kind,
             stage: retained_stage,
             actor: retained_actor,
+            root_cancel_claim: root_claim,
             resolved: false,
         });
         GameStepV3::Ready
@@ -649,10 +867,24 @@ impl<S> GameAuthorityV3<S> {
         let retained_root = root.clone();
         let state_root = root.clone();
         let owner = Arc::clone(self);
+        // Only P-C needs a distinct original receipt witness. Allocate it
+        // before the claim CAS so Own dispatch keeps its existing behavior.
+        let receipt_identity = match &identity {
+            GameDispatchEnvelopeIdentityV3::Pc(_) => Some(Arc::new(())),
+            GameDispatchEnvelopeIdentityV3::Own(_, _) => None,
+        };
+        let mut root_claim = if matches!(&identity, GameDispatchEnvelopeIdentityV3::Pc(_)) {
+            match self.try_claim_pc_root_cancel(&state, root) {
+                Ok(claim) => Some(claim),
+                Err(error) => return error,
+            }
+        } else {
+            None
+        };
         let mut current = self.control.load(Ordering::SeqCst);
         loop {
             if current & ABORT_REQUESTED != 0 {
-                return GameStepV3::Aborted;
+                return self.return_unstarted_pc_root_claim(root_claim.take(), GameStepV3::Aborted);
             }
             if current
                 & (ADMISSION_SEALED
@@ -661,13 +893,13 @@ impl<S> GameAuthorityV3<S> {
                     | PUBLICATION_NOT_STARTED)
                 != 0
             {
-                return GameStepV3::Closed;
+                return self.return_unstarted_pc_root_claim(root_claim.take(), GameStepV3::Closed);
             }
             if current & DISPATCH_MASK == DISPATCH_MASK {
-                return GameStepV3::Capacity;
+                return self.return_unstarted_pc_root_claim(root_claim.take(), GameStepV3::Capacity);
             }
             let Some(next) = current.checked_add(DISPATCH_CLAIM) else {
-                return GameStepV3::Capacity;
+                return self.return_unstarted_pc_root_claim(root_claim.take(), GameStepV3::Capacity);
             };
             match self
                 .control
@@ -684,6 +916,8 @@ impl<S> GameAuthorityV3<S> {
             owner,
             root: retained_root,
             envelope: identity,
+            receipt_identity,
+            root_cancel_claim: root_claim,
             send_result: None,
             attempted: false,
             settled: false,
@@ -798,6 +1032,328 @@ impl<S> GameAuthorityV3<S> {
 }
 
 impl GameAuthorityV3<super::pc_worker_v3::PcWorkerSupervisorV3> {
+    /// Observe one original P-C receipt only after the game is permanently
+    /// closed to further dispatch by sticky abort or admission seal. Normal
+    /// Full and Disconnected remain retryable before either condition.
+    fn try_check_pc_not_sent(
+        self: &Arc<Self>,
+        root: &RoventCollectionRootAdmissionV3,
+        envelope: &RoventCollectionRootAdmissionV3,
+        receipt: &GameDispatchReceiptV3<super::pc_worker_v3::PcWorkerSupervisorV3>,
+    ) -> GameStepV3 {
+        let state = match self.lock() {
+            Ok(state) => state,
+            Err(error) => return error,
+        };
+        if self.unknown.load(Ordering::SeqCst) {
+            return GameStepV3::Unknown;
+        }
+        if !receipt.matches_game(self)
+            || !receipt.matches_root(root)
+            || !receipt.matches_envelope(envelope)
+            || !root.same_original_admission(envelope)
+            || receipt.receipt_identity.is_none()
+            || !matches!(receipt.outcome, GameDispatchOutcomeV3::Full
+                | GameDispatchOutcomeV3::Disconnected | GameDispatchOutcomeV3::Aborted
+                | GameDispatchOutcomeV3::AdmissionSealed)
+        {
+            return GameStepV3::Foreign;
+        }
+        if !state.admitted.iter().any(|original| original.same_original_admission(root)) {
+            return GameStepV3::Foreign;
+        }
+        if self.control.load(Ordering::SeqCst) & (ABORT_REQUESTED | ADMISSION_SEALED) == 0 {
+            return GameStepV3::Busy;
+        }
+        if state.dispatching.iter().any(|original| original.same_original_admission(root)) {
+            return GameStepV3::Busy;
+        }
+        if state.dispatched.iter().any(|original| original.same_original_admission(root)) {
+            return GameStepV3::Foreign;
+        }
+        GameStepV3::Ready
+    }
+
+    /// Retain an exact-receipt witness in the original caller's destination.
+    /// This proves only no P-C dispatch, not worker or physical completion.
+    pub(super) fn try_observe_pc_not_sent(
+        self: &Arc<Self>,
+        root: &RoventCollectionRootAdmissionV3,
+        envelope: &RoventCollectionRootAdmissionV3,
+        receipt: &GameDispatchReceiptV3<super::pc_worker_v3::PcWorkerSupervisorV3>,
+        destination: &mut Option<PcNotSentDispatchWitnessV3>,
+    ) -> GameStepV3 {
+        if destination.is_some() {
+            return GameStepV3::Busy;
+        }
+        match self.try_check_pc_not_sent(root, envelope, receipt) {
+            GameStepV3::Ready => {}
+            other => return other,
+        }
+        let Some(identity) = receipt.receipt_identity.as_ref() else {
+            return GameStepV3::Unknown;
+        };
+        *destination = Some(PcNotSentDispatchWitnessV3 {
+            owner: Arc::clone(self),
+            root: root.clone(),
+            receipt_identity: Arc::clone(identity),
+        });
+        GameStepV3::Ready
+    }
+
+    /// After sticky game abort or quiescent original root cancel, reobserve
+    /// one pre-retained original route slot.
+    /// A missing operation record means no acquisition occurred; an inactive
+    /// retryable record means the original producer's no-effect result was
+    /// already validated. Neither case proves a teacher or native fence.
+    pub(super) fn try_observe_pc_route_never_started(
+        self: &Arc<Self>,
+        slot_owner: &Arc<Mutex<super::pc_worker_v3::PcOperationSlotV3>>,
+        slot: &super::pc_worker_v3::PcOperationSlotV3,
+        recovery: &super::pc_worker_v3::PcRootRecoveryV3,
+        registration: &super::native_capture::RoventNativeCaptureRegistration,
+        fence: &super::native_capture::RoventPreRouteFenceWitnessV3,
+    ) -> GameStepV3 {
+        // Actual original registration must first confirm its sticky fence.
+        // Busy and unknown are never converted to a no-route observation.
+        match fence.try_matches_original(registration, slot.admission()) {
+            Ok(Some(true)) => {}
+            Ok(Some(false)) => return GameStepV3::Foreign,
+            Ok(None) => return GameStepV3::Busy,
+            Err(_) => return GameStepV3::Unknown,
+        }
+        if slot.kind() != PcOperationKindV3::RouteInstall {
+            return GameStepV3::Foreign;
+        }
+        match slot.try_matches_abort_source(slot_owner, recovery, registration, 0) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        let Some(proof) = slot.abort_source_proof() else {
+            return GameStepV3::Unknown;
+        };
+        match proof.matches_game(self) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        let state = match self.lock() {
+            Ok(state) => state,
+            Err(error) => return error,
+        };
+        if !self.abort_requested() {
+            match self.observe_pc_root_cancel_quiescent_locked(&state, slot.admission()) {
+                GameStepV3::Ready => {}
+                other => return other,
+            }
+        }
+        if !state.admitted.iter().any(|root| root.same_original_admission(slot.admission())) {
+            return GameStepV3::Foreign;
+        }
+        let mut records = state.pc_operations.iter().filter(|operation| {
+            operation.root.same_original_admission(slot.admission())
+                && operation.kind == PcOperationKindV3::RouteInstall
+        });
+        let original = records.next();
+        if records.next().is_some() {
+            return GameStepV3::Unknown;
+        }
+        match original {
+            None if slot.has_no_attempt_data() => GameStepV3::Ready,
+            None => GameStepV3::Busy,
+            Some(record) if !Arc::ptr_eq(&record.slot, slot.identity()) => GameStepV3::Foreign,
+            Some(record) if record.generation == 0 => GameStepV3::Unknown,
+            Some(record) if record.active => GameStepV3::Busy,
+            Some(record) if record.retryable && record.failed_no_effect => GameStepV3::Unknown,
+            Some(record) if record.retryable && slot.has_no_attempt_data() => GameStepV3::Ready,
+            // The producer's error proves this attempt did not install a
+            // route, but can also report an existing route or ticket. Do not
+            // release this root until original registration has a durable
+            // no-route/no-late-ticket fence.
+            Some(record) if record.failed_no_effect => GameStepV3::Busy,
+            Some(_) => GameStepV3::Busy,
+        }
+    }
+
+    /// After sticky game abort or quiescent original root cancel, prove that
+    /// this original recovery's later slot has
+    /// never acquired an operation claim. A retained record, including an
+    /// already settled NoEffect, stays unresolved for this narrower proof.
+    /// This observes only acquisition, not worker or physical completion.
+    pub(super) fn try_observe_pc_operation_never_claimed(
+        self: &Arc<Self>,
+        slot_owner: &Arc<Mutex<super::pc_worker_v3::PcOperationSlotV3>>,
+        slot: &super::pc_worker_v3::PcOperationSlotV3,
+        recovery: &super::pc_worker_v3::PcRootRecoveryV3,
+        registration: &super::native_capture::RoventNativeCaptureRegistration,
+        index: usize,
+    ) -> GameStepV3 {
+        if index == 0 {
+            return GameStepV3::Foreign;
+        }
+        match slot.try_matches_abort_source(slot_owner, recovery, registration, index) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        if !slot.has_no_attempt_data() {
+            return GameStepV3::Busy;
+        }
+        let Some(proof) = slot.abort_source_proof() else {
+            return GameStepV3::Unknown;
+        };
+        match proof.matches_game(self) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        let state = match self.lock() {
+            Ok(state) => state,
+            Err(error) => return error,
+        };
+        if !self.abort_requested() {
+            match self.observe_pc_root_cancel_quiescent_locked(&state, slot.admission()) {
+                GameStepV3::Ready => {}
+                other => return other,
+            }
+        }
+        if !state.admitted.iter().any(|root| root.same_original_admission(slot.admission())) {
+            return GameStepV3::Foreign;
+        }
+        if state.pc_operations.iter().any(|operation| {
+            operation.root.same_original_admission(slot.admission()) && operation.kind == slot.kind()
+        }) {
+            // Do not infer no-effect from an existing record. This includes
+            // old successful and settled no-effect attempts alike.
+            return GameStepV3::Busy;
+        }
+        GameStepV3::Ready
+    }
+
+    /// Claim one operation against the same atomic abort word as teacher
+    /// effects. The original recovery owns both `slot` and `destination`.
+    /// A claim is authorization to attempt an operation, not its outcome.
+    pub(super) fn try_claim_pc_operation(
+        self: &Arc<Self>,
+        proof: &super::pc_worker_v3::PcReceivedStageProofV3,
+        slot: &super::pc_worker_v3::PcOperationSlotV3,
+        supervisor: &super::pc_worker_v3::PcWorkerSupervisorV3,
+        recovery: &super::pc_worker_v3::PcRootRecoveryV3,
+        destination: &mut Option<PcOperationClaimV3>,
+    ) -> GameStepV3 {
+        if destination.is_some() {
+            return GameStepV3::Busy;
+        }
+        match proof.matches_game(self) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        if !proof.matches_admission(slot.admission()) {
+            return GameStepV3::Foreign;
+        }
+        match slot.try_revalidate_with_guards(proof, supervisor, recovery) {
+            Ok(Some(true)) => {}
+            Ok(Some(false)) => return GameStepV3::Foreign,
+            Ok(None) => return GameStepV3::Busy,
+            Err(_) => return GameStepV3::Unknown,
+        }
+        let mut state = match self.lock() {
+            Ok(state) => state,
+            Err(error) => return error,
+        };
+        if state.phase != PhaseV3::Open {
+            return GameStepV3::Closed;
+        }
+        if !state.admitted.iter().any(|root| root.same_original_admission(slot.admission())) {
+            return GameStepV3::Foreign;
+        }
+        let index = state.pc_operations.iter().position(|operation| {
+            operation.root.same_original_admission(slot.admission()) && operation.kind == slot.kind()
+        });
+        let generation = if let Some(index) = index {
+            let operation = &state.pc_operations[index];
+            if !Arc::ptr_eq(&operation.slot, slot.identity()) {
+                return GameStepV3::Foreign;
+            }
+            if operation.active {
+                return GameStepV3::Busy;
+            }
+            if !operation.retryable {
+                return GameStepV3::Existing;
+            }
+            let Some(next) = operation.generation.checked_add(1) else {
+                return GameStepV3::Capacity;
+            };
+            next
+        } else {
+            let limit = usize::from(self.inputs.plan().maximum_roots).checked_mul(6);
+            if limit.is_none_or(|limit| state.pc_operations.len() >= limit)
+                || state.pc_operations.try_reserve(1).is_err()
+            {
+                return GameStepV3::Capacity;
+            }
+            1
+        };
+        // All allocations and identity clones precede the successful CAS.
+        let root = slot.admission().clone();
+        let record_root = root.clone();
+        let identity = Arc::clone(slot.identity());
+        let record_identity = Arc::clone(slot.identity());
+        let owner = Arc::clone(self);
+        let kind = slot.kind();
+        let mut root_claim = match self.try_claim_pc_root_cancel(&state, &root) {
+            Ok(claim) => Some(claim),
+            Err(error) => return error,
+        };
+        let mut current = self.control.load(Ordering::SeqCst);
+        loop {
+            if current & ABORT_REQUESTED != 0 {
+                return self.return_unstarted_pc_root_claim(root_claim.take(), GameStepV3::Aborted);
+            }
+            if current & (ADMISSION_SEALED | PUBLICATION_GRANTED | NO_DATA_FINISHED
+                | PUBLICATION_NOT_STARTED | GAME_CLOSED) != 0
+            {
+                return self.return_unstarted_pc_root_claim(root_claim.take(), GameStepV3::Closed);
+            }
+            let Some(next) = current.checked_add(EFFECT_CLAIM) else {
+                return self.return_unstarted_pc_root_claim(root_claim.take(), GameStepV3::Capacity);
+            };
+            match self.control.compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+        if let Some(index) = index {
+            let operation = &mut state.pc_operations[index];
+            operation.generation = generation;
+            operation.active = true;
+            operation.retryable = false;
+            operation.failed_no_effect = false;
+        } else {
+            state.pc_operations.push(PcOperationRecordV3 {
+                root: record_root,
+                kind,
+                slot: record_identity,
+                generation,
+                active: true,
+                retryable: false,
+                failed_no_effect: false,
+            });
+        }
+        *destination = Some(PcOperationClaimV3 {
+            owner,
+            root,
+            kind,
+            slot: identity,
+            generation,
+            root_cancel_claim: root_claim,
+            resolved: false,
+        });
+        GameStepV3::Ready
+    }
+
     /// Move the original received-stage proof and nonclone scope source into
     /// an already retained destination only after same-owner revalidation.
     /// Neither Busy nor a rejection consumes either original input slot.
@@ -1056,6 +1612,7 @@ impl GameAuthorityV3<super::pc_worker_v3::PcWorkerSupervisorV3> {
         if !state.pending.is_empty()
             || !state.dispatching.is_empty()
             || state.effects.iter().any(|effect| effect.active)
+            || state.pc_operations.iter().any(|operation| operation.active)
             || self.control.load(Ordering::SeqCst) & !CONTROL_FLAGS != 0
         {
             return GameStepV3::Busy;
@@ -1130,6 +1687,7 @@ impl GameAuthorityV3<super::pc_worker_v3::PcWorkerSupervisorV3> {
         if !state.pending.is_empty()
             || !state.dispatching.is_empty()
             || state.effects.iter().any(|effect| effect.active)
+            || state.pc_operations.iter().any(|operation| operation.active)
             || self.control.load(Ordering::SeqCst) & !CONTROL_FLAGS != 0
         {
             return GameStepV3::Busy;
@@ -1553,6 +2111,7 @@ pub(super) struct GameDispatchReceiptV3<S> {
     owner: Arc<GameAuthorityV3<S>>,
     root: RoventCollectionRootAdmissionV3,
     envelope: GameDispatchEnvelopeIdentityV3,
+    receipt_identity: Option<Arc<()>>,
     outcome: GameDispatchOutcomeV3,
     abort_observed: bool,
     seal_observed: bool,
@@ -1575,6 +2134,32 @@ impl<S> GameDispatchReceiptV3<S> {
     }
     pub(super) fn seal_observed(&self) -> bool {
         self.seal_observed
+    }
+}
+
+/// Binds one exact P-C non-Sent receipt and its original game/root. The game
+/// state is reobserved on use; this is not a worker or physical fence.
+pub(super) struct PcNotSentDispatchWitnessV3 {
+    owner: Arc<GameAuthorityV3<super::pc_worker_v3::PcWorkerSupervisorV3>>,
+    root: RoventCollectionRootAdmissionV3,
+    receipt_identity: Arc<()>,
+}
+
+impl PcNotSentDispatchWitnessV3 {
+    pub(super) fn try_matches_original(
+        &self,
+        game: &Arc<GameAuthorityV3<super::pc_worker_v3::PcWorkerSupervisorV3>>,
+        root: &RoventCollectionRootAdmissionV3,
+        envelope: &RoventCollectionRootAdmissionV3,
+        receipt: &GameDispatchReceiptV3<super::pc_worker_v3::PcWorkerSupervisorV3>,
+    ) -> GameStepV3 {
+        if !Arc::ptr_eq(&self.owner, game)
+            || !self.root.same_original_admission(root)
+            || !receipt.receipt_identity.as_ref().is_some_and(|identity| Arc::ptr_eq(identity, &self.receipt_identity))
+        {
+            return GameStepV3::Foreign;
+        }
+        game.try_check_pc_not_sent(root, envelope, receipt)
     }
 }
 
@@ -1638,6 +2223,8 @@ pub(super) struct GameDispatchClaimV3<S> {
     owner: Arc<GameAuthorityV3<S>>,
     root: RoventCollectionRootAdmissionV3,
     envelope: GameDispatchEnvelopeIdentityV3,
+    receipt_identity: Option<Arc<()>>,
+    root_cancel_claim: Option<rz_uci::search_driver::RoventRootCancelClaimV3>,
     send_result: Option<GameDispatchOutcomeV3>,
     attempted: bool,
     settled: bool,
@@ -1736,10 +2323,14 @@ impl<S> GameDispatchClaimV3<S> {
             owner: Arc::clone(&self.owner),
             root: self.root.clone(),
             envelope: self.envelope.clone(),
+            receipt_identity: self.receipt_identity.as_ref().map(Arc::clone),
             outcome,
             abort_observed: prior & ABORT_REQUESTED != 0 || self.owner.abort_requested(),
             seal_observed: prior & ADMISSION_SEALED != 0,
         });
+        if !self.owner.resolve_pc_root_claim(&mut self.root_cancel_claim) {
+            return GameStepV3::Unknown;
+        }
         self.settled = true;
         GameStepV3::Ready
     }
@@ -1772,6 +2363,7 @@ pub(super) struct GameEffectClaimV3<S> {
     kind: GameEffectKindV3,
     stage: Arc<()>,
     actor: Option<Arc<()>>,
+    root_cancel_claim: Option<rz_uci::search_driver::RoventRootCancelClaimV3>,
     resolved: bool,
 }
 impl<S> GameEffectClaimV3<S> {
@@ -1852,6 +2444,9 @@ impl<S> GameEffectClaimV3<S> {
             return GameStepV3::Unknown;
         }
         state.effects[index].active = false;
+        if !self.owner.resolve_pc_root_claim(&mut self.root_cancel_claim) {
+            return GameStepV3::Unknown;
+        }
         self.resolved = true;
         GameStepV3::Ready
     }
@@ -2083,6 +2678,101 @@ impl GameEffectClaimV3<super::own_worker_v3::OwnWorkerSupervisorV3> {
         self.try_complete_verified()
     }
 }
+/// A single attempt on one pre-retained P-C operation slot. Unresolved
+/// claims are never silently refunded on drop or treated as device fences.
+pub(super) struct PcOperationClaimV3 {
+    owner: Arc<GameAuthorityV3<super::pc_worker_v3::PcWorkerSupervisorV3>>,
+    root: RoventCollectionRootAdmissionV3,
+    kind: PcOperationKindV3,
+    slot: Arc<()>,
+    generation: u64,
+    root_cancel_claim: Option<rz_uci::search_driver::RoventRootCancelClaimV3>,
+    resolved: bool,
+}
+
+impl PcOperationClaimV3 {
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Reobserve the original producer result retained in this recovery. A
+    /// no-effect result permits a new claim only after abort is checked again.
+    pub(super) fn try_complete_pc_operation(
+        &mut self,
+        proof: &super::pc_worker_v3::PcReceivedStageProofV3,
+        slot: &super::pc_worker_v3::PcOperationSlotV3,
+        supervisor: &super::pc_worker_v3::PcWorkerSupervisorV3,
+        recovery: &super::pc_worker_v3::PcRootRecoveryV3,
+    ) -> GameStepV3 {
+        if self.resolved {
+            return GameStepV3::Existing;
+        }
+        if !self.root.same_original_admission(slot.admission())
+            || self.kind != slot.kind()
+            || !Arc::ptr_eq(&self.slot, slot.identity())
+            || !proof.matches_admission(&self.root)
+        {
+            return GameStepV3::Foreign;
+        }
+        match proof.matches_game(&self.owner) {
+            Some(true) => {}
+            Some(false) => return GameStepV3::Foreign,
+            None => return GameStepV3::Unknown,
+        }
+        match slot.try_revalidate_with_guards(proof, supervisor, recovery) {
+            Ok(Some(true)) => {}
+            Ok(Some(false)) => return GameStepV3::Foreign,
+            Ok(None) => return GameStepV3::Busy,
+            Err(_) => return GameStepV3::Unknown,
+        }
+        let (retryable, failed_no_effect) = match slot.observation(self.generation, recovery) {
+            PcOperationObservationV3::Pending => return GameStepV3::Busy,
+            PcOperationObservationV3::NoEffect => (true, false),
+            PcOperationObservationV3::FailedNoEffect => (false, self.kind == PcOperationKindV3::RouteInstall),
+            PcOperationObservationV3::Committed => (false, false),
+            PcOperationObservationV3::Unknown => return GameStepV3::Unknown,
+        };
+        let mut state = match self.owner.lock() {
+            Ok(state) => state,
+            Err(error) => return error,
+        };
+        let Some(index) = state.pc_operations.iter().position(|operation| {
+            operation.active
+                && operation.root.same_original_admission(&self.root)
+                && operation.kind == self.kind
+                && Arc::ptr_eq(&operation.slot, &self.slot)
+                && operation.generation == self.generation
+        }) else {
+            return GameStepV3::Unknown;
+        };
+        if self.owner.control.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
+            if word & !(EFFECT_CLAIM - 1) == 0 {
+                None
+            } else {
+                Some(word - EFFECT_CLAIM)
+            }
+        }).is_err() {
+            return GameStepV3::Unknown;
+        }
+        state.pc_operations[index].active = false;
+        state.pc_operations[index].retryable = retryable;
+        state.pc_operations[index].failed_no_effect = failed_no_effect;
+        if !self.owner.resolve_pc_root_claim(&mut self.root_cancel_claim) {
+            return GameStepV3::Unknown;
+        }
+        self.resolved = true;
+        GameStepV3::Ready
+    }
+}
+
+impl Drop for PcOperationClaimV3 {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.owner.unknown.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 impl<S> Drop for GameEffectClaimV3<S> {
     fn drop(&mut self) {
         if !self.resolved {

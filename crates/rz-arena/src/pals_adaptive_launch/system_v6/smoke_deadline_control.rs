@@ -105,6 +105,7 @@ pub(crate) struct SmokeDeadlineControl {
     cancel_failure: Option<Arc<ArenaError>>,
     reobserve_sequence: u64,
     reobserve: Option<smoke_reobserve_sender::ReobserveAttempt>,
+    reobserve_owner: Arc<()>,
     // Drop after listener and every retained/partial stream.
     _retained_permit: Option<Arc<NoGameBindingPermit>>,
 }
@@ -237,6 +238,7 @@ impl SmokeDeadlineControl {
             cancel_failure: None,
             reobserve_sequence: 0,
             reobserve: None,
+            reobserve_owner: Arc::new(()),
             _retained_permit: Some(Arc::clone(permit)),
         })
     }
@@ -331,6 +333,7 @@ impl SmokeDeadlineControl {
             cancel_failure: None,
             reobserve_sequence: 0,
             reobserve: None,
+            reobserve_owner: Arc::new(()),
             _retained_permit: None,
         })
     }

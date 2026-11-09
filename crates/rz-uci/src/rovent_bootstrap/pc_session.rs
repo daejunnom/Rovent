@@ -4718,7 +4718,10 @@ impl RoventPcSessionDriver {
                                         }
                                     }
                                     *state = State::Idle(idle);
-                                    return Err(rejected.failure);
+                                    return Err(storage_failure_after_native(
+                                        &result,
+                                        rejected.failure,
+                                    ));
                                 }
                             }
                         }
@@ -4775,7 +4778,10 @@ impl RoventPcSessionDriver {
                                         State::ArchiveRetained { native }
                                     }
                                 };
-                                return Err(rejected.failure);
+                                return Err(storage_failure_after_native(
+                                    &result,
+                                    rejected.failure,
+                                ));
                             }
                         }
                         *state = match &result {
@@ -4812,9 +4818,12 @@ impl RoventPcSessionDriver {
                         }
                         let Some(receipt) = native._root_closure.as_ref() else {
                             *state = State::RejectedPort { native, port };
-                            return Err(physical_unknown_at(
-                                "RoventPcArchivePort",
-                                "original semantic closure receipt absent",
+                            return Err(storage_failure_after_native(
+                                &result,
+                                physical_unknown_at(
+                                    "RoventPcArchivePort",
+                                    "original semantic closure receipt absent",
+                                ),
                             ));
                         };
                         match port.into_port(receipt) {
@@ -4827,10 +4836,13 @@ impl RoventPcSessionDriver {
                             }
                             Err((port, error)) => {
                                 *state = State::RejectedPort { native, port };
-                                return Err(storage
-                                    .as_mut()
-                                    .expect("selected storage")
-                                    .retain_port_error(error));
+                                return Err(storage_failure_after_native(
+                                    &result,
+                                    storage
+                                        .as_mut()
+                                        .expect("selected storage")
+                                        .retain_port_error(error),
+                                ));
                             }
                         }
                     }
@@ -4882,9 +4894,15 @@ impl RoventPcSessionDriver {
                         None => Err(SearchSessionFailure::physical_completion_unknown()),
                     };
                     *state = State::ArchiveRetained { native };
-                    return outcome
-                        .and(native_result.map_err(storage_unknown_failure))
-                        .and(Err(SearchSessionFailure::physical_completion_unknown()));
+                    return match outcome {
+                        Err(archive_failure) => Err(storage_failure_after_native(
+                            &native_result,
+                            archive_failure,
+                        )),
+                        Ok(()) => native_result
+                            .map_err(storage_unknown_failure)
+                            .and(Err(SearchSessionFailure::physical_completion_unknown())),
+                    };
                 }
                 State::Manager(mut manager) => {
                     let actor = shared_actor.as_ref().and_then(|owner| owner.actor.as_ref());
@@ -5269,6 +5287,90 @@ fn physical_unknown_at(stage: &'static str, detail: impl std::fmt::Debug) -> Sea
 fn storage_unknown_failure(mut error: SearchSessionFailure) -> SearchSessionFailure {
     error.physical_completion = DriverPhysicalCompletion::Unknown;
     error
+}
+
+/// Keep the native error as the primary cause when archive finalization also
+/// fails. The archive owner keeps its own original error; this bounded summary
+/// prevents the caller's single failure value from hiding that second cause.
+fn storage_failure_after_native(
+    native: &Result<(), SearchSessionFailure>,
+    archive: SearchSessionFailure,
+) -> SearchSessionFailure {
+    let Err(original) = native else {
+        return archive;
+    };
+    let mut combined = original.clone();
+    let archive_detail = SearchSessionFailure::debug("RoventPcArchiveDetail", &archive.detail);
+    // The diagnostic projection takes only the first 256 characters of the
+    // detail. Put the secondary code and a bounded excerpt before the native
+    // detail so a long primary cause cannot hide the archive failure entirely.
+    let mut detail = String::new();
+    detail.push_str("[archive cleanup ");
+    detail.push_str(archive.code);
+    detail.push_str(": ");
+    detail.extend(archive_detail.detail.chars().take(96));
+    detail.push_str("] ");
+    detail.push_str(&original.detail);
+    combined.detail = detail;
+    if archive.physical_completion == DriverPhysicalCompletion::Unknown {
+        combined.physical_completion = DriverPhysicalCompletion::Unknown;
+    }
+    combined
+}
+
+#[cfg(test)]
+mod storage_failure_tests {
+    use super::*;
+
+    #[test]
+    fn archive_failure_preserves_the_native_cause_and_unknown_completion() {
+        let native = Err(failure("OriginalNative", "native cause"));
+        let archive = physical_unknown_at("OriginalArchive", "archive cause");
+        let combined = storage_failure_after_native(&native, archive.clone());
+        assert_eq!(combined.code, "OriginalNative");
+        assert_eq!(
+            combined.physical_completion,
+            DriverPhysicalCompletion::Unknown
+        );
+        assert!(combined.detail.contains("native cause"));
+        assert!(combined.detail.contains(archive.code));
+        assert!(combined.detail.contains("OriginalArchive"));
+    }
+
+    #[test]
+    fn archive_only_failure_preserves_its_original_fields() {
+        let archive = physical_unknown_at("OriginalArchive", "archive cause");
+        let result = storage_failure_after_native(&Ok(()), archive.clone());
+        assert_eq!(result.code, archive.code);
+        assert_eq!(result.detail, archive.detail);
+        assert_eq!(result.physical_completion, archive.physical_completion);
+    }
+
+    #[test]
+    fn secondary_detail_is_bounded_on_utf8_boundaries() {
+        let native = Err(failure("OriginalNative", "native cause"));
+        let archive = SearchSessionFailure {
+            code: "ArchiveLong",
+            detail: "가".repeat(10_000),
+            physical_completion: DriverPhysicalCompletion::Unknown,
+        };
+        let combined = storage_failure_after_native(&native, archive);
+        assert_eq!(combined.code, "OriginalNative");
+        assert!(combined.detail.contains("ArchiveLong"));
+        assert!(combined.detail.len() < 400);
+    }
+
+    #[test]
+    fn bounded_receipt_projection_keeps_both_failure_codes_and_causes() {
+        let native = Err(failure("OriginalNative", &"native cause ".repeat(100)));
+        let archive = physical_unknown_at("OriginalArchive", "archive cause");
+        let combined = storage_failure_after_native(&native, archive.clone());
+        let projected: String = combined.detail.chars().take(256).collect();
+        assert_eq!(combined.code, "OriginalNative");
+        assert!(projected.contains(archive.code));
+        assert!(projected.contains("OriginalArchive"));
+        assert!(projected.contains("native cause"));
+    }
 }
 fn failure(code: &'static str, detail: &str) -> SearchSessionFailure {
     SearchSessionFailure {

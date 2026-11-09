@@ -1938,3 +1938,6 @@ fn discarded_live_lane_cannot_be_reported_as_selective_completion() {
 
 #[path = "goal_tests.rs"]
 mod goals;
+
+#[path = "empty_archive_close_tests.rs"]
+mod empty_archive_close;

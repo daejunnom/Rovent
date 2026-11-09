@@ -6,8 +6,13 @@
 //! be relabelled as the arena's earlier start time.
 
 use super::{
-    PalsProxyBinaryPinV6, PalsProxyLaunchV6, controlled_path, relay,
-    runner_v6::PalsProxySupervisorV6,
+    PalsProxyBinaryPinV6, PalsProxyLaunchV6, controlled_path,
+    finish::PalsSessionReleaseClaimV6,
+    relay,
+    runner_v6::{
+        PalsProxySupervisorV6, ProxyStageV6, ProxySupervisorObservationV6,
+        SessionReleaseObservationV6,
+    },
 };
 use crate::pals_adaptive_startup::{
     PalsSystemStartupOptionsV6, read_control_owned, relative_control_path,
@@ -385,6 +390,53 @@ impl ProxyCliInputsV6 {
 }
 
 impl PreparedProxyCliV6 {
+    /// Internal composition point only: the executable guard stays closed.
+    /// Preserve this same owner and its original child on every outcome.
+    pub(super) fn start_once_supervised(&mut self) -> io::Result<ProxyStageV6> {
+        if self.window.cancelled.load(Ordering::Acquire)
+            || self.window.cleanup_cancelled.load(Ordering::Acquire)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "PALS original proxy or cleanup was cancelled",
+            ));
+        }
+        if Instant::now() >= self.window.startup_until || Instant::now() >= self.window.run_until {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "PALS original proxy window expired before start",
+            ));
+        }
+        self.verify_original_lock()?;
+        Ok(self.supervisor.start_once())
+    }
+
+    /// A single nonblocking observation; it neither reaps the child nor
+    /// waits for the output relay to join.
+    pub(super) fn poll_supervisor(&mut self) -> io::Result<ProxySupervisorObservationV6> {
+        self.supervisor.poll()
+    }
+
+    /// Read the original child's claim only when the supervisor's existing
+    /// quit/deadline condition permits it. This bounded call can block until
+    /// the original cleanup deadline; no child exit or GPU fence is inferred.
+    pub(super) fn observe_session_release_once(&mut self) -> SessionReleaseObservationV6 {
+        self.supervisor.observe_session_release_once()
+    }
+
+    /// The recorded bytes, event and ACK outcome remain with the same owner.
+    pub(super) fn session_release_claim(&self) -> Option<&PalsSessionReleaseClaimV6> {
+        self.supervisor.session_release.as_ref()
+    }
+
+    pub(super) fn startup_error(&self) -> Option<&io::Error> {
+        self.supervisor.failure.as_ref()
+    }
+
+    pub(super) fn session_release_error(&self) -> Option<&io::Error> {
+        self.supervisor.session_release_error.as_ref()
+    }
+
     /// Recheck the same held inode and its original no-follow path. This is
     /// not proof that another process cannot write after this observation.
     pub(super) fn verify_original_lock(&self) -> io::Result<()> {

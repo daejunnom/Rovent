@@ -22,18 +22,25 @@ pub(crate) mod fixture;
 #[cfg(all(test, feature = "pals-adaptive"))]
 mod collection_abort_tests;
 
-struct CollectionAbortHook {
-    game_gate: Arc<std::sync::atomic::AtomicU64>,
-    root_targets_revoked: Arc<std::sync::atomic::AtomicBool>,
+enum CollectionAbortHook {
+    V2 {
+        game_gate: Arc<std::sync::atomic::AtomicU64>,
+        root_targets_revoked: Arc<std::sync::atomic::AtomicBool>,
+    },
+    V3Root(Arc<crate::search_driver::RoventRootCancelGateV3>),
 }
 impl CollectionAbortHook {
     fn abort(&self) {
-        self.game_gate.fetch_or(
-            crate::search_driver::ROVENT_COLLECTION_ABORT_BIT,
-            std::sync::atomic::Ordering::AcqRel,
-        );
-        self.root_targets_revoked
-            .store(true, std::sync::atomic::Ordering::Release);
+        match self {
+            Self::V2 { game_gate, root_targets_revoked } => {
+                game_gate.fetch_or(
+                    crate::search_driver::ROVENT_COLLECTION_ABORT_BIT,
+                    std::sync::atomic::Ordering::AcqRel,
+                );
+                root_targets_revoked.store(true, std::sync::atomic::Ordering::Release);
+            }
+            Self::V3Root(gate) => gate.request_cancel(),
+        }
     }
 }
 impl std::fmt::Debug for CollectionAbortHook {
@@ -122,20 +129,83 @@ impl DriverStartSource {
         game_gate: Arc<std::sync::atomic::AtomicU64>,
         root_targets_revoked: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), ContractError> {
-        if self.authority != context.authority
-            || !Arc::ptr_eq(&self.control.cancellation, &context.control.cancellation)
-            || !self
-                .cancellation
-                .shares_cancellation_with(&context.cancellation)
-            || !Arc::ptr_eq(&self.current, &context.current)
+        self.bind_collection_hook(context, CollectionAbortHook::V2 {
+            game_gate,
+            root_targets_revoked,
+        })
+    }
+
+    #[cfg(feature = "pals-adaptive")]
+    pub(crate) fn bind_collection_root_cancel_v3(
+        self: &Arc<Self>,
+        context: &SearchSessionContext,
+        gate: Arc<crate::search_driver::RoventRootCancelGateV3>,
+    ) -> Result<(), ContractError> {
+        if !self.matches_collection_context(context) {
+            return Err(invalid("collection abort hook differs from original Start"));
+        }
+        if !gate.bind_once(self) {
+            return Err(invalid("V3 root cancellation gate already bound"));
+        }
+        let result = self.bind_collection_hook(context, CollectionAbortHook::V3Root(Arc::clone(&gate)));
+        if result.is_err() {
+            if self.collection_owner_binding_error.get().is_some() || !gate.is_cancel_requested() {
+                gate.mark_unknown();
+            }
+            return result;
+        }
+        if !gate.mark_ready() {
+            // A stop may win between binding the hook and publishing the
+            // gate. Never make a canceled/uncertain gate claimable.
+            if !gate.is_cancel_requested() {
+                gate.mark_unknown();
+            }
+            return Err(invalid("V3 root canceled before Start binding completed"));
+        }
+        Ok(())
+    }
+
+    fn matches_collection_context(&self, context: &SearchSessionContext) -> bool {
+        self.authority == context.authority
+            && Arc::ptr_eq(&self.control.cancellation, &context.control.cancellation)
+            && self.cancellation.shares_cancellation_with(&context.cancellation)
+            && Arc::ptr_eq(&self.current, &context.current)
+    }
+
+    #[cfg(feature = "pals-adaptive")]
+    pub(crate) fn matches_collection_root_cancel_v3(
+        self: &Arc<Self>,
+        context: &SearchSessionContext,
+        gate: &Arc<crate::search_driver::RoventRootCancelGateV3>,
+    ) -> Option<bool> {
+        if !self.matches_collection_context(context) {
+            return Some(false);
+        }
+        match self.collection_abort_hook.get() {
+            None => match gate.matches_original_start(self) {
+                Some(false) => Some(false),
+                _ => None,
+            },
+            Some(CollectionAbortHook::V3Root(original)) if Arc::ptr_eq(original, gate) => {
+                gate.matches_original_start(self)
+            }
+            Some(CollectionAbortHook::V3Root(_)) => Some(false),
+            Some(CollectionAbortHook::V2 { .. }) => Some(false),
+        }
+    }
+
+    #[cfg(feature = "pals-adaptive")]
+    fn bind_collection_hook(
+        &self,
+        context: &SearchSessionContext,
+        hook: CollectionAbortHook,
+    ) -> Result<(), ContractError> {
+        if !self.matches_collection_context(context)
         {
             return Err(invalid("collection abort hook differs from original Start"));
         }
         self.collection_abort_hook
-            .set(CollectionAbortHook {
-                game_gate,
-                root_targets_revoked,
-            })
+            .set(hook)
             .map_err(|_| invalid("collection abort hook already installed"))?;
         // One atomic word makes registration and actual owner cancellation
         // mutually ordered: if cancel wins, this installer performs the abort;

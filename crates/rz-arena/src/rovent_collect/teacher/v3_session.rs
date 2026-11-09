@@ -10,7 +10,7 @@ use rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2;
 use rz_search::external_cpu::collection_teacher::TeacherWorkerRegistration;
 use rz_search::external_cpu::process_scope::{CollectionProcessPermit, CollectionProcessScope};
 use rz_uci::pals_adaptive::{
-    AdaptiveCollectionError, RoventCollectionRootAdmissionV3, RoventTeacherScopeCapabilityV3,
+    AdaptiveCollectionError, AdaptiveCollectionStage, RoventCollectionRootAdmissionV3, RoventTeacherScopeCapabilityV3,
     RoventTeacherScopeClaimStageV3, RoventTeacherScopePhysicalAckV3, RoventTeacherScopeWorkerAckV3,
 };
 use rz_uci::rovent_bootstrap::RoventStartupControl;
@@ -24,6 +24,38 @@ use rz_uci::rovent_external_launch::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
+
+/// This code is emitted only when the original teacher scope's nonblocking
+/// mutex is temporarily held; no retirement acknowledgement was consumed.
+pub(crate) fn is_teacher_scope_busy(error: &AdaptiveCollectionError) -> bool {
+    error.stage == AdaptiveCollectionStage::Settled && error.code == "TeacherScopeBusy"
+}
+
+fn observe_retirement_v3<T>(
+    result: Result<Option<T>, AdaptiveCollectionError>,
+) -> Result<Option<T>, String> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if is_teacher_scope_busy(&error) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod retirement_observation_tests {
+    use super::*;
+
+    #[test]
+    fn scope_contention_is_pending_but_poison_and_other_errors_are_preserved() {
+        let busy = AdaptiveCollectionError::new(AdaptiveCollectionStage::Settled, "TeacherScopeBusy", "temporarily held");
+        assert!(matches!(observe_retirement_v3::<()>(Err(busy)), Ok(None)));
+        let poison = AdaptiveCollectionError::new(AdaptiveCollectionStage::Settled, "TeacherScopePoisoned", "original scope poisoned");
+        assert!(observe_retirement_v3::<()>(Err(poison)).unwrap_err().contains("TeacherScopePoisoned"));
+        let other_stage = AdaptiveCollectionError::new(AdaptiveCollectionStage::Dispatch, "TeacherScopeBusy", "different stage");
+        assert!(observe_retirement_v3::<()>(Err(other_stage)).is_err());
+        assert_eq!(observe_retirement_v3(Ok(Some(7))), Ok(Some(7)));
+    }
+}
 
 pub(crate) struct TeacherRosterEntryV3 {
     pub actor_id: String,
@@ -1003,16 +1035,10 @@ impl RoventCollectionTeacherSessionV3 {
             };
         }
         if self.physical.is_none() {
-            self.physical = self
-                .scope
-                .try_physical_retirement()
-                .map_err(|e| e.to_string())?;
+            self.physical = observe_retirement_v3(self.scope.try_physical_retirement())?;
         }
         if self.workers.is_none() {
-            self.workers = self
-                .scope
-                .try_worker_retirement()
-                .map_err(|e| e.to_string())?;
+            self.workers = observe_retirement_v3(self.scope.try_worker_retirement())?;
         }
         if self.physical.is_none() || self.workers.is_none() {
             return Ok(None);

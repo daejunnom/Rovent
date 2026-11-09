@@ -535,6 +535,17 @@ impl PendingDirectSmokeGrant {
 }
 
 impl OriginalDirectSmokeGrant {
+    /// Borrow the completed Run grant's exact stream for an explicitly
+    /// selected observation phase. Peer identity remains bound to the same
+    /// direct parent; this never renews the grant's original authority.
+    pub(super) fn reobserve_stream(&mut self) -> io::Result<&mut UnixStream> {
+        if self.scope.phase != ProxyEntrySmokePhase::Run {
+            return Err(invalid("reobservation requires the original Run grant"));
+        }
+        self.verify_original_peer()?;
+        Ok(&mut self.stream)
+    }
+
     /// Compare both actual sockets and their direct-parent identities. The
     /// caller separately owns proof of which role listener was selected.
     pub(super) fn cancel_peer(&self, stream: &UnixStream) -> io::Result<DirectSmokeCancelPeer> {

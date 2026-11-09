@@ -4,7 +4,9 @@
 //! proof. The bridge must retain the same recovery Arc before any claim,
 //! source handoff or physical worker spawn.
 use super::capture_router_v3::CaptureRouterV3;
+use super::game_authority_v3::{PcOperationClaimV3, PcOperationKindV3, PcOperationObservationV3};
 use super::launch::ManagedOutputOwnerV3;
+use super::native_capture::{RoventNativeCaptureRegistration, RoventPreRouteFenceAttemptV3, RoventPreRouteFenceWitnessV3, RoventRouteRollbackV3, RoventUnstartedRouteRollbackV3};
 use super::observer_lock_v3::RoventCollectionOwnerLockV3;
 use super::pc_hooks_lock_v3::{
     PcPreparedOutcomeV3, PcPreparedRootV3, PcQuotaEvidenceErrorV3, PcQuotaOutcomeV3,
@@ -25,6 +27,7 @@ use super::teacher::v3_pump::{
     TeacherPumpV3,
 };
 use super::teacher::v3_session::{
+    is_teacher_scope_busy,
     RoventCollectionTeacherSessionV3, TeacherPrepareErrorV3, TeacherPrepareOwnerV3,
     TeacherSessionClaimErrorV3, TeacherSessionStageStateV3, TeacherSessionStagingV3,
     TeacherStartErrorV3,
@@ -36,8 +39,8 @@ use rz_uci::pals_adaptive::{
     RoventTeacherScopePhysicalAckV3, RoventTeacherScopeWorkerAckV3,
 };
 use rz_uci::rovent_bootstrap::pc_collection_v3::{
-    RootHandoffV3, RoventPcCollectionWorkerKeyV3, RoventPcCollectionWorkerSpawnFailureV3,
-    RoventPcCollectionWorkerV3,
+    RootHandoffV3, RoventPcCollectionWorkerKeyV3, RoventPcCollectionWorkerSpawnFailureDetailsV3,
+    RoventPcCollectionWorkerSpawnFailureV3, RoventPcCollectionWorkerV3, RoventPcRootWorkerTaskV3,
 };
 use rz_uci::rovent_external_launch::{
     RoventTeacherScopeAggregateAckV3, RoventTeacherScopeAggregateFailureV3,
@@ -48,6 +51,159 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
+
+#[path = "pc_worker_operation_v3.rs"]
+mod pc_worker_operation_v3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PcUnstartedTaskDispositionV3 {
+    Pending,
+    Released,
+    Unknown,
+}
+
+/// The caller must invoke this outside the recovery guard, after observing
+/// the original spawn producer's returned error. This does not prove that any
+/// other teacher, native or GPU owner has completed.
+fn release_unstarted_pc_worker_task_v3(
+    task: RoventPcRootWorkerTaskV3,
+) -> Result<(), Box<dyn std::any::Any + Send>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(task)))
+}
+
+fn retain_pc_panic_v3(
+    destination: &mut Option<Box<dyn std::any::Any + Send>>,
+    additional: Box<dyn std::any::Any + Send>,
+) {
+    // Another owner may have recorded an unrelated panic while the recovery
+    // mutex was released. Preserve both original payloads rather than replace
+    // and drop the earlier unknown outcome.
+    *destination = Some(match destination.take() {
+        Some(previous) => Box::new((previous, additional)),
+        None => additional,
+    });
+}
+
+/// Keep the original proof and claim in their original owner across unwind.
+/// `access` only projects fields; it must not perform fallible work.
+fn with_preserved_pc_route_owners_v3<S, P, C, R>(
+    slot: &mut S,
+    access: impl for<'a> Fn(&'a mut S) -> (&'a mut Option<P>, &'a mut Option<C>),
+    operation: impl FnOnce(&mut S, Option<&P>, &mut Option<C>) -> R,
+) -> Result<R, Box<dyn std::any::Any + Send>> {
+    let (mut proof, mut claim) = {
+        let (proof, claim) = access(slot);
+        (proof.take(), claim.take())
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        operation(slot, proof.as_ref(), &mut claim)
+    }));
+    let (proof_slot, claim_slot) = access(slot);
+    *proof_slot = proof.take();
+    *claim_slot = claim;
+    result
+}
+
+/// The task has been returned by the original spawn attempt and detached from
+/// its outcome slot. Keep the recovery unlocked while disposing its captures.
+fn finish_failed_pc_task_release_v3(
+    recovery: &Arc<Mutex<PcRootRecoveryV3>>,
+    original_task: RoventPcRootWorkerTaskV3,
+) -> Result<(), String> {
+    let disposition = release_unstarted_pc_worker_task_v3(original_task);
+    let mut state = match recovery.lock() {
+        Ok(state) => state,
+        Err(poison) => {
+            let mut state = poison.into_inner();
+            state.worker_failure_task_disposition = Some(PcUnstartedTaskDispositionV3::Unknown);
+            state.worker_failure_release_poisoned = true;
+            if let Err(payload) = disposition {
+                state.worker_failure_task_drop_panicked = true;
+                retain_pc_panic_v3(&mut state.panic, payload);
+            }
+            state.failure.get_or_insert_with(|| "P-C V3 recovery poisoned during unstarted task release".into());
+            return Err("P-C V3 recovery poisoned".into());
+        }
+    };
+    match disposition {
+        Ok(()) => state.worker_failure_task_disposition = Some(PcUnstartedTaskDispositionV3::Released),
+        Err(payload) => {
+            state.worker_failure_task_disposition = Some(PcUnstartedTaskDispositionV3::Unknown);
+            state.worker_failure_task_drop_panicked = true;
+            retain_pc_panic_v3(&mut state.panic, payload);
+            state.failure.get_or_insert_with(|| "P-C V3 unstarted worker task release unknown".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod unstarted_worker_task_tests {
+    use super::*;
+
+    #[test]
+    fn returned_task_release_breaks_its_original_owner_cycle() {
+        let owner = Arc::new(Mutex::new(None::<RoventPcRootWorkerTaskV3>));
+        let captured = Arc::clone(&owner);
+        *owner.lock().unwrap() = Some(Box::new(move |_| Box::new(captured)));
+        let weak = Arc::downgrade(&owner);
+        let returned = owner.lock().unwrap().take().unwrap();
+        assert!(release_unstarted_pc_worker_task_v3(returned).is_ok());
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn panicking_task_destructor_is_observed_as_unknown() {
+        struct PanicOnDrop;
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) { panic!("task destructor failed"); }
+        }
+        let captured = PanicOnDrop;
+        let task: RoventPcRootWorkerTaskV3 = Box::new(move |_| {
+            let _ = &captured;
+            Box::new(())
+        });
+        assert!(release_unstarted_pc_worker_task_v3(task).is_err());
+    }
+
+    #[test]
+    fn task_release_panic_does_not_replace_an_existing_payload() {
+        type Payload = Box<dyn std::any::Any + Send>;
+        let mut original: Option<Payload> = Some(Box::new("earlier"));
+        retain_pc_panic_v3(&mut original, Box::new("release"));
+        let pair = original.unwrap().downcast::<(Payload, Payload)>().unwrap();
+        let (earlier, release) = *pair;
+        assert_eq!(*earlier.downcast::<&str>().unwrap(), "earlier");
+        assert_eq!(*release.downcast::<&str>().unwrap(), "release");
+    }
+
+    #[test]
+    fn route_unwind_retains_original_proof_claim_and_partial_result() {
+        struct Slot {
+            proof: Option<Arc<()>>,
+            claim: Option<Arc<()>>,
+            result_retained: bool,
+        }
+        let proof = Arc::new(());
+        let claim = Arc::new(());
+        let mut slot = Slot { proof: Some(Arc::clone(&proof)), claim: Some(Arc::clone(&claim)), result_retained: false };
+        let result: Result<(), _> = with_preserved_pc_route_owners_v3(
+            &mut slot,
+            |slot| (&mut slot.proof, &mut slot.claim),
+            |slot, original_proof, original_claim| {
+                assert!(Arc::ptr_eq(original_proof.unwrap(), &proof));
+                assert!(Arc::ptr_eq(original_claim.as_ref().unwrap(), &claim));
+                slot.result_retained = true;
+                panic!("route operation failed after result custody");
+            },
+        );
+        assert!(result.is_err());
+        assert!(Arc::ptr_eq(slot.proof.as_ref().unwrap(), &proof));
+        assert!(Arc::ptr_eq(slot.claim.as_ref().unwrap(), &claim));
+        assert!(slot.result_retained);
+    }
+}
 
 /// Pre-owned before a teacher scope can be claimed. The separate slot lock
 /// permits revalidation with the original supervisor/recovery guards held.
@@ -142,10 +298,206 @@ impl PcActorEffectSlotsV3 {
     }
 }
 
+/// One original root's bounded operation slot. The route receiver remains in
+/// this slot from installation until its original attempt has settled.
+pub(super) struct PcOperationSlotV3 {
+    original_self: Weak<Mutex<PcOperationSlotV3>>,
+    kind: PcOperationKindV3,
+    identity: Arc<()>,
+    admission: RoventCollectionRootAdmissionV3,
+    recovery: Weak<Mutex<PcRootRecoveryV3>>,
+    registration: RoventNativeCaptureRegistration,
+    proof: Option<PcReceivedStageProofV3>,
+    claim: Option<PcOperationClaimV3>,
+    generation: Option<u64>,
+    route_destination: Option<(SpeculativeRootV3, Arc<Mutex<SpeculativeReceiverV3>>)>,
+    route_result: Option<Result<Option<()>, crate::ArenaError>>,
+    route_unknown: bool,
+    worker_destination: Option<Result<RoventPcCollectionWorkerV3, RoventPcCollectionWorkerSpawnFailureV3>>,
+    worker_undispatched: Option<(RoventCollectionRootAdmissionV3, RoventPcRootWorkerTaskV3)>,
+    worker_failure_details: Option<RoventPcCollectionWorkerSpawnFailureDetailsV3>,
+    worker_unknown: bool,
+}
+
+fn pc_operation_index_v3(kind: PcOperationKindV3) -> usize {
+    match kind {
+        PcOperationKindV3::RouteInstall => 0,
+        PcOperationKindV3::NativeWorker => 1,
+        PcOperationKindV3::AttachRoute => 2,
+        PcOperationKindV3::PrepareAdmission => 3,
+        PcOperationKindV3::BindPolicyConsumer => 4,
+        PcOperationKindV3::PublishPrepared => 5,
+    }
+}
+
+impl PcOperationSlotV3 {
+    pub(super) fn kind(&self) -> PcOperationKindV3 { self.kind }
+    pub(super) fn identity(&self) -> &Arc<()> { &self.identity }
+    pub(super) fn admission(&self) -> &RoventCollectionRootAdmissionV3 { &self.admission }
+    pub(super) fn abort_source_proof(&self) -> Option<&PcReceivedStageProofV3> { self.proof.as_ref() }
+
+    /// Reobserve this exact pre-retained slot and received-stage proof
+    /// without reacquiring the supervisor/recovery mutexes held by the caller.
+    pub(super) fn try_matches_abort_source(
+        &self,
+        slot_owner: &Arc<Mutex<PcOperationSlotV3>>,
+        recovery: &PcRootRecoveryV3,
+        registration: &RoventNativeCaptureRegistration,
+        index: usize,
+    ) -> Option<bool> {
+        if pc_operation_index_v3(self.kind) != index || index >= recovery.operation_slots.len()
+            || !Weak::ptr_eq(&self.original_self, &Arc::downgrade(slot_owner))
+            || !Weak::ptr_eq(&self.recovery, &recovery.original_self)
+            || !recovery.operation_slots[index].as_ref().is_some_and(|original| Arc::ptr_eq(original, slot_owner))
+            || !Arc::ptr_eq(&self.identity, &recovery.operation_identities[index])
+            || !self.admission.same_original_admission(&recovery.admission)
+            || !self.registration.same_original_owner(registration)
+        {
+            return Some(false);
+        }
+        let Some(proof) = self.proof.as_ref() else { return None; };
+        if !proof.matches_admission(&recovery.admission)
+            || !Weak::ptr_eq(&proof.recovery, &recovery.original_self)
+            || !recovery.stage.as_ref().is_some_and(|stage| Weak::ptr_eq(&proof.stage, &Arc::downgrade(stage)))
+            || !recovery.original_scope_identity.as_ref().is_some_and(|scope| Weak::ptr_eq(&proof.scope_identity, scope))
+        {
+            return Some(false);
+        }
+        // A vanished weak owner is unresolved; never convert it to a safe
+        // post-route completion or a reason to release original custody.
+        let bridge = proof.bridge.upgrade()?;
+        let _supervisor = proof.supervisor.upgrade()?;
+        if !bridge.capture_registration().same_original_owner(registration)
+            || !recovery.matches_received_root(&bridge)
+            || proof.matches_game(bridge.game_authority()) != Some(true)
+        {
+            return Some(false);
+        }
+        if !bridge.game_authority().abort_requested() {
+            use super::game_authority_v3::GameStepV3 as G;
+            match bridge.game_authority().try_observe_pc_root_cancel_quiescent(&self.admission) {
+                G::Ready => {}
+                G::Busy | G::Unknown => return None,
+                _ => return Some(false),
+            }
+        }
+        Some(true)
+    }
+
+    /// Exhaustive by design: adding a new producer/result field requires an
+    /// explicit decision before an unattempted slot can authorize cleanup.
+    pub(super) fn has_no_attempt_data(&self) -> bool {
+        let Self {
+            original_self: _, kind: _, identity: _, admission: _, recovery: _,
+            registration: _, proof: _, claim, generation, route_destination,
+            route_result, route_unknown, worker_destination, worker_undispatched,
+            worker_failure_details, worker_unknown,
+        } = self;
+        claim.is_none() && generation.is_none() && route_destination.is_none()
+            && route_result.is_none() && !*route_unknown && worker_destination.is_none()
+            && worker_undispatched.is_none() && worker_failure_details.is_none() && !*worker_unknown
+    }
+
+    /// Reobserve this producer's actual failed, no-install result only after
+    /// authority has settled the matching generation. An arbitrary error,
+    /// missing destination, or panic alone is not this evidence.
+    pub(super) fn has_settled_failed_route_no_effect(&self, original_generation: u64) -> bool {
+        let Self {
+            original_self: _, kind, identity: _, admission: _, recovery: _,
+            registration: _, proof: _, claim, generation, route_destination,
+            route_result, route_unknown, worker_destination, worker_undispatched,
+            worker_failure_details, worker_unknown,
+        } = self;
+        *kind == PcOperationKindV3::RouteInstall
+            && claim.is_none() && *generation == Some(original_generation)
+            && route_destination.is_none() && matches!(route_result, Some(Err(_)))
+            && !*route_unknown && worker_destination.is_none()
+            && worker_undispatched.is_none() && worker_failure_details.is_none()
+            && !*worker_unknown
+    }
+
+    pub(super) fn try_revalidate_with_guards(
+        &self,
+        proof: &PcReceivedStageProofV3,
+        supervisor: &PcWorkerSupervisorV3,
+        recovery: &PcRootRecoveryV3,
+    ) -> Result<Option<bool>, &'static str> {
+        if !self.admission.same_original_admission(&recovery.admission)
+            || !Weak::ptr_eq(&self.recovery, &recovery.original_self)
+            || !Arc::ptr_eq(&self.identity, &recovery.operation_identities[pc_operation_index_v3(self.kind)])
+            || !recovery.operation_slots[pc_operation_index_v3(self.kind)]
+                .as_ref().is_some_and(|original| Weak::ptr_eq(&self.original_self, &Arc::downgrade(original)))
+            || !self.registration.same_original_owner(supervisor.bridge.capture_registration())
+        {
+            return Ok(Some(false));
+        }
+        proof.try_revalidate_with_guards(supervisor, recovery)
+    }
+
+    pub(super) fn observation(&self, generation: u64, recovery: &PcRootRecoveryV3) -> PcOperationObservationV3 {
+        if self.generation != Some(generation)
+            || !Weak::ptr_eq(&self.recovery, &recovery.original_self)
+            || !Arc::ptr_eq(&self.identity, &recovery.operation_identities[pc_operation_index_v3(self.kind)])
+        {
+            return PcOperationObservationV3::Unknown;
+        }
+        if self.kind == PcOperationKindV3::NativeWorker {
+            if self.worker_unknown || self.worker_undispatched.is_some() {
+                return PcOperationObservationV3::Unknown;
+            }
+            return match (&self.worker_destination, &self.worker_failure_details, recovery.worker_failure_task_disposition) {
+                (None, None, None) => PcOperationObservationV3::Pending,
+                (Some(Ok(worker)), None, None) if worker.matches_admission(&self.admission) => PcOperationObservationV3::Committed,
+                (Some(Err(failure)), None, None) if failure.admission.same_original_admission(&self.admission) => PcOperationObservationV3::Pending,
+                (None, Some(details), Some(PcUnstartedTaskDispositionV3::Pending)) if details.matches_admission(&self.admission) => PcOperationObservationV3::Pending,
+                (None, Some(details), Some(PcUnstartedTaskDispositionV3::Released)) if details.matches_admission(&self.admission) => PcOperationObservationV3::FailedNoEffect,
+                _ => PcOperationObservationV3::Unknown,
+            };
+        }
+        if self.kind != PcOperationKindV3::RouteInstall {
+            return PcOperationObservationV3::Unknown;
+        }
+        if self.route_unknown {
+            return PcOperationObservationV3::Unknown;
+        }
+        match (&self.route_result, &self.route_destination) {
+            (None, _) => PcOperationObservationV3::Pending,
+            (Some(Ok(None)), None) => PcOperationObservationV3::NoEffect,
+            (Some(Err(_)), None) => PcOperationObservationV3::FailedNoEffect,
+            (Some(Ok(Some(()))), Some((root, receiver))) => {
+                let receiver = match receiver.try_lock() {
+                    Ok(receiver) => receiver,
+                    Err(std::sync::TryLockError::WouldBlock) => return PcOperationObservationV3::Pending,
+                    Err(_) => return PcOperationObservationV3::Unknown,
+                };
+                if root.matches_admission(&self.admission)
+                    && receiver.matches_original_route(root)
+                    && self.registration.owns_speculative_root_v3(root)
+                {
+                    PcOperationObservationV3::Committed
+                } else {
+                    PcOperationObservationV3::Unknown
+                }
+            }
+            _ => PcOperationObservationV3::Unknown,
+        }
+    }
+}
+
+/// Separate historical custody for a route that was installed and then
+/// rolled back before an observer or worker existed. Never a native fence.
+struct PcPostRouteRollbackV3 {
+    route: SpeculativeRootV3,
+    receiver: Arc<Mutex<SpeculativeReceiverV3>>,
+    witness: RoventUnstartedRouteRollbackV3,
+}
+
 /// The original scope, route, session and any uncertain worker remain rooted
 /// here even if preparation or a worker task is interrupted.
 pub(crate) struct PcRootRecoveryV3 {
     original_self: Weak<Mutex<PcRootRecoveryV3>>,
+    operation_identities: [Arc<()>; 6],
+    operation_slots: [Option<Arc<Mutex<PcOperationSlotV3>>>; 6],
     scope_effects: Arc<Mutex<PcScopeEffectSlotsV3>>,
     actor_effects: Vec<Arc<Mutex<PcActorEffectSlotsV3>>>,
     admission: RoventCollectionRootAdmissionV3,
@@ -181,7 +533,12 @@ pub(crate) struct PcRootRecoveryV3 {
     actor_start_failure: Option<TeacherStartErrorV3>,
     panic: Option<Box<dyn std::any::Any + Send>>,
     worker: Option<RoventPcCollectionWorkerV3>,
-    worker_spawn_failure: Option<RoventPcCollectionWorkerSpawnFailureV3>,
+    worker_spawn_failure: Option<RoventPcCollectionWorkerSpawnFailureDetailsV3>,
+    worker_failure_task_disposition: Option<PcUnstartedTaskDispositionV3>,
+    worker_failure_release_poisoned: bool,
+    worker_failure_task_drop_panicked: bool,
+    teacher_drain_failure: Option<String>,
+    teacher_claim_observation_error: Option<&'static str>,
     worker_key: Option<RoventPcCollectionWorkerKeyV3>,
     handoff: Option<RootHandoffV3>,
     aggregate: Option<RoventTeacherScopeAggregateAckV3>,
@@ -193,6 +550,13 @@ pub(crate) struct PcRootRecoveryV3 {
     aborted_pre_route_release: Option<Result<(), &'static str>>,
     aborted_no_scope_release: Option<Result<(), &'static str>>,
     aborted_unclaimed_stage_release: Option<Result<(), &'static str>>,
+    post_route_result: Option<RoventRouteRollbackV3>,
+    post_route_custody: Option<PcPostRouteRollbackV3>,
+    pre_route_fence: Option<RoventPreRouteFenceWitnessV3>,
+    post_route_unknown: bool,
+    post_route_error: Option<String>,
+    sealed_abort_post_route: bool,
+    aborted_post_route_release: Option<Result<(), &'static str>>,
     diagnostics: Vec<(String, TeacherDiagnostics)>,
     prepared: Option<PcPreparedRootV3>,
     custodian: TeacherRecoveryCustodianV3,
@@ -213,6 +577,8 @@ impl PcRootRecoveryV3 {
         Arc::new_cyclic(|original_self| {
             Mutex::new(Self {
                 original_self: original_self.clone(),
+                operation_identities: std::array::from_fn(|_| Arc::new(())),
+                operation_slots: std::array::from_fn(|_| None),
                 scope_effects: Arc::new(Mutex::new(PcScopeEffectSlotsV3::new())),
                 actor_effects: Vec::new(),
                 admission,
@@ -249,6 +615,11 @@ impl PcRootRecoveryV3 {
                 panic: None,
                 worker: None,
                 worker_spawn_failure: None,
+                worker_failure_task_disposition: None,
+                worker_failure_release_poisoned: false,
+                worker_failure_task_drop_panicked: false,
+                teacher_drain_failure: None,
+                teacher_claim_observation_error: None,
                 worker_key: None,
                 handoff: None,
                 aggregate: None,
@@ -258,6 +629,13 @@ impl PcRootRecoveryV3 {
                 aborted_pre_route_release: None,
                 aborted_no_scope_release: None,
                 aborted_unclaimed_stage_release: None,
+                post_route_result: None,
+                post_route_custody: None,
+                pre_route_fence: None,
+                post_route_unknown: false,
+                post_route_error: None,
+                sealed_abort_post_route: false,
+                aborted_post_route_release: None,
                 diagnostics: Vec::new(),
                 prepared: None,
                 custodian: TeacherRecoveryCustodianV3::new(),
@@ -293,11 +671,405 @@ impl PcRootRecoveryV3 {
         }
     }
 
+    /// This distinct receipt is valid only for the original route that was
+    /// installed, revoked and rolled back before observer/worker creation.
+    pub(crate) fn aborted_post_route_aggregate(&self) -> Option<&RoventTeacherScopeAggregateAckV3> {
+        if self.sealed_abort_post_route { self.aggregate.as_ref() } else { None }
+    }
+
+    /// The recovery guard is held by the caller, so no new slot can be
+    /// installed while this checks each later stage. Each authority check
+    /// additionally observes sticky abort and the absence of its original
+    /// root/kind record. Existing records remain held even after NoEffect.
+    fn try_observe_later_operations_never_attempted(
+        &self,
+        registration: &RoventNativeCaptureRegistration,
+    ) -> Result<Option<bool>, &'static str> {
+        use super::game_authority_v3::GameStepV3 as G;
+        for (index, slot_owner) in self.operation_slots.iter().enumerate().skip(1) {
+            let Some(slot_owner) = slot_owner else { continue; };
+            let slot = match slot_owner.try_lock() {
+                Ok(slot) => slot,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(_) => return Err("P-C V3 later operation slot poisoned"),
+            };
+            let Some(proof) = slot.abort_source_proof() else { return Ok(None); };
+            let Some(bridge) = proof.bridge.upgrade() else { return Ok(None); };
+            match bridge.game_authority().try_observe_pc_operation_never_claimed(
+                slot_owner, &slot, self, registration, index,
+            ) {
+                G::Ready => {}
+                G::Busy | G::Unknown => return Ok(None),
+                _ => return Ok(Some(false)),
+            }
+        }
+        Ok(Some(true))
+    }
+
+    /// Publish and retain this original admission's sticky registration fence.
+    /// The fence closes route/ticket admission only, not physical work.
+    pub(crate) fn try_retain_pre_route_fence(
+        &mut self,
+        registration: &RoventNativeCaptureRegistration,
+        maximum_roots: u16,
+    ) -> Result<Option<bool>, &'static str> {
+        if let Some(original) = &self.pre_route_fence {
+            return original.try_matches_original(registration, &self.admission);
+        }
+        match registration.try_seal_pre_route_v3(&self.admission, maximum_roots) {
+            RoventPreRouteFenceAttemptV3::Sealed(witness)
+            | RoventPreRouteFenceAttemptV3::AlreadySealed(witness) => {
+                self.pre_route_fence = Some(witness);
+                Ok(Some(true))
+            }
+            RoventPreRouteFenceAttemptV3::Busy => Ok(None),
+            RoventPreRouteFenceAttemptV3::Conflict => Err("P-C V3 pre-route registration conflicts with a route or ticket"),
+            RoventPreRouteFenceAttemptV3::Capacity => Err("P-C V3 pre-route fence capacity unavailable"),
+            RoventPreRouteFenceAttemptV3::Poisoned => Err("P-C V3 pre-route registration fence poisoned"),
+        }
+    }
+
+    /// Reobserve the same sticky fence without publishing a new one.
+    pub(crate) fn try_observe_pre_route_fence(
+        &self,
+        registration: &RoventNativeCaptureRegistration,
+    ) -> Result<Option<bool>, &'static str> {
+        match &self.pre_route_fence {
+            Some(original) => original.try_matches_original(registration, &self.admission),
+            None => Ok(Some(false)),
+        }
+    }
+
+    /// A scope aggregate does not settle a still-owned authority claim.
+    pub(crate) fn try_observe_teacher_claims_settled(
+        &self,
+    ) -> Result<Option<bool>, &'static str> {
+        let scope = match self.scope_effects.try_lock() {
+            Ok(scope) => scope,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 scope claim state poisoned"),
+        };
+        if scope.claim.is_some() && !scope.finished {
+            return Ok(Some(false));
+        }
+        drop(scope);
+        for owner in &self.actor_effects {
+            let actor = match owner.try_lock() {
+                Ok(actor) => actor,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(_) => return Err("P-C V3 actor claim state poisoned"),
+            };
+            if actor.claim.is_some() && !actor.finished {
+                return Ok(Some(false));
+            }
+        }
+        Ok(Some(true))
+    }
+
+    /// Local observation only: a clear retained slot can still have an
+    /// earlier settled no-effect record in authority. The enclosing authority
+    /// and registration fence remain separate checks.
+    pub(crate) fn try_observe_failure_operation_slots_clear(
+        &self,
+        registration: &RoventNativeCaptureRegistration,
+    ) -> Result<Option<bool>, &'static str> {
+        for (index, owner) in self.operation_slots.iter().enumerate() {
+            let Some(owner) = owner else { continue; };
+            let slot = match owner.try_lock() {
+                Ok(slot) => slot,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(_) => return Err("P-C V3 original operation slot poisoned"),
+            };
+            if pc_operation_index_v3(slot.kind) != index
+                || !Weak::ptr_eq(&slot.original_self, &Arc::downgrade(owner))
+                || !Weak::ptr_eq(&slot.recovery, &self.original_self)
+                || !Arc::ptr_eq(&slot.identity, &self.operation_identities[index])
+                || !slot.admission.same_original_admission(&self.admission)
+                || !slot.registration.same_original_owner(registration)
+            {
+                return Ok(Some(false));
+            }
+            if slot.route_unknown || slot.worker_unknown {
+                return Err("P-C V3 original operation outcome unknown");
+            }
+            if slot.claim.is_some() {
+                return Ok(None);
+            }
+            if !slot.has_no_attempt_data() {
+                return Ok(Some(false));
+            }
+        }
+        Ok(Some(true))
+    }
+
+    /// A route can still be in its original operation slot after the caller
+    /// has requested abort. Only the original sticky-abort authority may
+    /// establish that this exact route operation never installed anything.
+    fn try_observe_pre_route_never_started(
+        &self,
+        registration: &RoventNativeCaptureRegistration,
+    ) -> Result<Option<bool>, &'static str> {
+        use super::game_authority_v3::GameStepV3 as G;
+        let Some(fence) = self.pre_route_fence.as_ref() else { return Ok(None); };
+        match fence.try_matches_original(registration, &self.admission)? {
+            Some(true) => {}
+            other => return Ok(other),
+        }
+        let Some(slot_owner) = self.operation_slots[0].as_ref() else {
+            // Slot creation precedes every route claim and slots are retained
+            // for the lifetime of this original recovery.
+            return Ok(Some(true));
+        };
+        let slot = match slot_owner.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 route operation slot poisoned"),
+        };
+        let Some(proof) = slot.abort_source_proof() else { return Ok(None); };
+        let Some(bridge) = proof.bridge.upgrade() else { return Ok(None); };
+        match bridge.game_authority().try_observe_pc_route_never_started(
+            slot_owner, &slot, self, registration, fence,
+        ) {
+            G::Ready => Ok(Some(true)),
+            G::Busy | G::Unknown => Ok(None),
+            _ => Ok(Some(false)),
+        }
+    }
+
+    fn try_validate_aborted_post_route(
+        &self,
+        registration: &RoventNativeCaptureRegistration,
+    ) -> Result<Option<bool>, &'static str> {
+        if self.post_route_unknown || self.post_route_error.is_some() || self.panic.is_some() || !self.abort_targets_revoked
+            || !self.teacher_reserved || self.owner.is_some() || self.pump.is_some()
+            || self.pump_setup_unknown || self.pump_setup_failure.is_some()
+            || self.closed_custody.is_some() || self.closed_custody_setup_unknown
+            || self.processed.is_some() || self.retained.is_some() || self.consumer.is_some()
+            || self.consumer_setup_unknown || self.worker.is_some() || self.worker_key.is_some()
+            || self.worker_spawn_failure.is_some() || self.handoff.is_some()
+            || self.prepared.is_some() || self.published || self.abort_before_route
+            || self.sealed_abort_before_route || self.sealed_abort_no_scope
+        {
+            return Ok(Some(false));
+        }
+        match self.try_observe_later_operations_never_attempted(registration)? {
+            Some(true) => {}
+            other => return Ok(other),
+        }
+        let (Some(custody), Some(route), Some(receiver), Some(slot_owner)) = (
+            self.post_route_custody.as_ref(), self.route.as_ref(), self.receiver.as_ref(),
+            self.operation_slots[0].as_ref(),
+        ) else { return Ok(Some(false)); };
+        if !custody.route.same_original_route(route)
+            || !Arc::ptr_eq(&custody.receiver, receiver)
+            || !custody.witness.matches_original_route(route)
+            || !route.matches_admission(&self.admission)
+            || !self.aggregate.as_ref().is_some_and(|ack| ack.matches_admission(&self.admission))
+        {
+            return Ok(Some(false));
+        }
+        let slot = match slot_owner.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 post-route operation slot poisoned"),
+        };
+        match slot.try_matches_abort_source(slot_owner, self, registration, 0) {
+            Some(true) => {}
+            Some(false) => return Ok(Some(false)),
+            None => return Ok(None),
+        }
+        if slot.claim.is_some() || slot.route_unknown || slot.route_destination.is_some()
+            || !matches!(slot.route_result.as_ref(), Some(Ok(Some(()))))
+            || !slot.registration.same_original_owner(registration)
+            || !Arc::ptr_eq(&slot.identity, &self.operation_identities[0])
+        {
+            return Ok(Some(false));
+        }
+        let Some(proof) = slot.proof.as_ref() else { return Ok(Some(false)); };
+        let Some(bridge) = proof.bridge.upgrade() else { return Ok(Some(false)); };
+        if !bridge.game_authority().abort_requested()
+            || !self.matches_received_root(&bridge)
+            || !proof.matches_admission(&self.admission)
+        {
+            return Ok(Some(false));
+        }
+        let receiver = match receiver.try_lock() {
+            Ok(receiver) => receiver,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 post-route receiver poisoned"),
+        };
+        if !receiver.matches_original_route(route) { return Ok(Some(false)); }
+        match receiver.try_handoffs_accounted(route) {
+            Ok(None) => return Ok(None),
+            Ok(Some(false)) => return Ok(Some(false)),
+            Ok(Some(true)) => {}
+            Err(_) => return Err("P-C V3 post-route receiver accounting failed"),
+        }
+        let scope = match self.scope_effects.try_lock() {
+            Ok(scope) => scope,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 post-route scope poisoned"),
+        };
+        if scope.claim.is_some() && !scope.finished { return Ok(Some(false)); }
+        for actor in &self.actor_effects {
+            let actor = match actor.try_lock() {
+                Ok(actor) => actor,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(_) => return Err("P-C V3 post-route actor poisoned"),
+            };
+            if actor.claim.is_some() && !actor.finished { return Ok(Some(false)); }
+        }
+        Ok(Some(true))
+    }
+
+    pub(crate) fn try_seal_aborted_post_route(
+        &mut self,
+        registration: &RoventNativeCaptureRegistration,
+    ) -> Result<Option<bool>, &'static str> {
+        match self.try_validate_aborted_post_route(registration)? {
+            Some(true) => { self.sealed_abort_post_route = true; Ok(Some(true)) }
+            other => Ok(other),
+        }
+    }
+
+    pub(crate) fn try_observe_sealed_aborted_post_route(
+        &self,
+        registration: &RoventNativeCaptureRegistration,
+    ) -> Result<Option<bool>, &'static str> {
+        if !self.sealed_abort_post_route { return Ok(Some(false)); }
+        self.try_validate_aborted_post_route(registration)
+    }
+
+    /// Revoke and remove only the exact ticket-free route whose original
+    /// receiver is still held by this recovery. Nothing here proves a native
+    /// fence or teacher completion; those remain separate obligations.
+    fn try_abort_unstarted_route(
+        &mut self,
+        registration: &RoventNativeCaptureRegistration,
+    ) -> Result<Option<bool>, &'static str> {
+        if self.post_route_custody.is_some() { return Ok(Some(true)); }
+        if self.post_route_unknown || self.post_route_error.is_some() || self.panic.is_some()
+            || self.owner.is_some() || self.pump.is_some() || self.pump_setup_unknown
+            || self.pump_setup_failure.is_some() || self.closed_custody.is_some()
+            || self.closed_custody_setup_unknown || self.processed.is_some() || self.retained.is_some()
+            || self.consumer.is_some() || self.consumer_setup_unknown || self.worker.is_some()
+            || self.worker_key.is_some() || self.worker_spawn_failure.is_some() || self.handoff.is_some()
+            || self.prepared.is_some() || self.published
+        {
+            return Ok(Some(false));
+        }
+        match self.try_observe_later_operations_never_attempted(registration)? {
+            Some(true) => {}
+            other => return Ok(other),
+        }
+        let (Some(route), Some(receiver), Some(slot_owner)) = (
+            self.route.as_ref().cloned(), self.receiver.as_ref().cloned(), self.operation_slots[0].as_ref().cloned(),
+        ) else { return Ok(Some(false)); };
+        {
+            let slot = match slot_owner.try_lock() {
+                Ok(slot) => slot,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(_) => return Err("P-C V3 route operation slot poisoned"),
+            };
+            match slot.try_matches_abort_source(&slot_owner, self, registration, 0) {
+                Some(true) => {}
+                Some(false) => return Ok(Some(false)),
+                None => return Ok(None),
+            }
+            if slot.claim.is_some() || slot.route_unknown || slot.route_destination.is_some()
+                || !matches!(slot.route_result.as_ref(), Some(Ok(Some(()))))
+                || !slot.registration.same_original_owner(registration)
+                || !Arc::ptr_eq(&slot.identity, &self.operation_identities[0])
+                || !registration.owns_speculative_root_v3(&route)
+            { return Ok(Some(false)); }
+        }
+        {
+            let scope = match self.scope_effects.try_lock() {
+                Ok(scope) => scope,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(_) => return Err("P-C V3 abort scope poisoned"),
+            };
+            if scope.claim.is_some() && !scope.finished { return Ok(None); }
+        }
+        for actor in &self.actor_effects {
+            let actor = match actor.try_lock() {
+                Ok(actor) => actor,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(_) => return Err("P-C V3 abort actor poisoned"),
+            };
+            if actor.claim.is_some() && !actor.finished { return Ok(None); }
+        }
+        {
+            let receiver_guard = match receiver.try_lock() {
+                Ok(receiver) => receiver,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(_) => return Err("P-C V3 route receiver poisoned"),
+            };
+            if !receiver_guard.matches_original_route(&route) { return Ok(Some(false)); }
+            match receiver_guard.try_handoffs_accounted(&route) {
+                Ok(None) => return Ok(None),
+                Ok(Some(false)) => return Ok(Some(false)),
+                Ok(Some(true)) => {}
+                Err(_) => return Err("P-C V3 route receiver accounting failed"),
+            }
+        }
+        route.cancel_all();
+        if !self.abort_targets_revoked {
+            match route.try_revoke_all_targets() {
+                Ok(Some(())) => self.abort_targets_revoked = true,
+                Ok(None) => return Ok(None),
+                Err(error) => {
+                    self.post_route_error = Some(format!("P-C V3 route revoke failed: {error}"));
+                    return Ok(Some(false));
+                }
+            }
+        }
+        if self.post_route_result.is_none() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                registration.try_rollback_unstarted_speculative_root_into_v3(&route, &mut self.post_route_result)
+            }));
+            match result {
+                Ok(Ok(None)) => return Ok(None),
+                Ok(Ok(Some(()))) => {}
+                Ok(Err(error)) => {
+                    self.post_route_error = Some(format!("P-C V3 route rollback failed: {error}"));
+                    return Ok(Some(false));
+                }
+                Err(payload) => {
+                    self.post_route_unknown = true;
+                    self.panic = Some(payload);
+                    return Ok(Some(false));
+                }
+            }
+        }
+        match self.post_route_result.take() {
+            Some(RoventRouteRollbackV3::RolledBack(witness)) => {
+                if !witness.matches_original_route(&route) {
+                    self.post_route_result = Some(RoventRouteRollbackV3::RolledBack(witness));
+                    self.post_route_unknown = true;
+                    return Ok(Some(false));
+                }
+                self.post_route_custody = Some(PcPostRouteRollbackV3 { route, receiver, witness });
+                Ok(Some(true))
+            }
+            Some(other) => {
+                self.post_route_result = Some(other);
+                self.post_route_error = Some("P-C V3 route was not unstarted".into());
+                Ok(Some(false))
+            }
+            None => {
+                self.post_route_unknown = true;
+                Ok(Some(false))
+            }
+        }
+    }
+
     /// Seal this exact aborted recovery before any stage/issuer was created.
     /// Issuing the original no-scope acknowledgement and returning any
     /// reserved quota remain the bridge ledger's separate responsibilities.
     pub(crate) fn seal_aborted_no_scope(&mut self) -> bool {
         if !self.abort_before_route
+            || self.operation_slots[0].is_some()
             || self.stage.is_some()
             || self.original_scope_identity.is_some()
             || self.preflight_failure.is_some()
@@ -350,6 +1122,7 @@ impl PcRootRecoveryV3 {
     ) -> Result<Option<bool>, &'static str> {
         use super::game_authority_v3::GameStepV3 as G;
         if !self.abort_before_route
+            || self.operation_slots[0].is_some()
             || self.panic.is_some()
             || self.route.is_some()
             || self.worker.is_some()
@@ -387,7 +1160,7 @@ impl PcRootRecoveryV3 {
         } = &mut *slots;
         if claim.is_some()
             || outcome.is_some()
-            || !matches!(*claim_step, None | Some(G::Busy | G::Aborted | G::Closed))
+            || !matches!(*claim_step, None | Some(G::Busy | G::Aborted | G::Closed | G::RootCanceled))
         {
             return Ok(Some(false));
         }
@@ -431,6 +1204,7 @@ impl PcRootRecoveryV3 {
     ) -> Result<Option<bool>, &'static str> {
         use super::game_authority_v3::GameStepV3 as G;
         if !self.abort_before_route
+            || self.operation_slots[0].is_some()
             || self.panic.is_some()
             || self.route.is_some()
             || self.worker.is_some()
@@ -459,7 +1233,7 @@ impl PcRootRecoveryV3 {
             || slots.outcome.is_some()
             || !matches!(
                 slots.claim_step,
-                None | Some(G::Busy | G::Aborted | G::Closed)
+                None | Some(G::Busy | G::Aborted | G::Closed | G::RootCanceled)
             )
         {
             return Ok(Some(false));
@@ -487,7 +1261,10 @@ impl PcRootRecoveryV3 {
 
     /// Seal only a known pre-route root whose own session physically retired.
     /// The ledger must separately validate this same recovery and aggregate.
-    pub(crate) fn seal_aborted_pre_route(&mut self) -> bool {
+    pub(crate) fn try_seal_aborted_pre_route(
+        &mut self,
+        registration: &RoventNativeCaptureRegistration,
+    ) -> Result<Option<bool>, &'static str> {
         if !self.abort_before_route
             || !self.teacher_reserved
             || self.panic.is_some()
@@ -515,26 +1292,34 @@ impl PcRootRecoveryV3 {
                 .as_ref()
                 .is_some_and(|ack| ack.matches_admission(&self.admission))
         {
-            return false;
+            return Ok(Some(false));
+        }
+        match self.try_observe_pre_route_never_started(registration)? {
+            Some(true) => {}
+            other => return Ok(other),
         }
         // Acquired effect claims are separate from physical aggregation. An
         // unknown or uncompleted claim may not be erased by a scope ACK.
-        let Ok(scope) = self.scope_effects.try_lock() else {
-            return false;
+        let scope = match self.scope_effects.try_lock() {
+            Ok(scope) => scope,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 pre-route scope poisoned"),
         };
         if scope.claim.is_some() && !scope.finished {
-            return false;
+            return Ok(Some(false));
         }
         for original in &self.actor_effects {
-            let Ok(actor) = original.try_lock() else {
-                return false;
+            let actor = match original.try_lock() {
+                Ok(actor) => actor,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(_) => return Err("P-C V3 pre-route actor poisoned"),
             };
             if actor.claim.is_some() && !actor.finished {
-                return false;
+                return Ok(Some(false));
             }
         }
         self.sealed_abort_before_route = true;
-        true
+        Ok(Some(true))
     }
     pub(crate) fn matches_route_pump(
         &self,
@@ -642,12 +1427,17 @@ impl PcRootRecoveryV3 {
     }
     /// Irreversibly close preparation before issuing the root's no-scope seal.
     /// This records no physical or worker completion by itself.
-    pub(crate) fn seal_definitely_unstarted(&mut self) -> bool {
+    pub(crate) fn seal_definitely_unstarted(&mut self) -> Result<Option<bool>, &'static str> {
         if self.failure.is_none() || !self.definitely_unstarted() {
-            return false;
+            return Ok(Some(false));
+        }
+        match self.try_observe_teacher_claims_settled()? {
+            None => return Ok(None),
+            Some(false) => return Ok(Some(false)),
+            Some(true) => {}
         }
         self.sealed_unstarted = true;
-        true
+        Ok(Some(true))
     }
     pub(crate) fn is_sealed_unstarted(&self) -> bool {
         self.sealed_unstarted
@@ -804,17 +1594,23 @@ impl PcRootRecoveryV3 {
         self.claimed_unstarted.as_ref()?.aggregate.as_ref()
     }
 
-    pub(crate) fn seal_claimed_unstarted(&mut self) -> bool {
-        if !self
-            .claimed_unstarted
-            .as_ref()
-            .is_some_and(|owner| owner.aggregate.is_some())
-            || self.try_claimed_unstarted() != ClaimedUnstartedPollV3::Confirmed
-        {
-            return false;
+    pub(crate) fn seal_claimed_unstarted(&mut self) -> Result<Option<bool>, &'static str> {
+        match self.try_observe_teacher_claims_settled()? {
+            None => return Ok(None),
+            Some(false) => return Ok(Some(false)),
+            Some(true) => {}
+        }
+        if !self.claimed_unstarted.as_ref().is_some_and(|owner| owner.aggregate.is_some()) {
+            return Ok(Some(false));
+        }
+        match self.try_claimed_unstarted() {
+            ClaimedUnstartedPollV3::Confirmed => {}
+            ClaimedUnstartedPollV3::Pending => return Ok(None),
+            ClaimedUnstartedPollV3::Ineligible => return Ok(Some(false)),
+            ClaimedUnstartedPollV3::Unknown => return Err("P-C V3 claimed teacher scope completion unknown"),
         }
         self.sealed_claimed_unstarted = true;
-        true
+        Ok(Some(true))
     }
 
     pub(crate) fn is_sealed_claimed_unstarted(&self) -> bool {
@@ -825,6 +1621,14 @@ impl PcRootRecoveryV3 {
         use rz_search::external_cpu::process_scope::{
             CollectionMemberPhysicalState as P, CollectionMemberWorkerState as W,
         };
+        match self.try_observe_teacher_claims_settled() {
+            Ok(Some(true)) => {}
+            Ok(None | Some(false)) => return ClaimedUnstartedPollV3::Pending,
+            Err(error) => {
+                self.teacher_claim_observation_error.get_or_insert(error);
+                return ClaimedUnstartedPollV3::Unknown;
+            }
+        }
         if self.failure.is_none()
             || !self.teacher_reserved
             || self.next_actor != 0
@@ -903,11 +1707,15 @@ impl PcRootRecoveryV3 {
             }));
             match result {
                 Ok(Ok(())) => recovery.closed = true,
+                Ok(Err(error)) if super::teacher::v3_session::is_teacher_scope_busy(&error) => {
+                    return ClaimedUnstartedPollV3::Pending;
+                }
                 Ok(Err(error)) => {
                     if recovery.scope_error.is_none() {
                         recovery.scope_error = Some(error);
                     }
-                    return ClaimedUnstartedPollV3::Pending;
+                    recovery.unknown = true;
+                    return ClaimedUnstartedPollV3::Unknown;
                 }
                 Err(payload) => {
                     recovery.panic = Some(payload);
@@ -923,6 +1731,9 @@ impl PcRootRecoveryV3 {
             match result {
                 Ok(Ok(Some(ack))) => recovery.physical = Some(ack),
                 Ok(Ok(None)) => return ClaimedUnstartedPollV3::Pending,
+                Ok(Err(error)) if super::teacher::v3_session::is_teacher_scope_busy(&error) => {
+                    return ClaimedUnstartedPollV3::Pending;
+                }
                 Ok(Err(error)) => {
                     if recovery.scope_error.is_none() {
                         recovery.scope_error = Some(error);
@@ -944,6 +1755,9 @@ impl PcRootRecoveryV3 {
             match result {
                 Ok(Ok(Some(ack))) => recovery.workers = Some(ack),
                 Ok(Ok(None)) => return ClaimedUnstartedPollV3::Pending,
+                Ok(Err(error)) if super::teacher::v3_session::is_teacher_scope_busy(&error) => {
+                    return ClaimedUnstartedPollV3::Pending;
+                }
                 Ok(Err(error)) => {
                     if recovery.scope_error.is_none() {
                         recovery.scope_error = Some(error);
@@ -2564,6 +3378,7 @@ enum PcScopeDriveV3 {
     Finished,
     Failed,
     Aborted,
+    RootCanceled,
 }
 
 /// All mutable effect slots were installed with this recovery before entry.
@@ -2656,6 +3471,7 @@ fn drive_pc_scope_effect_v3(
             G::Ready => {}
             G::Busy => return PcScopeDriveV3::Pending,
             G::Aborted | G::Closed => return PcScopeDriveV3::Aborted,
+            G::RootCanceled => return PcScopeDriveV3::RootCanceled,
             _ => return PcScopeDriveV3::Failed,
         }
     }
@@ -2669,6 +3485,7 @@ fn drive_pc_scope_effect_v3(
             G::Ready => {}
             G::Busy => return PcScopeDriveV3::Pending,
             G::Aborted | G::Closed => return PcScopeDriveV3::Aborted,
+            G::RootCanceled => return PcScopeDriveV3::RootCanceled,
             _ => return PcScopeDriveV3::Failed,
         }
     }
@@ -2828,6 +3645,7 @@ fn drive_pc_actor_effect_v3(
             G::Ready => {}
             G::Busy => return PcScopeDriveV3::Pending,
             G::Aborted | G::Closed => return PcScopeDriveV3::Aborted,
+            G::RootCanceled => return PcScopeDriveV3::RootCanceled,
             _ => return PcScopeDriveV3::Failed,
         }
     }
@@ -2849,6 +3667,7 @@ fn drive_pc_actor_effect_v3(
             G::Ready => {}
             G::Busy => return PcScopeDriveV3::Pending,
             G::Aborted | G::Closed => return PcScopeDriveV3::Aborted,
+            G::RootCanceled => return PcScopeDriveV3::RootCanceled,
             _ => return PcScopeDriveV3::Failed,
         }
     }
@@ -2902,6 +3721,119 @@ fn drive_pc_actor_effect_v3(
     }
 }
 
+/// Drive exactly one original route installation attempt. The result slot is
+/// retained in the recovery before the authority claim or producer entry.
+fn drive_pc_route_effect_v3(
+    supervisor: &PcWorkerSupervisorV3,
+    recovery: &mut PcRootRecoveryV3,
+    slot_owner: &Arc<Mutex<PcOperationSlotV3>>,
+) -> PcScopeDriveV3 {
+    use super::game_authority_v3::GameStepV3 as G;
+    let mut slot = match slot_owner.try_lock() {
+        Ok(slot) => slot,
+        Err(std::sync::TryLockError::WouldBlock) => return PcScopeDriveV3::Pending,
+        Err(_) => return PcScopeDriveV3::Failed,
+    };
+    let game = supervisor.bridge.game_authority();
+    let result = with_preserved_pc_route_owners_v3(
+        &mut *slot,
+        |slot| (&mut slot.proof, &mut slot.claim),
+        |slot, proof, claim| {
+        let Some(proof) = proof else {
+            return PcScopeDriveV3::Failed;
+        };
+        let mut newly_claimed = false;
+        if claim.is_none() {
+            match game.try_claim_pc_operation(proof, slot, supervisor, recovery, claim) {
+                G::Ready => newly_claimed = true,
+                G::Busy => return PcScopeDriveV3::Pending,
+                G::Aborted | G::Closed => return PcScopeDriveV3::Aborted,
+                G::RootCanceled => return PcScopeDriveV3::RootCanceled,
+                _ => return PcScopeDriveV3::Failed,
+            }
+        }
+        let Some(original) = claim.as_mut() else {
+            return PcScopeDriveV3::Failed;
+        };
+        if newly_claimed {
+            if slot.route_destination.is_some() || slot.route_result.is_some() || slot.route_unknown {
+                return PcScopeDriveV3::Failed;
+            }
+            slot.generation = Some(original.generation());
+            let registration = slot.registration.clone();
+            let admission = slot.admission.clone();
+            let mailbox = supervisor.bridge.inputs().plan().teacher_mailbox_capacity as usize;
+            let tickets = supervisor.bridge.inputs().plan().teacher_tickets_per_root as usize;
+            let producer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                registration.try_install_speculative_root_into_v3(
+                    &admission,
+                    mailbox,
+                    tickets,
+                    Arc::new(AtomicBool::new(false)),
+                    &mut slot.route_destination,
+                )
+            }));
+            match producer {
+                Ok(result) => slot.route_result = Some(result),
+                Err(payload) => {
+                    slot.route_unknown = true;
+                    retain_pc_panic_v3(&mut recovery.panic, payload);
+                    recovery.failure.get_or_insert_with(|| "P-C V3 route installation outcome unknown".into());
+                    return PcScopeDriveV3::Pending;
+                }
+            }
+        }
+        match original.try_complete_pc_operation(proof, slot, supervisor, recovery) {
+            G::Ready => {}
+            G::Busy | G::Unknown => return PcScopeDriveV3::Pending,
+            _ => return PcScopeDriveV3::Failed,
+        }
+        // Drop only an already settled claim. Keep the producer result until
+        // it is transferred or explicitly recorded as a failure.
+        *claim = None;
+        match slot.route_result.as_ref() {
+            Some(Ok(None)) => {
+                slot.route_result = None;
+                slot.generation = None;
+                PcScopeDriveV3::Pending
+            }
+            Some(Err(error)) => {
+                recovery.failure.get_or_insert_with(|| format!("P-C V3 route installation: {error}"));
+                PcScopeDriveV3::Failed
+            }
+            Some(Ok(Some(()))) => {
+                let Some((route, receiver)) = slot.route_destination.as_ref() else {
+                    return PcScopeDriveV3::Failed;
+                };
+                if recovery.route.is_some() || recovery.receiver.is_some() {
+                    slot.route_unknown = true;
+                    recovery.failure.get_or_insert_with(|| "P-C V3 route recovery destination already occupied".into());
+                    return PcScopeDriveV3::Pending;
+                }
+                // Clone the original owners while the producer slot still
+                // retains them. If anything unwinds before both assignments,
+                // the original receiver remains accessible in this slot.
+                let route = route.clone();
+                let receiver = Arc::clone(receiver);
+                recovery.route = Some(route);
+                recovery.receiver = Some(receiver);
+                slot.route_destination = None;
+                PcScopeDriveV3::Finished
+            }
+            None => PcScopeDriveV3::Failed,
+        }
+    });
+    match result {
+        Ok(step) => step,
+        Err(payload) => {
+            slot.route_unknown = true;
+            retain_pc_panic_v3(&mut recovery.panic, payload);
+            recovery.failure.get_or_insert_with(|| "P-C V3 route effect outcome unknown".into());
+            PcScopeDriveV3::Pending
+        }
+    }
+}
+
 /// Called outside the native manager callback. Busy leaves the same recovery
 /// owner in place; no new actor or claim is issued for another root.
 fn prepare_root_step_v3(
@@ -2942,9 +3874,70 @@ fn prepare_root_step_v3(
     if !state.matches_received_root(bridge) {
         return Err("P-C V3 original receiver witness missing or changed".into());
     }
-    // A claim acquired before abort must still be settled from its original
-    // outcome; abort closes new admission but cannot erase that claim.
-    if bridge.game_authority().abort_requested() {
+    // Root cancellation is not a game abort and is only a request. Original
+    // in-flight effects still have to be settled before any root cleanup.
+    let game = bridge.game_authority();
+    let root_cancel_requested = if game.abort_requested() {
+        // Game-wide abort has its own authority and cleanup proofs; an
+        // unbound root gate must not conceal that separate request.
+        false
+    } else {
+        match game.try_observe_pc_root_cancel(&state.admission) {
+            super::game_authority_v3::GameStepV3::Ready => false,
+            super::game_authority_v3::GameStepV3::RootCanceled => true,
+            super::game_authority_v3::GameStepV3::Busy if game.abort_requested() => false,
+            super::game_authority_v3::GameStepV3::Busy => return Ok(PcPrepareStepV3::Pending),
+            _ => return Err("P-C V3 original root cancel observation unresolved".into()),
+        }
+    };
+    // Settle an already-issued worker operation before failure or abort can
+    // decide this root. No new task factory is available on reobservation.
+    if let Some(worker_slot) = state.operation_slots[1].as_ref().cloned() {
+        let active = match worker_slot.try_lock() {
+            Ok(slot) => slot.claim.is_some(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(PcPrepareStepV3::Pending),
+            Err(_) => return Err("P-C V3 worker operation slot poisoned".into()),
+        };
+        if active {
+            use pc_worker_operation_v3::PcWorkerEffectDriveV3 as W;
+            let result = pc_worker_operation_v3::drive_pc_worker_effect_v3(
+                supervisor, &mut state, &worker_slot,
+                None::<fn() -> RoventPcRootWorkerTaskV3>,
+            );
+            return match result {
+                W::DropUnstartedTask(task) => {
+                    drop(state);
+                    finish_failed_pc_task_release_v3(recovery, task)?;
+                    Ok(PcPrepareStepV3::Pending)
+                }
+                W::Failed => {
+                    state.failure.get_or_insert_with(|| "P-C V3 worker acquisition unresolved".into());
+                    Ok(PcPrepareStepV3::Failed)
+                }
+                W::Pending | W::Finished | W::Aborted => Ok(PcPrepareStepV3::Pending),
+            };
+        }
+    }
+    // Settle an existing route claim even if abort has not yet been observed.
+    // Otherwise abort may arrive between two observations while the original
+    // route and receiver are still only in the claim's result slot, causing
+    // this root to be incorrectly classified as pre-route.
+    if let Some(route_slot) = state.operation_slots[0].as_ref().cloned() {
+        let active = match route_slot.try_lock() {
+            Ok(slot) => slot.claim.is_some(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(PcPrepareStepV3::Pending),
+            Err(_) => return Err("P-C V3 route operation slot poisoned".into()),
+        };
+        if active {
+            if matches!(drive_pc_route_effect_v3(supervisor, &mut state, &route_slot), PcScopeDriveV3::Failed) {
+                state.failure.get_or_insert_with(|| "P-C V3 active route outcome unresolved".into());
+            }
+            return Ok(PcPrepareStepV3::Pending);
+        }
+    }
+    // Claims acquired before either abort or a preparation failure retain
+    // their original authority until their own result has been settled.
+    if bridge.game_authority().abort_requested() || root_cancel_requested || state.failure.is_some() {
         let active = match state.scope_effects.try_lock() {
             Ok(slots) => slots.claim.is_some() && !slots.finished,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(PcPrepareStepV3::Pending),
@@ -3013,16 +4006,39 @@ fn prepare_root_step_v3(
                             .failure
                             .get_or_insert_with(|| "P-C V3 active actor outcome unresolved".into());
                     }
-                    PcScopeDriveV3::Pending | PcScopeDriveV3::Aborted => {}
+                    PcScopeDriveV3::Pending | PcScopeDriveV3::Aborted | PcScopeDriveV3::RootCanceled => {}
                 }
                 return Ok(PcPrepareStepV3::Pending);
             }
         }
     }
+    if root_cancel_requested && !bridge.game_authority().abort_requested() {
+        if let Some(route) = state.route.as_ref() {
+            route.cancel_all();
+            match route.try_revoke_all_targets() {
+                Ok(Some(())) => {}
+                Ok(None) => return Ok(PcPrepareStepV3::Pending),
+                Err(error) => return Err(format!("P-C V3 root target revocation failed: {error}")),
+            }
+        }
+        // Only a never-published pre-route root may use the separate
+        // root-local pre-route retirement. Live route/worker custody needs its
+        // own physical drain and cannot be converted to a no-scope result.
+        if state.route.is_some() || state.worker.is_some() || state.worker_key.is_some()
+            || state.prepared.is_some() || state.published
+        {
+            return Ok(PcPrepareStepV3::Pending);
+        }
+        match bridge.game_authority().try_observe_pc_root_cancel_quiescent(&state.admission) {
+            super::game_authority_v3::GameStepV3::Ready => {}
+            super::game_authority_v3::GameStepV3::Busy => return Ok(PcPrepareStepV3::Pending),
+            _ => return Err("P-C V3 original root cancel quiescence unresolved".into()),
+        }
+    }
     if state.published {
         return Ok(PcPrepareStepV3::Published);
     }
-    if bridge.game_authority().abort_requested()
+    if (bridge.game_authority().abort_requested() || root_cancel_requested)
         && state.route.is_none()
         && state.worker.is_none()
         && state.worker_key.is_none()
@@ -3123,7 +4139,7 @@ fn prepare_root_step_v3(
         // Preserve the exact session and recovery custodian. A claim or spawn
         // with an unknown outcome is never promoted to a no-worker result.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            state.try_drain_teacher_before_route(cleanup_deadline)
+            state.try_drain_teacher_without_live_route(cleanup_deadline)
         }));
         let release = match result {
             Ok(ready) => {
@@ -3165,6 +4181,56 @@ fn prepare_root_step_v3(
                     state.aborted_pre_route_release =
                         Some(Err("P-C V3 pre-route release panicked"));
                 }
+            }
+        }
+        return Ok(PcPrepareStepV3::Pending);
+    }
+    if bridge.game_authority().abort_requested()
+        && state.route.is_some() && state.receiver.is_some()
+        && state.owner.is_none() && state.pump.is_none() && state.consumer.is_none()
+        && state.worker.is_none() && state.worker_key.is_none() && state.prepared.is_none()
+        && !state.published
+    {
+        if state.aborted_post_route_release.is_some() {
+            return Ok(PcPrepareStepV3::Pending);
+        }
+        match state.try_abort_unstarted_route(bridge.capture_registration()) {
+            Ok(Some(true)) => {}
+            Ok(None) => return Ok(PcPrepareStepV3::Pending),
+            Ok(Some(false)) => {
+                state.failure.get_or_insert_with(|| "P-C V3 post-route abort custody unresolved".into());
+                return Ok(PcPrepareStepV3::Pending);
+            }
+            Err(error) => {
+                state.failure.get_or_insert_with(|| error.into());
+                return Ok(PcPrepareStepV3::Pending);
+            }
+        }
+        if !state.try_drain_teacher_without_live_route(cleanup_deadline) {
+            return Ok(PcPrepareStepV3::Pending);
+        }
+        // The bridge verifies separate post-route custody and the real
+        // teacher aggregate before releasing only this root's quota.
+        drop(state);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bridge.try_release_aborted_post_route(&admission, recovery)
+        }));
+        let mut state = recovery.lock().map_err(|_| "P-C V3 recovery poisoned")?;
+        match outcome {
+            Ok(Ok(Some(true))) => state.aborted_post_route_release = Some(Ok(())),
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(false))) => {
+                let error = "P-C V3 post-route release rejected";
+                state.aborted_post_route_release = Some(Err(error));
+                state.failure.get_or_insert_with(|| error.into());
+            }
+            Ok(Err(error)) => {
+                state.aborted_post_route_release = Some(Err(error));
+                state.failure.get_or_insert_with(|| error.into());
+            }
+            Err(payload) => {
+                state.panic = Some(payload);
+                state.aborted_post_route_release = Some(Err("P-C V3 post-route release panicked"));
             }
         }
         return Ok(PcPrepareStepV3::Pending);
@@ -3289,7 +4355,7 @@ fn prepare_root_step_v3(
         if staged.state() == S::Prepared || scope_pending {
             match drive_pc_scope_effect_v3(supervisor, &mut state, &stage, &mut staged) {
                 PcScopeDriveV3::Finished => {}
-                PcScopeDriveV3::Pending | PcScopeDriveV3::Aborted => {
+                PcScopeDriveV3::Pending | PcScopeDriveV3::Aborted | PcScopeDriveV3::RootCanceled => {
                     return Ok(PcPrepareStepV3::Pending);
                 }
                 PcScopeDriveV3::Failed => {
@@ -3355,7 +4421,7 @@ fn prepare_root_step_v3(
             cleanup_deadline,
         ) {
             PcScopeDriveV3::Finished => state.next_actor += 1,
-            PcScopeDriveV3::Pending | PcScopeDriveV3::Aborted => {}
+            PcScopeDriveV3::Pending | PcScopeDriveV3::Aborted | PcScopeDriveV3::RootCanceled => {}
             PcScopeDriveV3::Failed => {
                 state
                     .failure
@@ -3366,23 +4432,48 @@ fn prepare_root_step_v3(
         return Ok(PcPrepareStepV3::Pending);
     }
     if state.route.is_none() {
-        if bridge.game_authority().abort_requested() {
-            return Ok(PcPrepareStepV3::Pending);
+        if state.operation_slots[0].is_none() {
+            let stage_guard = match stage.try_lock() {
+                Ok(stage) => stage,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(PcPrepareStepV3::Pending),
+                Err(_) => return Err("P-C V3 stage poisoned".into()),
+            };
+            let proof = match PcReceivedStageProofV3::try_from_guards(supervisor, &state, &stage, &stage_guard) {
+                Ok(Some(proof)) => proof,
+                Ok(None) => return Ok(PcPrepareStepV3::Pending),
+                Err(error) => return Err(error.into()),
+            };
+            let identity = Arc::clone(&state.operation_identities[0]);
+            let admission = admission.clone();
+            let recovery = state.original_self.clone();
+            let registration = bridge.capture_registration().clone();
+            state.operation_slots[0] = Some(Arc::new_cyclic(|original_self| Mutex::new(PcOperationSlotV3 {
+                original_self: original_self.clone(),
+                kind: PcOperationKindV3::RouteInstall,
+                identity,
+                admission,
+                recovery,
+                registration,
+                proof: Some(proof),
+                claim: None,
+                generation: None,
+                route_destination: None,
+                route_result: None,
+                route_unknown: false,
+                worker_destination: None,
+                worker_undispatched: None,
+                worker_failure_details: None,
+                worker_unknown: false,
+            })));
         }
-        let installed = bridge
-            .capture_registration()
-            .try_install_speculative_root_v3(
-                &admission,
-                inputs.plan().teacher_mailbox_capacity as usize,
-                inputs.plan().teacher_tickets_per_root as usize,
-                Arc::new(AtomicBool::new(false)),
-            )
-            .map_err(|e| e.to_string())?;
-        let Some((route, receiver)) = installed else {
-            return Ok(PcPrepareStepV3::Pending);
+        let route_slot = Arc::clone(state.operation_slots[0].as_ref().expect("original route slot retained"));
+        return match drive_pc_route_effect_v3(supervisor, &mut state, &route_slot) {
+            PcScopeDriveV3::Finished | PcScopeDriveV3::Pending | PcScopeDriveV3::Aborted | PcScopeDriveV3::RootCanceled => Ok(PcPrepareStepV3::Pending),
+            PcScopeDriveV3::Failed => {
+                state.failure.get_or_insert_with(|| "P-C V3 route effect failed or unresolved".into());
+                Ok(PcPrepareStepV3::Failed)
+            }
         };
-        state.route = Some(route);
-        state.receiver = Some(Arc::new(Mutex::new(receiver)));
     }
     if state.owner.is_none() {
         state.owner = Some(
@@ -3554,9 +4645,16 @@ fn prepare_root_step_v3(
     // Root worker construction and publication are deliberately separate from
     // claiming the teacher scope; failure must keep the original owner.
     if state.worker.is_none() {
+        let Some(worker_slot) = pc_worker_operation_v3::ensure_pc_worker_operation_slot_v3(
+            supervisor, &mut state, &stage,
+        ).map_err(str::to_owned)? else {
+            return Ok(PcPrepareStepV3::Pending);
+        };
         let original = Arc::clone(recovery);
         let game = Arc::clone(bridge.game_authority());
-        let task = Box::new(move |receiver: rz_uci::rovent_bootstrap::pc_collection_v3::RoventPcRootHandoffReceiverV3| {
+        // This factory captures only reconstructible owner Arcs. The actual
+        // one-shot task is not constructed until the abort claim succeeds.
+        let task_factory = move || -> RoventPcRootWorkerTaskV3 { Box::new(move |receiver: rz_uci::rovent_bootstrap::pc_collection_v3::RoventPcRootHandoffReceiverV3| {
             let mut handoff = None;
             while Instant::now() < cleanup_deadline {
                 if let Ok(mut owner) = original.try_lock() {
@@ -3609,16 +4707,22 @@ fn prepare_root_step_v3(
                 }
             }
             Box::new(original) as Box<dyn std::any::Any + Send>
-        });
-        match RoventPcCollectionWorkerV3::spawn(admission.clone(), task) {
-            Ok(worker) => {
-                state.worker_key = Some(worker.recovery_key());
-                state.worker = Some(worker);
-            }
-            Err(error) => {
-                state.worker_spawn_failure = Some(error);
-                state.failure = Some("P-C V3 worker spawn failed".into());
+        }) };
+        use pc_worker_operation_v3::PcWorkerEffectDriveV3 as W;
+        let result = pc_worker_operation_v3::drive_pc_worker_effect_v3(
+            supervisor, &mut state, &worker_slot, Some(task_factory),
+        );
+        match result {
+            W::Finished => {}
+            W::Pending | W::Aborted => return Ok(PcPrepareStepV3::Pending),
+            W::Failed => {
+                state.failure.get_or_insert_with(|| "P-C V3 worker acquisition unresolved".into());
                 return Ok(PcPrepareStepV3::Failed);
+            }
+            W::DropUnstartedTask(task) => {
+                drop(state);
+                finish_failed_pc_task_release_v3(recovery, task)?;
+                return Ok(PcPrepareStepV3::Pending);
             }
         }
     }
@@ -3880,16 +4984,20 @@ impl PcRootRecoveryV3 {
         }
     }
 
-    /// Drain the same session when abort arrived before a route or root worker
-    /// existed. The aggregate stays in this recovery; it is not a handoff,
-    /// native fence, semantic success, or permission to release any quota.
-    fn try_drain_teacher_before_route(&mut self, deadline: Instant) -> bool {
+    /// Drain the same session with no live route or root worker. A route that
+    /// existed may only use this after exact rollback custody was retained.
+    /// The aggregate is not a handoff, fence, success, or quota receipt.
+    fn try_drain_teacher_without_live_route(&mut self, deadline: Instant) -> bool {
         if self.aggregate.is_some() {
             return true;
         }
+        let post_route_held = match (&self.post_route_custody, &self.route, &self.receiver) {
+            (Some(custody), Some(route), Some(receiver)) => custody.route.same_original_route(route)
+                && Arc::ptr_eq(&custody.receiver, receiver) && custody.witness.matches_original_route(route),
+            _ => false,
+        };
         if self.panic.is_some()
-            || self.route.is_some()
-            || self.receiver.is_some()
+            || ((self.route.is_some() || self.receiver.is_some()) && !post_route_held)
             || self.owner.is_some()
             || self.pump.is_some()
             || self.worker.is_some()
@@ -3904,26 +5012,38 @@ impl PcRootRecoveryV3 {
         };
         let session = match stage.try_lock() {
             Ok(stage) => stage.session(),
-            Err(_) => None,
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+            Err(_) => {
+                self.record_teacher_drain_failure("P-C V3 abort stage poisoned".into());
+                return false;
+            }
         };
         let Some(session) = session else {
             // Prepared/claimed/unknown stages retain their original owner.
             return false;
         };
-        let Ok(mut session) = session.try_lock() else {
-            return false;
+        let mut session = match session.try_lock() {
+            Ok(session) => session,
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+            Err(_) => {
+                self.record_teacher_drain_failure("P-C V3 abort session poisoned".into());
+                return false;
+            }
         };
         if !session
             .original_admission()
             .same_original_admission(&self.admission)
         {
-            self.failure
-                .get_or_insert_with(|| "P-C V3 abort session admission differs".into());
+            self.record_teacher_drain_failure("P-C V3 abort session admission differs".into());
             return false;
         }
         if let Err(error) = session.request_shutdown(deadline) {
-            self.failure
-                .get_or_insert_with(|| format!("P-C V3 abort shutdown: {error}"));
+            // This is the producer's documented nonblocking lock conflict;
+            // a later tick may close the same original scope successfully.
+            if is_teacher_scope_busy(&error) {
+                return false;
+            }
+            self.record_teacher_drain_failure(format!("P-C V3 abort shutdown: {error}"));
             return false;
         }
         let actors: Vec<String> = session.registration().teachers.keys().cloned().collect();
@@ -3940,8 +5060,15 @@ impl PcRootRecoveryV3 {
             } else {
                 false
             };
-            if has_lifecycle && !matches!(session.finish_worker(&actor), Ok(true)) {
-                return false;
+            if has_lifecycle {
+                match session.finish_worker(&actor) {
+                    Ok(true) => {}
+                    Ok(false) => return false,
+                    Err(error) => {
+                        self.record_teacher_drain_failure(format!("P-C V3 abort worker {actor}: {error}"));
+                        return false;
+                    }
+                }
             }
         }
         match session.try_aggregate() {
@@ -3951,11 +5078,16 @@ impl PcRootRecoveryV3 {
             }
             Ok(None) => false,
             Err(error) => {
-                self.failure
-                    .get_or_insert_with(|| format!("P-C V3 abort aggregate: {error}"));
+                self.record_teacher_drain_failure(format!("P-C V3 abort aggregate: {error}"));
                 false
             }
         }
+    }
+
+    /// Preserve an earlier root failure and the distinct drain failure.
+    fn record_teacher_drain_failure(&mut self, error: String) {
+        self.failure.get_or_insert_with(|| error.clone());
+        self.teacher_drain_failure.get_or_insert(error);
     }
 
     /// Only actual drained terminals, joined teacher workers and the original

@@ -2080,6 +2080,16 @@ struct RoleBinding<Q, O> {
     collection_consumption_pending: Option<bool>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_ranking_pending: Option<collection::VersionedRootRankingAcceptance>,
+    /// A V3 root-ranking callback has been attempted for this exact binding.
+    /// Busy keeps its original proof in `collection_ranking_pending`.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v3_ranking_started: bool,
+    /// Secondary failures from post-consumption recovery wait until the
+    /// original semantic error has passed through its usual classification.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v3_recovery_accounting_error: Option<AdaptiveManagerError>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v3_recovery_ranking_error: Option<AdaptiveCollectionError>,
     /// Failed callbacks are not retried, but their original proof must stay
     /// with the failed binding until explicit owner handoff.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -4891,6 +4901,12 @@ where
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_ranking_pending: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v3_ranking_started: false,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v3_recovery_accounting_error: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v3_recovery_ranking_error: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_ranking_failed: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_raw_ranking_failed: None,
@@ -4921,6 +4937,8 @@ where
     /// One bounded owner turn. Receiving messages precedes dispatch so native
     /// completions and control acks cannot starve behind the ordinary work queue.
     pub fn tick(&mut self) -> Result<bool, AdaptiveManagerError> {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        self.report_v3_ranking_recovery_errors();
         if self.phase == ManagerPhase::Finished {
             return Ok(false);
         }
@@ -5117,17 +5135,24 @@ where
                     ("schedule_root_round", Self::schedule_root_round),
                 ] {
                     match action(self) {
-                        Ok(progress) => changed |= progress,
+                        Ok(progress) => {
+                            changed |= progress;
+                            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                            self.report_v3_ranking_recovery_errors();
+                        }
                         Err(error) => {
                             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                             if matches!(error, AdaptiveManagerError::AdmissionClosed)
                                 && self.cohort_action_expired(Instant::now())
                             {
                                 self.begin_root_quiesce(self.cleanup_until()?)?;
+                                self.report_v3_ranking_recovery_errors();
                                 changed = true;
                                 break;
                             }
                             self.frontier_boundary_or_failure(error.at_semantic_stage(stage))?;
+                            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                            self.report_v3_ranking_recovery_errors();
                             break;
                         }
                     }
@@ -5180,10 +5205,14 @@ where
                 Ok(progress) => changed |= progress,
                 Err(error) => self.record_failure(error.at_semantic_stage("drain_flush_deferred")),
             }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            self.report_v3_ranking_recovery_errors();
             match self.poll_shutdown() {
                 Ok(progress) => changed |= progress,
                 Err(error) => self.record_failure(error.at_semantic_stage("poll_shutdown")),
             }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            self.report_v3_ranking_recovery_errors();
         }
         Ok(changed)
     }
@@ -5303,6 +5332,23 @@ where
         }
         Ok(())
     }
+    fn failure_requires_quarantine(&self, error: &AdaptiveManagerError) -> bool {
+        matches!(error, AdaptiveManagerError::PhysicalUnknown)
+            || (matches!(error, AdaptiveManagerError::NnuecPreparation(_))
+                && (!self.nnuec_cleanup_settled() || !self.utility_cleanup_settled()))
+            || matches!(
+                error,
+                AdaptiveManagerError::GoalLocalBlocked(GoalLocalBlockReason::Frontier(
+                    FrontierError::NativeUnknown
+                ))
+            )
+            || matches!(error, AdaptiveManagerError::Frontier(FrontierError::NativeUnknown))
+            || matches!(
+                error,
+                AdaptiveManagerError::Cpu(CpuWorkerError::UnknownUsage | CpuWorkerError::Quarantined)
+            )
+    }
+
     fn record_failure(&mut self, error: AdaptiveManagerError) {
         if matches!(
             error,
@@ -5334,25 +5380,7 @@ where
         if self.failures.len() == 64 {
             self.failures.pop_front();
         }
-        let unsafe_completion = matches!(error, AdaptiveManagerError::PhysicalUnknown)
-            || (matches!(error, AdaptiveManagerError::NnuecPreparation(_))
-                && (!self.nnuec_cleanup_settled() || !self.utility_cleanup_settled()))
-            || matches!(
-                error,
-                AdaptiveManagerError::GoalLocalBlocked(GoalLocalBlockReason::Frontier(
-                    FrontierError::NativeUnknown
-                ))
-            )
-            || matches!(
-                error,
-                AdaptiveManagerError::Frontier(FrontierError::NativeUnknown)
-            )
-            || matches!(
-                error,
-                AdaptiveManagerError::Cpu(
-                    CpuWorkerError::UnknownUsage | CpuWorkerError::Quarantined
-                )
-            );
+        let unsafe_completion = self.failure_requires_quarantine(&error);
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         let independent_collection = matches!(&error, AdaptiveManagerError::Collection(_))
             && self.collection_failure_is_independent();
@@ -6359,7 +6387,21 @@ where
                             }
                         }
                         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                        if let Some(observer) = &mut self.collection_observer_v2 {
+                        let notify_collection_ranking = !self.collection_is_v3()
+                            || !self.roles[index].collection_v3_ranking_started;
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        if notify_collection_ranking
+                            && self.collection_is_v3()
+                            && self.collection_observer_v2.is_some()
+                        {
+                            // Remember the attempt, including proof failure or
+                            // Busy, before any later candidate can fail.
+                            self.roles[index].collection_v3_ranking_started = true;
+                        }
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        if let Some(observer) = self.collection_observer_v2.as_mut()
+                            .filter(|_| notify_collection_ranking)
+                        {
                             let proof = self
                                 .collection_admission_v2
                                 .as_ref()
@@ -6529,6 +6571,8 @@ where
                 Ok(())
             })();
             if let Err(error) = attempted {
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                let v3_root_ranking = purpose == RolePurpose::RootRanking && self.collection_is_v3();
                 // Store consumption precedes next-view materialization. A
                 // later failure must retain both the semantic error and the
                 // actual source consumption, without retrying its commit.
@@ -6539,21 +6583,45 @@ where
                     self.driver.role_consumption_recorded(&ticket, &input.view)
                 };
                 match consumed {
-                    Ok(true) if !self.roles[index].consumption_recorded => {
-                        if let Err(observation) = self.mark_role_consumed(index, true) {
-                            self.record_failure(
-                                observation.at_semantic_stage("mark_role_consumed_after_error"),
-                            );
+                    Ok(true) => {
+                        if !self.roles[index].consumption_recorded {
+                            if let Err(observation) = self.mark_role_consumed(index, true) {
+                                let observation = observation.at_semantic_stage("mark_role_consumed_after_error");
+                                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                                if v3_root_ranking {
+                                    if self.failure_requires_quarantine(&observation) {
+                                        self.phase = ManagerPhase::Quarantined;
+                                    }
+                                    self.roles[index].collection_v3_recovery_accounting_error.get_or_insert(observation);
+                                } else {
+                                    self.record_failure(observation);
+                                }
+                                #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+                                self.record_failure(observation);
+                            }
+                        }
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        if v3_root_ranking {
+                            self.recover_v3_root_ranking_after_consumption(index, &ticket, &input, output.as_ref());
                         }
                     }
-                    Ok(_) => {}
+                    Ok(false) => {}
                     Err(readback) => {
                         if !self.roles[index].consumption_recorded {
                             self.roles[index].consumption_unknown = true;
                         }
-                        self.record_failure(
-                            readback.at_semantic_stage("role_consumption_readback"),
-                        );
+                        let readback = readback.at_semantic_stage("role_consumption_readback");
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        if v3_root_ranking {
+                            if self.failure_requires_quarantine(&readback) {
+                                self.phase = ManagerPhase::Quarantined;
+                            }
+                            self.roles[index].collection_v3_recovery_accounting_error.get_or_insert(readback);
+                        } else {
+                            self.record_failure(readback);
+                        }
+                        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+                        self.record_failure(readback);
                     }
                 }
                 if self.roles[index].consumption_recorded {
@@ -6604,7 +6672,92 @@ where
         }
         Ok(())
     }
+    /// Retry only the missing V3 root-ranking observation after the original
+    /// search owner has confirmed that this exact ticket and view were used.
+    /// The semantic error is returned unchanged; a collection error is held
+    /// on the original binding until the caller has classified that error.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn recover_v3_root_ranking_after_consumption(
+        &mut self,
+        index: usize,
+        ticket: &RoleTicketEnvelope,
+        input: &FrameInput<ReviewView, Q>,
+        output: &B::Output,
+    ) {
+        if self.roles[index].collection_v3_ranking_started {
+            return;
+        }
+        self.roles[index].collection_v3_ranking_started = true;
+        let ranking = self.root_ranking_proof.as_ref().filter(|ranking| {
+            ranking.source().ticket == *ticket && ranking.view().digest() == input.view.digest()
+        });
+        let proof = ranking
+            .ok_or_else(|| AdaptiveCollectionError::new(
+                AdaptiveCollectionStage::Accepted,
+                "MissingOriginalV3RootRanking",
+                "consumed V3 root ranking has no matching original proof",
+            ))
+            .and_then(|ranking| {
+                self.collection_admission_v2.as_ref().ok_or_else(|| {
+                    AdaptiveCollectionError::new(
+                        AdaptiveCollectionStage::Accepted,
+                        "MissingV3Admission",
+                        "consumed V3 root ranking has no original admission",
+                    )
+                }).and_then(|admission| {
+                    collection::VersionedRootRankingAcceptance::from_observed_ranking(
+                        ranking, admission, output.proposer_ranking_output(),
+                    )
+                })
+            });
+        match proof {
+            Ok(proof) => {
+                let result = self.collection_observer_v2.as_mut().ok_or_else(|| {
+                    AdaptiveCollectionError::new(
+                        AdaptiveCollectionStage::Accepted,
+                        "MissingV3Observer",
+                        "consumed V3 root ranking has no original observer",
+                    )
+                }).and_then(|observer| observer.try_adaptive_root_ranking(&proof, input, output));
+                match result {
+                    Ok(collection::AdaptiveCollectionBoundaryV2::Ready) => {}
+                    Ok(collection::AdaptiveCollectionBoundaryV2::Busy) => {
+                        self.roles[index].collection_ranking_pending = Some(proof);
+                    }
+                    Err(error) => {
+                        self.roles[index].collection_observation_failed = true;
+                        self.roles[index].collection_ranking_failed = Some(proof);
+                        self.collection_v2_first_failure.get_or_insert_with(|| error.clone());
+                        self.roles[index].collection_v3_recovery_ranking_error.get_or_insert(error);
+                    }
+                }
+            }
+            Err(error) => {
+                self.roles[index].collection_observation_failed = true;
+                self.roles[index].collection_raw_ranking_failed = ranking.cloned();
+                self.collection_v2_first_failure.get_or_insert_with(|| error.clone());
+                self.roles[index].collection_v3_recovery_ranking_error.get_or_insert(error);
+            }
+        }
+    }
+
+    /// Publish secondary observations only after the root action's own result
+    /// was classified, so controlled quiesce and retry policies remain intact.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn report_v3_ranking_recovery_errors(&mut self) {
+        for index in 0..self.roles.len() {
+            if let Some(error) = self.roles[index].collection_v3_recovery_accounting_error.take() {
+                self.record_failure(error);
+            }
+            if let Some(error) = self.roles[index].collection_v3_recovery_ranking_error.take() {
+                self.record_failure(error.into());
+            }
+        }
+    }
+
     fn retire_role_binding(&mut self, index: usize) -> Result<(), AdaptiveManagerError> {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        self.report_v3_ranking_recovery_errors();
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if self.roles[index].collection_consumption_pending.is_some()
             || self.roles[index].collection_ranking_pending.is_some()

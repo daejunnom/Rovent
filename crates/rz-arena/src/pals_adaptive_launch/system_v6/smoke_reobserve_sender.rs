@@ -27,6 +27,7 @@ pub(crate) struct SmokeReobserveObservation {
     pub written: usize,
     pub response_bytes: Vec<u8>,
     pub first_timeout: Option<Arc<ArenaError>>,
+    original_control: Arc<()>,
 }
 
 pub(crate) enum SmokeReobserveProgress {
@@ -280,7 +281,28 @@ impl SmokeDeadlineControl {
             written: attempt.written,
             response_bytes: attempt.received,
             first_timeout: attempt.first_timeout,
+            original_control: Arc::clone(&self.reobserve_owner),
         })
+    }
+    pub(crate) fn owns_no_game_reobservation(
+        &self,
+        observation: &SmokeReobserveObservation,
+    ) -> bool {
+        Arc::ptr_eq(&self.reobserve_owner, &observation.original_control)
+            && observation.request.scope == self.scopes[0]
+            && observation
+                .response
+                .validate_for(&observation.request)
+                .is_ok()
+            && observation.written == observation.request_bytes.len()
+            && observation
+                .request
+                .encode()
+                .is_ok_and(|bytes| bytes == observation.request_bytes)
+            && observation
+                .response
+                .encode()
+                .is_ok_and(|bytes| bytes == observation.response_bytes)
     }
     pub(crate) fn no_game_reobserve_failure(&self) -> Option<&ArenaError> {
         let attempt = self.reobserve.as_ref()?;

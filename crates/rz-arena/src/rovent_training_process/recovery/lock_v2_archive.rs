@@ -411,6 +411,39 @@ impl InspectedRoventLockV2Archive {
 }
 
 impl CheckedRoventLockV2HistoricalDataset {
+    /// Preflight used only when a V3 inspector revalidates this ancestor.
+    /// No file is opened and the V2 entry points keep their original rules.
+    pub(super) fn ensure_v3_nonsecret_paths(&self) -> Result<(), ArenaError> {
+        for retained in &self.archive.held {
+            super::lock_v3_archive::ensure_v3_nonsecret_path(&retained.pin.path)?;
+        }
+        for ancestor in &self.original_ancestors {
+            for retained in &ancestor.held {
+                super::lock_v3_archive::ensure_v3_nonsecret_path(&retained.pin.path)?;
+            }
+        }
+        for ancestor in &self.lock_v2_ancestors {
+            ancestor.ensure_v3_nonsecret_paths()?;
+        }
+        Ok(())
+    }
+
+    /// Original sealed metadata for cross-family ancestry; this grants no new
+    /// admission or execution authority. Callers must revalidate the owner.
+    pub(super) fn historical_ancestry_metadata(
+        &self,
+    ) -> (HistoricalCollectionMetadata, HistoricalIndexMetadata, &str) {
+        (
+            HistoricalCollectionMetadata::submitted(&self.archive.manifest.registration),
+            HistoricalIndexMetadata::from_validated_parts(
+                self.archive.index.record_count,
+                self.archive.index.chunks.clone(),
+                self.archive.index.origins.clone(),
+                self.archive.publication.canonical_index_sha256.clone(),
+            ),
+            self.archive.publication.canonical_index_sha256.as_str(),
+        )
+    }
     /// Reuses the original index seals and ancestor owners; no family is
     /// re-encoded, and this check grants no learner or current-run authority.
     pub fn inspect(

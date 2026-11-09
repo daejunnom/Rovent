@@ -1,7 +1,7 @@
 //! Exact archive maintenance while the original semantic owner has no root work.
 //! This custody is not a physical fence. The concrete UCI owner must retain its
 //! actual native/actor acknowledgements before lending either idle owner here.
-use super::adaptive_root::{IdleArchiveGameSeal, UnusedArchiveSetupSeal};
+use super::adaptive_root::{EmptyArchiveGameSeal, IdleArchiveGameSeal, UnusedArchiveSetupSeal};
 use super::archive_lifecycle::{
     IdleArchiveCheckpoint, SEARCH_ARCHIVE_IO_BYTES, allocation_controls,
     observe_selected_archive_usage,
@@ -131,6 +131,7 @@ pub struct IdleSemanticArchiveOwner<M: RoleModel> {
     last_checkpoint: Option<Arc<IdleArchiveCheckpoint>>,
     last_transition_remaining: Option<u64>,
     setup: Option<UnusedIdleArchiveSetupSnapshot>,
+    empty_close_retained: bool,
     #[cfg(feature = "archive-origin-diagnostics")]
     last_prepare_pressure: Option<ArchiveRootPressure>,
     #[cfg(test)]
@@ -176,6 +177,7 @@ impl<M: RoleModel> ResearcherPreparingOwner<M> {
             pending: None,
             last_checkpoint: None,
             last_transition_remaining: None,
+            empty_close_retained: false,
             setup: None,
             #[cfg(feature = "archive-origin-diagnostics")]
             last_prepare_pressure: None,
@@ -200,6 +202,7 @@ impl<M: RoleModel> PcSemanticOwner<M> {
             pending: None,
             last_checkpoint: None,
             last_transition_remaining: None,
+            empty_close_retained: false,
             setup: None,
             #[cfg(feature = "archive-origin-diagnostics")]
             last_prepare_pressure: None,
@@ -228,6 +231,7 @@ impl<M: RoleModel> PalsEngine<M> {
             pending: None,
             last_checkpoint: None,
             last_transition_remaining: None,
+            empty_close_retained: false,
             setup: None,
             #[cfg(feature = "archive-origin-diagnostics")]
             last_prepare_pressure: None,
@@ -291,9 +295,44 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         }
     }
     fn setup_retained(&self) -> bool {
-        self.setup
+        self.empty_close_retained || self.setup
             .as_ref()
             .is_some_and(|state| !state.configuration_complete || state.completion_unknown)
+    }
+    pub(super) fn retain_empty_close_failure(&mut self) {
+        self.empty_close_retained = true;
+    }
+
+    /// A ready, rootless game owns no durable game facts to checkpoint. This
+    /// seals its original registry and Store; it is not a native completion fence.
+    pub(super) fn seal_empty_close(&self, scope: SearchAuthority) -> Result<(EmptyArchiveGameSeal, ArchiveOwnerSnapshot), PalsError> {
+        self.validate_idle()?;
+        let semantic = self.semantic();
+        let seal = semantic.seal_empty_archive_game(scope)?;
+        let current = self.archive_owner_snapshot()?.ok_or(StoreError::ArchiveDisabled)?;
+        if !current.complete || current.admission_closed || current.committed_chunks != 0
+            || current.reserved_generations != 0 || current.pending_files_retained
+            || current.pending_buffers_retained || current.pending_commit_bytes != Some(0)
+            || self.stores().hot_stats() != ArchiveStats::default()
+            || !semantic.nodes.is_empty() || !semantic.records.is_empty()
+            || semantic.revision != 0 || !semantic.repair_queue.is_empty()
+        {
+            return Err(StoreError::InvalidConditions("empty archive game is not empty and open").into());
+        }
+        if let Some(previous) = semantic.archive_state.previous_closed_owner {
+            if !previous.complete || !previous.admission_closed
+                || current.owner_id == previous.owner_id
+                || current.root_sha256 != previous.root_sha256
+                || current.repository_sha256 != previous.repository_sha256
+                || current.runtime_limits != previous.runtime_limits
+                || current.session_write_ledger_id != previous.session_write_ledger_id
+                || current.session_write_bytes_max != previous.session_write_bytes_max
+                || current.session_write_bytes_consumed != previous.session_write_bytes_consumed
+            {
+                return Err(StoreError::InvalidConditions("empty archive newgame owner transition").into());
+            }
+        }
+        Ok((seal, current))
     }
     #[cfg(test)]
     pub(super) fn panic_setup_after_enable_for_test(&mut self) {
