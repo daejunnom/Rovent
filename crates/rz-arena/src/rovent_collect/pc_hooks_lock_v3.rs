@@ -2809,6 +2809,9 @@ impl PcV3LaunchClosure {
             Ok(super::pc_worker_v3::PcDriverPollV3::Ready(
                 super::pc_worker_v3::PcSupervisorDriverObservationV3::Completed,
             )) => {}
+            Ok(super::pc_worker_v3::PcDriverPollV3::Ready(
+                super::pc_worker_v3::PcSupervisorDriverObservationV3::Unknown,
+            )) => return Ok(None),
             Ok(super::pc_worker_v3::PcDriverPollV3::Ready(failure)) => {
                 return Err(invalid(format!(
                     "P-C V3 game driver did not complete: {failure:?}"

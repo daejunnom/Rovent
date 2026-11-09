@@ -576,7 +576,7 @@ impl ManagedPcEntryResultV3 {
             } => (*recovery_error, panic.is_some()),
             _ => (None, false),
         };
-        let (stage, settlement, native, first_error, cleanup_deadline_elapsed) =
+        let (stage, settlement, native, mut first_error, cleanup_deadline_elapsed) =
             match &self.original {
                 EntryState::Selection(error) => (
                     "selection_error",
@@ -668,6 +668,40 @@ impl ManagedPcEntryResultV3 {
                     (stage, settlement, native, first_error, *deadline_reached)
                 }
             };
+        let (root_failure, output_error) = match &self.original {
+            EntryState::Run { original, .. } => {
+                use crate::rovent_collect::pc_worker_v3::PcRootFailureObservationV3;
+                let root = match original.recovery_key().root_failure_observation() {
+                    Ok(PcDriverPollV3::Ready(PcRootFailureObservationV3::Failed { error, unknown, pending })) => {
+                        let detail = bounded_detail(&error);
+                        if first_error.is_none() {
+                            first_error = Some(("root", Some(detail.clone())));
+                        }
+                        serde_json::json!({"status":"failed", "detail":detail,
+                            "root_scan_unknown":unknown, "root_scan_pending":pending})
+                    }
+                    Ok(PcDriverPollV3::Ready(PcRootFailureObservationV3::NoFailureObserved)) =>
+                        serde_json::json!({"status":"no_failure_observed"}),
+                    Ok(PcDriverPollV3::Pending) => serde_json::json!({"status":"pending"}),
+                    Ok(PcDriverPollV3::Ready(PcRootFailureObservationV3::Unknown)) | Err(_) =>
+                        serde_json::json!({"status":"unknown"}),
+                };
+                let output = match original.recovery_key().output_error_observation() {
+                    Ok(PcDriverPollV3::Ready(Some(error))) => {
+                        let detail = bounded_detail(error);
+                        if first_error.is_none() {
+                            first_error = Some(("output", Some(detail.clone())));
+                        }
+                        serde_json::json!({"status":"failed", "detail":detail})
+                    }
+                    Ok(PcDriverPollV3::Ready(None)) => serde_json::json!({"status":"no_failure_observed"}),
+                    Ok(PcDriverPollV3::Pending) => serde_json::json!({"status":"pending"}),
+                    Err(_) => serde_json::json!({"status":"unknown"}),
+                };
+                (root, output)
+            }
+            _ => (serde_json::json!({"status":"not_started"}), serde_json::json!({"status":"not_started"})),
+        };
         let publication_deadline_elapsed = matches!(
             &self.original,
             EntryState::Run {
@@ -703,6 +737,8 @@ impl ManagedPcEntryResultV3 {
             "stage":stage,
             "native":native,
             "first_error":first_error.map(|(kind,detail)| serde_json::json!({"kind":kind,"detail":detail})),
+            "root_failure":root_failure,
+            "output_error":output_error,
             "recovery_error":recovery_error,
             "recovery_panic":recovery_panic,
             "cleanup_deadline_elapsed":cleanup_deadline_elapsed,

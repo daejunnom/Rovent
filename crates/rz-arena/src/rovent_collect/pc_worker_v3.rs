@@ -49,6 +49,138 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+fn record_teacher_drain_shutdown(failure: &mut Option<String>, error: &AdaptiveCollectionError) {
+    if !super::teacher::v3_session::is_teacher_scope_busy(error) {
+        failure.get_or_insert_with(|| format!("P-C V3 teacher shutdown: {error}"));
+    }
+}
+
+fn try_teacher_recovery_lock<'a, T>(
+    lock: &'a Mutex<T>,
+    failure: &mut Option<String>,
+    name: &'static str,
+) -> Option<std::sync::MutexGuard<'a, T>> {
+    match lock.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            failure.get_or_insert_with(|| format!("P-C V3 teacher {name} lock poisoned"));
+            None
+        }
+    }
+}
+
+fn retain_teacher_drain_aggregate<T>(
+    failure: &mut Option<String>,
+    result: Result<Option<T>, String>,
+) -> Option<T> {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            failure.get_or_insert_with(|| format!("P-C V3 teacher aggregate: {error}"));
+            None
+        }
+    }
+}
+
+fn teacher_drain_worker_finished(
+    failure: &mut Option<String>,
+    result: Result<bool, &'static str>,
+) -> bool {
+    match result {
+        Ok(finished) => finished,
+        Err(error) => {
+            failure.get_or_insert_with(|| format!("P-C V3 teacher worker finish: {error}"));
+            false
+        }
+    }
+}
+
+fn teacher_pending_drain_ready(
+    failure: &mut Option<String>,
+    result: Result<TeacherPendingDrainV3, String>,
+    still_pending: bool,
+) -> bool {
+    match result {
+        Ok(TeacherPendingDrainV3::Drained) => !still_pending,
+        Ok(
+            TeacherPendingDrainV3::Pending
+            | TeacherPendingDrainV3::Full
+            | TeacherPendingDrainV3::Unknown,
+        ) => false,
+        Err(error) => {
+            failure.get_or_insert_with(|| format!("P-C V3 teacher pending drain: {error}"));
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod teacher_drain_error_tests {
+    use super::*;
+    use rz_uci::pals_adaptive::AdaptiveCollectionStage;
+
+    #[test]
+    fn drain_preserves_real_errors_and_keeps_busy_pending() {
+        let mut failure = None;
+        let busy = AdaptiveCollectionError::new(
+            AdaptiveCollectionStage::Settled, "TeacherScopeBusy", "busy",
+        );
+        record_teacher_drain_shutdown(&mut failure, &busy);
+        assert!(failure.is_none());
+        let poison = AdaptiveCollectionError::new(
+            AdaptiveCollectionStage::Settled, "TeacherScopePoisoned", "poisoned",
+        );
+        record_teacher_drain_shutdown(&mut failure, &poison);
+        assert!(failure.as_ref().unwrap().contains("TeacherScopePoisoned"));
+        let first = failure.clone();
+        assert!(retain_teacher_drain_aggregate::<()>(&mut failure, Err("aggregate failed".into())).is_none());
+        assert_eq!(failure, first);
+        failure = None;
+        assert!(retain_teacher_drain_aggregate::<()>(&mut failure, Ok(None)).is_none());
+        assert!(failure.is_none());
+        assert!(retain_teacher_drain_aggregate::<()>(&mut failure, Err("aggregate failed".into())).is_none());
+        assert!(failure.as_ref().unwrap().contains("aggregate failed"));
+        failure = None;
+        assert!(!teacher_drain_worker_finished(&mut failure, Ok(false)));
+        assert!(failure.is_none());
+        assert!(!teacher_drain_worker_finished(&mut failure, Err("actor absent")));
+        assert!(failure.as_ref().unwrap().contains("actor absent"));
+        failure = None;
+        for state in [
+            TeacherPendingDrainV3::Pending,
+            TeacherPendingDrainV3::Full,
+            TeacherPendingDrainV3::Unknown,
+        ] {
+            assert!(!teacher_pending_drain_ready(&mut failure, Ok(state), true));
+            assert!(failure.is_none());
+        }
+        assert!(!teacher_pending_drain_ready(&mut failure, Ok(TeacherPendingDrainV3::Drained), true));
+        assert!(teacher_pending_drain_ready(&mut failure, Ok(TeacherPendingDrainV3::Drained), false));
+        assert!(!teacher_pending_drain_ready(&mut failure, Err("pump failed".into()), true));
+        assert!(failure.as_ref().unwrap().contains("pump failed"));
+    }
+
+    #[test]
+    fn recovery_lock_contention_is_pending_and_poison_preserves_first_failure() {
+        let lock = Arc::new(Mutex::new(()));
+        let guard = lock.lock().unwrap();
+        let mut failure = None;
+        assert!(try_teacher_recovery_lock(&lock, &mut failure, "session").is_none());
+        assert!(failure.is_none());
+        drop(guard);
+        let child = Arc::clone(&lock);
+        assert!(std::thread::spawn(move || {
+            let _held = child.lock().unwrap();
+            panic!("intentional fixture poison");
+        }).join().is_err());
+        assert!(try_teacher_recovery_lock(&lock, &mut failure, "session").is_none());
+        assert_eq!(failure.as_deref(), Some("P-C V3 teacher session lock poisoned"));
+        assert!(try_teacher_recovery_lock(&lock, &mut failure, "stage").is_none());
+        assert_eq!(failure.as_deref(), Some("P-C V3 teacher session lock poisoned"));
+    }
+}
+
 /// Pre-owned before a teacher scope can be claimed. The separate slot lock
 /// permits revalidation with the original supervisor/recovery guards held.
 struct PcScopeEffectSlotsV3 {
@@ -1015,6 +1147,7 @@ pub(crate) struct PcWorkerSupervisorV3 {
     bridge: Arc<RoventPcCollectionBridgeV3>,
     router: Arc<CaptureRouterV3>,
     roots: Vec<Arc<Mutex<PcRootRecoveryV3>>>,
+    first_root_error: Option<String>,
     pending_root: Option<PcReceivedRootV3>,
     pipeline: Option<PolicyRowPipelineOwnerV3>,
     managed_output: Option<Arc<ManagedOutputOwnerV3>>,
@@ -1367,10 +1500,135 @@ pub(crate) enum PcSupervisorDriverObservationV3 {
     Failed {
         first_error: Option<String>,
         run_error: Option<String>,
+        root_error: Option<String>,
+        root_error_unknown: bool,
+        root_error_pending: bool,
     },
     Panicked {
         first_error: Option<String>,
     },
+    /// A root could not be inspected; this is not evidence of failure or success.
+    Unknown,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PcRootFailureObservationV3 {
+    NoFailureObserved,
+    Failed { error: String, unknown: bool, pending: bool },
+    Unknown,
+}
+
+fn observe_root_failures<T>(
+    roots: &[Arc<Mutex<T>>],
+    first_error: Option<&str>,
+    failure: impl for<'a> Fn(&'a T) -> Option<&'a str>,
+) -> PcDriverPollV3<PcRootFailureObservationV3> {
+    let mut unknown = false;
+    let mut busy = false;
+    let mut first_error = first_error.map(str::to_owned);
+    for original in roots {
+        match original.try_lock() {
+            Ok(root) => {
+                if first_error.is_none() {
+                    first_error = failure(&root).map(str::to_owned);
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => busy = true,
+            Err(std::sync::TryLockError::Poisoned(_)) => unknown = true,
+        }
+    }
+    if let Some(error) = first_error {
+        PcDriverPollV3::Ready(PcRootFailureObservationV3::Failed { error, unknown, pending: busy })
+    } else if unknown {
+        PcDriverPollV3::Ready(PcRootFailureObservationV3::Unknown)
+    } else if busy {
+        PcDriverPollV3::Pending
+    } else {
+        PcDriverPollV3::Ready(PcRootFailureObservationV3::NoFailureObserved)
+    }
+}
+
+fn classify_joined_driver(
+    first_error: Option<&String>,
+    result: &Result<(), String>,
+    root: PcRootFailureObservationV3,
+) -> PcSupervisorDriverObservationV3 {
+    let (root_error, root_error_unknown, root_error_pending) = match root {
+        PcRootFailureObservationV3::Failed { error, unknown, pending } => (Some(error), unknown, pending),
+        PcRootFailureObservationV3::NoFailureObserved => (None, false, false),
+        PcRootFailureObservationV3::Unknown => (None, true, false),
+    };
+    match (first_error, result, root_error, root_error_unknown, root_error_pending) {
+        (None, Ok(()), None, false, false) => PcSupervisorDriverObservationV3::Completed,
+        (None, Ok(()), None, true, false) => PcSupervisorDriverObservationV3::Unknown,
+        (None, Ok(()), None, _, true) => PcSupervisorDriverObservationV3::Unknown,
+        (first_error, result, root_error, root_error_unknown, root_error_pending) => PcSupervisorDriverObservationV3::Failed {
+            first_error: first_error.cloned(),
+            run_error: result.as_ref().err().cloned(),
+            root_error,
+            root_error_unknown,
+            root_error_pending,
+        },
+    }
+}
+
+#[cfg(test)]
+mod root_failure_observation_tests {
+    use super::*;
+
+    #[test]
+    fn joined_driver_keeps_original_root_and_run_errors_distinct() {
+        let startup = "startup error".to_owned();
+        let result = Err("driver error".to_owned());
+        let observed = classify_joined_driver(
+            Some(&startup),
+            &result,
+            PcRootFailureObservationV3::Failed { error: "teacher drain failed".into(), unknown: false, pending: false },
+        );
+        assert!(matches!(observed, PcSupervisorDriverObservationV3::Failed {
+            first_error: Some(first), run_error: Some(run), root_error: Some(root), root_error_unknown: false, root_error_pending: false,
+        } if first == "startup error" && run == "driver error" && root == "teacher drain failed"));
+    }
+
+    #[test]
+    fn unknown_root_is_not_success_or_failure_but_does_not_hide_known_driver_failure() {
+        assert!(matches!(classify_joined_driver(None, &Ok(()), PcRootFailureObservationV3::Unknown), PcSupervisorDriverObservationV3::Unknown));
+        assert!(matches!(classify_joined_driver(None, &Ok(()), PcRootFailureObservationV3::Failed {error:"root".into(), unknown:false, pending:false}), PcSupervisorDriverObservationV3::Failed {root_error: Some(_), ..}));
+        assert!(matches!(classify_joined_driver(None, &Err("driver".into()), PcRootFailureObservationV3::Unknown), PcSupervisorDriverObservationV3::Failed {run_error: Some(_), root_error_unknown: true, ..}));
+    }
+
+    #[test]
+    fn root_snapshot_keeps_busy_and_poison_distinct_from_recorded_failure() {
+        let root = Arc::new(Mutex::new(None::<String>));
+        let held = root.lock().unwrap();
+        assert!(matches!(observe_root_failures(&[Arc::clone(&root)], None, |r| r.as_deref()), PcDriverPollV3::Pending));
+        drop(held);
+        *root.lock().unwrap() = Some("original drain error".into());
+        assert!(matches!(observe_root_failures(&[Arc::clone(&root)], None, |r| r.as_deref()), PcDriverPollV3::Ready(PcRootFailureObservationV3::Failed { error, unknown: false, pending: false }) if error == "original drain error"));
+        let poison = Arc::new(Mutex::new(None::<String>));
+        let poison_worker = Arc::clone(&poison);
+        assert!(std::thread::spawn(move || { let _guard = poison_worker.lock().unwrap(); panic!("poison"); }).join().is_err());
+        assert!(matches!(observe_root_failures(&[poison], None, |r| r.as_deref()), PcDriverPollV3::Ready(PcRootFailureObservationV3::Unknown)));
+    }
+
+    #[test]
+    fn retained_first_error_preserves_other_roots_unknown_and_busy() {
+        let failed = Arc::new(Mutex::new(Some("later failure".to_owned())));
+        let poisoned = Arc::new(Mutex::new(None::<String>));
+        let worker = Arc::clone(&poisoned);
+        assert!(std::thread::spawn(move || { let _guard = worker.lock().unwrap(); panic!("poison"); }).join().is_err());
+        let busy = Arc::new(Mutex::new(None::<String>));
+        let held = busy.lock().unwrap();
+        let observed = observe_root_failures(
+            &[failed, poisoned, Arc::clone(&busy)], Some("first failure"), |r| r.as_deref(),
+        );
+        let PcDriverPollV3::Ready(PcRootFailureObservationV3::Failed { error, unknown, pending }) = observed else { panic!("known root error must remain visible") };
+        assert_eq!(error, "first failure");
+        assert!(unknown && pending);
+        assert!(matches!(classify_joined_driver(None, &Ok(()), PcRootFailureObservationV3::Failed { error, unknown, pending }),
+            PcSupervisorDriverObservationV3::Failed { root_error: Some(root), root_error_unknown: true, root_error_pending: true, .. } if root == "first failure"));
+        drop(held);
+    }
 }
 
 impl PcSupervisorJoinedProofV3 {
@@ -1408,13 +1666,14 @@ impl PcSupervisorJoinedProofV3 {
                         "P-C joined driver result absent",
                     ));
                 };
-                match (custody.first_error.as_ref(), result) {
-                    (None, Ok(())) => PcSupervisorDriverObservationV3::Completed,
-                    (first_error, result) => PcSupervisorDriverObservationV3::Failed {
-                        first_error: first_error.cloned(),
-                        run_error: result.as_ref().err().cloned(),
-                    },
-                }
+                let root_observation = {
+                    let supervisor = driver_evidence_lock!(self.supervisor, "supervisor");
+                    match supervisor.try_root_failure_observation() {
+                        PcDriverPollV3::Pending => return Ok(PcDriverPollV3::Pending),
+                        PcDriverPollV3::Ready(observation) => observation,
+                    }
+                };
+                classify_joined_driver(custody.first_error.as_ref(), result, root_observation)
             }
             SupervisorThreadStateV3::JoinPanicked if self.panicked && custody.panic.is_some() => {
                 PcSupervisorDriverObservationV3::Panicked {
@@ -2291,6 +2550,11 @@ impl SupervisorStartCustodyV3 {
 }
 
 impl PcWorkerSupervisorV3 {
+    /// Observe retained root failures without terminating the driver, altering
+    /// recovery, or promoting an unknown lock state to a failed root.
+    pub(crate) fn try_root_failure_observation(&self) -> PcDriverPollV3<PcRootFailureObservationV3> {
+        observe_root_failures(&self.roots, self.first_root_error.as_deref(), PcRootRecoveryV3::failure)
+    }
     /// Call only while holding the guard obtained from `original` itself.
     /// The bridge performs this binding before any worker or admission.
     pub(super) fn bind_original_identity(
@@ -2447,6 +2711,7 @@ impl PcWorkerSupervisorV3 {
             bridge,
             router,
             roots,
+            first_root_error: None,
             pending_root: None,
             pipeline: None,
             managed_output: None,
@@ -2530,15 +2795,25 @@ impl PcWorkerSupervisorV3 {
                 self.startup_deadline,
                 self.cleanup_deadline,
             );
-            match outcome {
-                Ok(PcPrepareStepV3::Published) => {}
-                Ok(PcPrepareStepV3::Pending | PcPrepareStepV3::Failed) => continue,
+            let published = match outcome {
+                Ok(PcPrepareStepV3::Published) => true,
+                Ok(PcPrepareStepV3::Pending | PcPrepareStepV3::Failed) => false,
                 Err(error) => {
                     if let Ok(mut root) = original.lock() {
-                        root.failure = Some(error);
+                        root.failure.get_or_insert(error);
                     }
-                    continue;
+                    false
                 }
+            };
+            if self.first_root_error.is_none() {
+                if let Ok(root) = original.try_lock() {
+                    if let Some(error) = root.failure() {
+                        self.first_root_error = Some(error.to_owned());
+                    }
+                }
+            }
+            if !published {
+                continue;
             }
             let admission = original
                 .lock()
@@ -3819,7 +4094,8 @@ impl PcRootRecoveryV3 {
             }
         }
         if let Some(pump) = self.pump.as_ref().map(Arc::clone) {
-            if let Ok(mut pump) = pump.try_lock() {
+            match pump.try_lock() {
+                Ok(mut pump) => {
                 pump.close_admission();
                 match pump.try_closed_drain() {
                     Ok(observation) => self.abort_input_observation = Some(observation),
@@ -3851,19 +4127,30 @@ impl PcRootRecoveryV3 {
                             .get_or_insert_with(|| format!("P-C V3 abort terminal drain: {error}"));
                     }
                 }
-            }
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.abort_terminal_unknown = true;
+                    self.failure
+                        .get_or_insert_with(|| "P-C V3 teacher pump lock poisoned".into());
+                }
+            };
         }
         let Some(stage) = self.stage.as_ref().map(Arc::clone) else {
             return;
         };
         let session = match stage.try_lock() {
             Ok(stage) => stage.session(),
-            Err(_) => None,
+            Err(std::sync::TryLockError::WouldBlock) => return,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                self.failure.get_or_insert_with(|| "P-C V3 teacher stage lock poisoned".into());
+                return;
+            }
         };
         let Some(session) = session else {
             return;
         };
-        let Ok(mut session) = session.try_lock() else {
+        let Some(mut session) = try_teacher_recovery_lock(&session, &mut self.failure, "session") else {
             return;
         };
         if !session
@@ -3875,6 +4162,11 @@ impl PcRootRecoveryV3 {
             return;
         }
         if let Err(error) = session.request_shutdown(deadline) {
+            // A nonblocking conflict retains the same original scope and can
+            // be retried; it is not a shutdown or physical completion proof.
+            if super::teacher::v3_session::is_teacher_scope_busy(&error) {
+                return;
+            }
             self.failure
                 .get_or_insert_with(|| format!("P-C V3 abort shutdown: {error}"));
         }
@@ -3902,15 +4194,15 @@ impl PcRootRecoveryV3 {
         let Some(stage) = self.stage.as_ref().map(Arc::clone) else {
             return false;
         };
-        let session = match stage.try_lock() {
-            Ok(stage) => stage.session(),
-            Err(_) => None,
+        let session = match try_teacher_recovery_lock(&stage, &mut self.failure, "stage") {
+            Some(stage) => stage.session(),
+            None => return false,
         };
         let Some(session) = session else {
             // Prepared/claimed/unknown stages retain their original owner.
             return false;
         };
-        let Ok(mut session) = session.try_lock() else {
+        let Some(mut session) = try_teacher_recovery_lock(&session, &mut self.failure, "session") else {
             return false;
         };
         if !session
@@ -3922,6 +4214,9 @@ impl PcRootRecoveryV3 {
             return false;
         }
         if let Err(error) = session.request_shutdown(deadline) {
+            if super::teacher::v3_session::is_teacher_scope_busy(&error) {
+                return false;
+            }
             self.failure
                 .get_or_insert_with(|| format!("P-C V3 abort shutdown: {error}"));
             return false;
@@ -3940,7 +4235,9 @@ impl PcRootRecoveryV3 {
             } else {
                 false
             };
-            if has_lifecycle && !matches!(session.finish_worker(&actor), Ok(true)) {
+            if has_lifecycle
+                && !teacher_drain_worker_finished(&mut self.failure, session.finish_worker(&actor))
+            {
                 return false;
             }
         }
@@ -3968,16 +4265,26 @@ impl PcRootRecoveryV3 {
         };
         let session = match stage.try_lock() {
             Ok(stage) => stage.session(),
-            Err(_) => None,
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                self.failure.get_or_insert_with(|| "P-C V3 teacher stage lock poisoned".into());
+                return false;
+            }
         };
         let Some(session) = session else {
             return false;
         };
         {
-            let Ok(mut session) = session.try_lock() else {
-                return false;
+            let mut session = match session.try_lock() {
+                Ok(session) => session,
+                Err(std::sync::TryLockError::WouldBlock) => return false,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.failure.get_or_insert_with(|| "P-C V3 teacher session lock poisoned".into());
+                    return false;
+                }
             };
-            if session.request_shutdown(deadline).is_err() {
+            if let Err(error) = session.request_shutdown(deadline) {
+                record_teacher_drain_shutdown(&mut self.failure, &error);
                 return false;
             }
         }
@@ -3985,28 +4292,32 @@ impl PcRootRecoveryV3 {
             return false;
         };
         {
-            let Ok(mut pump) = pump_owner.try_lock() else {
-                return false;
+            let mut pump = match pump_owner.try_lock() {
+                Ok(pump) => pump,
+                Err(std::sync::TryLockError::WouldBlock) => return false,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.failure.get_or_insert_with(|| "P-C V3 teacher pump lock poisoned".into());
+                    return false;
+                }
             };
             // Output and semantic failure remain in the retained pump or
             // consumer; neither alone prevents physical worker retirement.
             // An actual pending dispatch is still a separate drain barrier.
             let _ = pump.try_pump();
             if pump.has_pending() {
-                match pump.try_drain_pending() {
-                    Ok(TeacherPendingDrainV3::Drained) if !pump.has_pending() => {}
-                    Ok(
-                        TeacherPendingDrainV3::Drained
-                        | TeacherPendingDrainV3::Pending
-                        | TeacherPendingDrainV3::Full
-                        | TeacherPendingDrainV3::Unknown,
-                    )
-                    | Err(_) => return false,
+                let result = pump.try_drain_pending();
+                if !teacher_pending_drain_ready(&mut self.failure, result, pump.has_pending()) {
+                    return false;
                 }
             }
         }
-        let Ok(mut session) = session.try_lock() else {
-            return false;
+        let mut session = match session.try_lock() {
+            Ok(session) => session,
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                self.failure.get_or_insert_with(|| "P-C V3 teacher session lock poisoned".into());
+                return false;
+            }
         };
         let actors: Vec<String> = session.registration().teachers.keys().cloned().collect();
         for actor in actors {
@@ -4019,18 +4330,23 @@ impl PcRootRecoveryV3 {
                     self.diagnostics.push((actor.clone(), diagnostics));
                 }
             }
-            if !matches!(session.finish_worker(&actor), Ok(true)) {
+            if !teacher_drain_worker_finished(&mut self.failure, session.finish_worker(&actor)) {
                 return false;
             }
         }
         if self.aggregate.is_none() {
-            match session.try_aggregate() {
-                Ok(Some(aggregate)) => self.aggregate = Some(aggregate),
-                _ => return false,
+            self.aggregate = retain_teacher_drain_aggregate(&mut self.failure, session.try_aggregate());
+            if self.aggregate.is_none() {
+                return false;
             }
         }
-        let Ok(mut original_handoff) = handoff.try_lock() else {
-            return false;
+        let mut original_handoff = match handoff.try_lock() {
+            Ok(handoff) => handoff,
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                self.failure.get_or_insert_with(|| "P-C V3 teacher handoff lock poisoned".into());
+                return false;
+            }
         };
         let Some(aggregate) = self.aggregate.take() else {
             return false;
