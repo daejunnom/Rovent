@@ -130,6 +130,10 @@ impl Drop for TargetAppendGuardV3<'_> {
 }
 
 #[cfg(test)]
+#[path = "target_gate_two_root_tests.rs"]
+mod two_root_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
