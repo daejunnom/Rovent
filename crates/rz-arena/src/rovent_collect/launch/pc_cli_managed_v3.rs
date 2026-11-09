@@ -109,7 +109,9 @@ pub(crate) fn parse_managed_own_collection_cli_v3(
 ) -> Result<Option<ManagedCollectionCliV3>, ArenaError> {
     let selected = parse_managed_collection_cli_for_v3(arguments, true)?;
     check(
-        selected.as_ref().is_none_or(|value| value.long_game_preflight.is_none()),
+        selected
+            .as_ref()
+            .is_none_or(|value| value.long_game_preflight.is_none()),
         "Own V3 long-game preflight is not connected",
     )?;
     Ok(selected)
@@ -172,7 +174,7 @@ fn parse_managed_collection_cli_for_v3(
     } else {
         super::pc_lock_v3::parse_pc_collection_cli_v3(selection_arguments)?
     }
-        .ok_or_else(|| invalid("missing V3 Collection selector"))?;
+    .ok_or_else(|| invalid("missing V3 Collection selector"))?;
     let mut take = |key: &str| {
         managed
             .remove(key)
@@ -353,9 +355,22 @@ mod tests {
     fn own_managed_selection_keeps_transport_and_rejects_pc_crossing() {
         let mut own = arguments();
         own[0] = "--v3-mode=own".into();
-        let selected = parse_managed_own_collection_cli_v3(own.clone()).unwrap().unwrap();
-        assert_eq!([selected.channel, selected.output, selected.input, selected.plan], [3, 4, 5, 6]);
-        assert_eq!(selected.selection.native_arguments, ["--native-argument=kept"]);
+        let selected = parse_managed_own_collection_cli_v3(own.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            [
+                selected.channel,
+                selected.output,
+                selected.input,
+                selected.plan
+            ],
+            [3, 4, 5, 6]
+        );
+        assert_eq!(
+            selected.selection.native_arguments,
+            ["--native-argument=kept"]
+        );
         assert!(parse_managed_collection_cli_v3(own.clone()).is_err());
         own[7] = "--v3-managed-plan-fd=3".into();
         assert!(parse_managed_own_collection_cli_v3(own).is_err());

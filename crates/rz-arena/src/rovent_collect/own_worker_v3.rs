@@ -22,8 +22,8 @@ use super::teacher::v3_pump::{
     TeacherClosedHandoffV3, TeacherPumpSetupErrorV3, TeacherPumpV3,
 };
 use super::teacher::v3_session::{
-    RoventCollectionTeacherSessionV3, TeacherPrepareErrorV3, TeacherSessionClaimErrorV3, TeacherSessionStageStateV3,
-    TeacherSessionStagingV3, TeacherStartErrorV3,
+    RoventCollectionTeacherSessionV3, TeacherPrepareErrorV3, TeacherSessionClaimErrorV3,
+    TeacherSessionStageStateV3, TeacherSessionStagingV3, TeacherStartErrorV3,
 };
 use super::writer_lock_v3::RoventCorpusWriterLockV3;
 use super::{ArenaError, invalid};
@@ -130,7 +130,6 @@ impl OwnActorEffectSlotsV3 {
     }
 }
 
-
 /// Publish this Arc to the bridge before claiming a teacher scope, opening a
 /// route, or starting a worker. All uncertain original owners stay together.
 pub(crate) struct OwnRootRecoveryV3 {
@@ -208,63 +207,65 @@ impl OwnRootRecoveryV3 {
         inputs: Arc<PreparedPcCollectionInputsV3>,
         pipeline: PolicyRowPipelineOwnerV3,
     ) -> Arc<Mutex<Self>> {
-        Arc::new_cyclic(|original_self| Mutex::new(Self {
-            original_self: original_self.clone(),
-            scope_effects: Arc::new(Mutex::new(OwnScopeEffectSlotsV3::new())),
-            actor_effects: Vec::new(),
-            original_scope_identity: None,
-            recovery_published: false,
-            request,
-            inputs,
-            pipeline,
-            retained_policy: None,
-            stage: None,
-            route: None,
-            receiver: None,
-            owner: None,
-            pump: None,
-            closed_custody: None,
-            closed_custody_setup_unknown: false,
-            consumer: None,
-            consumer_phase: 0,
-            processed: None,
-            consumer_failure: None,
-            rejection_scope: None,
-            rejection_retained: false,
-            rejection_retention_failure: None,
-            persistence_failure: None,
-            pump_error: None,
-            pump_unknown: false,
-            worker_key: None,
-            worker_stage: None,
-            worker_prepare_failure: None,
-            worker_start_rejection: None,
-            custodian: TeacherRecoveryCustodianV3::new(),
-            panic: None,
-            additional_panics: Vec::new(),
-            preflight_failure: None,
-            actor_failure: None,
-            worker: None,
-            prepared: None,
-            aggregate: None,
-            diagnostics: Vec::new(),
-            next_actor: 0,
-            published: false,
-            route_unlinked: false,
-            failure: None,
-            additional_failures: Vec::new(),
-            shutdown_failure: None,
-            shutdown_failure_count: 0,
-            pump_failure: None,
-            pump_failure_count: 0,
-            pump_admission_closed: false,
-            closed_input_pending: false,
-            closed_input_error: None,
-            closed_handoff_pending: false,
-            closed_handoff_error: None,
-            target_revoke_pending: false,
-            target_revoke_error: None,
-        }))
+        Arc::new_cyclic(|original_self| {
+            Mutex::new(Self {
+                original_self: original_self.clone(),
+                scope_effects: Arc::new(Mutex::new(OwnScopeEffectSlotsV3::new())),
+                actor_effects: Vec::new(),
+                original_scope_identity: None,
+                recovery_published: false,
+                request,
+                inputs,
+                pipeline,
+                retained_policy: None,
+                stage: None,
+                route: None,
+                receiver: None,
+                owner: None,
+                pump: None,
+                closed_custody: None,
+                closed_custody_setup_unknown: false,
+                consumer: None,
+                consumer_phase: 0,
+                processed: None,
+                consumer_failure: None,
+                rejection_scope: None,
+                rejection_retained: false,
+                rejection_retention_failure: None,
+                persistence_failure: None,
+                pump_error: None,
+                pump_unknown: false,
+                worker_key: None,
+                worker_stage: None,
+                worker_prepare_failure: None,
+                worker_start_rejection: None,
+                custodian: TeacherRecoveryCustodianV3::new(),
+                panic: None,
+                additional_panics: Vec::new(),
+                preflight_failure: None,
+                actor_failure: None,
+                worker: None,
+                prepared: None,
+                aggregate: None,
+                diagnostics: Vec::new(),
+                next_actor: 0,
+                published: false,
+                route_unlinked: false,
+                failure: None,
+                additional_failures: Vec::new(),
+                shutdown_failure: None,
+                shutdown_failure_count: 0,
+                pump_failure: None,
+                pump_failure_count: 0,
+                pump_admission_closed: false,
+                closed_input_pending: false,
+                closed_input_error: None,
+                closed_handoff_pending: false,
+                closed_handoff_error: None,
+                target_revoke_pending: false,
+                target_revoke_error: None,
+            })
+        })
     }
 
     /// False or Busy retains the launch; effect issuance is not completion.
@@ -274,10 +275,17 @@ impl OwnRootRecoveryV3 {
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
             Err(_) => return Err("Own /3 scope slots poisoned"),
         };
-        if !scope.finished && (scope.proof.is_some() || scope.teacher_source.is_some()
-            || scope.game_source.is_some() || scope.claim.is_some() || scope.outcome.is_some()
-            || scope.issue_error.is_some() || scope.source_error.is_some()
-            || scope.claim_error.is_some() || scope.completion_error.is_some()) {
+        if !scope.finished
+            && (scope.proof.is_some()
+                || scope.teacher_source.is_some()
+                || scope.game_source.is_some()
+                || scope.claim.is_some()
+                || scope.outcome.is_some()
+                || scope.issue_error.is_some()
+                || scope.source_error.is_some()
+                || scope.claim_error.is_some()
+                || scope.completion_error.is_some())
+        {
             return Ok(Some(false));
         }
         drop(scope);
@@ -287,10 +295,17 @@ impl OwnRootRecoveryV3 {
                 Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
                 Err(_) => return Err("Own /3 actor slots poisoned"),
             };
-            if !actor.finished && (actor.proof.is_some() || actor.teacher_source.is_some()
-                || actor.game_source.is_some() || actor.claim.is_some() || actor.outcome.is_some()
-                || actor.issue_error.is_some() || actor.source_error.is_some()
-                || actor.claim_error.is_some() || actor.completion_error.is_some()) {
+            if !actor.finished
+                && (actor.proof.is_some()
+                    || actor.teacher_source.is_some()
+                    || actor.game_source.is_some()
+                    || actor.claim.is_some()
+                    || actor.outcome.is_some()
+                    || actor.issue_error.is_some()
+                    || actor.source_error.is_some()
+                    || actor.claim_error.is_some()
+                    || actor.completion_error.is_some())
+            {
                 return Ok(Some(false));
             }
         }
@@ -419,7 +434,10 @@ impl OwnReceivedStageProofV3 {
     pub(super) fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
         self.admission.same_original_admission(admission)
     }
-    pub(super) fn matches_recovery(&self, recovery: &Arc<Mutex<OwnRootRecoveryV3>>) -> Option<bool> {
+    pub(super) fn matches_recovery(
+        &self,
+        recovery: &Arc<Mutex<OwnRootRecoveryV3>>,
+    ) -> Option<bool> {
         self.recovery
             .upgrade()
             .map(|original| Arc::ptr_eq(&original, recovery))
@@ -516,10 +534,12 @@ impl OwnReceivedStageProofV3 {
         {
             return Ok(Some(false));
         }
-        bridge.try_matches_registered_recovery(&self.admission, &recovery_owner, &recovery.request.revocation_flag())
+        bridge.try_matches_registered_recovery(
+            &self.admission,
+            &recovery_owner,
+            &recovery.request.revocation_flag(),
+        )
     }
-
-
 }
 
 /// Same received root, original ready session and exact actor slot. A source
@@ -621,7 +641,6 @@ impl OwnReceivedActorProofV3 {
     }
 }
 
-
 /// One supervisor owns the pinned input and every root recovery. Its caller
 /// chooses finite deadlines and must retain this owner across any failure.
 pub(crate) struct OwnWorkerSupervisorV3 {
@@ -684,12 +703,14 @@ impl OwnWorkerSupervisorV3 {
             Ok(owner) => {
                 let identity = Arc::downgrade(supervisor);
                 if let Some(original) = owner.original_self.get() {
-                    if !Weak::ptr_eq(original, &identity) { return Err("Own /3 supervisor identity differs"); }
+                    if !Weak::ptr_eq(original, &identity) {
+                        return Err("Own /3 supervisor identity differs");
+                    }
                 } else if owner.original_self.set(identity).is_err() {
                     return Err("Own /3 supervisor identity binding raced");
                 }
                 Arc::clone(owner.bridge.game())
-            },
+            }
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
             Err(std::sync::TryLockError::Poisoned(_)) => return Err("Own /3 supervisor poisoned"),
         };
@@ -889,7 +910,8 @@ impl OwnWorkerSupervisorV3 {
             }
             // Keep the exact transfer and poison state across an unwind while
             // allowing proof checks to borrow the whole supervisor.
-            let mut transfer = std::mem::replace(&mut self.transfers[index], OwnPublishTransferV3::Empty);
+            let mut transfer =
+                std::mem::replace(&mut self.transfers[index], OwnPublishTransferV3::Empty);
             let mut poisoned = self.poisoned_roots[index];
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if let Ok(mut root) = original.try_lock() {
@@ -1049,7 +1071,8 @@ fn drive_own_scope_effect_v3(
             }
         }
         if teacher_source.is_none() {
-            if let Err(error) = stage.issue_scope_effect_source(&recovery.request.admission, teacher_source)
+            if let Err(error) =
+                stage.issue_scope_effect_source(&recovery.request.admission, teacher_source)
             {
                 *issue_error = Some(error);
                 return OwnScopeDriveV3::Failed;
@@ -1197,9 +1220,11 @@ fn drive_own_actor_effect_v3(
     }
     if game_source.is_none() {
         if teacher_source.is_none() {
-            if let Err(error) =
-                session.issue_actor_effect_source(&recovery.request.admission, actor_id, teacher_source)
-            {
+            if let Err(error) = session.issue_actor_effect_source(
+                &recovery.request.admission,
+                actor_id,
+                teacher_source,
+            ) {
                 *issue_error = Some(error);
                 return OwnScopeDriveV3::Failed;
             }
@@ -1315,7 +1340,6 @@ fn drive_own_actor_effect_v3(
     }
 }
 
-
 fn prepare_own_root_step_v3(
     supervisor: &OwnWorkerSupervisorV3,
     bridge: &Arc<RoventOwnCollectionBridgeV3>,
@@ -1428,15 +1452,23 @@ fn prepare_own_root_step_v3(
         Err(_) => return Err("Own /3 scope slots poisoned".into()),
     };
     if scope_active {
-        let stage_owner = state.stage.as_ref().map(Arc::clone)
+        let stage_owner = state
+            .stage
+            .as_ref()
+            .map(Arc::clone)
             .ok_or("Own /3 active scope lost stage owner")?;
         let mut stage = match stage_owner.try_lock() {
             Ok(stage) => stage,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnPrepareStepV3::Pending),
             Err(_) => return Err("Own /3 stage poisoned".into()),
         };
-        if matches!(drive_own_scope_effect_v3(supervisor, &mut state, &stage_owner, &mut stage), OwnScopeDriveV3::Failed) {
-            state.failure.get_or_insert_with(|| "Own /3 active scope outcome unresolved".into());
+        if matches!(
+            drive_own_scope_effect_v3(supervisor, &mut state, &stage_owner, &mut stage),
+            OwnScopeDriveV3::Failed
+        ) {
+            state
+                .failure
+                .get_or_insert_with(|| "Own /3 active scope outcome unresolved".into());
         }
         return Ok(OwnPrepareStepV3::Pending);
     }
@@ -1447,32 +1479,59 @@ fn prepare_own_root_step_v3(
             Err(_) => return Err("Own /3 actor slots poisoned".into()),
         };
         if active {
-            let stage_owner = state.stage.as_ref().map(Arc::clone)
+            let stage_owner = state
+                .stage
+                .as_ref()
+                .map(Arc::clone)
                 .ok_or("Own /3 active actor lost stage owner")?;
             let stage = match stage_owner.try_lock() {
                 Ok(stage) => stage,
                 Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnPrepareStepV3::Pending),
                 Err(_) => return Err("Own /3 stage poisoned".into()),
             };
-            let session_owner = stage.session().ok_or("Own /3 active actor lost session owner")?;
+            let session_owner = stage
+                .session()
+                .ok_or("Own /3 active actor lost session owner")?;
             let mut session = match session_owner.try_lock() {
                 Ok(session) => session,
                 Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnPrepareStepV3::Pending),
                 Err(_) => return Err("Own /3 session poisoned".into()),
             };
-            if matches!(drive_own_actor_effect_v3(supervisor, &mut state, &stage_owner, &stage, &session_owner, &mut session, &actor_slot, startup_deadline, cleanup_deadline), OwnScopeDriveV3::Failed) {
-                state.failure.get_or_insert_with(|| "Own /3 active actor outcome unresolved".into());
+            if matches!(
+                drive_own_actor_effect_v3(
+                    supervisor,
+                    &mut state,
+                    &stage_owner,
+                    &stage,
+                    &session_owner,
+                    &mut session,
+                    &actor_slot,
+                    startup_deadline,
+                    cleanup_deadline
+                ),
+                OwnScopeDriveV3::Failed
+            ) {
+                state
+                    .failure
+                    .get_or_insert_with(|| "Own /3 active actor outcome unresolved".into());
             }
             return Ok(OwnPrepareStepV3::Pending);
         }
     }
     let root_expired = match admission.root_admission().try_accepts_original() {
         Ok(value) => !value,
-        Err(error) if error.code == rz_contracts::ErrorCode::ResourceExhausted => return Ok(OwnPrepareStepV3::Pending),
-        Err(error) => { state.failure = Some(format!("Own /3 root observation failed: {error}")); return Ok(OwnPrepareStepV3::Failed); }
+        Err(error) if error.code == rz_contracts::ErrorCode::ResourceExhausted => {
+            return Ok(OwnPrepareStepV3::Pending);
+        }
+        Err(error) => {
+            state.failure = Some(format!("Own /3 root observation failed: {error}"));
+            return Ok(OwnPrepareStepV3::Failed);
+        }
     };
     if bridge.game().abort_requested() || state.request.is_revoked() || root_expired {
-        state.failure.get_or_insert_with(|| "Own /3 original request revoked; retain staged owners".into());
+        state
+            .failure
+            .get_or_insert_with(|| "Own /3 original request revoked; retain staged owners".into());
         return Ok(OwnPrepareStepV3::Failed);
     }
     if state.failure.is_some() {
@@ -1540,7 +1599,7 @@ fn prepare_own_root_step_v3(
             Ok(Ok(stage)) => {
                 state.original_scope_identity = Some(stage.scope_effect_identity_weak());
                 state.stage = Some(Arc::new(Mutex::new(stage)));
-            },
+            }
             Ok(Err(error)) => {
                 state.preflight_failure = Some(error);
                 state.failure = Some("Own /3 teacher preflight rejected".into());
@@ -1570,14 +1629,21 @@ fn prepare_own_root_step_v3(
         if staged.state() == TeacherSessionStageStateV3::Prepared || scope_pending {
             match drive_own_scope_effect_v3(supervisor, &mut state, &stage, &mut staged) {
                 OwnScopeDriveV3::Finished => {}
-                OwnScopeDriveV3::Pending | OwnScopeDriveV3::Aborted => return Ok(OwnPrepareStepV3::Pending),
+                OwnScopeDriveV3::Pending | OwnScopeDriveV3::Aborted => {
+                    return Ok(OwnPrepareStepV3::Pending);
+                }
                 OwnScopeDriveV3::Failed => {
-                    state.failure.get_or_insert_with(|| "Own /3 teacher scope effect unresolved".into());
+                    state
+                        .failure
+                        .get_or_insert_with(|| "Own /3 teacher scope effect unresolved".into());
                     return Ok(OwnPrepareStepV3::Failed);
                 }
             }
         }
-        if !matches!(staged.state(), TeacherSessionStageStateV3::Claimed | TeacherSessionStageStateV3::Ready) {
+        if !matches!(
+            staged.state(),
+            TeacherSessionStageStateV3::Claimed | TeacherSessionStageStateV3::Ready
+        ) {
             state.failure = Some("Own /3 teacher scope unresolved".into());
             return Ok(OwnPrepareStepV3::Failed);
         }
@@ -1595,11 +1661,21 @@ fn prepare_own_root_step_v3(
     };
     if state.next_actor < state.inputs.plan().teacher_slots.len() {
         if state.actor_effects.len() == state.next_actor {
-            if state.actor_effects.try_reserve(1).is_err() { return Ok(OwnPrepareStepV3::Pending); }
-            let actor = state.inputs.plan().teacher_slots[state.next_actor].actor_id.clone();
-            state.actor_effects.push(Arc::new(Mutex::new(OwnActorEffectSlotsV3::new(actor))));
+            if state.actor_effects.try_reserve(1).is_err() {
+                return Ok(OwnPrepareStepV3::Pending);
+            }
+            let actor = state.inputs.plan().teacher_slots[state.next_actor]
+                .actor_id
+                .clone();
+            state
+                .actor_effects
+                .push(Arc::new(Mutex::new(OwnActorEffectSlotsV3::new(actor))));
         }
-        let actor_slot = state.actor_effects.get(state.next_actor).cloned().ok_or("Own /3 original actor slot absent")?;
+        let actor_slot = state
+            .actor_effects
+            .get(state.next_actor)
+            .cloned()
+            .ok_or("Own /3 original actor slot absent")?;
         let stage_guard = match stage.try_lock() {
             Ok(value) => value,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnPrepareStepV3::Pending),
@@ -1610,11 +1686,23 @@ fn prepare_own_root_step_v3(
             Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnPrepareStepV3::Pending),
             Err(_) => return Err("Own /3 session poisoned".into()),
         };
-        match drive_own_actor_effect_v3(supervisor, &mut state, &stage, &stage_guard, &session, &mut owner, &actor_slot, startup_deadline, cleanup_deadline) {
+        match drive_own_actor_effect_v3(
+            supervisor,
+            &mut state,
+            &stage,
+            &stage_guard,
+            &session,
+            &mut owner,
+            &actor_slot,
+            startup_deadline,
+            cleanup_deadline,
+        ) {
             OwnScopeDriveV3::Finished => state.next_actor += 1,
-            OwnScopeDriveV3::Pending | OwnScopeDriveV3::Aborted => {},
+            OwnScopeDriveV3::Pending | OwnScopeDriveV3::Aborted => {}
             OwnScopeDriveV3::Failed => {
-                state.failure.get_or_insert_with(|| "Own /3 actor effect unresolved".into());
+                state
+                    .failure
+                    .get_or_insert_with(|| "Own /3 actor effect unresolved".into());
                 return Ok(OwnPrepareStepV3::Failed);
             }
         }

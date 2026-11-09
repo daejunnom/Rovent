@@ -189,7 +189,11 @@ pub(crate) fn run_original_v3_lifecycle(
         (scope, empty_owner, until, returned)
     };
     lifecycle
-        .finish(Some(StorageSemanticOwner::Pc(returned)), final_until, &signal)
+        .finish(
+            Some(StorageSemanticOwner::Pc(returned)),
+            final_until,
+            &signal,
+        )
         .unwrap_or_else(|failure| panic!("V3 archive final worker: {:?}", failure.failure));
     let mut observation = lifecycle.observation();
     observation.require_after_finish();

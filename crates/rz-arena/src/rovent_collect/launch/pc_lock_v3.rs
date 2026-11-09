@@ -79,7 +79,10 @@ fn parse_collection_cli_v3(
             .remove(key)
             .ok_or_else(|| invalid(format!("missing {key}")))
     };
-    check(take("--v3-mode")? == expected_mode, "unsupported Collection /3 mode")?;
+    check(
+        take("--v3-mode")? == expected_mode,
+        "unsupported Collection /3 mode",
+    )?;
     let plan_pin = RoventPublicationFile {
         path: take("--v3-plan")?,
         sha256: take("--v3-plan-sha256")?,
@@ -1390,7 +1393,10 @@ impl CollectionInputsPurposeV3 {
     }
 
     fn validate_plan_schema(self, schema: &str) -> Result<(), ArenaError> {
-        check(schema == self.plan_schema(), "Collection /3 explicit launch plan domain")
+        check(
+            schema == self.plan_schema(),
+            "Collection /3 explicit launch plan domain",
+        )
     }
 }
 
@@ -1403,7 +1409,10 @@ impl PreparedPcCollectionInputsV3 {
         deadline: Instant,
     ) -> Result<Self, ArenaError> {
         Self::open_from_managed_observation_for(
-            observation, plan_pin, deadline, CollectionInputsPurposeV3::Pc,
+            observation,
+            plan_pin,
+            deadline,
+            CollectionInputsPurposeV3::Pc,
         )
     }
 
@@ -1415,7 +1424,10 @@ impl PreparedPcCollectionInputsV3 {
         deadline: Instant,
     ) -> Result<Self, ArenaError> {
         Self::open_from_managed_observation_for(
-            observation, plan_pin, deadline, CollectionInputsPurposeV3::Own,
+            observation,
+            plan_pin,
+            deadline,
+            CollectionInputsPurposeV3::Own,
         )
     }
 
@@ -1762,10 +1774,22 @@ mod cli_tests {
     #[test]
     fn purpose_schema_rejects_cross_domain() {
         use CollectionInputsPurposeV3::{Own, Pc};
-        assert!(Pc.validate_plan_schema(ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN).is_ok());
-        assert!(Own.validate_plan_schema(ROVENT_OWN_COLLECTION_LOCK_V3_LAUNCH_PLAN).is_ok());
-        assert!(Pc.validate_plan_schema(ROVENT_OWN_COLLECTION_LOCK_V3_LAUNCH_PLAN).is_err());
-        assert!(Own.validate_plan_schema(ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN).is_err());
+        assert!(
+            Pc.validate_plan_schema(ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN)
+                .is_ok()
+        );
+        assert!(
+            Own.validate_plan_schema(ROVENT_OWN_COLLECTION_LOCK_V3_LAUNCH_PLAN)
+                .is_ok()
+        );
+        assert!(
+            Pc.validate_plan_schema(ROVENT_OWN_COLLECTION_LOCK_V3_LAUNCH_PLAN)
+                .is_err()
+        );
+        assert!(
+            Own.validate_plan_schema(ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1785,20 +1809,33 @@ mod cli_tests {
             bytes: bytes.len() as u64,
         };
         let pinned = OriginalPinnedFile::from_original_plan(
-            original.try_clone().unwrap(), &pin, PLAN_MAX_BYTES,
+            original.try_clone().unwrap(),
+            &pin,
+            PLAN_MAX_BYTES,
             Instant::now() + Duration::from_secs(5),
-        ).expect("retained original descriptor");
+        )
+        .expect("retained original descriptor");
         let retained = pinned._file.metadata().unwrap();
-        assert_eq!((identity.dev(), identity.ino()),
-            (cap_fs_ext::MetadataExt::dev(&retained), cap_fs_ext::MetadataExt::ino(&retained)));
+        assert_eq!(
+            (identity.dev(), identity.ino()),
+            (
+                cap_fs_ext::MetadataExt::dev(&retained),
+                cap_fs_ext::MetadataExt::ino(&retained)
+            )
+        );
         assert_eq!(pinned.bytes(), bytes);
         assert_eq!(original.stream_position().unwrap(), 3);
         let mut wrong = pin.clone();
         wrong.sha256 = "0".repeat(64);
-        assert!(OriginalPinnedFile::from_original_plan(
-            original.try_clone().unwrap(), &wrong, PLAN_MAX_BYTES,
-            Instant::now() + Duration::from_secs(5),
-        ).is_err());
+        assert!(
+            OriginalPinnedFile::from_original_plan(
+                original.try_clone().unwrap(),
+                &wrong,
+                PLAN_MAX_BYTES,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .is_err()
+        );
         assert_eq!(original.stream_position().unwrap(), 3);
     }
 
@@ -1839,7 +1876,9 @@ mod cli_tests {
             "--v3-plan-bytes=1".to_owned(),
             "--process-epoch=9".to_owned(),
         ];
-        let parsed = parse_own_collection_cli_v3(arguments.clone()).unwrap().unwrap();
+        let parsed = parse_own_collection_cli_v3(arguments.clone())
+            .unwrap()
+            .unwrap();
         assert_eq!(parsed.native_arguments, ["--process-epoch=9"]);
         assert!(parse_pc_collection_cli_v3(arguments.clone()).is_err());
         let mut duplicate = arguments;

@@ -961,8 +961,13 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
                     // The original abort fence rejects this late admission.
                     // Retain the exact reservation for the normal cleanup
                     // owner; this is not a capture or physical completion.
-                    state.failed_reservations.push(Staged { ticket, reservation });
-                    Err(invalid("lock-v3 registration canceled by original pre-route fence"))
+                    state.failed_reservations.push(Staged {
+                        ticket,
+                        reservation,
+                    });
+                    Err(invalid(
+                        "lock-v3 registration canceled by original pre-route fence",
+                    ))
                 }
                 LockV3RegistrationAttempt::Failed(error, reservation) => {
                     state.failed_reservations.push(Staged {

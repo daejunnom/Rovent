@@ -282,11 +282,15 @@ fn prepare_managed_collection_v3(
         };
     let inputs_result = if own {
         PreparedPcCollectionInputsV3::open_own_from_managed_observation(
-            &mut observation, pin, bootstrap_until,
+            &mut observation,
+            pin,
+            bootstrap_until,
         )
     } else {
         PreparedPcCollectionInputsV3::open_from_managed_observation(
-            &mut observation, pin, bootstrap_until,
+            &mut observation,
+            pin,
+            bootstrap_until,
         )
     };
     let inputs = match inputs_result {

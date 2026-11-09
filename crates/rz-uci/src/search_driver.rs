@@ -167,7 +167,9 @@ impl RoventRootCancelGateV3 {
 
     /// Order a single original acquisition against this root's UCI cancel.
     /// The caller must retain the claim with the actual operation owner.
-    pub fn try_claim(self: &Arc<Self>) -> Result<RoventRootCancelClaimV3, RoventRootCancelClaimErrorV3> {
+    pub fn try_claim(
+        self: &Arc<Self>,
+    ) -> Result<RoventRootCancelClaimV3, RoventRootCancelClaimErrorV3> {
         let initial = self.word.load(Ordering::SeqCst);
         if initial & V3_ROOT_UNKNOWN != 0 {
             return Err(RoventRootCancelClaimErrorV3::Unknown);
@@ -199,10 +201,17 @@ impl RoventRootCancelGateV3 {
             if value & V3_ROOT_COUNT_MASK == V3_ROOT_COUNT_MASK {
                 return Err(RoventRootCancelClaimErrorV3::Capacity);
             }
-            match self.word.compare_exchange(value, value + 1, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(_) => return Ok(RoventRootCancelClaimV3 {
-                    gate: Arc::clone(self), _original_start: original_start, resolved: false,
-                }),
+            match self
+                .word
+                .compare_exchange(value, value + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => {
+                    return Ok(RoventRootCancelClaimV3 {
+                        gate: Arc::clone(self),
+                        _original_start: original_start,
+                        resolved: false,
+                    });
+                }
                 Err(observed) => value = observed,
             }
         }
@@ -220,21 +229,36 @@ impl RoventRootCancelGateV3 {
                 self.mark_unknown();
                 return false;
             }
-            match self.word.compare_exchange(current, current | V3_ROOT_BOUND,
-                                             Ordering::SeqCst, Ordering::SeqCst) {
+            match self.word.compare_exchange(
+                current,
+                current | V3_ROOT_BOUND,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
                 Ok(_) => return true,
                 Err(observed) => current = observed,
             }
         }
     }
 
-    pub(crate) fn matches_original_start(&self, start: &Arc<crate::engine::DriverStartSource>) -> Option<bool> {
-        self.original_start.get().map(|original| Weak::ptr_eq(original, &Arc::downgrade(start)))
+    pub(crate) fn matches_original_start(
+        &self,
+        start: &Arc<crate::engine::DriverStartSource>,
+    ) -> Option<bool> {
+        self.original_start
+            .get()
+            .map(|original| Weak::ptr_eq(original, &Arc::downgrade(start)))
     }
 
     pub(crate) fn mark_ready(&self) -> bool {
-        self.word.compare_exchange(V3_ROOT_BOUND, V3_ROOT_BOUND | V3_ROOT_READY,
-                                   Ordering::SeqCst, Ordering::SeqCst).is_ok()
+        self.word
+            .compare_exchange(
+                V3_ROOT_BOUND,
+                V3_ROOT_BOUND | V3_ROOT_READY,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
     }
 
     /// Request only logical root cancellation. The original route owner must
@@ -258,8 +282,16 @@ impl RoventRootCancelClaimV3 {
                 self.gate.mark_unknown();
                 return Err(RoventRootCancelClaimErrorV3::Unknown);
             }
-            match self.gate.word.compare_exchange(value, value - 1, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(_) => { self.resolved = true; return Ok(()); }
+            match self.gate.word.compare_exchange(
+                value,
+                value - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    self.resolved = true;
+                    return Ok(());
+                }
                 Err(observed) => value = observed,
             }
         }
@@ -284,10 +316,16 @@ impl SearchSessionContext {
         &self,
         gate: Arc<RoventRootCancelGateV3>,
     ) -> Result<(), ContractError> {
-        self.original_start.as_ref().ok_or_else(|| {
-            ContractError::new(ErrorCode::IdentityMismatch, Stage::Admission,
-                               "original UCI Start absent")
-        })?.bind_collection_root_cancel_v3(self, gate)
+        self.original_start
+            .as_ref()
+            .ok_or_else(|| {
+                ContractError::new(
+                    ErrorCode::IdentityMismatch,
+                    Stage::Admission,
+                    "original UCI Start absent",
+                )
+            })?
+            .bind_collection_root_cancel_v3(self, gate)
     }
 
     /// Re-observe the original Start/gate association without taking a lock.

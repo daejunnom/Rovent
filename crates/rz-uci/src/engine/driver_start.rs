@@ -32,7 +32,10 @@ enum CollectionAbortHook {
 impl CollectionAbortHook {
     fn abort(&self) {
         match self {
-            Self::V2 { game_gate, root_targets_revoked } => {
+            Self::V2 {
+                game_gate,
+                root_targets_revoked,
+            } => {
                 game_gate.fetch_or(
                     crate::search_driver::ROVENT_COLLECTION_ABORT_BIT,
                     std::sync::atomic::Ordering::AcqRel,
@@ -129,10 +132,13 @@ impl DriverStartSource {
         game_gate: Arc<std::sync::atomic::AtomicU64>,
         root_targets_revoked: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), ContractError> {
-        self.bind_collection_hook(context, CollectionAbortHook::V2 {
-            game_gate,
-            root_targets_revoked,
-        })
+        self.bind_collection_hook(
+            context,
+            CollectionAbortHook::V2 {
+                game_gate,
+                root_targets_revoked,
+            },
+        )
     }
 
     #[cfg(feature = "pals-adaptive")]
@@ -147,7 +153,8 @@ impl DriverStartSource {
         if !gate.bind_once(self) {
             return Err(invalid("V3 root cancellation gate already bound"));
         }
-        let result = self.bind_collection_hook(context, CollectionAbortHook::V3Root(Arc::clone(&gate)));
+        let result =
+            self.bind_collection_hook(context, CollectionAbortHook::V3Root(Arc::clone(&gate)));
         if result.is_err() {
             if self.collection_owner_binding_error.get().is_some() || !gate.is_cancel_requested() {
                 gate.mark_unknown();
@@ -168,7 +175,9 @@ impl DriverStartSource {
     fn matches_collection_context(&self, context: &SearchSessionContext) -> bool {
         self.authority == context.authority
             && Arc::ptr_eq(&self.control.cancellation, &context.control.cancellation)
-            && self.cancellation.shares_cancellation_with(&context.cancellation)
+            && self
+                .cancellation
+                .shares_cancellation_with(&context.cancellation)
             && Arc::ptr_eq(&self.current, &context.current)
     }
 
@@ -200,8 +209,7 @@ impl DriverStartSource {
         context: &SearchSessionContext,
         hook: CollectionAbortHook,
     ) -> Result<(), ContractError> {
-        if !self.matches_collection_context(context)
-        {
+        if !self.matches_collection_context(context) {
             return Err(invalid("collection abort hook differs from original Start"));
         }
         self.collection_abort_hook

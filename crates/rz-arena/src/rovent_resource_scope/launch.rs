@@ -2353,8 +2353,10 @@ pub(crate) type OwnCollectionFactoryV3 = Box<
             &Dir,
             &Arc<File>,
             &rz_uci::rovent_bootstrap::RoventStartupControl,
-        ) -> Result<rz_uci::rovent_bootstrap::launch::RoventOwnFactoryProductV3, RoventLaunchError>
-        + Send,
+        ) -> Result<
+            rz_uci::rovent_bootstrap::launch::RoventOwnFactoryProductV3,
+            RoventLaunchError,
+        > + Send,
 >;
 
 pub(crate) type OwnCollectionRetainResourceV3 =
@@ -2367,7 +2369,10 @@ pub(crate) fn run_own_collection_with_resources_v3_preowned(
     reservation: crate::rovent_collect::launch::own_recovery_v3::OwnRunReservationV3,
 ) -> Result<
     crate::rovent_collect::launch::own_recovery_v3::OwnRunHandleV3,
-    (crate::rovent_collect::launch::own_recovery_v3::OwnRunReservationV3, &'static str),
+    (
+        crate::rovent_collect::launch::own_recovery_v3::OwnRunReservationV3,
+        &'static str,
+    ),
 > {
     let (pin, arguments) = match reservation.original_invocation() {
         Ok(original) => original,
@@ -2814,9 +2819,9 @@ fn run_native_with_resources_v3_inner(
     // owner and do not publish an observation as a finished-run readback.
     // BeforeNative distinguishes GPU entry from a partially started CPU
     // supervisor; it does not authorize releasing the shared resource owner.
-    let post_auth_cpu_custody_unresolved =
-        post_auth_entered.load(std::sync::atomic::Ordering::Acquire)
-            || own_factory_entered.load(std::sync::atomic::Ordering::Acquire);
+    let post_auth_cpu_custody_unresolved = post_auth_entered
+        .load(std::sync::atomic::Ordering::Acquire)
+        || own_factory_entered.load(std::sync::atomic::Ordering::Acquire);
     let native_quarantined = post_auth_cpu_custody_unresolved
         || control_panic_may_be_native
         || matches!(

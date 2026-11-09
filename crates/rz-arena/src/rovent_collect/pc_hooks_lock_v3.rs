@@ -4290,7 +4290,9 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
             match self.try_progress_dispatch(slot, true) {
                 Ok(true) => {}
                 Ok(false) => {
-                    return Ok(RoventPcCollectionAdmissionOutcomeV3::PendingUncertain { admission });
+                    return Ok(RoventPcCollectionAdmissionOutcomeV3::PendingUncertain {
+                        admission,
+                    });
                 }
                 Err(error) => return Err(failure(AdaptiveManagerError::Invalid(error), admission)),
             }

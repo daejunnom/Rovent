@@ -4,8 +4,8 @@
 //! same-owner settlement must be connected before these owners can run. The
 //! prepared value itself is not a lifecycle custody or recovery registration.
 
-use super::{ArenaError, invalid};
 use super::pc_lock_v3::{ManagedOutputOwnerV3, PreparedPcCollectionInputsV3};
+use super::{ArenaError, invalid};
 use crate::rovent_collect::capture_router_v3::CaptureRouterV3;
 use crate::rovent_collect::game_authority_v3::{GameAuthorityV3, GameStepV3};
 use crate::rovent_collect::own_hooks_lock_v3::RoventOwnCollectionBridgeV3;
@@ -47,7 +47,9 @@ fn read_supplied_lock_bytes(
     }
     let len = usize::try_from(before.len()).map_err(|_| invalid("Own /3 lock length"))?;
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(len).map_err(|_| invalid("Own /3 lock allocation"))?;
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| invalid("Own /3 lock allocation"))?;
     let mut buffer = [0_u8; 65536];
     while bytes.len() < len {
         if Instant::now() >= deadline {
@@ -66,7 +68,15 @@ fn read_supplied_lock_bytes(
         return Err(invalid("Own /3 original lock read deadline"));
     }
     let stamp = |m: &std::fs::Metadata| {
-        (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec())
+        (
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
     };
     if stamp(&before) != stamp(&after) {
         return Err(invalid("Own /3 original lock changed while reading"));
@@ -84,7 +94,9 @@ fn verify_supplied_lock(
     let decoded = RoventInputLockV3::from_json(text)
         .map_err(|error| invalid(format!("Own /3 original lock: {error}")))?;
     if &decoded != lock {
-        return Err(invalid("Own /3 original lock FD differs from decoded owner"));
+        return Err(invalid(
+            "Own /3 original lock FD differs from decoded owner",
+        ));
     }
     Ok(())
 }

@@ -87,9 +87,6 @@ const MAX_SELECTION_BYTES: u64 = 64 << 10;
 mod cohort_prepare;
 // Compile the unconnected outer-owner transport only for focused Linux tests.
 // This declaration is not a product dispatch or an admission capability.
-#[cfg(all(test, target_os = "linux"))]
-#[path = "launch/owner_ipc.rs"]
-mod owner_ipc_test_only;
 mod collection;
 mod collection_v2_observer;
 #[cfg(test)]
@@ -101,6 +98,9 @@ mod evidence;
 mod go_observer;
 #[cfg(target_os = "linux")]
 mod own_collection_v3;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "launch/owner_ipc.rs"]
+mod owner_ipc_test_only;
 #[cfg(feature = "native-validation-diagnostics")]
 mod selected_view_observation;
 pub mod storage;
@@ -1473,9 +1473,8 @@ pub struct RoventOwnFactoryProductV3 {
     pub(super) original_lock_file: Arc<std::fs::File>,
     pub(super) scope_leaf: Box<dyn std::any::Any + Send>,
     pub(super) entry_identity: Arc<()>,
-    pub(super) no_uci_dispatch_sink: Box<
-        dyn FnOnce(RoventOwnUciNoDispatchV3) -> Result<(), RoventLaunchError> + Send,
-    >,
+    pub(super) no_uci_dispatch_sink:
+        Box<dyn FnOnce(RoventOwnUciNoDispatchV3) -> Result<(), RoventLaunchError> + Send>,
 }
 
 /// This invocation's `run_native_admitted` reached its Own guard before it
@@ -1519,7 +1518,14 @@ impl RoventOwnFactoryProductV3 {
             dyn FnOnce(RoventOwnUciNoDispatchV3) -> Result<(), RoventLaunchError> + Send,
         >,
     ) -> Self {
-        Self { native_owner, original_input_lock, original_lock_file, scope_leaf, entry_identity, no_uci_dispatch_sink }
+        Self {
+            native_owner,
+            original_input_lock,
+            original_lock_file,
+            scope_leaf,
+            entry_identity,
+            no_uci_dispatch_sink,
+        }
     }
 }
 
@@ -1549,23 +1555,23 @@ pub fn run_own_collection_v3_with_original_factory_retaining_connected_control_s
     control: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
     parent_stream: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>,
     factory: impl FnOnce(
-            &Arc<RoventInputLockV3>,
-            &Dir,
-            &Arc<std::fs::File>,
-            &RoventStartupControl,
-        ) -> Result<RoventOwnFactoryProductV3, RoventLaunchError>
-        + 'a,
+        &Arc<RoventInputLockV3>,
+        &Dir,
+        &Arc<std::fs::File>,
+        &RoventStartupControl,
+    ) -> Result<RoventOwnFactoryProductV3, RoventLaunchError>
+    + 'a,
     admit_resource: impl FnOnce(
-            &Arc<RoventInputLockV3>,
-            &Dir,
-            &std::fs::File,
-            std::time::Instant,
-            std::time::Instant,
-            Option<&Dir>,
-            Option<&std::path::Path>,
-            &Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
-        ) -> Result<(), RoventLaunchError>
-        + 'a,
+        &Arc<RoventInputLockV3>,
+        &Dir,
+        &std::fs::File,
+        std::time::Instant,
+        std::time::Instant,
+        Option<&Dir>,
+        Option<&std::path::Path>,
+        &Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+    ) -> Result<(), RoventLaunchError>
+    + 'a,
 ) -> ControlledV3Result<C> {
     run_with_v3_control_slot_inner(
         arguments,
@@ -1667,10 +1673,23 @@ fn run_with_v3_control_slot_inner<'a, C: Send + 'static>(
                 collection,
             )?,
             (None, Some(factory)) => v3::admit_original_own_factory(
-                &arguments, lock, root, cwd, lock_file, Some(resource), factory,
+                &arguments,
+                lock,
+                root,
+                cwd,
+                lock_file,
+                Some(resource),
+                factory,
             )?,
-            (None, None) => v3::admit_original(&arguments, lock, root, cwd, lock_file, Some(resource))?,
-            (Some(_), Some(_)) => return Err(error("CollectionAdmission", "conflicting original collection owners")),
+            (None, None) => {
+                v3::admit_original(&arguments, lock, root, cwd, lock_file, Some(resource))?
+            }
+            (Some(_), Some(_)) => {
+                return Err(error(
+                    "CollectionAdmission",
+                    "conflicting original collection owners",
+                ));
+            }
         };
         Ok::<_, RoventLaunchError>((arguments, original))
     }));

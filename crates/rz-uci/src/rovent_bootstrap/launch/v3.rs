@@ -1715,7 +1715,16 @@ pub(super) fn admit_original<'a>(
     lock_file: File,
     resource: Option<ResourceAdmissionV3<'a>>,
 ) -> Result<OriginalV3Inputs<'a>, RoventLaunchError> {
-    admit_original_inner(arguments, lock, root, cwd, Arc::new(lock_file), resource, None, None)
+    admit_original_inner(
+        arguments,
+        lock,
+        root,
+        cwd,
+        Arc::new(lock_file),
+        resource,
+        None,
+        None,
+    )
 }
 
 /// Admit the explicit /3 P/C Collection using the same original process,
@@ -1756,7 +1765,14 @@ pub(super) fn admit_original_own_factory<'a>(
     factory: super::OwnFactoryV3<'a>,
 ) -> Result<OriginalV3Inputs<'a>, RoventLaunchError> {
     admit_original_inner(
-        arguments, lock, root, cwd, Arc::new(lock_file), resource, None, Some(factory),
+        arguments,
+        lock,
+        root,
+        cwd,
+        Arc::new(lock_file),
+        resource,
+        None,
+        Some(factory),
     )
 }
 
@@ -1783,7 +1799,10 @@ fn admit_original_inner<'a>(
         ));
     }
     if !matches!(
-        (lock.manifest.purpose, collection.is_some() || own_factory.is_some()),
+        (
+            lock.manifest.purpose,
+            collection.is_some() || own_factory.is_some()
+        ),
         (
             rz_experiments::RoventPurpose::Validation | rz_experiments::RoventPurpose::Deployment,
             false
@@ -1998,7 +2017,10 @@ fn admit_original_inner<'a>(
         if !Arc::ptr_eq(&product.original_input_lock, &lock)
             || !Arc::ptr_eq(&product.original_lock_file, &lock_file)
         {
-            return Err(error("CollectionAdmission", "Own factory original input or lock owner differs"));
+            return Err(error(
+                "CollectionAdmission",
+                "Own factory original input or lock owner differs",
+            ));
         }
         let owner = OriginalCollectionOwnerV3::Own(product.native_owner);
         owner.register_startup_control(&control)?;

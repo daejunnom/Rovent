@@ -154,23 +154,47 @@ fn natural_completion_closes_common_token_without_aborting_collection() {
 
 #[test]
 fn v3_root_gate_tracks_the_exact_start_and_settles_existing_claim() {
-    use crate::search_driver::{RoventRootCancelBindingV3 as Binding, RoventRootCancelClaimErrorV3 as Error, RoventRootCancelGateV3};
     use crate::search_driver::RoventRootClaimObservationV3 as Observation;
+    use crate::search_driver::{
+        RoventRootCancelBindingV3 as Binding, RoventRootCancelClaimErrorV3 as Error,
+        RoventRootCancelGateV3,
+    };
     let (mut owner, mut session, context) = started_unbound();
     let gate = RoventRootCancelGateV3::new();
     let foreign = RoventRootCancelGateV3::new();
-    assert_eq!(context.observe_original_collection_root_cancel_v3(&gate), Binding::Pending);
+    assert_eq!(
+        context.observe_original_collection_root_cancel_v3(&gate),
+        Binding::Pending
+    );
     assert!(matches!(gate.try_claim(), Err(Error::NotBound)));
-    context.bind_original_collection_root_cancel_v3(Arc::clone(&gate)).unwrap();
-    assert_eq!(context.observe_original_collection_root_cancel_v3(&gate), Binding::Bound);
-    assert_eq!(context.observe_original_collection_root_cancel_v3(&foreign), Binding::Foreign);
+    context
+        .bind_original_collection_root_cancel_v3(Arc::clone(&gate))
+        .unwrap();
+    assert_eq!(
+        context.observe_original_collection_root_cancel_v3(&gate),
+        Binding::Bound
+    );
+    assert_eq!(
+        context.observe_original_collection_root_cancel_v3(&foreign),
+        Binding::Foreign
+    );
     let claim = gate.try_claim().expect("original root claim");
     assert_eq!(gate.observe_canceled_claims(), Observation::NotCanceled);
-    let bad = owner.handle_line(&mut session, "position startpos moves e2e5", |_| Ok(Color::White));
+    let bad = owner.handle_line(&mut session, "position startpos moves e2e5", |_| {
+        Ok(Color::White)
+    });
     assert!(!bad.session.accepted);
     assert!(!gate.is_cancel_requested());
-    assert!(owner.handle_line(&mut session, "stop", |_| Ok(Color::White)).session.accepted);
-    assert_eq!(context.observe_original_collection_root_cancel_v3(&gate), Binding::Canceled);
+    assert!(
+        owner
+            .handle_line(&mut session, "stop", |_| Ok(Color::White))
+            .session
+            .accepted
+    );
+    assert_eq!(
+        context.observe_original_collection_root_cancel_v3(&gate),
+        Binding::Canceled
+    );
     assert!(matches!(gate.try_claim(), Err(Error::Canceled)));
     assert_eq!(gate.observe_canceled_claims(), Observation::Active);
     claim.resolve().expect("previous claim remains settleable");
@@ -180,18 +204,36 @@ fn v3_root_gate_tracks_the_exact_start_and_settles_existing_claim() {
 
 #[test]
 fn v3_stop_before_binding_never_makes_the_gate_claimable() {
-    use crate::search_driver::{RoventRootCancelBindingV3 as Binding, RoventRootCancelClaimErrorV3 as Error, RoventRootCancelGateV3};
+    use crate::search_driver::{
+        RoventRootCancelBindingV3 as Binding, RoventRootCancelClaimErrorV3 as Error,
+        RoventRootCancelGateV3,
+    };
     let (mut owner, mut session, context) = started_unbound();
-    assert!(owner.handle_line(&mut session, "stop", |_| Ok(Color::White)).session.accepted);
+    assert!(
+        owner
+            .handle_line(&mut session, "stop", |_| Ok(Color::White))
+            .session
+            .accepted
+    );
     let gate = RoventRootCancelGateV3::new();
-    assert!(context.bind_original_collection_root_cancel_v3(Arc::clone(&gate)).is_err());
-    assert_eq!(context.observe_original_collection_root_cancel_v3(&gate), Binding::Canceled);
+    assert!(
+        context
+            .bind_original_collection_root_cancel_v3(Arc::clone(&gate))
+            .is_err()
+    );
+    assert_eq!(
+        context.observe_original_collection_root_cancel_v3(&gate),
+        Binding::Canceled
+    );
     assert!(matches!(gate.try_claim(), Err(Error::Canceled)));
 }
 
 #[test]
 fn v3_original_start_bind_and_uci_stop_cannot_lose_cancellation() {
-    use crate::search_driver::{RoventRootCancelBindingV3 as Binding, RoventRootCancelClaimErrorV3 as Error, RoventRootCancelGateV3};
+    use crate::search_driver::{
+        RoventRootCancelBindingV3 as Binding, RoventRootCancelClaimErrorV3 as Error,
+        RoventRootCancelGateV3,
+    };
     use std::sync::Barrier;
     for _ in 0..24 {
         let (mut owner, mut session, context) = started_unbound();
@@ -203,9 +245,13 @@ fn v3_original_start_bind_and_uci_stop_cannot_lose_cancellation() {
                 owner.handle_line(&mut session, "stop", |_| Ok(Color::White))
             });
             barrier.wait();
-            let _bound_or_canceled = context.bind_original_collection_root_cancel_v3(Arc::clone(&gate));
+            let _bound_or_canceled =
+                context.bind_original_collection_root_cancel_v3(Arc::clone(&gate));
             assert!(stopped.join().unwrap().session.accepted);
-            assert_eq!(context.observe_original_collection_root_cancel_v3(&gate), Binding::Canceled);
+            assert_eq!(
+                context.observe_original_collection_root_cancel_v3(&gate),
+                Binding::Canceled
+            );
             assert!(matches!(gate.try_claim(), Err(Error::Canceled)));
         });
     }
@@ -213,38 +259,77 @@ fn v3_original_start_bind_and_uci_stop_cannot_lose_cancellation() {
 
 #[test]
 fn v3_precanceled_gate_binds_only_to_its_original_start() {
-    use crate::search_driver::{RoventRootCancelBindingV3 as Binding, RoventRootCancelClaimErrorV3 as Error, RoventRootCancelGateV3};
+    use crate::search_driver::{
+        RoventRootCancelBindingV3 as Binding, RoventRootCancelClaimErrorV3 as Error,
+        RoventRootCancelGateV3,
+    };
     let (_owner, _session, context) = started_unbound();
     let (_other_owner, _other_session, other_context) = started_unbound();
     let gate = RoventRootCancelGateV3::new();
     gate.request_cancel();
-    assert!(context.bind_original_collection_root_cancel_v3(Arc::clone(&gate)).is_err());
-    assert_eq!(context.observe_original_collection_root_cancel_v3(&gate), Binding::Canceled);
-    assert_eq!(other_context.observe_original_collection_root_cancel_v3(&gate), Binding::Foreign);
+    assert!(
+        context
+            .bind_original_collection_root_cancel_v3(Arc::clone(&gate))
+            .is_err()
+    );
+    assert_eq!(
+        context.observe_original_collection_root_cancel_v3(&gate),
+        Binding::Canceled
+    );
+    assert_eq!(
+        other_context.observe_original_collection_root_cancel_v3(&gate),
+        Binding::Foreign
+    );
     assert!(matches!(gate.try_claim(), Err(Error::Canceled)));
-    assert!(other_context.bind_original_collection_root_cancel_v3(Arc::clone(&gate)).is_err());
+    assert!(
+        other_context
+            .bind_original_collection_root_cancel_v3(Arc::clone(&gate))
+            .is_err()
+    );
 }
 
 #[test]
 fn v3_original_owner_binding_failure_stays_unknown() {
-    use crate::search_driver::{RoventRootCancelBindingV3 as Binding, RoventRootCancelClaimErrorV3 as Error, RoventRootCancelGateV3};
+    use crate::search_driver::{
+        RoventRootCancelBindingV3 as Binding, RoventRootCancelClaimErrorV3 as Error,
+        RoventRootCancelGateV3,
+    };
     let (_owner, _session, context) = started_unbound();
-    context.original_start.as_ref().unwrap().mark_collection_owner_binding_failed(invalid("original owner failed"));
+    context
+        .original_start
+        .as_ref()
+        .unwrap()
+        .mark_collection_owner_binding_failed(invalid("original owner failed"));
     let gate = RoventRootCancelGateV3::new();
-    assert!(context.bind_original_collection_root_cancel_v3(Arc::clone(&gate)).is_err());
-    assert_eq!(context.observe_original_collection_root_cancel_v3(&gate), Binding::Unknown);
+    assert!(
+        context
+            .bind_original_collection_root_cancel_v3(Arc::clone(&gate))
+            .is_err()
+    );
+    assert_eq!(
+        context.observe_original_collection_root_cancel_v3(&gate),
+        Binding::Unknown
+    );
     assert!(matches!(gate.try_claim(), Err(Error::Unknown)));
 }
 
 #[test]
 fn v3_lost_claim_is_unknown_and_is_not_refunded() {
-    use crate::search_driver::{RoventRootCancelBindingV3 as Binding, RoventRootCancelClaimErrorV3 as Error, RoventRootCancelGateV3};
     use crate::search_driver::RoventRootClaimObservationV3 as Observation;
+    use crate::search_driver::{
+        RoventRootCancelBindingV3 as Binding, RoventRootCancelClaimErrorV3 as Error,
+        RoventRootCancelGateV3,
+    };
     let (_owner, _session, context) = started_unbound();
     let gate = RoventRootCancelGateV3::new();
-    context.bind_original_collection_root_cancel_v3(Arc::clone(&gate)).unwrap();
+    context
+        .bind_original_collection_root_cancel_v3(Arc::clone(&gate))
+        .unwrap();
     drop(gate.try_claim().expect("original root claim"));
-    assert_eq!(context.observe_original_collection_root_cancel_v3(&gate), Binding::Unknown);
+    assert_eq!(
+        context.observe_original_collection_root_cancel_v3(&gate),
+        Binding::Unknown
+    );
     assert_eq!(gate.observe_canceled_claims(), Observation::Unknown);
     assert!(matches!(gate.try_claim(), Err(Error::Unknown)));
 }
@@ -256,7 +341,9 @@ fn v3_claim_and_original_uci_stop_have_one_root_order() {
     for _ in 0..24 {
         let (mut owner, mut session, context) = started_unbound();
         let gate = RoventRootCancelGateV3::new();
-        context.bind_original_collection_root_cancel_v3(Arc::clone(&gate)).unwrap();
+        context
+            .bind_original_collection_root_cancel_v3(Arc::clone(&gate))
+            .unwrap();
         let barrier = Barrier::new(2);
         std::thread::scope(|scope| {
             let stopped = scope.spawn(|| {
@@ -268,7 +355,7 @@ fn v3_claim_and_original_uci_stop_have_one_root_order() {
             assert!(stopped.join().unwrap().session.accepted);
             match attempt {
                 Ok(claim) => claim.resolve().unwrap(),
-                Err(Error::Canceled) => {},
+                Err(Error::Canceled) => {}
                 Err(other) => panic!("unexpected root claim state: {other:?}"),
             }
             assert!(gate.is_cancel_requested());

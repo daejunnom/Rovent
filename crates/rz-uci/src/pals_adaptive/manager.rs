@@ -5342,10 +5342,15 @@ where
                     FrontierError::NativeUnknown
                 ))
             )
-            || matches!(error, AdaptiveManagerError::Frontier(FrontierError::NativeUnknown))
             || matches!(
                 error,
-                AdaptiveManagerError::Cpu(CpuWorkerError::UnknownUsage | CpuWorkerError::Quarantined)
+                AdaptiveManagerError::Frontier(FrontierError::NativeUnknown)
+            )
+            || matches!(
+                error,
+                AdaptiveManagerError::Cpu(
+                    CpuWorkerError::UnknownUsage | CpuWorkerError::Quarantined
+                )
             )
     }
 
@@ -6399,7 +6404,9 @@ where
                             self.roles[index].collection_v3_ranking_started = true;
                         }
                         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                        if let Some(observer) = self.collection_observer_v2.as_mut()
+                        if let Some(observer) = self
+                            .collection_observer_v2
+                            .as_mut()
                             .filter(|_| notify_collection_ranking)
                         {
                             let proof = self
@@ -6572,7 +6579,8 @@ where
             })();
             if let Err(error) = attempted {
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                let v3_root_ranking = purpose == RolePurpose::RootRanking && self.collection_is_v3();
+                let v3_root_ranking =
+                    purpose == RolePurpose::RootRanking && self.collection_is_v3();
                 // Store consumption precedes next-view materialization. A
                 // later failure must retain both the semantic error and the
                 // actual source consumption, without retrying its commit.
@@ -6586,13 +6594,16 @@ where
                     Ok(true) => {
                         if !self.roles[index].consumption_recorded {
                             if let Err(observation) = self.mark_role_consumed(index, true) {
-                                let observation = observation.at_semantic_stage("mark_role_consumed_after_error");
+                                let observation =
+                                    observation.at_semantic_stage("mark_role_consumed_after_error");
                                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                                 if v3_root_ranking {
                                     if self.failure_requires_quarantine(&observation) {
                                         self.phase = ManagerPhase::Quarantined;
                                     }
-                                    self.roles[index].collection_v3_recovery_accounting_error.get_or_insert(observation);
+                                    self.roles[index]
+                                        .collection_v3_recovery_accounting_error
+                                        .get_or_insert(observation);
                                 } else {
                                     self.record_failure(observation);
                                 }
@@ -6602,7 +6613,12 @@ where
                         }
                         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                         if v3_root_ranking {
-                            self.recover_v3_root_ranking_after_consumption(index, &ticket, &input, output.as_ref());
+                            self.recover_v3_root_ranking_after_consumption(
+                                index,
+                                &ticket,
+                                &input,
+                                output.as_ref(),
+                            );
                         }
                     }
                     Ok(false) => {}
@@ -6616,7 +6632,9 @@ where
                             if self.failure_requires_quarantine(&readback) {
                                 self.phase = ManagerPhase::Quarantined;
                             }
-                            self.roles[index].collection_v3_recovery_accounting_error.get_or_insert(readback);
+                            self.roles[index]
+                                .collection_v3_recovery_accounting_error
+                                .get_or_insert(readback);
                         } else {
                             self.record_failure(readback);
                         }
@@ -6692,33 +6710,44 @@ where
             ranking.source().ticket == *ticket && ranking.view().digest() == input.view.digest()
         });
         let proof = ranking
-            .ok_or_else(|| AdaptiveCollectionError::new(
-                AdaptiveCollectionStage::Accepted,
-                "MissingOriginalV3RootRanking",
-                "consumed V3 root ranking has no matching original proof",
-            ))
+            .ok_or_else(|| {
+                AdaptiveCollectionError::new(
+                    AdaptiveCollectionStage::Accepted,
+                    "MissingOriginalV3RootRanking",
+                    "consumed V3 root ranking has no matching original proof",
+                )
+            })
             .and_then(|ranking| {
-                self.collection_admission_v2.as_ref().ok_or_else(|| {
-                    AdaptiveCollectionError::new(
-                        AdaptiveCollectionStage::Accepted,
-                        "MissingV3Admission",
-                        "consumed V3 root ranking has no original admission",
-                    )
-                }).and_then(|admission| {
-                    collection::VersionedRootRankingAcceptance::from_observed_ranking(
-                        ranking, admission, output.proposer_ranking_output(),
-                    )
-                })
+                self.collection_admission_v2
+                    .as_ref()
+                    .ok_or_else(|| {
+                        AdaptiveCollectionError::new(
+                            AdaptiveCollectionStage::Accepted,
+                            "MissingV3Admission",
+                            "consumed V3 root ranking has no original admission",
+                        )
+                    })
+                    .and_then(|admission| {
+                        collection::VersionedRootRankingAcceptance::from_observed_ranking(
+                            ranking,
+                            admission,
+                            output.proposer_ranking_output(),
+                        )
+                    })
             });
         match proof {
             Ok(proof) => {
-                let result = self.collection_observer_v2.as_mut().ok_or_else(|| {
-                    AdaptiveCollectionError::new(
-                        AdaptiveCollectionStage::Accepted,
-                        "MissingV3Observer",
-                        "consumed V3 root ranking has no original observer",
-                    )
-                }).and_then(|observer| observer.try_adaptive_root_ranking(&proof, input, output));
+                let result = self
+                    .collection_observer_v2
+                    .as_mut()
+                    .ok_or_else(|| {
+                        AdaptiveCollectionError::new(
+                            AdaptiveCollectionStage::Accepted,
+                            "MissingV3Observer",
+                            "consumed V3 root ranking has no original observer",
+                        )
+                    })
+                    .and_then(|observer| observer.try_adaptive_root_ranking(&proof, input, output));
                 match result {
                     Ok(collection::AdaptiveCollectionBoundaryV2::Ready) => {}
                     Ok(collection::AdaptiveCollectionBoundaryV2::Busy) => {
@@ -6727,16 +6756,22 @@ where
                     Err(error) => {
                         self.roles[index].collection_observation_failed = true;
                         self.roles[index].collection_ranking_failed = Some(proof);
-                        self.collection_v2_first_failure.get_or_insert_with(|| error.clone());
-                        self.roles[index].collection_v3_recovery_ranking_error.get_or_insert(error);
+                        self.collection_v2_first_failure
+                            .get_or_insert_with(|| error.clone());
+                        self.roles[index]
+                            .collection_v3_recovery_ranking_error
+                            .get_or_insert(error);
                     }
                 }
             }
             Err(error) => {
                 self.roles[index].collection_observation_failed = true;
                 self.roles[index].collection_raw_ranking_failed = ranking.cloned();
-                self.collection_v2_first_failure.get_or_insert_with(|| error.clone());
-                self.roles[index].collection_v3_recovery_ranking_error.get_or_insert(error);
+                self.collection_v2_first_failure
+                    .get_or_insert_with(|| error.clone());
+                self.roles[index]
+                    .collection_v3_recovery_ranking_error
+                    .get_or_insert(error);
             }
         }
     }
@@ -6746,10 +6781,16 @@ where
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn report_v3_ranking_recovery_errors(&mut self) {
         for index in 0..self.roles.len() {
-            if let Some(error) = self.roles[index].collection_v3_recovery_accounting_error.take() {
+            if let Some(error) = self.roles[index]
+                .collection_v3_recovery_accounting_error
+                .take()
+            {
                 self.record_failure(error);
             }
-            if let Some(error) = self.roles[index].collection_v3_recovery_ranking_error.take() {
+            if let Some(error) = self.roles[index]
+                .collection_v3_recovery_ranking_error
+                .take()
+            {
                 self.record_failure(error.into());
             }
         }

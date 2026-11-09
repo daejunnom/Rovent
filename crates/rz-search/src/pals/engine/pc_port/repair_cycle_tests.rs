@@ -154,7 +154,10 @@ fn mixed_go_limits_bound_optional_repair_by_earlier_horizon() {
         });
         assert_eq!(port.continuation_limit(), horizon);
         let input = port.next_role().unwrap().expect("root proposal");
-        assert_eq!(input.question.context.purpose, RoleQueryPurpose::ProposePolicy);
+        assert_eq!(
+            input.question.context.purpose,
+            RoleQueryPurpose::ProposePolicy
+        );
         assert!(input.question.context.prefix.is_empty());
         let selected = Some(BoardMove::from_uci("e2e4").unwrap());
         let (accepted, output) =
@@ -162,7 +165,10 @@ fn mixed_go_limits_bound_optional_repair_by_earlier_horizon() {
         let physical = evidence(&port, &input, 1);
         port.consume_accepted(&input, &accepted, &output, Some(physical))
             .unwrap();
-        assert_eq!(!port.repair_cycles.as_ref().unwrap().active.is_empty(), admitted);
+        assert_eq!(
+            !port.repair_cycles.as_ref().unwrap().active.is_empty(),
+            admitted
+        );
     }
 }
 

@@ -444,9 +444,19 @@ impl RoventPcCollectionWorkerSpawnFailureV3 {
     /// This decomposition does not prove that task disposal completed.
     pub fn into_details_and_task(
         self,
-    ) -> (RoventPcCollectionWorkerSpawnFailureDetailsV3, RoventPcRootWorkerTaskV3) {
-        let Self { admission, error, task } = self;
-        (RoventPcCollectionWorkerSpawnFailureDetailsV3 { admission, error }, task)
+    ) -> (
+        RoventPcCollectionWorkerSpawnFailureDetailsV3,
+        RoventPcRootWorkerTaskV3,
+    ) {
+        let Self {
+            admission,
+            error,
+            task,
+        } = self;
+        (
+            RoventPcCollectionWorkerSpawnFailureDetailsV3 { admission, error },
+            task,
+        )
     }
 }
 

@@ -36,14 +36,19 @@ pub struct AncestryCheckedRoventLockV3Archive {
 /// This does not grant permission to read any other path.
 pub(super) fn ensure_v3_nonsecret_path(path: &Path) -> Result<(), ArenaError> {
     for part in path.components() {
-        let Component::Normal(part) = part else { continue };
+        let Component::Normal(part) = part else {
+            continue;
+        };
         let name = part
             .to_str()
             .ok_or_else(|| invalid("lock-v3 path is not UTF-8"))?
             .to_ascii_lowercase();
         let protected = name == ".env"
             || name.starts_with(".env.")
-            || matches!(name.as_str(), ".ssh" | ".gnupg" | ".aws" | "authorized_keys" | "known_hosts")
+            || matches!(
+                name.as_str(),
+                ".ssh" | ".gnupg" | ".aws" | "authorized_keys" | "known_hosts"
+            )
             || name.contains("credential")
             || name.contains("service-account")
             || name.contains("service_account")
@@ -57,9 +62,11 @@ pub(super) fn ensure_v3_nonsecret_path(path: &Path) -> Result<(), ArenaError> {
             || name.contains("access_token")
             || name.contains("refresh_token")
             || ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]
-                .iter().any(|key| name == *key || name.starts_with(&format!("{key}.")))
+                .iter()
+                .any(|key| name == *key || name.starts_with(&format!("{key}.")))
             || [".key", ".pem", ".p12", ".pfx", ".ppk"]
-                .iter().any(|suffix| name.ends_with(suffix));
+                .iter()
+                .any(|suffix| name.ends_with(suffix));
         check(!protected, "lock-v3 protected path is not readable")?;
     }
     Ok(())
@@ -180,9 +187,14 @@ impl InspectedRoventLockV3Archive {
                     admission.system_runtime_identity_sha256.as_deref()
                         == Some(system.system_identity_sha256.as_str())
                         && admission.cpu_runtime_library_sha256.is_none()
-                        && system.libraries.iter().filter(|item| {
-                            item.role == "ort-core" && item.sha256 == publication.runtime_sha256
-                        }).count() == 1,
+                        && system
+                            .libraries
+                            .iter()
+                            .filter(|item| {
+                                item.role == "ort-core" && item.sha256 == publication.runtime_sha256
+                            })
+                            .count()
+                            == 1,
                     "lock-v3 system CUDA publication mismatch",
                 )?,
             }
@@ -258,19 +270,25 @@ impl InspectedRoventLockV3Archive {
                 )?;
                 let origin = &row.native.raw_retirement["root_admission"]["native_origin"];
                 let observed = &origin["startup_observation"];
-                check(observed["runtime_library_sha256"].as_str() == Some(publication.runtime_sha256.as_str()),
-                    "lock-v3 row runtime differs from publication")?;
+                check(
+                    observed["runtime_library_sha256"].as_str()
+                        == Some(publication.runtime_sha256.as_str()),
+                    "lock-v3 row runtime differs from publication",
+                )?;
                 match &lock.manifest.system_runtime_lock.runtime {
                     NativeRuntimeSourceV6::Cpu => check(
                         observed["provider"].as_str() == Some("cpu")
                             && observed["provider_ready"].as_bool() == Some(true)
-                            && admission.cpu_runtime_library_sha256.as_deref() == Some(publication.runtime_sha256.as_str()),
+                            && admission.cpu_runtime_library_sha256.as_deref()
+                                == Some(publication.runtime_sha256.as_str()),
                         "lock-v3 CPU runtime observation mismatch",
                     )?,
                     NativeRuntimeSourceV6::SystemCuda(system) => check(
-                        observed["system_runtime_identity_sha256"].as_str() == Some(system.system_identity_sha256.as_str())
+                        observed["system_runtime_identity_sha256"].as_str()
+                            == Some(system.system_identity_sha256.as_str())
                             && observed["provider_ready"].as_bool() == Some(true)
-                            && admission.system_runtime_identity_sha256.as_deref() == Some(system.system_identity_sha256.as_str()),
+                            && admission.system_runtime_identity_sha256.as_deref()
+                                == Some(system.system_identity_sha256.as_str()),
                         "lock-v3 CUDA runtime observation mismatch",
                     )?,
                 }
@@ -365,9 +383,14 @@ impl AncestryCheckedRoventLockV3Archive {
         for ancestor in &lock_v2_ancestors {
             ancestor.ensure_v3_nonsecret_paths()?;
         }
-        check(original_ancestors.len().saturating_add(lock_v3_ancestors.len())
-            .saturating_add(lock_v2_ancestors.len()) <= 256,
-            "lock-v3 bounded historical ancestors")?;
+        check(
+            original_ancestors
+                .len()
+                .saturating_add(lock_v3_ancestors.len())
+                .saturating_add(lock_v2_ancestors.len())
+                <= 256,
+            "lock-v3 bounded historical ancestors",
+        )?;
         let archive = InspectedRoventLockV3Archive::inspect(root, publication_pin, budget)?;
         // A retained ancestor's metadata is not proof that its original files
         // still have their pinned bytes and identity at this admission point.
@@ -382,7 +405,8 @@ impl AncestryCheckedRoventLockV3Archive {
         for ancestor in &lock_v2_ancestors {
             ancestor.revalidate(budget)?;
         }
-        let v2_metadata = lock_v2_ancestors.iter()
+        let v2_metadata = lock_v2_ancestors
+            .iter()
             .map(|ancestor| ancestor.historical_ancestry_metadata())
             .collect::<Vec<_>>();
         let manifest = HistoricalCollectionMetadata::submitted(&archive.manifest.registration);
@@ -422,25 +446,44 @@ impl AncestryCheckedRoventLockV3Archive {
                     )
                 }),
         );
-        ancestors.extend(v2_metadata.iter().map(|(manifest, index, digest)| (*digest, manifest, index)));
+        ancestors.extend(
+            v2_metadata
+                .iter()
+                .map(|(manifest, index, digest)| (*digest, manifest, index)),
+        );
         // The shared ancestry audit enforces exact, transitive source sets,
         // but does not itself rule out a cycle. Check every provided family,
         // including the current archive, without interpreting any new authority.
-        let mut pending = ancestors.iter().map(|(sha, source, _)| {
-            ((*sha).to_owned(), source.ancestor_index_sha256.clone())
-        }).collect::<BTreeMap<_, _>>();
-        check(pending.len() == ancestors.len()
-            && !pending.contains_key(&archive.publication.canonical_index_sha256),
-            "lock-v3 duplicate or self ancestor")?;
-        pending.insert(archive.publication.canonical_index_sha256.clone(),
-            manifest.ancestor_index_sha256.clone());
+        let mut pending = ancestors
+            .iter()
+            .map(|(sha, source, _)| ((*sha).to_owned(), source.ancestor_index_sha256.clone()))
+            .collect::<BTreeMap<_, _>>();
+        check(
+            pending.len() == ancestors.len()
+                && !pending.contains_key(&archive.publication.canonical_index_sha256),
+            "lock-v3 duplicate or self ancestor",
+        )?;
+        pending.insert(
+            archive.publication.canonical_index_sha256.clone(),
+            manifest.ancestor_index_sha256.clone(),
+        );
         while !pending.is_empty() {
-            let completed = pending.iter().filter_map(|(sha, dependencies)| {
-                dependencies.iter().all(|dependency| !pending.contains_key(dependency))
-                    .then_some(sha.clone())
-            }).collect::<Vec<_>>();
-            check(!completed.is_empty(), "lock-v3 cyclic ancestor declarations")?;
-            for sha in completed { pending.remove(&sha); }
+            let completed = pending
+                .iter()
+                .filter_map(|(sha, dependencies)| {
+                    dependencies
+                        .iter()
+                        .all(|dependency| !pending.contains_key(dependency))
+                        .then_some(sha.clone())
+                })
+                .collect::<Vec<_>>();
+            check(
+                !completed.is_empty(),
+                "lock-v3 cyclic ancestor declarations",
+            )?;
+            for sha in completed {
+                pending.remove(&sha);
+            }
         }
         audit_original_ancestry(&manifest, &index, &ancestors)?;
         Ok(Self {
@@ -455,8 +498,11 @@ impl AncestryCheckedRoventLockV3Archive {
         let mut result = self.archive.observation();
         result["cross_publication_ancestry_checked"] = json!(true);
         result["learner_role_bindings_checked"] = json!(false);
-        result["ancestor_count"] =
-            json!(self.original_ancestors.len() + self.lock_v3_ancestors.len() + self.lock_v2_ancestors.len());
+        result["ancestor_count"] = json!(
+            self.original_ancestors.len()
+                + self.lock_v3_ancestors.len()
+                + self.lock_v2_ancestors.len()
+        );
         // This does not cover P/C-to-R joins, current parent sample admission,
         // Python intake, or trainer-process and physical execution authority.
         result
@@ -504,9 +550,18 @@ mod tests {
     fn secret_names_are_rejected_lexically_before_read_credit() {
         let base = std::env::temp_dir().join("rovent-v3-lexical-test");
         for name in [
-            ".env", ".ENV.local", ".ssh", "id_ed25519", "id_rsa.pub",
-            "service-account.json", "service_account.json", "credentials.json",
-            "api_key.txt", "client-secret.json", "private.pem", "key.p12",
+            ".env",
+            ".ENV.local",
+            ".ssh",
+            "id_ed25519",
+            "id_rsa.pub",
+            "service-account.json",
+            "service_account.json",
+            "credentials.json",
+            "api_key.txt",
+            "client-secret.json",
+            "private.pem",
+            "key.p12",
         ] {
             assert!(ensure_v3_nonsecret_path(&base.join(name)).is_err());
         }
@@ -522,7 +577,8 @@ mod tests {
             1024,
             Instant::now() + std::time::Duration::from_secs(60),
             Arc::new(AtomicBool::new(false)),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(InspectedRoventLockV3Archive::inspect(&root, &pin, &budget).is_err());
         assert_eq!(budget.observation()["charged_bytes"], 0);
     }

@@ -5,7 +5,8 @@ use super::{check, hex, invalid};
 use crate::ArenaError;
 use rz_experiments::rovent_corpus::RoventNativeLifecycle;
 use rz_experiments::rovent_corpus_lock_v3::{
-    ROVENT_LOCK_V3_NATIVE_RAW_DOMAIN, cpu_native::ROVENT_LOCK_V3_CPU_NATIVE_RAW_DOMAIN,
+    ROVENT_LOCK_V3_NATIVE_RAW_DOMAIN,
+    cpu_native::ROVENT_LOCK_V3_CPU_NATIVE_RAW_DOMAIN,
     record::{RoventCorpusManifestLockV3, RoventTrainingRecordLockV3},
     validate_native_lifecycle_lock_v3,
 };

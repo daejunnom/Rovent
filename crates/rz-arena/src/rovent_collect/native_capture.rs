@@ -15,13 +15,13 @@ use rz_uci::pals_native::ticketed::{
     VirtualReviewPhysicalInvocationEvidence, VirtualReviewPreparedTicket,
 };
 use std::cell::Cell;
+#[cfg(target_os = "linux")]
+use std::sync::Weak;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     mpsc,
 };
-#[cfg(target_os = "linux")]
-use std::sync::Weak;
 
 /// A ticket's independent speculative handoff state. It never proves NN
 /// dispatch, acceptance, physical completion, a teacher target or retirement.
@@ -243,7 +243,8 @@ impl RoventPreRouteFenceWitnessV3 {
         registration: &RoventNativeCaptureRegistration,
         admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
     ) -> Result<Option<bool>, &'static str> {
-        if !self.registration_owner
+        if !self
+            .registration_owner
             .upgrade()
             .is_some_and(|owner| Arc::ptr_eq(&owner, &registration.speculative_owner_v3))
             || !self.admission.same_original_admission(admission)
@@ -253,9 +254,15 @@ impl RoventPreRouteFenceWitnessV3 {
         let fences = match registration.pre_route_fences_v3.try_lock() {
             Ok(fences) => fences,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err("lock-v3 pre-route fence poisoned"),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("lock-v3 pre-route fence poisoned");
+            }
         };
-        Ok(Some(fences.iter().any(|entry| entry.same_original_admission(admission))))
+        Ok(Some(
+            fences
+                .iter()
+                .any(|entry| entry.same_original_admission(admission)),
+        ))
     }
 }
 
@@ -404,8 +411,7 @@ pub struct RoventNativeCaptureRegistration {
     #[cfg(target_os = "linux")]
     speculative_roots_v3: Arc<Mutex<Vec<SpeculativeRootV3>>>,
     #[cfg(target_os = "linux")]
-    pre_route_fences_v3:
-        Arc<Mutex<Vec<rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3>>>,
+    pre_route_fences_v3: Arc<Mutex<Vec<rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3>>>,
 }
 pub struct RoventNativeInputObserver {
     registered: Registrations,
@@ -509,14 +515,21 @@ impl RoventNativeCaptureRegistration {
             registration_owner: Arc::downgrade(&self.speculative_owner_v3),
             admission: admission.clone(),
         };
-        if fences.iter().any(|entry| entry.same_original_admission(admission)) {
+        if fences
+            .iter()
+            .any(|entry| entry.same_original_admission(admission))
+        {
             return A::AlreadySealed(witness());
         }
         let authority = admission.root_admission().authority();
-        if fences.iter().any(|entry| entry.root_admission().authority() == authority)
-            || registered.values().any(|entry| matches!(entry,
+        if fences
+            .iter()
+            .any(|entry| entry.root_admission().authority() == authority)
+            || registered.values().any(|entry| {
+                matches!(entry,
                 RegisteredInputCapture::LockV3 { admission: old, .. }
-                    if old.root_admission().authority() == authority))
+                    if old.root_admission().authority() == authority)
+            })
         {
             return A::Conflict;
         }
@@ -525,7 +538,10 @@ impl RoventNativeCaptureRegistration {
             Err(std::sync::TryLockError::WouldBlock) => return A::Busy,
             Err(std::sync::TryLockError::Poisoned(_)) => return A::Poisoned,
         };
-        if roots.iter().any(|root| root.admission().root_admission().authority() == authority) {
+        if roots
+            .iter()
+            .any(|root| root.admission().root_admission().authority() == authority)
+        {
             return A::Conflict;
         }
         if fences.len() >= usize::from(maximum_roots) || fences.try_reserve(1).is_err() {
@@ -605,7 +621,10 @@ impl RoventNativeCaptureRegistration {
         destination: &mut Option<(SpeculativeRootV3, R)>,
         retain_receiver: impl FnOnce(SpeculativeReceiverV3) -> R,
     ) -> Result<Option<()>, ArenaError> {
-        check(destination.is_none(), "lock-v3 original result slot is occupied")?;
+        check(
+            destination.is_none(),
+            "lock-v3 original result slot is occupied",
+        )?;
         let registered = match self.registered.try_lock() {
             Ok(registered) => registered,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
@@ -689,7 +708,10 @@ impl RoventNativeCaptureRegistration {
         root: &SpeculativeRootV3,
         destination: &mut Option<RoventRouteRollbackV3>,
     ) -> Result<Option<()>, ArenaError> {
-        check(destination.is_none(), "lock-v3 rollback result slot is occupied")?;
+        check(
+            destination.is_none(),
+            "lock-v3 rollback result slot is occupied",
+        )?;
         let registered = match self.registered.try_lock() {
             Ok(value) => value,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
@@ -1496,7 +1518,10 @@ impl RoventNativeCaptureRegistration {
                 );
             }
         };
-        if fences.iter().any(|entry| entry.same_original_admission(admission)) {
+        if fences
+            .iter()
+            .any(|entry| entry.same_original_admission(admission))
+        {
             return LockV3RegistrationAttempt::Canceled(reservation);
         }
         if fences.iter().any(|entry| {

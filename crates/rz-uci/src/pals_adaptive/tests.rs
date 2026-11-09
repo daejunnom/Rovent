@@ -2231,7 +2231,9 @@ fn invalid_continued_registration_returns_live_native_and_same_cpu_owner() {
 #[test]
 fn root_ranking_failure_before_consumption_keeps_output_unconsumed() {
     let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
-    manager.driver_mut().fail_root_ranking_before_consumption_once = true;
+    manager
+        .driver_mut()
+        .fail_root_ranking_before_consumption_once = true;
     manager.prepare_root_ranking(root).unwrap();
     pump(&mut manager, until, |manager| {
         manager.failures().next().is_some()
@@ -2253,7 +2255,9 @@ fn root_ranking_failure_before_consumption_keeps_output_unconsumed() {
 fn root_ranking_failure_after_consumption_charges_original_ticket_once() {
     let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
     let expected_view = root.view.seal_digest();
-    manager.driver_mut().fail_root_ranking_after_consumption_once = true;
+    manager
+        .driver_mut()
+        .fail_root_ranking_after_consumption_once = true;
     manager.prepare_root_ranking(root).unwrap();
     pump(&mut manager, until, |manager| {
         manager.failures().next().is_some()
@@ -2267,7 +2271,10 @@ fn root_ranking_failure_after_consumption_charges_original_ticket_once() {
     assert!(receipt.permits_archive_close());
     assert_eq!(manager.counters().consumed_role_outputs, 1);
     assert_eq!(manager.driver().consumed.len(), 1);
-    assert_eq!(manager.driver().consumed[0].view.view_digest.0, expected_view);
+    assert_eq!(
+        manager.driver().consumed[0].view.view_digest.0,
+        expected_view
+    );
     assert!(manager.roles.is_empty());
     assert!(facts.finish_called.load(Ordering::Acquire));
 }
@@ -2275,7 +2282,9 @@ fn root_ranking_failure_after_consumption_charges_original_ticket_once() {
 #[test]
 fn root_ranking_failure_with_unknown_readback_preserves_original_binding() {
     let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
-    manager.driver_mut().fail_root_ranking_after_consumption_once = true;
+    manager
+        .driver_mut()
+        .fail_root_ranking_after_consumption_once = true;
     manager.driver_mut().fail_role_consumption_readback = true;
     manager.prepare_root_ranking(root).unwrap();
     pump(&mut manager, until, |manager| {
@@ -2291,7 +2300,10 @@ fn root_ranking_failure_with_unknown_readback_preserves_original_binding() {
         .find(|binding| binding.consumption_unknown)
         .expect("uncertain original root binding must remain in custody");
     assert!(!original.consumption_recorded);
-    assert_eq!(manager.driver().consumed.as_slice(), &[original.ticket.unwrap()]);
+    assert_eq!(
+        manager.driver().consumed.as_slice(),
+        &[original.ticket.unwrap()]
+    );
     assert!(manager.failures().any(|error| matches!(
         error,
         AdaptiveManagerError::Semantic(detail)

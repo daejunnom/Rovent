@@ -26,8 +26,8 @@ use rz_uci::rovent_bootstrap::launch::{
 use std::any::Any;
 use std::fs::File;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
 // This gate controls only the right to invoke this entry's controlled action;
@@ -47,12 +47,14 @@ impl ReservationGateV3 {
     }
 
     fn reclaim(&self) -> bool {
-        self.0.compare_exchange(
-            ReservationPhaseV3::Available as u8,
-            ReservationPhaseV3::Held as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ).is_ok()
+        self.0
+            .compare_exchange(
+                ReservationPhaseV3::Available as u8,
+                ReservationPhaseV3::Held as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     fn abandon_unstarted(&self) {
@@ -67,12 +69,14 @@ impl ReservationGateV3 {
     }
 
     fn start(&self) -> bool {
-        self.0.compare_exchange(
-            ReservationPhaseV3::Held as u8,
-            ReservationPhaseV3::Started as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ).is_ok()
+        self.0
+            .compare_exchange(
+                ReservationPhaseV3::Held as u8,
+                ReservationPhaseV3::Started as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 }
 
@@ -149,21 +153,28 @@ impl OwnRunHandleV3 {
     /// dropped its handle. This is not proof of termination or permission to
     /// remove any entry. A poisoned registry is never reported as empty.
     pub(crate) fn registered() -> Result<Vec<Self>, &'static str> {
-        let registry = registry().try_lock().map_err(|_| "Own /3 registry unavailable")?;
+        let registry = registry()
+            .try_lock()
+            .map_err(|_| "Own /3 registry unavailable")?;
         let Some(registry) = registry.as_ref() else {
             return Ok(Vec::new());
         };
         let mut handles = Vec::new();
-        handles.try_reserve_exact(registry.entries.len())
+        handles
+            .try_reserve_exact(registry.entries.len())
             .map_err(|_| "Own /3 recovery handle allocation failed")?;
-        handles.extend(registry.entries.iter().map(|entry| Self { entry: Arc::clone(entry) }));
+        handles.extend(registry.entries.iter().map(|entry| Self {
+            entry: Arc::clone(entry),
+        }));
         Ok(handles)
     }
 
     /// Whether an original return or panic is retained. A busy outcome slot
     /// is not treated as a missing outcome or as physical completion.
     pub(crate) fn outcome_recorded(&self) -> Result<bool, &'static str> {
-        self.entry.outcome.try_lock()
+        self.entry
+            .outcome
+            .try_lock()
             .map(|outcome| outcome.is_some())
             .map_err(|_| "Own /3 outcome slot unavailable")
     }
@@ -175,17 +186,25 @@ impl OwnRunHandleV3 {
     pub(crate) fn try_reacquire_reservation(
         &self,
     ) -> Result<Option<OwnRunReservationV3>, &'static str> {
-        let registry = registry().try_lock().map_err(|_| "Own /3 registry unavailable")?;
+        let registry = registry()
+            .try_lock()
+            .map_err(|_| "Own /3 registry unavailable")?;
         let Some(registry) = registry.as_ref() else {
             return Err("Own /3 original recovery entry missing");
         };
-        if !registry.entries.iter().any(|entry| Arc::ptr_eq(entry, &self.entry)) {
+        if !registry
+            .entries
+            .iter()
+            .any(|entry| Arc::ptr_eq(entry, &self.entry))
+        {
             return Err("Own /3 original recovery entry missing");
         }
         if !self.entry.reservation.reclaim() {
             return Ok(None);
         }
-        Ok(Some(OwnRunReservationV3 { entry: Arc::clone(&self.entry) }))
+        Ok(Some(OwnRunReservationV3 {
+            entry: Arc::clone(&self.entry),
+        }))
     }
 
     /// Observe the original outcome without transferring its custody. A
@@ -195,7 +214,10 @@ impl OwnRunHandleV3 {
         &self,
         observe: impl for<'a> FnOnce(&'a OwnRunOutcomeV3) -> R,
     ) -> Result<Option<R>, &'static str> {
-        let outcome = self.entry.outcome.try_lock()
+        let outcome = self
+            .entry
+            .outcome
+            .try_lock()
             .map_err(|_| "Own /3 outcome slot unavailable")?;
         let Some(original) = outcome.as_ref() else {
             return Ok(None);
@@ -226,7 +248,10 @@ impl OwnRunReservationV3 {
                 return Err((prepared, "Own /3 registry profile differs"));
             }
             if existing.entries.len() >= maximum_live_attempts.get() {
-                return Err((prepared, "Own /3 registry capacity reached; original entries retained"));
+                return Err((
+                    prepared,
+                    "Own /3 registry capacity reached; original entries retained",
+                ));
             }
         }
         // Do not pin an empty registry profile when allocation fails before
@@ -274,7 +299,10 @@ impl OwnRunReservationV3 {
     pub(crate) fn original_invocation(
         &self,
     ) -> Result<(RoventNativeResourcePlanPin, Vec<String>), &'static str> {
-        let pin = self.entry.inputs.resource_plan_pin()
+        let pin = self
+            .entry
+            .inputs
+            .resource_plan_pin()
             .map_err(|_| "Own /3 original resource plan pin unavailable")?;
         Ok((pin, self.entry.arguments.clone()))
     }
@@ -282,15 +310,13 @@ impl OwnRunReservationV3 {
     /// Register before invoking any controlled resource/native callback.
     /// The original returned outcome or panic is retained in the entry before
     /// a handle is returned. Failure before begin returns the original token.
-    pub(crate) fn execute<F>(
-        self,
-        action: F,
-    ) -> Result<OwnRunHandleV3, (Self, &'static str)>
+    pub(crate) fn execute<F>(self, action: F) -> Result<OwnRunHandleV3, (Self, &'static str)>
     where
         F: FnOnce(
             OwnCollectionFactoryV3,
             OwnCollectionRetainResourceV3,
-        ) -> Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure>,
+        )
+            -> Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure>,
     {
         let entry = Arc::clone(&self.entry);
         let mut outcome = match entry.outcome.try_lock() {
@@ -319,9 +345,8 @@ impl OwnRunReservationV3 {
             let factory: OwnCollectionFactoryV3 = Box::new(move |lock, root, file, startup| {
                 own_factory(factory_entry, lock, root, file, startup)
             });
-            let retain: OwnCollectionRetainResourceV3 = Box::new(move |resource| {
-                retain_resource(resource_entry, resource)
-            });
+            let retain: OwnCollectionRetainResourceV3 =
+                Box::new(move |resource| retain_resource(resource_entry, resource));
             action(factory, retain)
         }));
         // No callback, allocation, or other fallible operation occurs between
@@ -339,8 +364,13 @@ fn retain_resource(
     entry: Weak<OwnRunEntryV3>,
     resource: &Arc<Mutex<NativeResourceCustody>>,
 ) -> Result<(), &'static str> {
-    let entry = entry.upgrade().ok_or("Own /3 original recovery entry missing")?;
-    let mut state = entry.state.try_lock().map_err(|_| "Own /3 original entry unavailable")?;
+    let entry = entry
+        .upgrade()
+        .ok_or("Own /3 original recovery entry missing")?;
+    let mut state = entry
+        .state
+        .try_lock()
+        .map_err(|_| "Own /3 original entry unavailable")?;
     if !state.in_flight || state.resource.is_some() {
         return Err("Own /3 original resource owner already supplied or not in flight");
     }
@@ -355,8 +385,13 @@ fn own_factory(
     lock_file: &Arc<File>,
     startup: &RoventStartupControl,
 ) -> Result<RoventOwnFactoryProductV3, RoventLaunchError> {
-    let error = |detail: String| RoventLaunchError { stage: "OwnCollectionAdmission", detail };
-    let entry = entry.upgrade().ok_or_else(|| error("original recovery entry missing".into()))?;
+    let error = |detail: String| RoventLaunchError {
+        stage: "OwnCollectionAdmission",
+        detail,
+    };
+    let entry = entry
+        .upgrade()
+        .ok_or_else(|| error("original recovery entry missing".into()))?;
     let native = {
         // Keep this run's original state slot reserved while preparing. The
         // constructor starts no worker and does not call this entry; the
@@ -364,19 +399,37 @@ fn own_factory(
         // after this factory returns. Other observers use try_lock and remain
         // pending. This avoids dropping a successfully prepared original
         // owner if a second lock acquisition is busy after construction.
-        let mut state = entry.state.try_lock().map_err(|_| error("original entry unavailable".into()))?;
-        if !state.in_flight || state.resource.is_none() || state.factory_entered || state.prepared.is_some() {
+        let mut state = entry
+            .state
+            .try_lock()
+            .map_err(|_| error("original entry unavailable".into()))?;
+        if !state.in_flight
+            || state.resource.is_none()
+            || state.factory_entered
+            || state.prepared.is_some()
+        {
             return Err(error("original factory is not available".into()));
         }
         state.factory_entered = true;
         state.input_lock = Some(Arc::clone(lock));
         state.lock_file = Some(Arc::clone(lock_file));
         state.startup = Some(startup.clone());
-        startup.check().map_err(|failure| error(failure.to_string()))?;
-        let prepared = Arc::new(OwnCollectionPreparedV3::prepare(
-            &entry.inputs, &entry.output, lock, root, lock_file,
-            startup.until.min(entry.work_until), entry.work_until, entry.cleanup_until,
-        ).map_err(|failure| error(failure.to_string()))?);
+        startup
+            .check()
+            .map_err(|failure| error(failure.to_string()))?;
+        let prepared = Arc::new(
+            OwnCollectionPreparedV3::prepare(
+                &entry.inputs,
+                &entry.output,
+                lock,
+                root,
+                lock_file,
+                startup.until.min(entry.work_until),
+                entry.work_until,
+                entry.cleanup_until,
+            )
+            .map_err(|failure| error(failure.to_string()))?,
+        );
         let native = Arc::clone(prepared.native_owner());
         state.prepared = Some(prepared);
         native
@@ -389,21 +442,36 @@ fn own_factory(
     };
     let sink_entry = Arc::downgrade(&entry);
     let sink = Box::new(move |proof: RoventOwnUciNoDispatchV3| {
-        let entry = sink_entry.upgrade().ok_or_else(|| error("original recovery entry missing".into()))?;
-        let mut state = entry.state.try_lock().map_err(|_| error("original entry unavailable".into()))?;
-        let matches = state.prepared.as_ref().zip(state.input_lock.as_ref()).zip(state.lock_file.as_ref())
-            .is_some_and(|((prepared, input), file)| proof.matches_original(
-                prepared.native_owner(), input, file, &entry.identity,
-            ));
+        let entry = sink_entry
+            .upgrade()
+            .ok_or_else(|| error("original recovery entry missing".into()))?;
+        let mut state = entry
+            .state
+            .try_lock()
+            .map_err(|_| error("original entry unavailable".into()))?;
+        let matches = state
+            .prepared
+            .as_ref()
+            .zip(state.input_lock.as_ref())
+            .zip(state.lock_file.as_ref())
+            .is_some_and(|((prepared, input), file)| {
+                proof.matches_original(prepared.native_owner(), input, file, &entry.identity)
+            });
         if !matches || state.no_uci_dispatch.is_some() {
-            return Err(error("original no-dispatch evidence differs or already recorded".into()));
+            return Err(error(
+                "original no-dispatch evidence differs or already recorded".into(),
+            ));
         }
         state.no_uci_dispatch = Some(proof);
         Ok(())
     });
     Ok(RoventOwnFactoryProductV3::new(
-        native, Arc::clone(lock), Arc::clone(lock_file), Box::new(leaf),
-        Arc::clone(&entry.identity), sink,
+        native,
+        Arc::clone(lock),
+        Arc::clone(lock_file),
+        Box::new(leaf),
+        Arc::clone(&entry.identity),
+        sink,
     ))
 }
 
@@ -415,21 +483,29 @@ mod reservation_tests {
     #[test]
     fn original_unstarted_reservation_has_one_reclaimer_and_started_is_not_reissued() {
         let gate = Arc::new(ReservationGateV3::held());
-        assert!(!gate.reclaim(), "a live original reservation cannot be duplicated");
+        assert!(
+            !gate.reclaim(),
+            "a live original reservation cannot be duplicated"
+        );
         gate.abandon_unstarted();
 
         let rendezvous = Arc::new(Barrier::new(3));
         let successes = std::thread::scope(|threads| {
-            let workers: Vec<_> = (0..2).map(|_| {
-                let gate = Arc::clone(&gate);
-                let rendezvous = Arc::clone(&rendezvous);
-                threads.spawn(move || {
-                    rendezvous.wait();
-                    gate.reclaim()
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    let gate = Arc::clone(&gate);
+                    let rendezvous = Arc::clone(&rendezvous);
+                    threads.spawn(move || {
+                        rendezvous.wait();
+                        gate.reclaim()
+                    })
                 })
-            }).collect();
+                .collect();
             rendezvous.wait();
-            workers.into_iter().map(|worker| if worker.join().unwrap() { 1 } else { 0 }).sum::<usize>()
+            workers
+                .into_iter()
+                .map(|worker| if worker.join().unwrap() { 1 } else { 0 })
+                .sum::<usize>()
         });
         assert_eq!(successes, 1, "the same original reservation has one owner");
         assert!(gate.start());

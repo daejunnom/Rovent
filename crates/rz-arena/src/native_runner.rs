@@ -5194,7 +5194,8 @@ pub(crate) mod linux {
                                         &options,
                                         &role_pids,
                                         crate::external_uci::preflight_advertisement(
-                                            &receipt.external_preflight, &e.id,
+                                            &receipt.external_preflight,
+                                            &e.id,
                                         )?,
                                     )
                                 }) {

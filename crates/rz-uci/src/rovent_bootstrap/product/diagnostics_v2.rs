@@ -287,9 +287,7 @@ impl<T> ObservedV2<T> {
             }
             // Keep the original storage projection if even the omission marker
             // cannot fit; absent receipt fields still mean unobserved.
-            if exceeds(encoded.len())
-                && row["storage"].get("receipt_detail_omitted").is_some()
-            {
+            if exceeds(encoded.len()) && row["storage"].get("receipt_detail_omitted").is_some() {
                 if let Some(storage) = row["storage"].as_object_mut() {
                     storage.remove("receipt_detail_omitted");
                 }
@@ -774,7 +772,10 @@ mod tests {
         let row: serde_json::Value = serde_json::from_slice(&sink).unwrap();
         assert_eq!(row["storage"]["status"], "observed");
         assert_eq!(row["storage"]["phase_receipts"][0]["nonce"], 11);
-        assert_eq!(row["storage"]["phase_receipts"][1]["hot_after"]["states"], 120);
+        assert_eq!(
+            row["storage"]["phase_receipts"][1]["hot_after"]["states"],
+            120
+        );
     }
 
     #[test]
@@ -794,8 +795,17 @@ mod tests {
         let mut row = serde_json::json!({"event":"root", "root":{"kept":true},
             "storage":storage});
         let mut original = row.clone();
-        assert!(omit_storage_receipt_fields(&mut original,
-            &["hot_before", "hot_after", "next_authority", "nonce", "generation_before", "generation_after"]));
+        assert!(omit_storage_receipt_fields(
+            &mut original,
+            &[
+                "hot_before",
+                "hot_after",
+                "next_authority",
+                "nonce",
+                "generation_before",
+                "generation_after"
+            ]
+        ));
         original["domain"] = serde_json::json!(DOMAIN);
         original["observation_complete_so_far"] = serde_json::json!(true);
         let original_len = serde_json::to_vec(&original).unwrap().len() + 1;
@@ -809,8 +819,15 @@ mod tests {
         assert_eq!(row["root"]["kept"], true);
         assert_eq!(row["storage"]["status"], "observed");
         assert_eq!(row["storage"]["receipt_detail_omitted"], true);
-        assert_eq!(row["storage"]["phase_receipts"][0]["operation"], "prepare_root");
-        assert!(row["storage"]["phase_receipts"][0].get("hot_before").is_none());
+        assert_eq!(
+            row["storage"]["phase_receipts"][0]["operation"],
+            "prepare_root"
+        );
+        assert!(
+            row["storage"]["phase_receipts"][0]
+                .get("hot_before")
+                .is_none()
+        );
         assert!(!observed.observation_lost.load(Ordering::Acquire));
     }
 
