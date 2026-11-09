@@ -27,6 +27,8 @@ mod corpus_family;
 use corpus_family::*;
 mod lock_v2_archive;
 pub use lock_v2_archive::*;
+mod lock_v3_archive;
+pub use lock_v3_archive::*;
 
 /// Borrowed lineage of an already admitted original row; no replay or learner
 /// authority can be created from this projection.

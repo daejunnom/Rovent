@@ -377,21 +377,45 @@ pub(super) fn verify_historical_pc_divergence_lock_v2(
     manifest: &RoventCorpusManifestV2,
     lock: &rz_experiments::RoventInputLockV2,
 ) -> Result<(), ArenaError> {
-    verify_historical_pc_divergence_fields(record, manifest, Some(lock))
+    verify_historical_pc_divergence_fields(record, manifest, Some(HistoricalLock::V2(lock)))
+}
+
+/// Future visible evidence is verified against the same original /3 lock;
+/// never reinterpret its native envelope as a /2 record.
+pub(super) fn verify_historical_pc_divergence_lock_v3(
+    record: &RoventTrainingRecordV2,
+    manifest: &RoventCorpusManifestV2,
+    lock: &rz_experiments::RoventInputLockV3,
+) -> Result<(), ArenaError> {
+    verify_historical_pc_divergence_fields(record, manifest, Some(HistoricalLock::V3(lock)))
+}
+
+#[derive(Clone, Copy)]
+enum HistoricalLock<'a> {
+    V2(&'a rz_experiments::RoventInputLockV2),
+    V3(&'a rz_experiments::RoventInputLockV3),
 }
 
 fn verify_historical_pc_divergence_fields(
     record: &RoventTrainingRecordV2,
     manifest: &RoventCorpusManifestV2,
-    lock: Option<&rz_experiments::RoventInputLockV2>,
+    lock: Option<HistoricalLock<'_>>,
 ) -> Result<(), ArenaError> {
     if let Some(head) = record.head_sources.get("divergence") {
         verify_raw(record, head)?;
         if let Some(visible) =
             visible_record_evidence(record, &head.raw_receipt["witness"]["source"])?
         {
-            if let Some(lock) = lock {
+            if let Some(HistoricalLock::V2(lock)) = lock {
                 super::historical_native_lock_v2::verify_historical_lock_v2_input(
+                    &visible.input,
+                    &visible.wire.input_sha256,
+                    &visible.wire.native,
+                    manifest,
+                    lock,
+                )?;
+            } else if let Some(HistoricalLock::V3(lock)) = lock {
+                super::historical_native_lock_v3::verify_historical_lock_v3_input(
                     &visible.input,
                     &visible.wire.input_sha256,
                     &visible.wire.native,

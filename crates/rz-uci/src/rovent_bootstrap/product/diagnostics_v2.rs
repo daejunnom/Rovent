@@ -259,12 +259,51 @@ impl<T> ObservedV2<T> {
             self.observation_lost.store(true, Ordering::Release);
             return;
         };
+        // Prefer the existing storage observation to new optional receipt
+        // details when the combined row approaches the original pipe budget.
+        // This never changes the original owner's completion result.
+        let existing_bytes = state.bytes;
+        let exceeds = |size: usize| {
+            size.saturating_add(1) > MAX_ROW_BYTES
+                || existing_bytes.saturating_add(size).saturating_add(1) > MAX_TOTAL_BYTES
+        };
+        if exceeds(encoded.len()) {
+            for fields in [
+                &["hot_before", "hot_after", "next_authority"][..],
+                &["nonce", "generation_before", "generation_after"][..],
+            ] {
+                if !exceeds(encoded.len()) {
+                    break;
+                }
+                if omit_storage_receipt_fields(&mut row, fields) {
+                    row["storage"]["receipt_detail_omitted"] = serde_json::json!(true);
+                    let Ok(trimmed) = serde_json::to_vec(&row) else {
+                        state.incomplete = true;
+                        self.observation_lost.store(true, Ordering::Release);
+                        return;
+                    };
+                    encoded = trimmed;
+                }
+            }
+            // Keep the original storage projection if even the omission marker
+            // cannot fit; absent receipt fields still mean unobserved.
+            if exceeds(encoded.len())
+                && row["storage"].get("receipt_detail_omitted").is_some()
+            {
+                if let Some(storage) = row["storage"].as_object_mut() {
+                    storage.remove("receipt_detail_omitted");
+                }
+                let Ok(trimmed) = serde_json::to_vec(&row) else {
+                    state.incomplete = true;
+                    self.observation_lost.store(true, Ordering::Release);
+                    return;
+                };
+                encoded = trimmed;
+            }
+        }
         // Optional storage details cannot suppress an otherwise valid root
         // or finish observation when both no longer fit the shared pipe row.
-        if (encoded.len().saturating_add(1) > MAX_ROW_BYTES
-            || state.bytes.saturating_add(encoded.len()).saturating_add(1) > MAX_TOTAL_BYTES)
-            && row.get("storage").is_some()
-        {
+        if exceeds(encoded.len()) && row.get("storage").is_some() {
             row["storage"] = serde_json::json!({"status":"unknown", "reason":"row_budget"});
             let Ok(fallback) = serde_json::to_vec(&row) else {
                 state.incomplete = true;
@@ -315,6 +354,25 @@ impl<T> ObservedV2<T> {
     }
 }
 
+fn omit_storage_receipt_fields(row: &mut serde_json::Value, fields: &[&str]) -> bool {
+    let Some(receipts) = row
+        .get_mut("storage")
+        .and_then(|storage| storage.get_mut("phase_receipts"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut omitted = false;
+    for receipt in receipts {
+        if let Some(object) = receipt.as_object_mut() {
+            for field in fields {
+                omitted |= object.remove(*field).is_some();
+            }
+        }
+    }
+    omitted
+}
+
 fn compact_archive_owner(owner: &serde_json::Value) -> serde_json::Value {
     if !owner.is_object() {
         return serde_json::Value::Null;
@@ -346,6 +404,11 @@ fn compact_storage(value: serde_json::Value) -> serde_json::Value {
                     #[allow(unused_mut)] // Optional archive diagnostics extend this projection.
                     let mut result = serde_json::json!({
                         "operation":item.get("operation"), "authority":item.get("authority"),
+                        "nonce":item.get("nonce"),
+                        "generation_before":item.get("generation_before"),
+                        "generation_after":item.get("generation_after"),
+                        "hot_before":item.get("hot_before"), "hot_after":item.get("hot_after"),
+                        "next_authority":item.get("next_authority"),
                         "loaded_root":item.get("loaded_root"), "io_bytes":item.get("io_bytes"),
                         "archive_owner":compact_archive_owner(&item["archive_owner"])
                     });
@@ -593,9 +656,13 @@ mod tests {
                 "phase_receipts_known":true,
                 "phase_receipts":[
                     {"operation":"prepare_root", "authority":{"game":2,"root":4},
+                     "nonce":11,"generation_before":3,"generation_after":4,
+                     "hot_before":{"states":9,"lines":5,"observations":3},
+                     "hot_after":{"states":4,"lines":2,"observations":1},
                      "archive_owner":{"owner_id":3,"generation":1,"complete":true,
                        "committed_chunks":2,"ram_reclaim_events":1}},
                     {"operation":"restore_root_if_archived", "authority":{"game":2,"root":4},
+                     "nonce":12,"generation_before":4,"generation_after":4,
                      "loaded_root":7,"archive_owner":{"owner_id":3,"generation":1,
                        "complete":true,"loads_completed":1}}
                 ],
@@ -606,6 +673,14 @@ mod tests {
         assert_eq!(summary["status"], "observed");
         assert_eq!(summary["phase_scope"]["root"], 4);
         assert_eq!(summary["phase_receipts"][1]["loaded_root"], 7);
+        assert_eq!(summary["phase_receipts"][0]["nonce"], 11);
+        assert_eq!(summary["phase_receipts"][1]["nonce"], 12);
+        assert_eq!(summary["phase_receipts"][0]["generation_before"], 3);
+        assert_eq!(summary["phase_receipts"][0]["generation_after"], 4);
+        assert_eq!(summary["phase_receipts"][0]["hot_before"]["states"], 9);
+        assert_eq!(summary["phase_receipts"][0]["hot_after"]["lines"], 2);
+        assert!(summary["phase_receipts"][1]["hot_before"].is_null());
+        assert!(summary["phase_receipts"][0]["next_authority"].is_null());
         assert_eq!(
             summary["phase_receipts"][0]["archive_owner"]["ram_reclaim_events"],
             1
@@ -648,6 +723,95 @@ mod tests {
         assert_eq!(storage["original_phase_join"]["worker_joined"], true);
         assert_eq!(storage["finish_completed"], false);
         assert_eq!(storage["physical_completion_attested"], false);
+    }
+
+    #[test]
+    fn populated_archive_phase_fits_a_representative_root_row() {
+        let scope = authority_observation(authority(4));
+        let hot = serde_json::json!({"states":120,"lines":48,"situations":18,
+            "observations":32,"dependencies":16,"executions":8,"consumers":4,
+            "history_bytes":4096});
+        let owner = serde_json::json!({"owner_id":3,"generation":4,"complete":true,
+            "committed_chunks":2,"integrity_verified_chunks":2,"ram_reclaim_events":1,
+            "loads_requested":1,"loads_completed":1,"load_bytes_total":8192,
+            "admission_closed":false,"cleanup_complete":false});
+        let storage = compact_storage(serde_json::json!({
+            "complete":true,
+            "facts":{"phase_scope":scope,"phase_receipts_known":true,
+                "phase_receipts":[
+                    {"operation":"prepare_root","authority":scope,"nonce":11,
+                     "generation_before":3,"generation_after":4,
+                     "hot_before":hot,"hot_after":hot,"archive_owner":owner},
+                    {"operation":"restore_root_if_archived","authority":scope,"nonce":12,
+                     "generation_before":4,"generation_after":4,
+                     "hot_before":hot,"hot_after":hot,"archive_owner":owner}
+                ],
+                "original_phase_join":{"worker_joined":true,"owners_returned":true,
+                    "admission_closed":true}}
+        }));
+        let observed = ObservedV2::new((), "a".repeat(64));
+        observed.observation_lost.store(false, Ordering::Release);
+        let mut sink = Vec::new();
+        observed.emit_to(&mut sink, serde_json::json!({
+            "event":"root","authority":scope,"input_lock_sha256":"a".repeat(64),
+            "source_status":"original_receipt_matched","driver_result":"ok",
+            "root_physical_completion":"unknown_unless_explicit_in_original_receipt",
+            "root":{"kind":"original_current_root","receipt_domain":"rz-rovent-pc-native-root/2",
+                "input_lock_sha256":"a".repeat(64),"root_admission_sha256":"b".repeat(64),
+                "root_budget_sha256":"c".repeat(64),"deadline_seal_sha256":"d".repeat(64),
+                "state_and_history_sha256":"e".repeat(64),"original_start_matches":true,
+                "goal_status":"depth_satisfied","completed_depth":4,"maximum_examined_ply":6,
+                "native_usage_known":true,"native_nodes":128,"native_qsearch_nodes":64,
+                "reserved_native_nodes":0,"outstanding_native_executions":0,
+                "submitted_role_tickets":8,"completed_nn_inputs":8,"consumed_role_outputs":8,
+                "consumed_nn_inputs":8,"root_fence_permits_reuse":true,
+                "semantic_closure_permitted":true,"native_process_joined":true,
+                "native_physical_shutdown_confirmed":true,"quarantined":false,
+                "pending_tickets":0,"retained_outputs":0,"repair_observed":false},
+            "storage":storage
+        }), Some(authority(4)), false);
+        assert!(sink.len() <= MAX_ROW_BYTES);
+        let row: serde_json::Value = serde_json::from_slice(&sink).unwrap();
+        assert_eq!(row["storage"]["status"], "observed");
+        assert_eq!(row["storage"]["phase_receipts"][0]["nonce"], 11);
+        assert_eq!(row["storage"]["phase_receipts"][1]["hot_after"]["states"], 120);
+    }
+
+    #[test]
+    fn receipt_expansion_yields_to_the_original_storage_at_row_limit() {
+        let hot = serde_json::json!({"states":120,"lines":48,"situations":18,
+            "observations":32,"dependencies":16,"executions":8,"consumers":4,
+            "history_bytes":4096});
+        let storage = compact_storage(serde_json::json!({
+            "complete":true,
+            "facts":{"phase_receipts_known":true,"phase_receipts":[
+                {"operation":"prepare_root","nonce":11,"generation_before":3,
+                 "generation_after":4,"hot_before":hot,"hot_after":hot},
+                {"operation":"restore_root_if_archived","nonce":12,"generation_before":4,
+                 "generation_after":4,"hot_before":hot,"hot_after":hot}
+            ]}
+        }));
+        let mut row = serde_json::json!({"event":"root", "root":{"kept":true},
+            "storage":storage});
+        let mut original = row.clone();
+        assert!(omit_storage_receipt_fields(&mut original,
+            &["hot_before", "hot_after", "next_authority", "nonce", "generation_before", "generation_after"]));
+        original["domain"] = serde_json::json!(DOMAIN);
+        original["observation_complete_so_far"] = serde_json::json!(true);
+        let original_len = serde_json::to_vec(&original).unwrap().len() + 1;
+        row["root"]["padding"] = serde_json::json!("x".repeat(MAX_ROW_BYTES - original_len - 64));
+        let observed = ObservedV2::new((), String::new());
+        observed.observation_lost.store(false, Ordering::Release);
+        let mut sink = Vec::new();
+        observed.emit_to(&mut sink, row, Some(authority(4)), false);
+        assert!(sink.len() <= MAX_ROW_BYTES);
+        let row: serde_json::Value = serde_json::from_slice(&sink).unwrap();
+        assert_eq!(row["root"]["kept"], true);
+        assert_eq!(row["storage"]["status"], "observed");
+        assert_eq!(row["storage"]["receipt_detail_omitted"], true);
+        assert_eq!(row["storage"]["phase_receipts"][0]["operation"], "prepare_root");
+        assert!(row["storage"]["phase_receipts"][0].get("hot_before").is_none());
+        assert!(!observed.observation_lost.load(Ordering::Acquire));
     }
 
     #[test]

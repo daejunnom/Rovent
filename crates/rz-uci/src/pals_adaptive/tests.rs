@@ -286,6 +286,8 @@ struct DriverFixture {
     fail_role_once: bool,
     fail_after_role_consumption_once: bool,
     fail_role_consumption_readback: bool,
+    fail_root_ranking_before_consumption_once: bool,
+    fail_root_ranking_after_consumption_once: bool,
     #[cfg(feature = "pals-adaptive-diagnostics")]
     fail_publish_closed_once: bool,
     raw_cpu_receipts: Vec<ExecutionId>,
@@ -584,6 +586,19 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
                 .snapshot()
                 .same_state(self.rules.rules().snapshot())
         );
+        if std::mem::take(&mut self.fail_root_ranking_before_consumption_once) {
+            return Err(AdaptiveManagerError::Semantic(
+                "authored root ranking failure before consumption".into(),
+            ));
+        }
+        if std::mem::take(&mut self.fail_root_ranking_after_consumption_once) {
+            // Mirror the real Search ordering: the original ticket/view has
+            // been consumed before candidate materialization can fail.
+            self.role_consumed(&ranking.source().ticket, ranking.view())?;
+            return Err(AdaptiveManagerError::Semantic(
+                "authored root ranking failure after consumption".into(),
+            ));
+        }
         let width = match self.scope {
             FixtureScope::TwoIndependentRoles => 2,
             FixtureScope::OwnCpuResume
@@ -984,6 +999,8 @@ fn fixture_with_registered_role_limit_window(
         fail_role_once: false,
         fail_after_role_consumption_once: false,
         fail_role_consumption_readback: false,
+        fail_root_ranking_before_consumption_once: false,
+        fail_root_ranking_after_consumption_once: false,
         #[cfg(feature = "pals-adaptive-diagnostics")]
         fail_publish_closed_once: false,
         raw_cpu_receipts: Vec::new(),
@@ -2209,6 +2226,85 @@ fn invalid_continued_registration_returns_live_native_and_same_cpu_owner() {
     }
 }
 
+// These synthetic driver tests exercise manager accounting; the fixture does
+// not install a V3 collection observer or a production V2 collection owner.
+#[test]
+fn root_ranking_failure_before_consumption_keeps_output_unconsumed() {
+    let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    manager.driver_mut().fail_root_ranking_before_consumption_once = true;
+    manager.prepare_root_ranking(root).unwrap();
+    pump(&mut manager, until, |manager| {
+        manager.failures().next().is_some()
+    });
+    assert!(matches!(
+        manager.failures().next(),
+        Some(AdaptiveManagerError::Semantic(detail))
+            if detail.contains("authored root ranking failure before consumption")
+    ));
+    let receipt = shutdown(&mut manager, until);
+    assert!(receipt.permits_archive_close());
+    assert_eq!(manager.counters().consumed_role_outputs, 0);
+    assert!(manager.driver().consumed.is_empty());
+    assert!(manager.roles.is_empty());
+    assert!(facts.finish_called.load(Ordering::Acquire));
+}
+
+#[test]
+fn root_ranking_failure_after_consumption_charges_original_ticket_once() {
+    let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    let expected_view = root.view.seal_digest();
+    manager.driver_mut().fail_root_ranking_after_consumption_once = true;
+    manager.prepare_root_ranking(root).unwrap();
+    pump(&mut manager, until, |manager| {
+        manager.failures().next().is_some()
+    });
+    assert!(matches!(
+        manager.failures().next(),
+        Some(AdaptiveManagerError::Semantic(detail))
+            if detail.contains("authored root ranking failure after consumption")
+    ));
+    let receipt = shutdown(&mut manager, until);
+    assert!(receipt.permits_archive_close());
+    assert_eq!(manager.counters().consumed_role_outputs, 1);
+    assert_eq!(manager.driver().consumed.len(), 1);
+    assert_eq!(manager.driver().consumed[0].view.view_digest.0, expected_view);
+    assert!(manager.roles.is_empty());
+    assert!(facts.finish_called.load(Ordering::Acquire));
+}
+
+#[test]
+fn root_ranking_failure_with_unknown_readback_preserves_original_binding() {
+    let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    manager.driver_mut().fail_root_ranking_after_consumption_once = true;
+    manager.driver_mut().fail_role_consumption_readback = true;
+    manager.prepare_root_ranking(root).unwrap();
+    pump(&mut manager, until, |manager| {
+        manager.failures().next().is_some()
+    });
+    let receipt = shutdown(&mut manager, until);
+    assert!(receipt.native_physical_shutdown_confirmed);
+    assert!(receipt.quarantined);
+    assert!(!receipt.permits_archive_close());
+    let original = manager
+        .roles
+        .iter()
+        .find(|binding| binding.consumption_unknown)
+        .expect("uncertain original root binding must remain in custody");
+    assert!(!original.consumption_recorded);
+    assert_eq!(manager.driver().consumed.as_slice(), &[original.ticket.unwrap()]);
+    assert!(manager.failures().any(|error| matches!(
+        error,
+        AdaptiveManagerError::Semantic(detail)
+            if detail == "authored role consumption readback failure"
+    )));
+    assert!(manager.failures().any(|error| matches!(
+        error,
+        AdaptiveManagerError::Semantic(detail)
+            if detail.contains("authored root ranking failure after consumption")
+    )));
+    assert!(facts.finish_called.load(Ordering::Acquire));
+}
+
 #[test]
 fn next_view_failure_preserves_actual_original_role_consumption() {
     let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
@@ -2829,6 +2925,8 @@ mod adaptive_partial_feedback {
                 fail_role_once: false,
                 fail_after_role_consumption_once: false,
                 fail_role_consumption_readback: false,
+                fail_root_ranking_before_consumption_once: false,
+                fail_root_ranking_after_consumption_once: false,
                 #[cfg(feature = "pals-adaptive-diagnostics")]
                 fail_publish_closed_once: false,
                 raw_cpu_receipts: Vec::new(),

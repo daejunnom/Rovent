@@ -1007,33 +1007,141 @@ impl PcRunRecoveryKeyV3 {
     /// not settle the owner or establish physical completion.
     pub(crate) fn root_failure_observation(
         &self,
-    ) -> Result<PcDriverPollV3<crate::rovent_collect::pc_worker_v3::PcRootFailureObservationV3>, PcDriverEvidenceErrorV3> {
+    ) -> Result<
+        PcDriverPollV3<crate::rovent_collect::pc_worker_v3::PcRootFailureObservationV3>,
+        PcDriverEvidenceErrorV3,
+    > {
         let guard = match self.0.original.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
-            Err(TryLockError::Poisoned(_)) => return Ok(PcDriverPollV3::Ready(
-                crate::rovent_collect::pc_worker_v3::PcRootFailureObservationV3::Unknown,
-            )),
+            Err(TryLockError::Poisoned(_)) => {
+                return Ok(PcDriverPollV3::Ready(
+                    crate::rovent_collect::pc_worker_v3::PcRootFailureObservationV3::Unknown,
+                ));
+            }
         };
-        let original = guard.as_ref().ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
+        let original = guard
+            .as_ref()
+            .ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
         let supervisor = match original.owners.supervisor().try_lock() {
             Ok(supervisor) => supervisor,
             Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
-            Err(TryLockError::Poisoned(_)) => return Ok(PcDriverPollV3::Ready(
-                crate::rovent_collect::pc_worker_v3::PcRootFailureObservationV3::Unknown,
-            )),
+            Err(TryLockError::Poisoned(_)) => {
+                return Ok(PcDriverPollV3::Ready(
+                    crate::rovent_collect::pc_worker_v3::PcRootFailureObservationV3::Unknown,
+                ));
+            }
         };
         Ok(supervisor.try_root_failure_observation())
     }
 
-    pub(crate) fn output_error_observation(&self) -> Result<PcDriverPollV3<Option<String>>, PcDriverEvidenceErrorV3> {
+    /// A separate, non-atomic observation of secondary teacher drain errors.
+    /// The same original owner is retained; this grants no settlement rights.
+    pub(crate) fn teacher_drain_failure_observation(
+        &self,
+    ) -> Result<
+        PcDriverPollV3<crate::rovent_collect::pc_worker_v3::PcRootFailureObservationV3>,
+        PcDriverEvidenceErrorV3,
+    > {
+        use crate::rovent_collect::pc_worker_v3::PcRootFailureObservationV3;
         let guard = match self.0.original.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
-            Err(TryLockError::Poisoned(_)) => return Err(PcDriverEvidenceErrorV3::Poisoned("recovery")),
+            Err(TryLockError::Poisoned(_)) => {
+                return Ok(PcDriverPollV3::Ready(PcRootFailureObservationV3::Unknown));
+            }
         };
-        let original = guard.as_ref().ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
-        Ok(PcDriverPollV3::Ready(original.output_error.as_ref().map(ToString::to_string)))
+        let original = guard
+            .as_ref()
+            .ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
+        let supervisor = match original.owners.supervisor().try_lock() {
+            Ok(supervisor) => supervisor,
+            Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+            Err(TryLockError::Poisoned(_)) => {
+                return Ok(PcDriverPollV3::Ready(PcRootFailureObservationV3::Unknown));
+            }
+        };
+        Ok(supervisor.try_teacher_drain_failure_observation())
+    }
+
+    /// Observe pre-dispatch authority failures in the same original bridge.
+    /// This is diagnostic only and does not change game or worker outcomes.
+    pub(crate) fn root_authority_failure_observation(
+        &self,
+    ) -> Result<
+        PcDriverPollV3<
+            crate::rovent_collect::pc_hooks_lock_v3::PcRootAuthorityFailureObservationV3,
+        >,
+        PcDriverEvidenceErrorV3,
+    > {
+        use crate::rovent_collect::pc_hooks_lock_v3::PcRootAuthorityFailureObservationV3;
+        let guard = match self.0.original.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+            Err(TryLockError::Poisoned(_)) => {
+                return Ok(PcDriverPollV3::Ready(
+                    PcRootAuthorityFailureObservationV3::Unknown,
+                ));
+            }
+        };
+        let original = guard
+            .as_ref()
+            .ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
+        Ok(PcDriverPollV3::Ready(
+            original
+                .owners
+                .bridge()
+                .try_root_authority_failure_observation(),
+        ))
+    }
+
+    /// Observe Start gate binding errors independently of root authority
+    /// failures, without changing the original bridge or its custody.
+    pub(crate) fn root_cancel_bind_failure_observation(
+        &self,
+    ) -> Result<
+        PcDriverPollV3<
+            crate::rovent_collect::pc_hooks_lock_v3::PcRootAuthorityFailureObservationV3,
+        >,
+        PcDriverEvidenceErrorV3,
+    > {
+        use crate::rovent_collect::pc_hooks_lock_v3::PcRootAuthorityFailureObservationV3;
+        let guard = match self.0.original.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+            Err(TryLockError::Poisoned(_)) => {
+                return Ok(PcDriverPollV3::Ready(
+                    PcRootAuthorityFailureObservationV3::Unknown,
+                ));
+            }
+        };
+        let original = guard
+            .as_ref()
+            .ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
+        Ok(PcDriverPollV3::Ready(
+            original
+                .owners
+                .bridge()
+                .try_root_cancel_bind_failure_observation(),
+        ))
+    }
+
+    pub(crate) fn output_error_observation(
+        &self,
+    ) -> Result<PcDriverPollV3<Option<String>>, PcDriverEvidenceErrorV3> {
+        let guard = match self.0.original.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(PcDriverEvidenceErrorV3::Poisoned("recovery"));
+            }
+        };
+        let original = guard
+            .as_ref()
+            .ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
+        Ok(PcDriverPollV3::Ready(
+            original.output_error.as_ref().map(ToString::to_string),
+        ))
     }
 
     /// Observe the same output-close evidence without moving its original owner.

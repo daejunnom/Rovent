@@ -28,6 +28,8 @@ mod proxy_entry_smoke_supervisor_v1;
 #[allow(dead_code)]
 mod proxy_entry_smoke_v1;
 #[allow(dead_code)]
+mod proxy_reobserve_gateway_v1;
+#[allow(dead_code)]
 mod smoke_expected_argv_v1;
 #[cfg(test)]
 mod smoke_prepare_lock_fixture;

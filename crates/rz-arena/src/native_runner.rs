@@ -72,6 +72,16 @@ fn v6_effective_deadlines(
 #[cfg(test)]
 mod original_window_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_and_late_evidence_share_the_original_output_budget() {
+        let reserved = AtomicU64::new(0);
+        assert!(reserve_no_game_evidence(&reserved, 4, 10).is_ok());
+        assert!(reserve_no_game_evidence(&reserved, 5, 10).is_ok());
+        assert!(reserve_no_game_evidence(&reserved, 2, 10).is_err());
+        assert_eq!(reserved.load(Ordering::Acquire), 9);
+    }
     #[test]
     fn original_window_only_reduces_time_and_refuses_expired_dispatch() {
         let now = std::time::Instant::now();
@@ -757,6 +767,7 @@ struct IndependentNoGameOwners {
     cancel_not_granted: Arc<AtomicBool>,
     cancel_failure: Arc<std::sync::OnceLock<Arc<ArenaError>>>,
     raw_persistence_started: AtomicBool,
+    evidence_budget_reserved: AtomicU64,
 }
 
 /// Limits and tree-watch declaration derived from this selected snapshot.
@@ -1109,6 +1120,18 @@ fn no_game_raw_bytes(evidence: &IndependentNoGameRawEvidence) -> u64 {
     u64::try_from(process.saturating_add(observation)).unwrap_or(u64::MAX)
 }
 
+/// Charge the original per-run output budget before writes. A failed or
+/// ambiguous write is not silently refunded as if it had written nothing.
+#[cfg(target_os = "linux")]
+fn reserve_no_game_evidence(reserved: &AtomicU64, bytes: u64, cap: u64) -> Result<(), ArenaError> {
+    reserved
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            used.checked_add(bytes).filter(|total| *total <= cap)
+        })
+        .map(|_| ())
+        .map_err(|_| ArenaError::Budget("NoGame evidence exceeds original output budget".into()))
+}
+
 /// Single-use authority for one prepared owner. A weak identity keeps this
 /// declaration from extending a snapshot/control/GPU lifetime by itself.
 #[cfg(target_os = "linux")]
@@ -1341,6 +1364,7 @@ impl PreparedIndependentNoGameOwner {
                 cancel_not_granted: Arc::new(AtomicBool::new(false)),
                 cancel_failure: Arc::new(std::sync::OnceLock::new()),
                 raw_persistence_started: AtomicBool::new(false),
+                evidence_budget_reserved: AtomicU64::new(0),
             }),
             process: None,
             retained_receipt: None,
@@ -1511,6 +1535,118 @@ impl PreparedIndependentNoGameOwner {
         self.persist_raw_evidence_with_dispatch(basename, None)
     }
 
+    /// Persist bytes observed after an earlier snapshot under fresh names.
+    /// Offsets are caller-reported; both are recorded and checked against the
+    /// retained prefix. Failure does not consume the original bytes or frame.
+    pub(crate) fn persist_late_evidence(
+        &self,
+        basename: &str,
+        stdout_offset: usize,
+        stderr_offset: usize,
+        reobservation: &crate::pals_adaptive_launch::SmokeReobserveObservation,
+    ) -> Result<IndependentNoGamePersistence, ArenaError> {
+        if !crate::native_launch::safe_output_basename(basename) {
+            return Err(ArenaError::Invalid(
+                "NoGame late evidence basename invalid".into(),
+            ));
+        }
+        let owners = self
+            .owners
+            .as_ref()
+            .ok_or_else(|| ArenaError::Invalid("NoGame original owner unavailable".into()))?;
+        let observation = owners
+            .observation
+            .as_ref()
+            .ok_or_else(|| ArenaError::Invalid("NoGame original observation unavailable".into()))?;
+        {
+            let control = owners
+                ._binding
+                .control()
+                .try_lock()
+                .map_err(|error| match error {
+                    TryLockError::WouldBlock => {
+                        ArenaError::Io("NoGame reobserve control busy; retry storage".into())
+                    }
+                    TryLockError::Poisoned(_) => {
+                        ArenaError::Io("NoGame reobserve control poisoned".into())
+                    }
+                })?;
+            if !control.owns_no_game_reobservation(reobservation) {
+                return Err(ArenaError::Integrity(
+                    "NoGame reobservation belongs to another owner".into(),
+                ));
+            }
+        }
+        let stdout = observation
+            .buffered_stdout()
+            .get(stdout_offset..)
+            .ok_or_else(|| {
+                ArenaError::Invalid("NoGame stdout offset exceeds retained prefix".into())
+            })?;
+        let stderr = observation
+            .buffered_stderr()
+            .get(stderr_offset..)
+            .ok_or_else(|| {
+                ArenaError::Invalid("NoGame stderr offset exceeds retained prefix".into())
+            })?;
+        let snapshot = owners._binding.snapshot();
+        let cap = snapshot.plan.input().budget.max_output_bytes;
+        let summary = serde_json::to_vec(&serde_json::json!({
+            "scope": "same_nogame_reobservation_not_physical_fence",
+            "sequence": reobservation.request.sequence,
+            "status": format!("{:?}", reobservation.response.status),
+            "original_cleanup_elapsed": reobservation.response.original_cleanup_elapsed,
+            "reported_error": reobservation.response.error.as_deref(),
+            "first_observation_timeout": reobservation.first_timeout.as_ref().map(ToString::to_string),
+            "physical_or_process_completion_unknown": self.unresolved(),
+            "stdout_offset": stdout_offset, "stdout_bytes": stdout.len(),
+            "stderr_offset": stderr_offset, "stderr_bytes": stderr.len(),
+        })).map_err(|_| ArenaError::Io("NoGame late evidence summary encoding failed".into()))?;
+        let files = [
+            (format!("{basename}.stdout-delta"), stdout),
+            (format!("{basename}.stderr-delta"), stderr),
+            (
+                format!("{basename}.request"),
+                reobservation.request_bytes.as_slice(),
+            ),
+            (
+                format!("{basename}.response"),
+                reobservation.response_bytes.as_slice(),
+            ),
+            (format!("{basename}.summary.json"), summary.as_slice()),
+        ];
+        let total = files
+            .iter()
+            .try_fold(0u64, |sum, (_, bytes)| {
+                sum.checked_add(u64::try_from(bytes.len()).ok()?)
+            })
+            .ok_or_else(|| ArenaError::Budget("NoGame late evidence bytes overflow".into()))?;
+        if total > cap {
+            return Err(ArenaError::Budget(
+                "NoGame late evidence exceeds original output budget".into(),
+            ));
+        }
+        reserve_no_game_evidence(&owners.evidence_budget_reserved, total, cap)?;
+        let files = files
+            .into_iter()
+            .map(|(name, bytes)| {
+                let result = linux::put_directory(&snapshot.directory, &name, bytes, cap);
+                (name, result)
+            })
+            .collect();
+        let directory_sync = crate::native_launch::linux::readable_directory_pin(
+            &snapshot.directory,
+        )
+        .and_then(|dir| {
+            dir.sync_all()
+                .map_err(|_| ArenaError::Io("NoGame late evidence directory sync failed".into()))
+        });
+        Ok(IndependentNoGamePersistence {
+            files,
+            directory_sync,
+        })
+    }
+
     fn persist_raw_evidence_with_dispatch(
         &self,
         basename: &str,
@@ -1653,6 +1789,9 @@ impl PreparedIndependentNoGameOwner {
             .map_err(|_| {
                 ArenaError::Invalid("NoGame internal evidence persistence already attempted".into())
             })?;
+        let summary_size = u64::try_from(summary.len()).unwrap_or(u64::MAX);
+        let attempted = raw_total.saturating_add(summary_size).min(cap);
+        reserve_no_game_evidence(&owners.evidence_budget_reserved, attempted, cap)?;
         let mut files: Vec<_> = files
             .into_iter()
             .map(|(name, bytes)| {

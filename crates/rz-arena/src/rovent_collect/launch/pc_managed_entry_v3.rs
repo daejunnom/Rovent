@@ -26,6 +26,165 @@ fn bounded_detail(value: impl std::fmt::Display) -> String {
         .collect()
 }
 
+fn teacher_drain_diagnostic(
+    observed: Result<
+        PcDriverPollV3<crate::rovent_collect::pc_worker_v3::PcRootFailureObservationV3>,
+        PcDriverEvidenceErrorV3,
+    >,
+) -> serde_json::Value {
+    use crate::rovent_collect::pc_worker_v3::PcRootFailureObservationV3;
+    match observed {
+        Ok(PcDriverPollV3::Ready(PcRootFailureObservationV3::Failed {
+            error,
+            unknown,
+            pending,
+        })) => serde_json::json!({"status":"failed", "detail":bounded_detail(error),
+                "root_scan_unknown":unknown, "root_scan_pending":pending}),
+        Ok(PcDriverPollV3::Ready(PcRootFailureObservationV3::NoFailureObserved)) => {
+            serde_json::json!({"status":"no_failure_observed"})
+        }
+        Ok(PcDriverPollV3::Pending) => serde_json::json!({"status":"pending"}),
+        Ok(PcDriverPollV3::Ready(PcRootFailureObservationV3::Unknown)) | Err(_) => {
+            serde_json::json!({"status":"unknown"})
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BridgeSlotFailureScope {
+    RootAuthority,
+    RootCancelBind,
+}
+
+impl BridgeSlotFailureScope {
+    fn field(self) -> &'static str {
+        match self {
+            Self::RootAuthority => "original_bridge_root_slots.root_authority_failure",
+            Self::RootCancelBind => "original_bridge_root_slots.root_cancel_bind_error",
+        }
+    }
+}
+
+fn root_authority_diagnostic(
+    observed: Result<
+        PcDriverPollV3<
+            crate::rovent_collect::pc_hooks_lock_v3::PcRootAuthorityFailureObservationV3,
+        >,
+        PcDriverEvidenceErrorV3,
+    >,
+    scope: BridgeSlotFailureScope,
+) -> serde_json::Value {
+    use crate::rovent_collect::pc_hooks_lock_v3::PcRootAuthorityFailureObservationV3 as Observation;
+    let scope = scope.field();
+    match observed {
+        Ok(PcDriverPollV3::Ready(Observation::Failed { first, count })) => {
+            serde_json::json!({"status":"failed", "scope":scope, "first_order":"root_vector_order", "detail":bounded_detail(first), "count":count})
+        }
+        Ok(PcDriverPollV3::Ready(Observation::NoFailureObserved)) => {
+            serde_json::json!({"status":"no_failure_observed", "scope":scope, "first_order":"root_vector_order"})
+        }
+        Ok(PcDriverPollV3::Pending | PcDriverPollV3::Ready(Observation::Pending)) => {
+            serde_json::json!({"status":"pending", "scope":scope, "first_order":"root_vector_order"})
+        }
+        Ok(PcDriverPollV3::Ready(Observation::Unknown)) | Err(_) => {
+            serde_json::json!({"status":"unknown", "scope":scope, "first_order":"root_vector_order"})
+        }
+    }
+}
+
+fn bridge_slot_diagnostic_not_started(scope: BridgeSlotFailureScope) -> serde_json::Value {
+    serde_json::json!({"status":"not_started", "scope":scope.field(), "first_order":"root_vector_order"})
+}
+
+#[cfg(test)]
+mod independent_recovery_diagnostic_tests {
+    use super::*;
+    use crate::rovent_collect::pc_hooks_lock_v3::PcRootAuthorityFailureObservationV3 as Authority;
+    use crate::rovent_collect::pc_worker_v3::PcRootFailureObservationV3 as Root;
+    use rz_contracts::{ContractError, ErrorCode, Stage};
+
+    #[test]
+    fn separate_diagnostics_preserve_pending_unknown_and_secondary_error() {
+        let authority = root_authority_diagnostic(
+            Ok(PcDriverPollV3::Ready(Authority::Failed {
+                first: ContractError::new(ErrorCode::BackendFailure, Stage::Admission, "authority"),
+                count: 2,
+            })),
+            BridgeSlotFailureScope::RootAuthority,
+        );
+        assert_eq!(authority["status"], "failed");
+        assert_eq!(authority["count"], 2);
+        assert_eq!(
+            authority["scope"],
+            "original_bridge_root_slots.root_authority_failure"
+        );
+        assert_eq!(authority["first_order"], "root_vector_order");
+        let cancel_bind = root_authority_diagnostic(
+            Ok(PcDriverPollV3::Ready(Authority::Failed {
+                first: ContractError::new(
+                    ErrorCode::IdentityMismatch,
+                    Stage::Admission,
+                    "cancel binding",
+                ),
+                count: 1,
+            })),
+            BridgeSlotFailureScope::RootCancelBind,
+        );
+        assert_eq!(cancel_bind["status"], "failed");
+        assert_eq!(
+            cancel_bind["scope"],
+            "original_bridge_root_slots.root_cancel_bind_error"
+        );
+        assert_eq!(cancel_bind["first_order"], "root_vector_order");
+        assert!(
+            cancel_bind["detail"]
+                .as_str()
+                .unwrap()
+                .contains("cancel binding")
+        );
+        assert_ne!(authority["detail"], cancel_bind["detail"]);
+        let pending = root_authority_diagnostic(
+            Ok(PcDriverPollV3::Ready(Authority::Pending)),
+            BridgeSlotFailureScope::RootAuthority,
+        );
+        assert_eq!(pending["status"], "pending");
+        assert_eq!(
+            pending["scope"],
+            "original_bridge_root_slots.root_authority_failure"
+        );
+        let unknown = root_authority_diagnostic(
+            Ok(PcDriverPollV3::Ready(Authority::Unknown)),
+            BridgeSlotFailureScope::RootCancelBind,
+        );
+        assert_eq!(unknown["status"], "unknown");
+        assert_eq!(
+            unknown["scope"],
+            "original_bridge_root_slots.root_cancel_bind_error"
+        );
+        assert_eq!(
+            bridge_slot_diagnostic_not_started(BridgeSlotFailureScope::RootCancelBind)["first_order"],
+            "root_vector_order"
+        );
+        let teacher = teacher_drain_diagnostic(Ok(PcDriverPollV3::Ready(Root::Failed {
+            error: "secondary teacher error".into(),
+            unknown: true,
+            pending: true,
+        })));
+        assert_eq!(teacher["status"], "failed");
+        assert_eq!(teacher["detail"], "secondary teacher error");
+        assert_eq!(teacher["root_scan_unknown"], true);
+        assert_eq!(teacher["root_scan_pending"], true);
+        assert_eq!(
+            teacher_drain_diagnostic(Ok(PcDriverPollV3::Pending))["status"],
+            "pending"
+        );
+        assert_eq!(
+            teacher_drain_diagnostic(Ok(PcDriverPollV3::Ready(Root::Unknown)))["status"],
+            "unknown"
+        );
+    }
+}
+
 fn prepare_error(error: &ManagedPcPrepareErrorV3) -> (&'static str, Option<String>) {
     match error {
         ManagedPcPrepareErrorV3::DescriptorUncertain(error) => {
@@ -668,11 +827,23 @@ impl ManagedPcEntryResultV3 {
                     (stage, settlement, native, first_error, *deadline_reached)
                 }
             };
-        let (root_failure, output_error) = match &self.original {
+        // Each field is a separate point-in-time nonblocking observation.
+        // Do not infer one observation's state from another.
+        let (
+            root_failure,
+            output_error,
+            root_authority_failure,
+            root_cancel_bind_failure,
+            teacher_drain_failure,
+        ) = match &self.original {
             EntryState::Run { original, .. } => {
                 use crate::rovent_collect::pc_worker_v3::PcRootFailureObservationV3;
                 let root = match original.recovery_key().root_failure_observation() {
-                    Ok(PcDriverPollV3::Ready(PcRootFailureObservationV3::Failed { error, unknown, pending })) => {
+                    Ok(PcDriverPollV3::Ready(PcRootFailureObservationV3::Failed {
+                        error,
+                        unknown,
+                        pending,
+                    })) => {
                         let detail = bounded_detail(&error);
                         if first_error.is_none() {
                             first_error = Some(("root", Some(detail.clone())));
@@ -680,11 +851,13 @@ impl ManagedPcEntryResultV3 {
                         serde_json::json!({"status":"failed", "detail":detail,
                             "root_scan_unknown":unknown, "root_scan_pending":pending})
                     }
-                    Ok(PcDriverPollV3::Ready(PcRootFailureObservationV3::NoFailureObserved)) =>
-                        serde_json::json!({"status":"no_failure_observed"}),
+                    Ok(PcDriverPollV3::Ready(PcRootFailureObservationV3::NoFailureObserved)) => {
+                        serde_json::json!({"status":"no_failure_observed"})
+                    }
                     Ok(PcDriverPollV3::Pending) => serde_json::json!({"status":"pending"}),
-                    Ok(PcDriverPollV3::Ready(PcRootFailureObservationV3::Unknown)) | Err(_) =>
-                        serde_json::json!({"status":"unknown"}),
+                    Ok(PcDriverPollV3::Ready(PcRootFailureObservationV3::Unknown)) | Err(_) => {
+                        serde_json::json!({"status":"unknown"})
+                    }
                 };
                 let output = match original.recovery_key().output_error_observation() {
                     Ok(PcDriverPollV3::Ready(Some(error))) => {
@@ -694,13 +867,34 @@ impl ManagedPcEntryResultV3 {
                         }
                         serde_json::json!({"status":"failed", "detail":detail})
                     }
-                    Ok(PcDriverPollV3::Ready(None)) => serde_json::json!({"status":"no_failure_observed"}),
+                    Ok(PcDriverPollV3::Ready(None)) => {
+                        serde_json::json!({"status":"no_failure_observed"})
+                    }
                     Ok(PcDriverPollV3::Pending) => serde_json::json!({"status":"pending"}),
                     Err(_) => serde_json::json!({"status":"unknown"}),
                 };
-                (root, output)
+                let authority = root_authority_diagnostic(
+                    original.recovery_key().root_authority_failure_observation(),
+                    BridgeSlotFailureScope::RootAuthority,
+                );
+                let cancel_bind = root_authority_diagnostic(
+                    original
+                        .recovery_key()
+                        .root_cancel_bind_failure_observation(),
+                    BridgeSlotFailureScope::RootCancelBind,
+                );
+                let teacher = teacher_drain_diagnostic(
+                    original.recovery_key().teacher_drain_failure_observation(),
+                );
+                (root, output, authority, cancel_bind, teacher)
             }
-            _ => (serde_json::json!({"status":"not_started"}), serde_json::json!({"status":"not_started"})),
+            _ => (
+                serde_json::json!({"status":"not_started"}),
+                serde_json::json!({"status":"not_started"}),
+                bridge_slot_diagnostic_not_started(BridgeSlotFailureScope::RootAuthority),
+                bridge_slot_diagnostic_not_started(BridgeSlotFailureScope::RootCancelBind),
+                serde_json::json!({"status":"not_started"}),
+            ),
         };
         let publication_deadline_elapsed = matches!(
             &self.original,
@@ -739,6 +933,9 @@ impl ManagedPcEntryResultV3 {
             "first_error":first_error.map(|(kind,detail)| serde_json::json!({"kind":kind,"detail":detail})),
             "root_failure":root_failure,
             "output_error":output_error,
+            "root_authority_failure":root_authority_failure,
+            "root_cancel_bind_failure":root_cancel_bind_failure,
+            "teacher_drain_failure":teacher_drain_failure,
             "recovery_error":recovery_error,
             "recovery_panic":recovery_panic,
             "cleanup_deadline_elapsed":cleanup_deadline_elapsed,
